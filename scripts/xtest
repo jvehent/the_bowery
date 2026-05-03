@@ -154,6 +154,10 @@ uname -a
 cat /etc/os-release 2>/dev/null | grep -E "^(NAME|VERSION_ID)=" || true
 
 echo
+echo "==> forcing apt to use IPv4 (works around VirtualBox NAT/bridge IPv6 stalls)"
+echo 'Acquire::ForceIPv4 "true";' | sudo tee /etc/apt/apt.conf.d/99force-ipv4 >/dev/null
+
+echo
 echo "==> installing system build deps (sudo will prompt once if needed)"
 sudo apt-get update -qq
 DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
