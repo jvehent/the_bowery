@@ -34,3 +34,9 @@ interval = "30s"
 # SQLite-backed baseline of observed binaries and process lineage. Use the
 # literal `:memory:` to keep the baseline in RAM (test/ephemeral agents).
 path = "/var/lib/bowery/baseline.db"
+
+[role]
+# How often to recompute and publish this node's role vector via the mesh
+# KV layer. Other nodes use the role vector to choose similar peers when
+# whispering (Phase 5).
+publish_interval = "60s"

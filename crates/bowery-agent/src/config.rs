@@ -16,6 +16,7 @@ const DEFAULT_KNOWN_NEIGHBORS_PATH: &str = "/var/lib/bowery/known_neighbors.json
 const DEFAULT_BASELINE_PATH: &str = "/var/lib/bowery/baseline.db";
 const DEFAULT_BOOTSTRAP_WINDOW_HOURS: u64 = 24 * 7; // 7 days
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+const DEFAULT_ROLE_PUBLISH_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +33,8 @@ pub struct Config {
     pub heartbeat: HeartbeatConfig,
     #[serde(default)]
     pub baseline: BaselineConfig,
+    #[serde(default)]
+    pub role: RoleConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +162,27 @@ impl Default for HeartbeatConfig {
 
 fn default_heartbeat_interval() -> Duration {
     Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleConfig {
+    /// Interval at which the agent recomputes and publishes its role
+    /// vector via the mesh KV. 60s by default.
+    #[serde(with = "humantime_serde", default = "default_role_publish_interval")]
+    pub publish_interval: Duration,
+}
+
+impl Default for RoleConfig {
+    fn default() -> Self {
+        Self {
+            publish_interval: default_role_publish_interval(),
+        }
+    }
+}
+
+fn default_role_publish_interval() -> Duration {
+    Duration::from_secs(DEFAULT_ROLE_PUBLISH_INTERVAL_SECS)
 }
 
 impl Config {

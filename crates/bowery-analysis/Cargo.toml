@@ -1,0 +1,26 @@
+[package]
+name = "bowery-analysis"
+description = "Pre-filter rules, baseline scoring, episode aggregation, and role vectors for The Bowery."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+bowery-baseline = { workspace = true }
+bowery-events = { workspace = true }
+
+base64 = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

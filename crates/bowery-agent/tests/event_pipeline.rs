@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use bowery_agent::config::{
     BaselineConfig, Config, HeartbeatConfig, IdentityConfig, KnownNeighborsConfig, MeshConfig,
-    WhisperConfig,
+    RoleConfig, WhisperConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_baseline::UpsertOutcome;
@@ -52,6 +52,9 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr) -> Config {
         },
         baseline: BaselineConfig {
             path: ":memory:".into(),
+        },
+        role: RoleConfig {
+            publish_interval: Duration::from_mins(1),
         },
     }
 }

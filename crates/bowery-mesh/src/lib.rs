@@ -29,6 +29,8 @@ use tracing::warn;
 const KEY_VERSION: &str = "version";
 const KEY_WHISPER_ADDR: &str = "whisper_addr";
 const KEY_VERIFYING_KEY: &str = "verifying_key";
+/// Key under which each node publishes its base64-encoded role vector.
+pub const KEY_ROLE_VECTOR: &str = "role_vec";
 pub const DEFAULT_CLUSTER_ID: &str = "bowery";
 
 #[derive(Debug, Error)]
@@ -49,6 +51,9 @@ pub struct PeerInfo {
     pub verifying_key: VerifyingKey,
     pub whisper_addr: SocketAddr,
     pub agent_version: String,
+    /// Base64-encoded role vector published by the peer, if any. Decode
+    /// with `bowery_analysis::RoleVector::from_base64`.
+    pub role_vector: Option<String>,
 }
 
 #[derive(Debug)]
@@ -177,6 +182,23 @@ impl Mesh {
         self.peers_rx.clone()
     }
 
+    /// Update a key in this node's KV state. Other nodes pick up the new
+    /// value via gossip on the next round.
+    pub async fn set_state(&self, key: impl Into<String>, value: impl Into<String>) -> Result<()> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| Error::Shutdown("mesh already shut down".into()))?;
+        let key = key.into();
+        let value = value.into();
+        handle
+            .with_chitchat(|chitchat| {
+                chitchat.self_node_state().set(key.clone(), value.clone());
+            })
+            .await;
+        Ok(())
+    }
+
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(handle) = self.handle.take() {
             handle
@@ -212,11 +234,13 @@ fn build_peer_infos(
                 warn!(claimed = %fp, derived = %derived_fp, "peer fingerprint/key mismatch");
                 return None;
             }
+            let role_vector = state.get(KEY_ROLE_VECTOR).map(str::to_string);
             Some(PeerInfo {
                 fingerprint: fp,
                 verifying_key: vk,
                 whisper_addr,
                 agent_version,
+                role_vector,
             })
         })
         .collect()

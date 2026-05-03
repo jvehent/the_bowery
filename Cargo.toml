@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/bowery-agent",
+    "crates/bowery-analysis",
     "crates/bowery-baseline",
     "crates/bowery-cli",
     "crates/bowery-crypto",
@@ -23,6 +24,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Internal
+bowery-analysis = { path = "crates/bowery-analysis", version = "0.0.1" }
 bowery-baseline = { path = "crates/bowery-baseline", version = "0.0.1" }
 bowery-crypto = { path = "crates/bowery-crypto", version = "0.0.1" }
 bowery-events = { path = "crates/bowery-events", version = "0.0.1" }

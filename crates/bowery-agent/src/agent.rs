@@ -5,11 +5,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bowery_analysis::{Analyzer, Episode, RoleFeatures, RoleVector, Verdict};
 use bowery_baseline::{Baseline, UpsertOutcome};
 use bowery_crypto::{Fingerprint, Identity};
 use bowery_events::source::EventSource;
 use bowery_events::{Event, ProcessExec, enrich};
-use bowery_mesh::{Mesh, MeshConfig, PeerInfo};
+use bowery_mesh::{KEY_ROLE_VECTOR, Mesh, MeshConfig, PeerInfo};
 use bowery_proto::WhisperPayload;
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
 use bowery_whisper::tls::PinnedCertVerifier;
@@ -42,6 +43,14 @@ pub enum AgentEvent {
         sha: [u8; 32],
         outcome: UpsertOutcome,
     },
+    /// Analyzer produced a verdict for an episode. Phase 3.
+    EpisodeAnalyzed {
+        verdict: Verdict,
+    },
+    /// Role vector recomputed and published via mesh KV. Phase 3.
+    RoleVectorPublished {
+        binary_count: u64,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -67,14 +76,16 @@ pub struct Agent {
     fingerprint: Fingerprint,
     known_neighbors: Arc<KnownNeighbors>,
     baseline: Arc<Baseline>,
+    analyzer: Arc<Analyzer>,
     endpoint: BoweryEndpoint,
-    mesh: Option<Mesh>,
+    mesh: Arc<Mesh>,
     shutdown_tx: watch::Sender<bool>,
     events_tx: broadcast::Sender<AgentEvent>,
     pin_task: JoinHandle<()>,
     accept_task: JoinHandle<()>,
     heartbeat_task: JoinHandle<()>,
     pipeline_task: JoinHandle<()>,
+    role_publisher_task: JoinHandle<()>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -101,6 +112,7 @@ impl Agent {
         )?);
 
         let baseline = Arc::new(open_baseline(&config.baseline.path)?);
+        let analyzer = Arc::new(Analyzer::with_default_rules(baseline.clone()));
 
         let accept_verifier = Arc::new(PinnedCertVerifier::new(known_neighbors.clone()));
         let endpoint =
@@ -124,7 +136,7 @@ impl Agent {
         if let Some(cluster) = config.mesh.cluster_id.as_ref() {
             mesh_cfg.cluster_id = cluster.clone();
         }
-        let mesh = Mesh::start(mesh_cfg).await?;
+        let mesh = Arc::new(Mesh::start(mesh_cfg).await?);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -156,6 +168,15 @@ impl Agent {
         let pipeline_task = spawn_pipeline_task(
             event_source.start(),
             baseline.clone(),
+            analyzer.clone(),
+            events_tx.clone(),
+            shutdown_rx.clone(),
+        );
+
+        let role_publisher_task = spawn_role_publisher_task(
+            mesh.clone(),
+            baseline.clone(),
+            config.role.publish_interval,
             events_tx.clone(),
             shutdown_rx,
         );
@@ -172,14 +193,16 @@ impl Agent {
             fingerprint,
             known_neighbors,
             baseline,
+            analyzer,
             endpoint,
-            mesh: Some(mesh),
+            mesh,
             shutdown_tx,
             events_tx,
             pin_task,
             accept_task,
             heartbeat_task,
             pipeline_task,
+            role_publisher_task,
         })
     }
 
@@ -209,16 +232,28 @@ impl Agent {
         &self.baseline
     }
 
-    pub async fn shutdown(mut self) -> Result<(), AgentError> {
+    pub fn analyzer(&self) -> &Arc<Analyzer> {
+        &self.analyzer
+    }
+
+    pub fn mesh(&self) -> &Arc<Mesh> {
+        &self.mesh
+    }
+
+    pub async fn shutdown(self) -> Result<(), AgentError> {
         let _ = self.shutdown_tx.send(true);
         self.endpoint.close().await;
         let _ = self.pin_task.await;
         let _ = self.accept_task.await;
         let _ = self.heartbeat_task.await;
         let _ = self.pipeline_task.await;
-        if let Some(mesh) = self.mesh.take() {
+        let _ = self.role_publisher_task.await;
+        if let Ok(mesh) = Arc::try_unwrap(self.mesh) {
             mesh.shutdown().await?;
         }
+        // Otherwise the mesh is still referenced (e.g. by an inflight task)
+        // and will drop when those references do; chitchat handles its own
+        // cleanup on Drop.
         Ok(())
     }
 }
@@ -382,6 +417,7 @@ async fn send_heartbeat(
 fn spawn_pipeline_task(
     mut events: mpsc::Receiver<Event>,
     baseline: Arc<Baseline>,
+    analyzer: Arc<Analyzer>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -390,7 +426,7 @@ fn spawn_pipeline_task(
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { break };
-                    process_event(&baseline, &events_tx, event).await;
+                    process_event(&baseline, &analyzer, &events_tx, event).await;
                 }
                 _ = shutdown_rx.changed() => break,
             }
@@ -400,22 +436,24 @@ fn spawn_pipeline_task(
 
 async fn process_event(
     baseline: &Arc<Baseline>,
+    analyzer: &Arc<Analyzer>,
     events_tx: &broadcast::Sender<AgentEvent>,
     event: Event,
 ) {
     // Phase 2 only persists ProcessExec; other variants are silently
     // consumed until later phases wire in network/file/exit handlers.
     if let Event::ProcessExec(exec) = event {
-        process_exec(baseline, events_tx, exec).await;
+        process_exec(baseline, analyzer, events_tx, exec).await;
     }
 }
 
 async fn process_exec(
     baseline: &Arc<Baseline>,
+    analyzer: &Arc<Analyzer>,
     events_tx: &broadcast::Sender<AgentEvent>,
     exec: ProcessExec,
 ) {
-    let Some(exe_path) = exec.exe_path else {
+    let Some(exe_path) = exec.exe_path.clone() else {
         debug!(
             pid = exec.pid,
             "exec event missing exe_path; skipping baseline"
@@ -435,6 +473,24 @@ async fn process_exec(
         }
     };
 
+    // Phase 3 ordering: build the episode and analyze BEFORE upserting,
+    // so the baseline scorer sees the prior history (count = 0 for a
+    // first-time exec, not 1).
+    let episode = Episode::from_exec(exec.clone());
+    let analyzer_for_call = analyzer.clone();
+    let episode_for_call = episode.clone();
+    let verdict = match tokio::task::spawn_blocking(move || {
+        analyzer_for_call.analyze(&episode_for_call, &sha)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(pid = exec.pid, error = %e, "analyzer task panicked");
+            return;
+        }
+    };
+
     let baseline_for_write = baseline.clone();
     let outcome =
         match tokio::task::spawn_blocking(move || baseline_for_write.upsert_binary(&sha)).await {
@@ -450,4 +506,61 @@ async fn process_exec(
         };
 
     let _ = events_tx.send(AgentEvent::BinaryRecorded { sha, outcome });
+    let _ = events_tx.send(AgentEvent::EpisodeAnalyzed { verdict });
+}
+
+// ---------------------------------------------------------------------------
+// Role-vector publisher
+// ---------------------------------------------------------------------------
+
+fn spawn_role_publisher_task(
+    mesh: Arc<Mesh>,
+    baseline: Arc<Baseline>,
+    interval: Duration,
+    events_tx: broadcast::Sender<AgentEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    publish_role_vector(&mesh, &baseline, &events_tx).await;
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
+}
+
+async fn publish_role_vector(
+    mesh: &Arc<Mesh>,
+    baseline: &Arc<Baseline>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+) {
+    let baseline_for_call = baseline.clone();
+    let features =
+        match tokio::task::spawn_blocking(move || RoleFeatures::from_baseline(&baseline_for_call))
+            .await
+        {
+            Ok(Ok(features)) => features,
+            Ok(Err(e)) => {
+                warn!(error = %e, "role features computation failed");
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, "role features task panicked");
+                return;
+            }
+        };
+    let vector = RoleVector::from_features(&features);
+    let encoded = vector.to_base64();
+    let binary_count = features.binary_count;
+    if let Err(e) = mesh.set_state(KEY_ROLE_VECTOR, encoded).await {
+        warn!(error = %e, "failed to publish role vector to mesh");
+        return;
+    }
+    debug!(binary_count, "published role vector");
+    let _ = events_tx.send(AgentEvent::RoleVectorPublished { binary_count });
 }

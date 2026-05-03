@@ -173,6 +173,7 @@ name = "bowery-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bowery-analysis",
  "bowery-baseline",
  "bowery-crypto",
  "bowery-events",
@@ -189,6 +190,19 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "bowery-analysis"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "bowery-baseline",
+ "bowery-events",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
