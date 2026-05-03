@@ -208,6 +208,8 @@ dependencies = [
  "anyhow",
  "bowery-crypto",
  "clap",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
