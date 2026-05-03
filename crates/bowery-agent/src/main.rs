@@ -8,6 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bowery_agent::{Agent, Config};
 use bowery_crypto::Identity;
+use bowery_events::source::NoopEventSource;
 use clap::Parser;
 use tracing::{error, info};
 
@@ -76,7 +77,10 @@ fn run(args: &Args) -> Result<()> {
         .context("building tokio runtime")?;
 
     runtime.block_on(async {
-        let agent = Agent::start(config, identity)
+        // Phase 2 placeholder: no real event source until the BPF loader
+        // lands. Replace with the eBPF source once the kernel-side work
+        // is wired up.
+        let agent = Agent::start(config, identity, Box::new(NoopEventSource))
             .await
             .context("starting agent")?;
         wait_for_shutdown().await?;

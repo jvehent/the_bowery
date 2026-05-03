@@ -11,10 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bowery_agent::config::{
-    Config, HeartbeatConfig, IdentityConfig, KnownNeighborsConfig, MeshConfig, WhisperConfig,
+    BaselineConfig, Config, HeartbeatConfig, IdentityConfig, KnownNeighborsConfig, MeshConfig,
+    WhisperConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_crypto::Identity;
+use bowery_events::source::NoopEventSource;
 use tempfile::TempDir;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -52,6 +54,9 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>) -> Config
         heartbeat: HeartbeatConfig {
             interval: Duration::from_millis(200),
         },
+        baseline: BaselineConfig {
+            path: ":memory:".into(),
+        },
     }
 }
 
@@ -77,10 +82,10 @@ async fn two_agents_discover_pin_and_heartbeat() {
         vec![mesh_addr_alpha.to_string()],
     );
 
-    let agent_alpha = Agent::start(cfg_alpha, id_alpha.clone())
+    let agent_alpha = Agent::start(cfg_alpha, id_alpha.clone(), Box::new(NoopEventSource))
         .await
         .expect("start alpha");
-    let agent_beta = Agent::start(cfg_beta, id_beta.clone())
+    let agent_beta = Agent::start(cfg_beta, id_beta.clone(), Box::new(NoopEventSource))
         .await
         .expect("start beta");
 

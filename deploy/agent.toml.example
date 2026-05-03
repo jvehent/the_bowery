@@ -29,3 +29,8 @@ bind_addr = "0.0.0.0:9902"
 [heartbeat]
 # Interval between heartbeat sweeps to known neighbors.
 interval = "30s"
+
+[baseline]
+# SQLite-backed baseline of observed binaries and process lineage. Use the
+# literal `:memory:` to keep the baseline in RAM (test/ephemeral agents).
+path = "/var/lib/bowery/baseline.db"

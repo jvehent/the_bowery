@@ -18,7 +18,9 @@ name = "bowery-agent"
 path = "src/main.rs"
 
 [dependencies]
+bowery-baseline = { workspace = true }
 bowery-crypto = { workspace = true }
+bowery-events = { workspace = true }
 bowery-mesh = { workspace = true }
 bowery-proto = { workspace = true }
 bowery-whisper = { workspace = true }
@@ -34,6 +36,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net"] }
 tracing-subscriber = { workspace = true }

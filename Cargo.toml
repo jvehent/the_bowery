@@ -2,8 +2,10 @@
 resolver = "3"
 members = [
     "crates/bowery-agent",
+    "crates/bowery-baseline",
     "crates/bowery-cli",
     "crates/bowery-crypto",
+    "crates/bowery-events",
     "crates/bowery-mesh",
     "crates/bowery-proto",
     "crates/bowery-whisper",
@@ -21,7 +23,9 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Internal
+bowery-baseline = { path = "crates/bowery-baseline", version = "0.0.1" }
 bowery-crypto = { path = "crates/bowery-crypto", version = "0.0.1" }
+bowery-events = { path = "crates/bowery-events", version = "0.0.1" }
 bowery-mesh = { path = "crates/bowery-mesh", version = "0.0.1" }
 bowery-proto = { path = "crates/bowery-proto", version = "0.0.1" }
 bowery-whisper = { path = "crates/bowery-whisper", version = "0.0.1" }
@@ -74,6 +78,9 @@ bytes = "1"
 chitchat = "0.10"
 tokio-stream = "0.1"
 futures = "0.3"
+
+# Baseline storage
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

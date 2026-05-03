@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_IDENTITY_PATH: &str = "/var/lib/bowery/identity.key";
 const DEFAULT_KNOWN_NEIGHBORS_PATH: &str = "/var/lib/bowery/known_neighbors.json";
+const DEFAULT_BASELINE_PATH: &str = "/var/lib/bowery/baseline.db";
 const DEFAULT_BOOTSTRAP_WINDOW_HOURS: u64 = 24 * 7; // 7 days
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
@@ -29,6 +30,8 @@ pub struct Config {
     pub whisper: WhisperConfig,
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
+    #[serde(default)]
+    pub baseline: BaselineConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +123,22 @@ impl Default for WhisperConfig {
 
 fn default_whisper_bind_addr() -> SocketAddr {
     "0.0.0.0:9902".parse().expect("static addr parses")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineConfig {
+    /// Path to the `SQLite` baseline database. The literal string `:memory:`
+    /// keeps the baseline in RAM (useful for tests and ephemeral agents).
+    pub path: PathBuf,
+}
+
+impl Default for BaselineConfig {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::from(DEFAULT_BASELINE_PATH),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

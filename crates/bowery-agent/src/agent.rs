@@ -5,7 +5,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bowery_baseline::{Baseline, UpsertOutcome};
 use bowery_crypto::{Fingerprint, Identity};
+use bowery_events::source::EventSource;
+use bowery_events::{Event, ProcessExec, enrich};
 use bowery_mesh::{Mesh, MeshConfig, PeerInfo};
 use bowery_proto::WhisperPayload;
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
@@ -13,7 +16,7 @@ use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::{BoweryConnection, BoweryEndpoint};
 use bowery_whisper::{FingerprintResolver, Sealer, Verifier};
 use thiserror::Error;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -26,8 +29,19 @@ const EVENT_CHANNEL_CAPACITY: usize = 4096;
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     PeerPinned(Fingerprint),
-    EnvelopeReceived { sender: Fingerprint, nonce: u64 },
-    HeartbeatSent { peer: Fingerprint },
+    EnvelopeReceived {
+        sender: Fingerprint,
+        nonce: u64,
+    },
+    HeartbeatSent {
+        peer: Fingerprint,
+    },
+    /// A binary observed via [`Event::ProcessExec`] was upserted into the
+    /// baseline. `outcome` distinguishes "first time seen" from "increment".
+    BinaryRecorded {
+        sha: [u8; 32],
+        outcome: UpsertOutcome,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -43,12 +57,16 @@ pub enum AgentError {
 
     #[error("mesh: {0}")]
     Mesh(#[from] bowery_mesh::Error),
+
+    #[error("baseline: {0}")]
+    Baseline(#[from] bowery_baseline::Error),
 }
 
 /// A running Bowery agent. Drop or [`Agent::shutdown`] to stop it.
 pub struct Agent {
     fingerprint: Fingerprint,
     known_neighbors: Arc<KnownNeighbors>,
+    baseline: Arc<Baseline>,
     endpoint: BoweryEndpoint,
     mesh: Option<Mesh>,
     shutdown_tx: watch::Sender<bool>,
@@ -56,6 +74,7 @@ pub struct Agent {
     pin_task: JoinHandle<()>,
     accept_task: JoinHandle<()>,
     heartbeat_task: JoinHandle<()>,
+    pipeline_task: JoinHandle<()>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -68,7 +87,11 @@ impl std::fmt::Debug for Agent {
 }
 
 impl Agent {
-    pub async fn start(config: Config, identity: Arc<Identity>) -> Result<Self, AgentError> {
+    pub async fn start(
+        config: Config,
+        identity: Arc<Identity>,
+        event_source: Box<dyn EventSource>,
+    ) -> Result<Self, AgentError> {
         let fingerprint = identity.fingerprint();
         info!(fingerprint = %fingerprint, "starting agent");
 
@@ -76,6 +99,8 @@ impl Agent {
             &config.known_neighbors.path,
             config.known_neighbors.bootstrap_window,
         )?);
+
+        let baseline = Arc::new(open_baseline(&config.baseline.path)?);
 
         let accept_verifier = Arc::new(PinnedCertVerifier::new(known_neighbors.clone()));
         let endpoint =
@@ -125,6 +150,13 @@ impl Agent {
             identity,
             config.heartbeat.interval,
             events_tx.clone(),
+            shutdown_rx.clone(),
+        );
+
+        let pipeline_task = spawn_pipeline_task(
+            event_source.start(),
+            baseline.clone(),
+            events_tx.clone(),
             shutdown_rx,
         );
 
@@ -132,12 +164,14 @@ impl Agent {
             fingerprint = %fingerprint,
             mesh = %config.mesh.listen_addr,
             whisper = %whisper_addr,
+            baseline = %config.baseline.path.display(),
             "agent ready"
         );
 
         Ok(Self {
             fingerprint,
             known_neighbors,
+            baseline,
             endpoint,
             mesh: Some(mesh),
             shutdown_tx,
@@ -145,6 +179,7 @@ impl Agent {
             pin_task,
             accept_task,
             heartbeat_task,
+            pipeline_task,
         })
     }
 
@@ -165,16 +200,34 @@ impl Agent {
         self.known_neighbors.count()
     }
 
+    /// Snapshot of the baseline binary count. Useful for tests and ops.
+    pub fn baseline_binary_count(&self) -> Result<u64, AgentError> {
+        Ok(self.baseline.count_binaries()?)
+    }
+
+    pub fn baseline(&self) -> &Arc<Baseline> {
+        &self.baseline
+    }
+
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         let _ = self.shutdown_tx.send(true);
         self.endpoint.close().await;
         let _ = self.pin_task.await;
         let _ = self.accept_task.await;
         let _ = self.heartbeat_task.await;
+        let _ = self.pipeline_task.await;
         if let Some(mesh) = self.mesh.take() {
             mesh.shutdown().await?;
         }
         Ok(())
+    }
+}
+
+fn open_baseline(path: &std::path::Path) -> bowery_baseline::Result<Baseline> {
+    if path.as_os_str() == ":memory:" {
+        Baseline::open_in_memory()
+    } else {
+        Baseline::open(path)
     }
 }
 
@@ -320,4 +373,81 @@ async fn send_heartbeat(
         },
         Err(e) => debug!(peer = %peer.fingerprint, error = %e, "heartbeat dial failed"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Event pipeline
+// ---------------------------------------------------------------------------
+
+fn spawn_pipeline_task(
+    mut events: mpsc::Receiver<Event>,
+    baseline: Arc<Baseline>,
+    events_tx: broadcast::Sender<AgentEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    process_event(&baseline, &events_tx, event).await;
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
+}
+
+async fn process_event(
+    baseline: &Arc<Baseline>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    event: Event,
+) {
+    // Phase 2 only persists ProcessExec; other variants are silently
+    // consumed until later phases wire in network/file/exit handlers.
+    if let Event::ProcessExec(exec) = event {
+        process_exec(baseline, events_tx, exec).await;
+    }
+}
+
+async fn process_exec(
+    baseline: &Arc<Baseline>,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    exec: ProcessExec,
+) {
+    let Some(exe_path) = exec.exe_path else {
+        debug!(
+            pid = exec.pid,
+            "exec event missing exe_path; skipping baseline"
+        );
+        return;
+    };
+
+    let sha = match tokio::task::spawn_blocking(move || enrich::sha256_file(&exe_path)).await {
+        Ok(Ok(sha)) => sha,
+        Ok(Err(e)) => {
+            debug!(pid = exec.pid, error = %e, "exe sha256 failed");
+            return;
+        }
+        Err(e) => {
+            warn!(pid = exec.pid, error = %e, "sha256 task panicked");
+            return;
+        }
+    };
+
+    let baseline_for_write = baseline.clone();
+    let outcome =
+        match tokio::task::spawn_blocking(move || baseline_for_write.upsert_binary(&sha)).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(e)) => {
+                warn!(pid = exec.pid, error = %e, "baseline upsert failed");
+                return;
+            }
+            Err(e) => {
+                warn!(pid = exec.pid, error = %e, "baseline task panicked");
+                return;
+            }
+        };
+
+    let _ = events_tx.send(AgentEvent::BinaryRecorded { sha, outcome });
 }
