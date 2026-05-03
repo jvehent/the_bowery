@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# build-ebpf — compile the bowery-ebpf crate for the BPF target.
+#
+# The eBPF crate is its own workspace because it builds for
+# bpfel-unknown-none (BPF bytecode), needs the unstable `build-std`
+# feature, and depends on `bpf-linker`. Keeping it separate prevents
+# the parent workspace from inheriting any of that.
+#
+# Output: crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf
+#
+# Requirements (one-time, installed by `scripts/xtest setup`):
+#   - Rust nightly with rust-src component
+#   - bpf-linker  (cargo install bpf-linker)
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+EBPF_DIR="$REPO_ROOT/crates/bowery-ebpf"
+
+if ! command -v bpf-linker >/dev/null; then
+    echo "error: bpf-linker not found on PATH" >&2
+    echo "       install with: cargo install bpf-linker" >&2
+    exit 1
+fi
+
+cd "$EBPF_DIR"
+cargo +nightly build --release "$@"
+
+OUT="$EBPF_DIR/target/bpfel-unknown-none/release/bowery-ebpf"
+if [[ ! -f "$OUT" ]]; then
+    echo "error: build succeeded but $OUT is missing" >&2
+    exit 1
+fi
+
+echo
+echo "built $OUT"
+ls -lh "$OUT"

@@ -125,6 +125,53 @@ mTLS, and signed envelopes in ~1.3 s.
 
 ---
 
+## 4a. Building the eBPF programs (Linux + KRSI hosts)
+
+The kernel-side programs live in `crates/bowery-ebpf/` and compile to
+the `bpfel-unknown-none` target. They're a separate Rust workspace
+(see [crates/bowery-ebpf/Cargo.toml](crates/bowery-ebpf/Cargo.toml))
+because the BPF target needs nightly + `bpf-linker` + the unstable
+`build-std` feature.
+
+The agent loads the resulting object at startup. If it isn't found,
+the agent runs without kernel events (mesh + heartbeat continue to
+work), so this step is technically optional for an isolated host but
+required for the actual EDR signal.
+
+Prerequisites (`scripts/xtest setup` does this on the remote target,
+otherwise install manually):
+
+```sh
+rustup toolchain install nightly --profile minimal --component rust-src
+cargo install bpf-linker
+```
+
+Build:
+
+```sh
+./scripts/build-ebpf
+# → crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf
+```
+
+At runtime the agent looks for the object in this order:
+
+1. `$BOWERY_BPF_OBJ_PATH` (env var)
+2. `/usr/local/lib/bowery/bowery-ebpf`
+3. `/usr/lib/bowery/bowery-ebpf`
+4. `crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf`
+   (handy when running from a workspace checkout)
+
+For production install:
+
+```sh
+sudo install -d -m 0755 /usr/local/lib/bowery
+sudo install -m 0644 crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf \
+    /usr/local/lib/bowery/bowery-ebpf
+```
+
+The agent needs `CAP_BPF` + `CAP_PERFMON` (or root) at runtime to load
+the program. The shipped systemd unit grants these.
+
 ## 4. Installing the agent (root)
 
 ```bash

@@ -1,0 +1,24 @@
+[package]
+name = "bowery-ebpf-loader"
+description = "User-space loader for The Bowery's eBPF programs. Drains ringbuf events and surfaces them as bowery_events::Event."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+bowery-events = { workspace = true }
+
+aya = { workspace = true }
+aya-log = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "net"] }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

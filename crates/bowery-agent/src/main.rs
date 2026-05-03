@@ -8,7 +8,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bowery_agent::{Agent, Config};
 use bowery_crypto::Identity;
-use bowery_events::source::NoopEventSource;
+use bowery_ebpf_loader::BpfEventSource;
+use bowery_events::source::{EventSource, NoopEventSource};
 use clap::Parser;
 use tracing::{error, info};
 
@@ -77,10 +78,25 @@ fn run(args: &Args) -> Result<()> {
         .context("building tokio runtime")?;
 
     runtime.block_on(async {
-        // Phase 2 placeholder: no real event source until the BPF loader
-        // lands. Replace with the eBPF source once the kernel-side work
-        // is wired up.
-        let agent = Agent::start(config, identity, Box::new(NoopEventSource))
+        // Try to attach the BPF source. If the BPF object isn't installed
+        // (host without KRSI, packaging miss, or in-tree dev without
+        // running build-ebpf), fall back to NoopEventSource and run with
+        // baseline+mesh+heartbeat only.
+        let event_source: Box<dyn EventSource> = match BpfEventSource::from_default_locations() {
+            Ok(src) => {
+                info!(path = %src.obj_path().display(), "attached BPF event source");
+                Box::new(src)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "BPF event source unavailable; running without kernel events"
+                );
+                Box::new(NoopEventSource)
+            }
+        };
+
+        let agent = Agent::start(config, identity, event_source)
             .await
             .context("starting agent")?;
         wait_for_shutdown().await?;

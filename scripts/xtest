@@ -189,6 +189,16 @@ else
 fi
 
 echo
+echo "==> installing BPF build toolchain (nightly + rust-src + bpf-linker)"
+. "$HOME/.cargo/env"
+rustup toolchain install nightly --profile minimal --component rust-src
+# bpf-linker is the LLVM-backed linker that produces BPF bytecode.
+# It builds against the system LLVM. Skip if already present.
+if ! command -v bpf-linker >/dev/null; then
+    cargo install bpf-linker
+fi
+
+echo
 echo "==> mounting bpffs (idempotent)"
 if ! mount | grep -q "^bpf "; then
     sudo mount -t bpf bpf /sys/fs/bpf

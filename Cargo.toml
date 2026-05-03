@@ -6,12 +6,15 @@ members = [
     "crates/bowery-baseline",
     "crates/bowery-cli",
     "crates/bowery-crypto",
+    "crates/bowery-ebpf-loader",
     "crates/bowery-events",
     "crates/bowery-llm",
     "crates/bowery-mesh",
     "crates/bowery-proto",
     "crates/bowery-whisper",
 ]
+# bowery-ebpf is its own workspace (compiles for bpfel-unknown-none).
+exclude = ["crates/bowery-ebpf"]
 
 [workspace.package]
 version = "0.0.1"
@@ -28,6 +31,7 @@ readme = "README.md"
 bowery-analysis = { path = "crates/bowery-analysis", version = "0.0.1" }
 bowery-baseline = { path = "crates/bowery-baseline", version = "0.0.1" }
 bowery-crypto = { path = "crates/bowery-crypto", version = "0.0.1" }
+bowery-ebpf-loader = { path = "crates/bowery-ebpf-loader", version = "0.0.1" }
 bowery-events = { path = "crates/bowery-events", version = "0.0.1" }
 bowery-llm = { path = "crates/bowery-llm", version = "0.0.1" }
 bowery-mesh = { path = "crates/bowery-mesh", version = "0.0.1" }
@@ -89,8 +93,16 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Async traits
 async-trait = "0.1"
 
+# eBPF userspace
+aya = "0.13"
+aya-log = "0.2"
+libc = "0.2"
+
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny` (not `forbid`) so individual crates that genuinely need unsafe
+# (the BPF loader, for now) can opt in via `#![allow(unsafe_code)]`.
+# Every crate that does so should document why at the file head.
+unsafe_code = "deny"
 unreachable_pub = "warn"
 missing_debug_implementations = "warn"
 

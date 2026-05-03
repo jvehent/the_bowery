@@ -18,10 +18,18 @@ MemoryMax=1G
 CPUWeight=100
 TasksMax=256
 
-# Capabilities. Phase 0 is idle so we don't grant anything yet; the eBPF loader
-# in Phase 2 will need CAP_BPF, CAP_PERFMON, and CAP_SYS_ADMIN.
-CapabilityBoundingSet=
-AmbientCapabilities=
+# Capabilities. The eBPF loader needs CAP_BPF + CAP_PERFMON to load
+# tracepoint programs and create ring-buffer maps. CAP_SYS_ADMIN is
+# required as a fallback on kernels without CAP_BPF granularity
+# (< 5.8). The agent drops to no privileges after BPF is loaded;
+# Bowery never persists CAP_SYS_ADMIN in the run loop.
+#
+# Note: NoNewPrivileges interacts with eBPF — when set, only programs
+# whose perf event creation is allowed for unprivileged users will
+# load. For our tracepoints and ring buffers it's compatible. Keep
+# the rest of the hardening intact.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN
 NoNewPrivileges=yes
 
 # Filesystem hardening.

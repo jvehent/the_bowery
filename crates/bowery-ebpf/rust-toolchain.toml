@@ -1,0 +1,7 @@
+[toolchain]
+# aya-ebpf requires the unstable `build-std` feature to compile core
+# for bpfel-unknown-none. This crate is its own workspace so we pin
+# nightly only here, not for the main agent.
+channel = "nightly"
+components = ["rust-src"]
+profile = "minimal"

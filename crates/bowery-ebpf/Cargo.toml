@@ -1,0 +1,37 @@
+[package]
+name = "bowery-ebpf"
+description = "eBPF programs for The Bowery agent (process exec tracepoint, KRSI hooks)."
+version = "0.0.1"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+
+[[bin]]
+name = "bowery-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1"
+
+[profile.dev]
+opt-level = 3
+debug = false
+overflow-checks = false
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
+# This crate compiles to the bpfel-unknown-none target with bpf-linker.
+# Keep it in its OWN workspace so it doesn't inherit the parent's deny
+# rules and lints (which assume hosted std). Build via:
+#
+#   cargo build --release --target bpfel-unknown-none -Z build-std=core
+#
+# scripts/build-ebpf wraps that.
+
+[workspace]
