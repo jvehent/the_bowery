@@ -1,0 +1,12 @@
+[Unit]
+Description=Resource slice for The Bowery agent
+Documentation=https://github.com/jvehent/the-bowery
+Before=slices.target
+
+[Slice]
+# Hard ceilings for the entire Bowery stack on a host. Tightened in Phase 0;
+# raised in Phase 4 to accommodate the embedded LLM analyzer (see DESIGN.md §6.4).
+CPUWeight=100
+MemoryHigh=1G
+MemoryMax=2G
+TasksMax=512

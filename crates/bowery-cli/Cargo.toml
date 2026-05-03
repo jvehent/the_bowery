@@ -1,0 +1,24 @@
+[package]
+name = "bowery-cli"
+description = "Operator CLI for The Bowery — issues signed messages into the mesh."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "bowery"
+path = "src/main.rs"
+
+[dependencies]
+bowery-crypto = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true

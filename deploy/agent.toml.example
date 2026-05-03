@@ -1,0 +1,7 @@
+# The Bowery agent configuration.
+# Install at /etc/bowery/agent.toml.
+
+[identity]
+# Path to the agent's Ed25519 identity key. Generated automatically on first
+# start if absent. Must be mode 0600.
+path = "/var/lib/bowery/identity.key"

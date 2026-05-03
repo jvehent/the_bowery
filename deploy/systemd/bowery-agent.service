@@ -1,0 +1,56 @@
+[Unit]
+Description=The Bowery agent
+Documentation=https://github.com/jvehent/the-bowery
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bowery-agent --config /etc/bowery/agent.toml
+Restart=on-failure
+RestartSec=5s
+
+# Resource isolation. Phase 0 ships a deliberately tight envelope; later phases
+# raise these for the LLM analyzer (see DESIGN.md §6.4).
+Slice=bowery.slice
+MemoryHigh=512M
+MemoryMax=1G
+CPUWeight=100
+TasksMax=256
+
+# Capabilities. Phase 0 is idle so we don't grant anything yet; the eBPF loader
+# in Phase 2 will need CAP_BPF, CAP_PERFMON, and CAP_SYS_ADMIN.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# Filesystem hardening.
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/bowery /var/log/bowery
+ConfigurationDirectory=bowery
+StateDirectory=bowery
+LogsDirectory=bowery
+
+# Network. Allow IPv4/IPv6 + Unix; later phases may tighten.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# System call filter. Conservative default; Phase 2 may need to relax for eBPF.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target
