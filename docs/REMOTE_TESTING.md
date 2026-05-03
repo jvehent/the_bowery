@@ -73,7 +73,21 @@ The file is git-ignored.
 ./scripts/xtest setup
 ```
 
-This installs:
+The first sudo step opens an interactive prompt and caches credentials
+for ~5 minutes so the rest runs unattended. **Run this from a real
+terminal** — sudo can't prompt through pipes or non-TTY shells.
+
+If you'd rather skip the prompt entirely (recommended for a dedicated
+dev VM), give your user passwordless sudo on the guest:
+
+```sh
+echo "$USER ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/$USER-nopasswd
+sudo chmod 440 /etc/sudoers.d/$USER-nopasswd
+```
+
+Then `xtest setup` and any future `sudo`-using subcommand runs silently.
+
+`xtest setup` installs:
 
 - `build-essential`, `pkg-config`, `cmake` — for `rusqlite` and future
   Phase 4b llama-cpp builds

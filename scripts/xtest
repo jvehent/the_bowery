@@ -89,6 +89,22 @@ ssh_cmd() {
     ssh "${ssh_opts[@]}" "$XTEST_USER@$XTEST_HOST" "$@"
 }
 
+# Cache sudo credentials on the target. If the user has NOPASSWD or the
+# timestamp is still hot, this is a silent no-op. Otherwise we open one
+# interactive `ssh -t` to prompt for the password; subsequent non-TTY
+# `ssh_cmd` calls then run sudo without prompting (default cache is
+# ~5 minutes, easily long enough for `apt-get install`).
+prime_sudo() {
+    if ssh_cmd 'sudo -n true' 2>/dev/null; then
+        return 0
+    fi
+    echo "==> sudo on $XTEST_HOST needs a password — prompting now"
+    ssh -t "${ssh_opts[@]}" "$XTEST_USER@$XTEST_HOST" 'sudo -v' || {
+        echo "error: sudo authentication failed" >&2
+        return 1
+    }
+}
+
 # Run a command inside REMOTE_PATH after sourcing cargo's env. Stdin is
 # inherited so the caller can pipe input through.
 remote() {
@@ -130,14 +146,17 @@ cmd_setup() {
     ssh_cmd 'uname -a; cat /etc/os-release 2>/dev/null | grep -E "^(NAME|VERSION_ID)=" || true'
 
     echo
-    echo "==> installing system build deps (sudo will prompt if needed)"
+    prime_sudo || exit 1
+
+    echo
+    echo "==> installing system build deps"
     ssh_cmd 'sudo apt-get update -qq && \
         DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
             build-essential pkg-config curl git ca-certificates \
             clang llvm cmake \
             linux-headers-$(uname -r) \
             libbpf-dev \
-            bpftrace || true'
+            bpftrace'
 
     echo
     echo "==> installing bpftool (best-effort; package name varies)"
