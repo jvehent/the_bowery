@@ -178,7 +178,9 @@ pub struct BoweryConnection {
 
 impl BoweryConnection {
     /// Send an opaque (already-sealed) envelope on a freshly opened
-    /// unidirectional stream.
+    /// unidirectional stream. Blocks until the peer has consumed the stream
+    /// (or explicitly stopped it), so the caller knows the data was
+    /// delivered before dropping the connection.
     pub async fn send_envelope(&self, bytes: &[u8]) -> Result<(), Error> {
         let len = u32::try_from(bytes.len()).map_err(|_| Error::FrameTooLarge(u32::MAX))?;
         if bytes.len() > MAX_FRAME_BYTES {
@@ -188,6 +190,11 @@ impl BoweryConnection {
         send.write_all(&len.to_be_bytes()).await?;
         send.write_all(bytes).await?;
         send.finish()?;
+        // Wait for the receiver to read to end-of-stream (or stop us).
+        // Without this, dropping the Connection right after finish() can
+        // race the receiver's read; quinn doesn't guarantee delivery once
+        // the underlying Connection is closed.
+        let _ = send.stopped().await;
         Ok(())
     }
 

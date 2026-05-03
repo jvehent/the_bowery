@@ -95,6 +95,12 @@ impl FingerprintResolver for StaticResolver {
     }
 }
 
+impl<T: FingerprintResolver + ?Sized> FingerprintResolver for Arc<T> {
+    fn resolve(&self, fp: &Fingerprint) -> Option<VerifyingKey> {
+        (**self).resolve(fp)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sealer
 // ---------------------------------------------------------------------------

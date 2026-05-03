@@ -1,7 +1,31 @@
-# The Bowery agent configuration.
-# Install at /etc/bowery/agent.toml.
+# The Bowery agent configuration. Install at /etc/bowery/agent.toml.
 
 [identity]
 # Path to the agent's Ed25519 identity key. Generated automatically on first
 # start if absent. Must be mode 0600.
 path = "/var/lib/bowery/identity.key"
+
+[known_neighbors]
+# Persistent TOFU pinning store. New peers are auto-pinned during the
+# bootstrap window after first start; outside of it, only operator-signed
+# add-neighbor messages can extend the pin set.
+path = "/var/lib/bowery/known_neighbors.json"
+bootstrap_window = "7d"
+
+[mesh]
+# UDP socket the chitchat gossip server listens on.
+listen_addr = "0.0.0.0:9901"
+# Optional: address other peers should use to reach us. Defaults to listen_addr.
+# advertise_addr = "10.0.0.5:9901"
+# Seed peers (host:port) used to bootstrap into the mesh.
+seeds = []
+# Cluster identifier; peers with mismatched cluster ids ignore each other.
+# cluster_id = "bowery"
+
+[whisper]
+# UDP socket the QUIC server binds to.
+bind_addr = "0.0.0.0:9902"
+
+[heartbeat]
+# Interval between heartbeat sweeps to known neighbors.
+interval = "30s"

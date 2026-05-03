@@ -1,19 +1,15 @@
-//! The Bowery agent daemon.
-//!
-//! Phase 0 scope: load (or generate) an identity key, install structured
-//! logging, install signal handlers, and idle until shutdown. Subsequent
-//! phases attach the eBPF loader, mesh, baseline, LLM, and response engine.
+//! Thin entrypoint: parse args, init logging, build an [`Agent`], run until
+//! a termination signal arrives.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bowery_agent::{Agent, Config};
+use bowery_crypto::Identity;
 use clap::Parser;
 use tracing::{error, info};
-
-mod config;
-
-use config::Config;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/bowery/agent.toml";
 
@@ -55,8 +51,9 @@ fn run(args: &Args) -> Result<()> {
         .clone()
         .unwrap_or_else(|| config.identity.path.clone());
 
-    let (identity, generated) = bowery_crypto::Identity::load_or_generate(&identity_path)
+    let (identity, generated) = Identity::load_or_generate(&identity_path)
         .with_context(|| format!("identity at {}", identity_path.display()))?;
+    let identity = Arc::new(identity);
 
     if generated {
         info!(
@@ -72,25 +69,26 @@ fn run(args: &Args) -> Result<()> {
         );
     }
 
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        fingerprint = %identity.fingerprint(),
-        "bowery-agent starting (phase 0: idle)"
-    );
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("bowery-agent")
         .build()
         .context("building tokio runtime")?;
 
-    runtime.block_on(idle_until_shutdown())?;
+    runtime.block_on(async {
+        let agent = Agent::start(config, identity)
+            .await
+            .context("starting agent")?;
+        wait_for_shutdown().await?;
+        agent.shutdown().await.context("shutting down agent")?;
+        Ok::<(), anyhow::Error>(())
+    })?;
 
     info!("bowery-agent shut down cleanly");
     Ok(())
 }
 
-async fn idle_until_shutdown() -> Result<()> {
+async fn wait_for_shutdown() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;

@@ -8,6 +8,7 @@
 //! ChaCha20-Poly1305 ciphertext keyed by an X25519 ECDH session key.
 
 mod envelope;
+pub mod known_neighbors;
 mod replay;
 pub mod tls;
 pub mod transport;
