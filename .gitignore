@@ -31,3 +31,4 @@ tarpaulin-report.html
 # Remote-testing driver state
 .xtest.env
 .xtest-ssh-*.sock
+.claude/
