@@ -71,7 +71,7 @@ pub trait FingerprintResolver: Send + Sync {
 
 /// `HashMap`-backed resolver. Useful for tests and one-shot operator
 /// commands where the set of valid senders is known up front.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct StaticResolver {
     keys: HashMap<Fingerprint, VerifyingKey>,
 }

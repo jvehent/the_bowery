@@ -16,7 +16,19 @@ bowery-proto = { workspace = true }
 
 ed25519-dalek = { workspace = true }
 prost = { workspace = true }
+quinn = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+x509-parser = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net"] }
 
 [lints]
 workspace = true

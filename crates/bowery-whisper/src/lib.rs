@@ -9,6 +9,8 @@
 
 mod envelope;
 mod replay;
+pub mod tls;
+pub mod transport;
 
 pub use envelope::{
     Error, FingerprintResolver, Sealer, StaticResolver, VerifiedEnvelope, Verifier,

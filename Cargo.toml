@@ -25,12 +25,19 @@ bowery-proto = { path = "crates/bowery-proto", version = "0.0.1" }
 bowery-whisper = { path = "crates/bowery-whisper", version = "0.0.1" }
 
 # Crypto
-ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8"] }
 sha2 = "0.10"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 base64 = "0.22"
 hex = "0.4"
+
+# TLS / transport
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+x509-parser = "0.16"
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs"] }
