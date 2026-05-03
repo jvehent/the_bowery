@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bowery_agent::config::{
-    BaselineConfig, Config, HeartbeatConfig, IdentityConfig, KnownNeighborsConfig, MeshConfig,
-    RoleConfig, WhisperConfig,
+    BaselineConfig, Config, HeartbeatConfig, IdentityConfig, KnownNeighborsConfig, LlmConfig,
+    MeshConfig, RoleConfig, WhisperConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_analysis::{RoleVector, Verdict};
@@ -55,6 +55,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, role_interval: Duration) -> C
         role: RoleConfig {
             publish_interval: role_interval,
         },
+        llm: LlmConfig::default(),
     }
 }
 

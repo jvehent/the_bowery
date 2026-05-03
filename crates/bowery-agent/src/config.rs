@@ -17,6 +17,9 @@ const DEFAULT_BASELINE_PATH: &str = "/var/lib/bowery/baseline.db";
 const DEFAULT_BOOTSTRAP_WINDOW_HOURS: u64 = 24 * 7; // 7 days
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const DEFAULT_ROLE_PUBLISH_INTERVAL_SECS: u64 = 60;
+const DEFAULT_LLM_INVOCATION_THRESHOLD: f32 = 0.7;
+const DEFAULT_LLM_QUEUE_CAPACITY: usize = 32;
+const DEFAULT_LLM_REQUEST_DEADLINE_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,6 +38,8 @@ pub struct Config {
     pub baseline: BaselineConfig,
     #[serde(default)]
     pub role: RoleConfig,
+    #[serde(default)]
+    pub llm: LlmConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +188,44 @@ impl Default for RoleConfig {
 
 fn default_role_publish_interval() -> Duration {
     Duration::from_secs(DEFAULT_ROLE_PUBLISH_INTERVAL_SECS)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmConfig {
+    /// Pre-filter suspicion above which the LLM is invoked. Below this,
+    /// the analyzer's verdict is taken as final.
+    #[serde(default = "default_llm_threshold")]
+    pub invocation_threshold: f32,
+    /// Maximum pending LLM requests. New requests beyond this drop the
+    /// oldest pending one to keep the pipeline unblocked.
+    #[serde(default = "default_llm_queue_capacity")]
+    pub queue_capacity: usize,
+    /// Per-request deadline. Requests slower than this are abandoned.
+    #[serde(with = "humantime_serde", default = "default_llm_request_deadline")]
+    pub request_deadline: Duration,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            invocation_threshold: default_llm_threshold(),
+            queue_capacity: default_llm_queue_capacity(),
+            request_deadline: default_llm_request_deadline(),
+        }
+    }
+}
+
+fn default_llm_threshold() -> f32 {
+    DEFAULT_LLM_INVOCATION_THRESHOLD
+}
+
+fn default_llm_queue_capacity() -> usize {
+    DEFAULT_LLM_QUEUE_CAPACITY
+}
+
+fn default_llm_request_deadline() -> Duration {
+    Duration::from_secs(DEFAULT_LLM_REQUEST_DEADLINE_SECS)
 }
 
 impl Config {

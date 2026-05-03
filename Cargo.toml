@@ -7,6 +7,7 @@ members = [
     "crates/bowery-cli",
     "crates/bowery-crypto",
     "crates/bowery-events",
+    "crates/bowery-llm",
     "crates/bowery-mesh",
     "crates/bowery-proto",
     "crates/bowery-whisper",
@@ -28,6 +29,7 @@ bowery-analysis = { path = "crates/bowery-analysis", version = "0.0.1" }
 bowery-baseline = { path = "crates/bowery-baseline", version = "0.0.1" }
 bowery-crypto = { path = "crates/bowery-crypto", version = "0.0.1" }
 bowery-events = { path = "crates/bowery-events", version = "0.0.1" }
+bowery-llm = { path = "crates/bowery-llm", version = "0.0.1" }
 bowery-mesh = { path = "crates/bowery-mesh", version = "0.0.1" }
 bowery-proto = { path = "crates/bowery-proto", version = "0.0.1" }
 bowery-whisper = { path = "crates/bowery-whisper", version = "0.0.1" }
@@ -83,6 +85,9 @@ futures = "0.3"
 
 # Baseline storage
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Async traits
+async-trait = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

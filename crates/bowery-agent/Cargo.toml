@@ -22,6 +22,7 @@ bowery-analysis = { workspace = true }
 bowery-baseline = { workspace = true }
 bowery-crypto = { workspace = true }
 bowery-events = { workspace = true }
+bowery-llm = { workspace = true }
 bowery-mesh = { workspace = true }
 bowery-proto = { workspace = true }
 bowery-whisper = { workspace = true }
@@ -38,6 +39,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 bowery-analysis = { workspace = true }
+bowery-llm = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net"] }

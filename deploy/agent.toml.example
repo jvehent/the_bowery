@@ -40,3 +40,15 @@ path = "/var/lib/bowery/baseline.db"
 # KV layer. Other nodes use the role vector to choose similar peers when
 # whispering (Phase 5).
 publish_interval = "60s"
+
+[llm]
+# Pre-filter suspicion above which the LLM analyzer is invoked. The
+# analyzer's verdict refines (or escalates) the rule + scorer output.
+# Phase 4 ships with a deterministic mock backend; the real Qwen3-0.6B
+# inference path lands in Phase 4b.
+invocation_threshold = 0.7
+# Maximum pending LLM requests. New requests beyond this are shed to
+# prevent the LLM from back-pressuring the event pipeline.
+queue_capacity = 32
+# Per-request deadline; requests slower than this are abandoned.
+request_deadline = "10s"

@@ -10,6 +10,10 @@ use bowery_baseline::{Baseline, UpsertOutcome};
 use bowery_crypto::{Fingerprint, Identity};
 use bowery_events::source::EventSource;
 use bowery_events::{Event, ProcessExec, enrich};
+use bowery_llm::{
+    AnalysisContext, InferenceOutcome, InferenceQueue, LlmAnalyzer, LlmVerdict, MockLlmAnalyzer,
+    MockMode, QueueConfig, ShedReason, Submitter,
+};
 use bowery_mesh::{KEY_ROLE_VECTOR, Mesh, MeshConfig, PeerInfo};
 use bowery_proto::WhisperPayload;
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
@@ -51,6 +55,34 @@ pub enum AgentEvent {
     RoleVectorPublished {
         binary_count: u64,
     },
+    /// LLM analyser refined the pre-filter verdict for an episode. Phase 4.
+    LlmVerdict {
+        episode_id: String,
+        verdict: LlmVerdict,
+    },
+    /// LLM backend rejected or shed a request (queue full, deadline,
+    /// inference error). Useful for ops to size the queue.
+    LlmShed {
+        episode_id: String,
+        reason: LlmShedReason,
+    },
+}
+
+/// Why an LLM request didn't produce a verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LlmShedReason {
+    QueueFull,
+    Deadline,
+    Failed(String),
+}
+
+impl From<ShedReason> for LlmShedReason {
+    fn from(value: ShedReason) -> Self {
+        match value {
+            ShedReason::QueueFull => Self::QueueFull,
+            ShedReason::Deadline => Self::Deadline,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -86,6 +118,8 @@ pub struct Agent {
     heartbeat_task: JoinHandle<()>,
     pipeline_task: JoinHandle<()>,
     role_publisher_task: JoinHandle<()>,
+    llm_outcomes_task: JoinHandle<()>,
+    llm_queue: Option<InferenceQueue>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -98,10 +132,25 @@ impl std::fmt::Debug for Agent {
 }
 
 impl Agent {
+    /// Start with the default LLM backend (Phase 4 ships the mock; the
+    /// real Qwen3-0.6B backend lands in Phase 4b).
     pub async fn start(
         config: Config,
         identity: Arc<Identity>,
         event_source: Box<dyn EventSource>,
+    ) -> Result<Self, AgentError> {
+        let llm: Arc<dyn LlmAnalyzer> = Arc::new(MockLlmAnalyzer::new(MockMode::Echo));
+        Self::start_with_llm(config, identity, event_source, llm).await
+    }
+
+    /// Start with a caller-provided LLM analyzer. Tests use this to
+    /// install [`MockLlmAnalyzer`] in `Quiet` / `Failing` modes.
+    #[allow(clippy::too_many_lines)] // top-level wiring; sub-tasks already factored out
+    pub async fn start_with_llm(
+        config: Config,
+        identity: Arc<Identity>,
+        event_source: Box<dyn EventSource>,
+        llm: Arc<dyn LlmAnalyzer>,
     ) -> Result<Self, AgentError> {
         let fingerprint = identity.fingerprint();
         info!(fingerprint = %fingerprint, "starting agent");
@@ -165,10 +214,23 @@ impl Agent {
             shutdown_rx.clone(),
         );
 
+        // LLM queue + outcomes bridge
+        let queue_cfg = QueueConfig {
+            capacity: config.llm.queue_capacity,
+            per_request_deadline: config.llm.request_deadline,
+        };
+        let (llm_out_tx, llm_out_rx) = mpsc::channel::<InferenceOutcome>(queue_cfg.capacity);
+        let llm_queue = InferenceQueue::start(llm.clone(), &queue_cfg, llm_out_tx);
+        let llm_submitter = llm_queue.submitter();
+        let llm_outcomes_task =
+            spawn_llm_outcomes_task(llm_out_rx, events_tx.clone(), shutdown_rx.clone());
+
         let pipeline_task = spawn_pipeline_task(
             event_source.start(),
             baseline.clone(),
             analyzer.clone(),
+            llm_submitter,
+            config.llm.invocation_threshold,
             events_tx.clone(),
             shutdown_rx.clone(),
         );
@@ -186,6 +248,7 @@ impl Agent {
             mesh = %config.mesh.listen_addr,
             whisper = %whisper_addr,
             baseline = %config.baseline.path.display(),
+            llm_backend = llm.name(),
             "agent ready"
         );
 
@@ -203,6 +266,8 @@ impl Agent {
             heartbeat_task,
             pipeline_task,
             role_publisher_task,
+            llm_outcomes_task,
+            llm_queue: Some(llm_queue),
         })
     }
 
@@ -240,7 +305,7 @@ impl Agent {
         &self.mesh
     }
 
-    pub async fn shutdown(self) -> Result<(), AgentError> {
+    pub async fn shutdown(mut self) -> Result<(), AgentError> {
         let _ = self.shutdown_tx.send(true);
         self.endpoint.close().await;
         let _ = self.pin_task.await;
@@ -248,6 +313,10 @@ impl Agent {
         let _ = self.heartbeat_task.await;
         let _ = self.pipeline_task.await;
         let _ = self.role_publisher_task.await;
+        let _ = self.llm_outcomes_task.await;
+        if let Some(llm_queue) = self.llm_queue.take() {
+            llm_queue.shutdown().await;
+        }
         if let Ok(mesh) = Arc::try_unwrap(self.mesh) {
             mesh.shutdown().await?;
         }
@@ -418,6 +487,8 @@ fn spawn_pipeline_task(
     mut events: mpsc::Receiver<Event>,
     baseline: Arc<Baseline>,
     analyzer: Arc<Analyzer>,
+    llm_submitter: Submitter,
+    llm_threshold: f32,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -426,7 +497,7 @@ fn spawn_pipeline_task(
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { break };
-                    process_event(&baseline, &analyzer, &events_tx, event).await;
+                    process_event(&baseline, &analyzer, &llm_submitter, llm_threshold, &events_tx, event).await;
                 }
                 _ = shutdown_rx.changed() => break,
             }
@@ -437,19 +508,31 @@ fn spawn_pipeline_task(
 async fn process_event(
     baseline: &Arc<Baseline>,
     analyzer: &Arc<Analyzer>,
+    llm_submitter: &Submitter,
+    llm_threshold: f32,
     events_tx: &broadcast::Sender<AgentEvent>,
     event: Event,
 ) {
     // Phase 2 only persists ProcessExec; other variants are silently
     // consumed until later phases wire in network/file/exit handlers.
     if let Event::ProcessExec(exec) = event {
-        process_exec(baseline, analyzer, events_tx, exec).await;
+        process_exec(
+            baseline,
+            analyzer,
+            llm_submitter,
+            llm_threshold,
+            events_tx,
+            exec,
+        )
+        .await;
     }
 }
 
 async fn process_exec(
     baseline: &Arc<Baseline>,
     analyzer: &Arc<Analyzer>,
+    llm_submitter: &Submitter,
+    llm_threshold: f32,
     events_tx: &broadcast::Sender<AgentEvent>,
     exec: ProcessExec,
 ) {
@@ -506,7 +589,75 @@ async fn process_exec(
         };
 
     let _ = events_tx.send(AgentEvent::BinaryRecorded { sha, outcome });
+
+    // Phase 4: gate LLM invocation on aggregated suspicion.
+    if verdict.suspicion >= llm_threshold {
+        let mut ctx = AnalysisContext::new(verdict.clone()).with_exe_sha256(&sha);
+        if let Some(p) = exec.exe_path.as_ref() {
+            ctx = ctx.with_exe_path(p.clone());
+        }
+        if !exec.args.is_empty() {
+            ctx = ctx.with_args(exec.args.clone());
+        }
+        let episode_id = verdict.episode_id.clone();
+        if let Err(reason) = llm_submitter.submit(ctx) {
+            let _ = events_tx.send(AgentEvent::LlmShed {
+                episode_id,
+                reason: reason.into(),
+            });
+        }
+    }
+
     let _ = events_tx.send(AgentEvent::EpisodeAnalyzed { verdict });
+}
+
+// ---------------------------------------------------------------------------
+// LLM outcomes bridge
+// ---------------------------------------------------------------------------
+
+fn spawn_llm_outcomes_task(
+    mut outcomes: mpsc::Receiver<InferenceOutcome>,
+    events_tx: broadcast::Sender<AgentEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                outcome = outcomes.recv() => {
+                    let Some(outcome) = outcome else { break };
+                    handle_llm_outcome(&events_tx, outcome);
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
+}
+
+fn handle_llm_outcome(events_tx: &broadcast::Sender<AgentEvent>, outcome: InferenceOutcome) {
+    match outcome {
+        InferenceOutcome::Verdict {
+            episode_id,
+            verdict,
+        } => {
+            let _ = events_tx.send(AgentEvent::LlmVerdict {
+                episode_id,
+                verdict: *verdict,
+            });
+        }
+        InferenceOutcome::Failed { episode_id, error } => {
+            warn!(episode = %episode_id, error = %error, "LLM analyzer failed");
+            let _ = events_tx.send(AgentEvent::LlmShed {
+                episode_id,
+                reason: LlmShedReason::Failed(error),
+            });
+        }
+        InferenceOutcome::Shed { episode_id, reason } => {
+            let _ = events_tx.send(AgentEvent::LlmShed {
+                episode_id,
+                reason: reason.into(),
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

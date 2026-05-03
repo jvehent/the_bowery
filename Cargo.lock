@@ -177,6 +177,7 @@ dependencies = [
  "bowery-baseline",
  "bowery-crypto",
  "bowery-events",
+ "bowery-llm",
  "bowery-mesh",
  "bowery-proto",
  "bowery-whisper",
@@ -249,6 +250,20 @@ version = "0.0.1"
 dependencies = [
  "sha2",
  "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bowery-llm"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "bowery-analysis",
+ "bowery-events",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
