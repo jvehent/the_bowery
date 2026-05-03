@@ -4,6 +4,8 @@ members = [
     "crates/bowery-agent",
     "crates/bowery-cli",
     "crates/bowery-crypto",
+    "crates/bowery-proto",
+    "crates/bowery-whisper",
 ]
 
 [workspace.package]
@@ -19,6 +21,8 @@ readme = "README.md"
 [workspace.dependencies]
 # Internal
 bowery-crypto = { path = "crates/bowery-crypto", version = "0.0.1" }
+bowery-proto = { path = "crates/bowery-proto", version = "0.0.1" }
+bowery-whisper = { path = "crates/bowery-whisper", version = "0.0.1" }
 
 # Crypto
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
@@ -52,6 +56,10 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"
 
 # Test helpers
 tempfile = "3"
+
+# Wire format
+prost = "0.13"
+bytes = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
