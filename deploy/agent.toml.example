@@ -44,11 +44,22 @@ publish_interval = "60s"
 [llm]
 # Pre-filter suspicion above which the LLM analyzer is invoked. The
 # analyzer's verdict refines (or escalates) the rule + scorer output.
-# Phase 4 ships with a deterministic mock backend; the real Qwen3-0.6B
-# inference path lands in Phase 4b.
+# Defaults to the deterministic mock backend; for real inference,
+# build with `--features llm-llama-cpp` and uncomment [llm.llama_cpp].
 invocation_threshold = 0.7
 # Maximum pending LLM requests. New requests beyond this are shed to
 # prevent the LLM from back-pressuring the event pipeline.
 queue_capacity = 32
 # Per-request deadline; requests slower than this are abandoned.
 request_deadline = "10s"
+
+# Uncomment to switch from the mock to a real Qwen3-0.6B local LLM.
+# Requires the binary to be built with `--features llm-llama-cpp`.
+#
+# [llm.llama_cpp]
+# model_path = "/var/lib/bowery/models/qwen3-0.6b-instruct-q4_k_m.gguf"
+# n_ctx = 4096
+# n_threads = 0       # 0 = llama.cpp default
+# n_gpu_layers = 0    # 0 = pure CPU
+# max_tokens = 256
+# temperature = 0.2   # low temp keeps JSON output stable

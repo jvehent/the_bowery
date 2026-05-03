@@ -24,10 +24,16 @@
 
 pub mod backend;
 pub mod context;
+#[cfg(feature = "llama-cpp")]
+pub mod llama_cpp;
+pub mod parse;
 pub mod prompt;
 pub mod queue;
 
 pub use backend::{LlmAnalyzer, LlmError, LlmVerdict, MockLlmAnalyzer, MockMode};
 pub use context::AnalysisContext;
+#[cfg(feature = "llama-cpp")]
+pub use llama_cpp::{LlamaCppAnalyzer, LlamaCppConfig};
+pub use parse::parse_verdict;
 pub use prompt::PromptStyle;
 pub use queue::{InferenceOutcome, InferenceQueue, QueueConfig, ShedReason, Submitter};

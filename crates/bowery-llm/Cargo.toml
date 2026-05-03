@@ -1,6 +1,6 @@
 [package]
 name = "bowery-llm"
-description = "Local LLM analyzer for The Bowery — Qwen3-0.6B is the target model; ships a mock + framework today, real backend in Phase 4b."
+description = "Local LLM analyzer for The Bowery — Qwen3-0.6B target. Mock backend by default; real llama.cpp backend behind the `llama-cpp` feature."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,13 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
+
+[features]
+default = []
+# Real on-device inference via llama-cpp-2 against a Qwen3-0.6B GGUF.
+# Adds a C++ build dep (llama.cpp via cmake). Without this feature
+# the crate ships only the mock backend + JSON parser.
+llama-cpp = ["dep:llama-cpp-2"]
 
 [dependencies]
 bowery-analysis = { workspace = true }
@@ -20,6 +27,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "time"] }
 tracing = { workspace = true }
+
+llama-cpp-2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

@@ -98,6 +98,10 @@ aya = "0.13"
 aya-log = "0.2"
 libc = "0.2"
 
+# Optional LLM backend (compiled when bowery-llm/llama-cpp is enabled).
+# Builds llama.cpp from C++ at build time; needs cmake + a C++ compiler.
+llama-cpp-2 = { version = "0.1", default-features = false }
+
 [workspace.lints.rust]
 # `deny` (not `forbid`) so individual crates that genuinely need unsafe
 # (the BPF loader, for now) can opt in via `#![allow(unsafe_code)]`.

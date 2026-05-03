@@ -125,6 +125,92 @@ mTLS, and signed envelopes in ~1.3 s.
 
 ---
 
+## 4b. Optional: real Qwen3-0.6B inference (LLM analyzer)
+
+By default the agent ships with a deterministic mock LLM backend, which
+is fine for plumbing tests but doesn't write rationales or recommend
+nuanced actions. To get real inference, build with `--features
+llm-llama-cpp` and provide a Qwen3-0.6B GGUF.
+
+### Prerequisites
+
+The feature pulls in `llama-cpp-2`, which compiles `llama.cpp` from
+source at build time. You need:
+
+- `cmake` ≥ 3.16
+- A C++17 compiler (`g++`/`clang++`)
+- ~2 GB RAM during the build, ~600 MB resident at runtime
+
+`scripts/xtest setup` installs cmake + clang on the remote target. On
+the local build host: `apt install -y cmake clang build-essential`.
+
+### Get the model
+
+Download `qwen3-0.6b-instruct-q4_k_m.gguf` (~400 MB) into the agent's
+state dir:
+
+```sh
+sudo install -d -m 0755 -o bowery -g bowery /var/lib/bowery/models
+sudo -u bowery curl -L -o /var/lib/bowery/models/qwen3-0.6b-instruct-q4_k_m.gguf \
+    https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Instruct-Q4_K_M.gguf
+```
+
+The file is read-only at runtime; the agent never writes to it. A
+signed-manifest fetcher (DESIGN.md §10) lands in a follow-up — for
+now the operator is responsible for provenance.
+
+### Build the agent with the feature
+
+```sh
+cargo build --release --features llm-llama-cpp -p bowery-agent
+```
+
+First build adds ~60 seconds for `llama.cpp` itself; incremental
+builds after that are fast.
+
+### Configure
+
+In `/etc/bowery/agent.toml`, add a `[llm.llama_cpp]` block:
+
+```toml
+[llm]
+invocation_threshold = 0.7
+
+[llm.llama_cpp]
+model_path = "/var/lib/bowery/models/qwen3-0.6b-instruct-q4_k_m.gguf"
+n_ctx = 4096
+n_threads = 0       # 0 = llama.cpp default
+n_gpu_layers = 0    # 0 = pure CPU; CPU is plenty for 0.6B
+max_tokens = 256
+temperature = 0.2   # low temp keeps JSON output stable
+```
+
+Without the `llama_cpp` block, the agent uses the mock backend even
+when the feature is compiled in.
+
+### Verify
+
+Start the agent. Look for:
+
+```
+INFO bowery_agent: loading Qwen3 GGUF via llama-cpp ...
+INFO bowery_llm::llama_cpp: loading Qwen3 GGUF (this is slow)
+INFO bowery_agent::agent: agent ready ... llm_backend=llama-cpp/qwen3-0.6b
+```
+
+Trigger a `ProcessExec` event with suspicion above
+`invocation_threshold` (e.g. exec something from `/tmp`); the agent
+emits an `LlmVerdict` log line with the model's rationale.
+
+### Resource budgeting
+
+- Cold-start: 1–3 seconds to load the GGUF
+- Inference: ~50–200 tokens/s on a single modern x86_64 core
+- A typical Bowery prompt + response is ~700 tokens → 5–15 seconds per
+  invocation. The Phase 4 inference queue caps backlog at 32 by
+  default and sheds the deadline (10s); tune both in `[llm]` if your
+  hardware is slower.
+
 ## 4a. Building the eBPF programs (Linux + KRSI hosts)
 
 The kernel-side programs live in `crates/bowery-ebpf/` and compile to

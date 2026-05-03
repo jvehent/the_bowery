@@ -17,6 +17,13 @@ path = "src/lib.rs"
 name = "bowery-agent"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enable the real Qwen3-0.6B inference path (llama.cpp). Adds a C++
+# build dep (cmake + clang). Without this feature the agent only has
+# the mock LLM backend.
+llm-llama-cpp = ["bowery-llm/llama-cpp"]
+
 [dependencies]
 bowery-analysis = { workspace = true }
 bowery-baseline = { workspace = true }

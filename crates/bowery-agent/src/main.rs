@@ -96,9 +96,17 @@ fn run(args: &Args) -> Result<()> {
             }
         };
 
-        let agent = Agent::start(config, identity, event_source)
-            .await
-            .context("starting agent")?;
+        // Pick the LLM backend. With `--features llm-llama-cpp` and a
+        // `[llm.llama_cpp]` block in the config, we load Qwen3-0.6B
+        // via llama.cpp; otherwise the Agent's default mock is used.
+        let agent = match build_llm(&config).await? {
+            Some(llm) => Agent::start_with_llm(config, identity, event_source, llm)
+                .await
+                .context("starting agent (llama-cpp)")?,
+            None => Agent::start(config, identity, event_source)
+                .await
+                .context("starting agent")?,
+        };
         wait_for_shutdown().await?;
         agent.shutdown().await.context("shutting down agent")?;
         Ok::<(), anyhow::Error>(())
@@ -106,6 +114,55 @@ fn run(args: &Args) -> Result<()> {
 
     info!("bowery-agent shut down cleanly");
     Ok(())
+}
+
+/// Construct the optional real LLM backend. Returns `None` when the
+/// agent should use its default (mock) analyzer.
+///
+/// Without `--features llm-llama-cpp`, this is a no-op that warns if
+/// the operator configured `[llm.llama_cpp]` anyway (so a misconfigured
+/// build doesn't silently fall back to mock).
+#[cfg(feature = "llm-llama-cpp")]
+async fn build_llm(config: &Config) -> Result<Option<Arc<dyn bowery_llm::LlmAnalyzer>>> {
+    use bowery_llm::{LlamaCppAnalyzer, LlamaCppConfig};
+
+    let Some(toml) = &config.llm.llama_cpp else {
+        return Ok(None);
+    };
+
+    let llama_cfg = LlamaCppConfig {
+        model_path: toml.model_path.clone(),
+        n_ctx: toml.n_ctx,
+        n_threads: toml.n_threads,
+        n_gpu_layers: toml.n_gpu_layers,
+        max_tokens: toml.max_tokens,
+        temperature: toml.temperature,
+    };
+    info!(
+        model = %llama_cfg.model_path.display(),
+        n_ctx = llama_cfg.n_ctx,
+        n_threads = llama_cfg.n_threads,
+        "loading Qwen3 GGUF via llama-cpp"
+    );
+    let analyzer = LlamaCppAnalyzer::new(llama_cfg)
+        .await
+        .context("loading Qwen3 model")?;
+    Ok(Some(Arc::new(analyzer) as Arc<dyn bowery_llm::LlmAnalyzer>))
+}
+
+// Without the feature this function does no I/O, but the call site
+// awaits it (so the feature-on variant can use `.await`). Allow the
+// "unused async" lint just here.
+#[cfg(not(feature = "llm-llama-cpp"))]
+#[allow(clippy::unused_async)]
+async fn build_llm(config: &Config) -> Result<Option<Arc<dyn bowery_llm::LlmAnalyzer>>> {
+    if config.llm.llama_cpp.is_some() {
+        tracing::warn!(
+            "[llm.llama_cpp] is set but the binary was built without \
+             --features llm-llama-cpp; falling back to the mock LLM"
+        );
+    }
+    Ok(None)
 }
 
 async fn wait_for_shutdown() -> Result<()> {

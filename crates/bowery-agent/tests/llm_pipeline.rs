@@ -60,6 +60,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, llm_threshold: f32) -> Config
             invocation_threshold: llm_threshold,
             queue_capacity: 16,
             request_deadline: Duration::from_secs(2),
+            llama_cpp: None,
         },
     }
 }

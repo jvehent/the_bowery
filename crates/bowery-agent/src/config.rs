@@ -204,6 +204,12 @@ pub struct LlmConfig {
     /// Per-request deadline. Requests slower than this are abandoned.
     #[serde(with = "humantime_serde", default = "default_llm_request_deadline")]
     pub request_deadline: Duration,
+    /// Optional: switch from the default mock backend to a real local
+    /// LLM. When set and the binary was built with `--features
+    /// llm-llama-cpp`, the agent loads a Qwen3-0.6B GGUF and runs
+    /// inference via llama.cpp.
+    #[serde(default)]
+    pub llama_cpp: Option<LlamaCppConfigToml>,
 }
 
 impl Default for LlmConfig {
@@ -212,8 +218,44 @@ impl Default for LlmConfig {
             invocation_threshold: default_llm_threshold(),
             queue_capacity: default_llm_queue_capacity(),
             request_deadline: default_llm_request_deadline(),
+            llama_cpp: None,
         }
     }
+}
+
+/// Mirror of `bowery_llm::LlamaCppConfig` shaped for TOML deserialisation.
+/// Kept separate so the agent's config crate doesn't pull in the llama-cpp
+/// build dep just to define this struct.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlamaCppConfigToml {
+    /// Path to the Qwen3-0.6B GGUF file.
+    pub model_path: PathBuf,
+    /// Context window in tokens.
+    #[serde(default = "default_llama_n_ctx")]
+    pub n_ctx: u32,
+    /// CPU threads. 0 → llama.cpp default.
+    #[serde(default)]
+    pub n_threads: i32,
+    /// GPU layers to offload (0 = pure CPU).
+    #[serde(default)]
+    pub n_gpu_layers: u32,
+    /// Maximum tokens generated per request.
+    #[serde(default = "default_llama_max_tokens")]
+    pub max_tokens: usize,
+    /// Sampling temperature.
+    #[serde(default = "default_llama_temperature")]
+    pub temperature: f32,
+}
+
+fn default_llama_n_ctx() -> u32 {
+    4096
+}
+fn default_llama_max_tokens() -> usize {
+    256
+}
+fn default_llama_temperature() -> f32 {
+    0.2
 }
 
 fn default_llm_threshold() -> f32 {
