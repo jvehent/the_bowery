@@ -27,3 +27,7 @@ tarpaulin-report.html
 # Local environment overrides
 .env
 .env.local
+
+# Remote-testing driver state
+.xtest.env
+.xtest-ssh-*.sock

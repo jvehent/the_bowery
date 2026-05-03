@@ -43,6 +43,8 @@ Run `bowery doctor` on each candidate host (instructions below). Exit code
 If your target distro isn't ready, options are:
 - **Switch to a stock distro kernel** (Pi: `apt install linux-image-arm64` on Bookworm; loses Pi-specific drivers).
 - **Build a custom kernel** with the required `CONFIG_*=y` options. ~hours on weaker hardware.
+- **Run a Linux VM and drive it remotely** — see [docs/REMOTE_TESTING.md](docs/REMOTE_TESTING.md) for the
+  `scripts/xtest` driver that pushes builds to a VirtualBox VM via SSH.
 - **Move to a different host** for development; treat the unready box as a *candidate deployment target* you'll validate later.
 
 ### 1.3 Build host

@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# xtest — drive a remote Linux VM as the build/test target for The Bowery.
+#
+# Designed for a VirtualBox VM running stock Ubuntu 22.04+ / 24.04 (which
+# has BPF-LSM, BTF, and a current Rust-buildable toolchain), but works
+# against any SSH-reachable Linux host.
+#
+# Workflow:
+#   1. Spin up the VM, enable SSH, set XTEST_HOST in .xtest.env.
+#   2. ./scripts/xtest setup        # one-time: install Rust + build deps
+#   3. ./scripts/xtest doctor       # confirm the kernel is ready
+#   4. ./scripts/xtest test         # iterate
+#
+# Subcommands (run `xtest help` for full list):
+#   setup       Install Rust toolchain + build deps + bpffs on the target.
+#   sync        rsync the workspace to the target (excludes target/, .git/objects).
+#   build       sync + cargo build [--release].
+#   test        sync + cargo test --workspace [extra cargo args].
+#   clippy      sync + cargo clippy --workspace --all-targets -- -D warnings.
+#   fmt-check   sync + cargo fmt --all -- --check.
+#   ci          Full CI mirror: fmt-check, clippy, test, release build.
+#   doctor      Build the CLI on the target, then run `bowery doctor`.
+#   probe       Print kernel, distro, and BPF readiness summary.
+#   shell       Open an interactive SSH session inside the synced workdir.
+#   exec ARG..  Run an arbitrary command on the target inside the workdir.
+#   stop-ssh    Tear down the SSH ControlMaster connection.
+#
+# Config is read from $REPO/.xtest.env, environment variables override:
+#   XTEST_HOST          (required) hostname/IP of the VM (e.g. 127.0.0.1 for NAT, 192.168.x.x for bridged)
+#   XTEST_USER          (default: $USER)
+#   XTEST_PORT          (default: 22; use the NAT-forwarded port for VirtualBox)
+#   XTEST_SSH_KEY       (default: ~/.ssh/id_ed25519)
+#   XTEST_REMOTE_PATH   (default: /home/$XTEST_USER/the_bowery)
+#   XTEST_CARGO_FLAGS   (extra flags for build/test, e.g. "--release")
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+# --- Config ------------------------------------------------------------------
+
+ENV_FILE="$REPO_ROOT/.xtest.env"
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$ENV_FILE"
+    set +a
+fi
+
+: "${XTEST_USER:=$USER}"
+: "${XTEST_PORT:=22}"
+: "${XTEST_SSH_KEY:=$HOME/.ssh/id_ed25519}"
+: "${XTEST_REMOTE_PATH:=/home/${XTEST_USER}/the_bowery}"
+: "${XTEST_CARGO_FLAGS:=}"
+
+# Subcommands that talk to the VM call this. `help` skips it so it
+# works even without a config file. Sets SOCK_NAME, SSH_CTL, and
+# ssh_opts as a side effect.
+require_config() {
+    if [[ -z "${XTEST_HOST:-}" ]]; then
+        echo "error: XTEST_HOST not set" >&2
+        echo "       create $ENV_FILE (see scripts/.xtest.env.example) or export XTEST_HOST" >&2
+        exit 2
+    fi
+    SOCK_NAME="$(printf '%s' "$XTEST_HOST" | tr '/.: ' '____')"
+    SSH_CTL="$REPO_ROOT/.xtest-ssh-${SOCK_NAME}.sock"
+    ssh_opts=(
+        -i "$XTEST_SSH_KEY"
+        -p "$XTEST_PORT"
+        -o ControlMaster=auto
+        -o "ControlPath=$SSH_CTL"
+        -o ControlPersist=10m
+        -o StrictHostKeyChecking=accept-new
+        -o ServerAliveInterval=30
+        -o LogLevel=ERROR
+    )
+}
+
+# --- SSH plumbing ------------------------------------------------------------
+
+# Build the rsh string rsync passes to ssh. Requires `require_config` first.
+rsync_rsh() {
+    printf "ssh -i '%s' -p '%s' -o ControlPath='%s' -o ControlMaster=auto -o ControlPersist=10m -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR" \
+        "$XTEST_SSH_KEY" "$XTEST_PORT" "$SSH_CTL"
+}
+
+ssh_cmd() {
+    ssh "${ssh_opts[@]}" "$XTEST_USER@$XTEST_HOST" "$@"
+}
+
+# Run a command inside REMOTE_PATH after sourcing cargo's env. Stdin is
+# inherited so the caller can pipe input through.
+remote() {
+    local cmd="$1"
+    ssh_cmd "set -e
+        if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi
+        cd \"$XTEST_REMOTE_PATH\"
+        $cmd"
+}
+
+# --- Subcommands -------------------------------------------------------------
+
+cmd_help() {
+    sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+}
+
+cmd_sync() {
+    require_config
+    echo "==> sync $REPO_ROOT/ -> $XTEST_USER@$XTEST_HOST:$XTEST_REMOTE_PATH/"
+    rsync -az --delete \
+        --exclude='/target/' \
+        --exclude='/.git/objects/' \
+        --exclude='/.git/lfs/' \
+        --exclude='*.swp' \
+        --exclude='*.swo' \
+        --exclude='.idea/' \
+        --exclude='.vscode/' \
+        --exclude='*:Zone.Identifier' \
+        --exclude='/.xtest-ssh-*.sock' \
+        --exclude='/.xtest.env' \
+        -e "$(rsync_rsh)" \
+        "$REPO_ROOT/" \
+        "$XTEST_USER@$XTEST_HOST:$XTEST_REMOTE_PATH/"
+}
+
+cmd_setup() {
+    require_config
+    echo "==> probing the target"
+    ssh_cmd 'uname -a; cat /etc/os-release 2>/dev/null | grep -E "^(NAME|VERSION_ID)=" || true'
+
+    echo
+    echo "==> installing system build deps (sudo will prompt if needed)"
+    ssh_cmd 'sudo apt-get update -qq && \
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
+            build-essential pkg-config curl git ca-certificates \
+            clang llvm cmake \
+            linux-headers-$(uname -r) \
+            libbpf-dev \
+            bpftrace || true'
+
+    echo
+    echo "==> installing bpftool (best-effort; package name varies)"
+    ssh_cmd 'DEBIAN_FRONTEND=noninteractive sudo apt-get install -y bpftool || \
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y linux-tools-common linux-tools-$(uname -r) || \
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y linux-tools-generic || \
+        echo "(bpftool not installed; not strictly required for builds)"'
+
+    echo
+    echo "==> installing rustup (idempotent)"
+    ssh_cmd 'if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --default-toolchain stable --profile minimal
+    else
+        . "$HOME/.cargo/env" && rustup self update >/dev/null 2>&1 || true
+    fi'
+
+    echo
+    echo "==> mounting bpffs (idempotent; safe even if already mounted)"
+    ssh_cmd 'if ! mount | grep -q "^bpf "; then sudo mount -t bpf bpf /sys/fs/bpf; fi
+    if ! grep -q "^bpf " /etc/fstab; then
+        echo "bpf  /sys/fs/bpf  bpf  defaults  0  0" | sudo tee -a /etc/fstab > /dev/null
+    fi'
+
+    echo
+    echo "==> creating remote workdir $XTEST_REMOTE_PATH"
+    ssh_cmd "mkdir -p '$XTEST_REMOTE_PATH'"
+
+    echo
+    echo "Setup complete. Try: $0 doctor"
+}
+
+cmd_build() {
+    cmd_sync
+    echo "==> cargo build $XTEST_CARGO_FLAGS $*"
+    remote "cargo build --workspace $XTEST_CARGO_FLAGS $*"
+}
+
+cmd_test() {
+    cmd_sync
+    echo "==> cargo test --workspace $XTEST_CARGO_FLAGS $*"
+    remote "cargo test --workspace $XTEST_CARGO_FLAGS $*"
+}
+
+cmd_clippy() {
+    cmd_sync
+    echo "==> cargo clippy --workspace --all-targets -- -D warnings"
+    remote "cargo clippy --workspace --all-targets -- -D warnings"
+}
+
+cmd_fmt_check() {
+    cmd_sync
+    echo "==> cargo fmt --all -- --check"
+    remote "cargo fmt --all -- --check"
+}
+
+cmd_ci() {
+    cmd_sync
+    echo
+    echo "==> [1/4] cargo fmt --all -- --check"
+    remote "cargo fmt --all -- --check"
+    echo
+    echo "==> [2/4] cargo clippy --workspace --all-targets -- -D warnings"
+    remote "cargo clippy --workspace --all-targets -- -D warnings"
+    echo
+    echo "==> [3/4] cargo test --workspace"
+    remote "cargo test --workspace"
+    echo
+    echo "==> [4/4] cargo build --workspace --release"
+    remote "cargo build --workspace --release"
+    echo
+    echo "All CI steps passed."
+}
+
+cmd_doctor() {
+    cmd_sync
+    echo "==> building bowery-cli on the target"
+    remote "cargo build --release -p bowery-cli >/dev/null"
+    echo
+    echo "==> ./target/release/bowery doctor"
+    remote "./target/release/bowery doctor"
+}
+
+cmd_probe() {
+    require_config
+    echo "== target ==              $XTEST_USER@$XTEST_HOST:$XTEST_PORT"
+    echo "== remote workdir ==      $XTEST_REMOTE_PATH"
+    echo
+    echo "== kernel =="
+    ssh_cmd 'uname -r'
+    echo
+    echo "== distro =="
+    ssh_cmd 'grep -E "^(NAME|VERSION)=" /etc/os-release || true'
+    echo
+    echo "== /sys/kernel/security/lsm =="
+    ssh_cmd 'cat /sys/kernel/security/lsm 2>/dev/null || echo "(unreadable)"'
+    echo
+    echo "== /sys/kernel/btf/vmlinux =="
+    ssh_cmd 'ls -lh /sys/kernel/btf/vmlinux 2>/dev/null || echo "(missing)"'
+    echo
+    echo "== bpffs =="
+    ssh_cmd 'mount | grep -E "^bpf " || echo "(not mounted)"'
+}
+
+cmd_shell() {
+    require_config
+    ssh_cmd "cd '$XTEST_REMOTE_PATH' && exec \$SHELL -l"
+}
+
+cmd_exec() {
+    require_config
+    if [[ $# -eq 0 ]]; then
+        echo "usage: $0 exec <command> [args...]" >&2
+        exit 2
+    fi
+    remote "$*"
+}
+
+cmd_stop_ssh() {
+    # Close every ControlMaster socket xtest has opened against any host.
+    local closed=0
+    for sock in "$REPO_ROOT"/.xtest-ssh-*.sock; do
+        [[ -S "$sock" ]] || continue
+        ssh -o "ControlPath=$sock" -O stop _ 2>/dev/null || true
+        rm -f "$sock"
+        echo "torn down: $sock"
+        closed=1
+    done
+    [[ $closed -eq 0 ]] && echo "(no active ControlMaster sockets)"
+}
+
+# --- Dispatch ----------------------------------------------------------------
+
+if [[ $# -lt 1 ]]; then
+    cmd_help
+    exit 2
+fi
+
+sub="$1"
+shift
+
+case "$sub" in
+    help|-h|--help) cmd_help ;;
+    setup)      cmd_setup ;;
+    sync)       cmd_sync ;;
+    build)      cmd_build "$@" ;;
+    test)       cmd_test "$@" ;;
+    clippy)     cmd_clippy ;;
+    fmt-check)  cmd_fmt_check ;;
+    ci)         cmd_ci ;;
+    doctor)     cmd_doctor ;;
+    probe)      cmd_probe ;;
+    shell)      cmd_shell ;;
+    exec)       cmd_exec "$@" ;;
+    stop-ssh)   cmd_stop_ssh ;;
+    *)
+        echo "error: unknown subcommand '$sub'" >&2
+        echo
+        cmd_help
+        exit 2
+        ;;
+esac

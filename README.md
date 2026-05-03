@@ -19,6 +19,8 @@ Existing EDRs send everything home and decide centrally. The Bowery flips that: 
 
 - [the_bowery_design.md](the_bowery_design.md) — original product requirements.
 - [DESIGN.md](DESIGN.md) — engineering design, locked decisions, phasing.
+- [INSTALL.md](INSTALL.md) — building, installing, and configuring the agent.
+- [docs/REMOTE_TESTING.md](docs/REMOTE_TESTING.md) — running the test suite against a Linux VM (for hosts without BPF-LSM, e.g. macOS / WSL2).
 
 ## Repository layout
 
