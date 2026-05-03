@@ -89,20 +89,18 @@ ssh_cmd() {
     ssh "${ssh_opts[@]}" "$XTEST_USER@$XTEST_HOST" "$@"
 }
 
-# Cache sudo credentials on the target. If the user has NOPASSWD or the
-# timestamp is still hot, this is a silent no-op. Otherwise we open one
-# interactive `ssh -t` to prompt for the password; subsequent non-TTY
-# `ssh_cmd` calls then run sudo without prompting (default cache is
-# ~5 minutes, easily long enough for `apt-get install`).
-prime_sudo() {
-    if ssh_cmd 'sudo -n true' 2>/dev/null; then
-        return 0
-    fi
-    echo "==> sudo on $XTEST_HOST needs a password — prompting now"
-    ssh -t "${ssh_opts[@]}" "$XTEST_USER@$XTEST_HOST" 'sudo -v' || {
-        echo "error: sudo authentication failed" >&2
-        return 1
-    }
+# Run a command in a fresh (non-multiplexed) interactive SSH session
+# with a dedicated pty. Used by `setup` for sudo: per-tty timestamp
+# caches mean separate `ssh_cmd` calls each get their own "tty" and
+# would re-prompt — keeping the whole setup in one session lets a
+# single password unlock everything.
+ssh_cmd_tty() {
+    ssh -tt -o ControlMaster=no \
+        -i "$XTEST_SSH_KEY" \
+        -p "$XTEST_PORT" \
+        -o StrictHostKeyChecking=accept-new \
+        -o LogLevel=ERROR \
+        "$XTEST_USER@$XTEST_HOST" "$@"
 }
 
 # Run a command inside REMOTE_PATH after sourcing cargo's env. Stdin is
@@ -142,51 +140,78 @@ cmd_sync() {
 
 cmd_setup() {
     require_config
-    echo "==> probing the target"
-    ssh_cmd 'uname -a; cat /etc/os-release 2>/dev/null | grep -E "^(NAME|VERSION_ID)=" || true'
+
+    # Build the entire setup as one shell script. Substitution:
+    # __REMOTE_PATH__ → $XTEST_REMOTE_PATH (only thing the local side
+    # needs to inject). All `$HOME` / `$USER` / `$(uname -r)` stay
+    # literal and resolve on the remote.
+    local script
+    script=$(cat <<'REMOTE'
+set -e
+
+echo "==> probing the target"
+uname -a
+cat /etc/os-release 2>/dev/null | grep -E "^(NAME|VERSION_ID)=" || true
+
+echo
+echo "==> installing system build deps (sudo will prompt once if needed)"
+sudo apt-get update -qq
+DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
+    build-essential pkg-config curl git ca-certificates \
+    clang llvm cmake \
+    "linux-headers-$(uname -r)" \
+    libbpf-dev \
+    bpftrace
+
+echo
+echo "==> installing bpftool (best-effort; package name varies)"
+if ! DEBIAN_FRONTEND=noninteractive sudo apt-get install -y bpftool 2>/dev/null; then
+    if ! DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
+            linux-tools-common "linux-tools-$(uname -r)" 2>/dev/null; then
+        if ! DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
+                linux-tools-generic 2>/dev/null; then
+            echo "(bpftool not installed; not strictly required for builds)"
+        fi
+    fi
+fi
+
+echo
+echo "==> installing rustup (idempotent)"
+if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal
+else
+    . "$HOME/.cargo/env" && rustup self update >/dev/null 2>&1 || true
+fi
+
+echo
+echo "==> mounting bpffs (idempotent)"
+if ! mount | grep -q "^bpf "; then
+    sudo mount -t bpf bpf /sys/fs/bpf
+fi
+if ! grep -q "^bpf " /etc/fstab; then
+    echo "bpf  /sys/fs/bpf  bpf  defaults  0  0" | sudo tee -a /etc/fstab > /dev/null
+fi
+
+echo
+echo "==> creating remote workdir __REMOTE_PATH__"
+mkdir -p "__REMOTE_PATH__"
+
+echo
+echo "Setup complete."
+REMOTE
+)
+    # Inject the remote workdir path. __REMOTE_PATH__ is a unique
+    # sentinel so we don't have to worry about collisions with shell
+    # syntax inside the heredoc.
+    script="${script//__REMOTE_PATH__/$XTEST_REMOTE_PATH}"
+
+    # Single ssh -tt session; sudo prompts once and the per-tty
+    # timestamp covers the rest of the script.
+    ssh_cmd_tty "$script"
 
     echo
-    prime_sudo || exit 1
-
-    echo
-    echo "==> installing system build deps"
-    ssh_cmd 'sudo apt-get update -qq && \
-        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
-            build-essential pkg-config curl git ca-certificates \
-            clang llvm cmake \
-            linux-headers-$(uname -r) \
-            libbpf-dev \
-            bpftrace'
-
-    echo
-    echo "==> installing bpftool (best-effort; package name varies)"
-    ssh_cmd 'DEBIAN_FRONTEND=noninteractive sudo apt-get install -y bpftool || \
-        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y linux-tools-common linux-tools-$(uname -r) || \
-        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y linux-tools-generic || \
-        echo "(bpftool not installed; not strictly required for builds)"'
-
-    echo
-    echo "==> installing rustup (idempotent)"
-    ssh_cmd 'if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
-        curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-          | sh -s -- -y --default-toolchain stable --profile minimal
-    else
-        . "$HOME/.cargo/env" && rustup self update >/dev/null 2>&1 || true
-    fi'
-
-    echo
-    echo "==> mounting bpffs (idempotent; safe even if already mounted)"
-    ssh_cmd 'if ! mount | grep -q "^bpf "; then sudo mount -t bpf bpf /sys/fs/bpf; fi
-    if ! grep -q "^bpf " /etc/fstab; then
-        echo "bpf  /sys/fs/bpf  bpf  defaults  0  0" | sudo tee -a /etc/fstab > /dev/null
-    fi'
-
-    echo
-    echo "==> creating remote workdir $XTEST_REMOTE_PATH"
-    ssh_cmd "mkdir -p '$XTEST_REMOTE_PATH'"
-
-    echo
-    echo "Setup complete. Try: $0 doctor"
+    echo "Try: $0 doctor"
 }
 
 cmd_build() {

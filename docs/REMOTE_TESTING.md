@@ -73,9 +73,11 @@ The file is git-ignored.
 ./scripts/xtest setup
 ```
 
-The first sudo step opens an interactive prompt and caches credentials
-for ~5 minutes so the rest runs unattended. **Run this from a real
-terminal** — sudo can't prompt through pipes or non-TTY shells.
+The whole setup runs in **one** interactive SSH session (a single pty
+the entire time) so sudo only prompts once — typical Ubuntu sudo
+caches its timestamp per-tty, and using separate SSH calls would
+re-prompt on every multiplexed channel. **Run this from a real
+terminal**; sudo cannot prompt through pipes or detached shells.
 
 If you'd rather skip the prompt entirely (recommended for a dedicated
 dev VM), give your user passwordless sudo on the guest:
