@@ -271,8 +271,15 @@ impl Agent {
         let (llm_out_tx, llm_out_rx) = mpsc::channel::<InferenceOutcome>(queue_cfg.capacity);
         let llm_queue = InferenceQueue::start(llm.clone(), &queue_cfg, llm_out_tx);
         let llm_submitter = llm_queue.submitter();
-        let llm_outcomes_task =
-            spawn_llm_outcomes_task(llm_out_rx, events_tx.clone(), shutdown_rx.clone());
+        let llm_outcomes_task = spawn_llm_outcomes_task(
+            llm_out_rx,
+            inbox.clone(),
+            fingerprint,
+            config.alerts.threshold,
+            llm.name().to_string(),
+            events_tx.clone(),
+            shutdown_rx.clone(),
+        );
 
         let (whisper_qa_tx, whisper_qa_rx) = mpsc::channel::<WhisperQaTrigger>(64);
         let whisper_qa_task = spawn_whisper_qa_task(
@@ -946,8 +953,13 @@ fn sha_to_hex(sha: &[u8; 32]) -> String {
 // LLM outcomes bridge
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_llm_outcomes_task(
     mut outcomes: mpsc::Receiver<InferenceOutcome>,
+    inbox: Arc<AlertInbox>,
+    originator_fp: Fingerprint,
+    alert_threshold: f32,
+    backend_label: String,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -956,7 +968,14 @@ fn spawn_llm_outcomes_task(
             tokio::select! {
                 outcome = outcomes.recv() => {
                     let Some(outcome) = outcome else { break };
-                    handle_llm_outcome(&events_tx, outcome);
+                    handle_llm_outcome(
+                        &events_tx,
+                        &inbox,
+                        originator_fp,
+                        alert_threshold,
+                        &backend_label,
+                        outcome,
+                    );
                 }
                 _ = shutdown_rx.changed() => break,
             }
@@ -964,12 +983,52 @@ fn spawn_llm_outcomes_task(
     })
 }
 
-fn handle_llm_outcome(events_tx: &broadcast::Sender<AgentEvent>, outcome: InferenceOutcome) {
+fn handle_llm_outcome(
+    events_tx: &broadcast::Sender<AgentEvent>,
+    inbox: &Arc<AlertInbox>,
+    originator_fp: Fingerprint,
+    alert_threshold: f32,
+    backend_label: &str,
+    outcome: InferenceOutcome,
+) {
     match outcome {
         InferenceOutcome::Verdict {
             episode_id,
+            ctx,
             verdict,
         } => {
+            // Re-emit a refined Alert with the LLM's rationale +
+            // suggested_actions. This *complements* the pre-verdict
+            // alert that process_exec already pushed: operators see two
+            // entries for the same episode_id, the second of which has
+            // the model's explanation. They can dedup on episode_id at
+            // display time if they want a single record per episode.
+            //
+            // The LLM may have lowered the suspicion below the alert
+            // threshold (e.g. "this is a known build artifact, not
+            // malicious"). In that case we don't append.
+            if verdict.suspicion >= alert_threshold {
+                let alert = Alert {
+                    originator_fp: originator_fp.as_bytes().to_vec(),
+                    episode_id: episode_id.clone(),
+                    exe_sha256_hex: ctx.exe_sha256_hex.clone().unwrap_or_default(),
+                    exe_path: ctx
+                        .exe_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    suspicion: verdict.suspicion,
+                    rationale: verdict.rationale.clone(),
+                    suggested_actions: verdict.suggested_actions.clone(),
+                    ts_unix_ms: current_unix_ms(),
+                    backend: backend_label.to_string(),
+                };
+                inbox.append(alert);
+                let _ = events_tx.send(AgentEvent::AlertEmitted {
+                    episode_id: episode_id.clone(),
+                    suspicion: verdict.suspicion,
+                });
+            }
             let _ = events_tx.send(AgentEvent::LlmVerdict {
                 episode_id,
                 verdict: *verdict,

@@ -52,10 +52,17 @@ impl Default for QueueConfig {
 /// Outcome the worker emits per request. `episode_id` is taken verbatim
 /// from the input context's `pre_verdict` so callers can route the
 /// result back to whoever submitted it.
+///
+/// `Verdict` carries the original `AnalysisContext` back so downstream
+/// consumers (e.g. the agent's alert-emission path) can build a
+/// refined record without having to maintain a sidecar map keyed by
+/// `episode_id`. The clone is cheap — `AnalysisContext` is at most a
+/// few hundred bytes per request.
 #[derive(Debug)]
 pub enum InferenceOutcome {
     Verdict {
         episode_id: String,
+        ctx: Box<AnalysisContext>,
         verdict: Box<LlmVerdict>,
     },
     Failed {
@@ -128,6 +135,7 @@ impl InferenceQueue {
                 let outcome = match result {
                     Ok(Ok(v)) => InferenceOutcome::Verdict {
                         episode_id,
+                        ctx: Box::new(ctx),
                         verdict: Box::new(v),
                     },
                     Ok(Err(e)) => InferenceOutcome::Failed {
