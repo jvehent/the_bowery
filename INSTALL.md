@@ -146,18 +146,31 @@ the local build host: `apt install -y cmake clang build-essential`.
 
 ### Get the model
 
-Download `qwen3-0.6b-instruct-q4_k_m.gguf` (~400 MB) into the agent's
-state dir:
+Use the CLI's curated registry:
+
+```sh
+bowery model list
+bowery model fetch qwen3-0.6b-q4_k_m
+# downloads to ~/.bowery/models/qwen3-0.6b-q4_k_m.gguf and prints the
+# config snippet to copy into agent.toml.
+```
+
+For a system-wide install, point `--out` at the agent's state dir:
 
 ```sh
 sudo install -d -m 0755 -o bowery -g bowery /var/lib/bowery/models
-sudo -u bowery curl -L -o /var/lib/bowery/models/qwen3-0.6b-instruct-q4_k_m.gguf \
-    https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Instruct-Q4_K_M.gguf
+sudo -u bowery bowery model fetch qwen3-0.6b-q4_k_m \
+    --out /var/lib/bowery/models
 ```
 
-The file is read-only at runtime; the agent never writes to it. A
-signed-manifest fetcher (DESIGN.md §10) lands in a follow-up — for
-now the operator is responsible for provenance.
+`fetch` validates the GGUF magic + size before declaring success; if
+the URL ever returns an HTML error page (we hit this once when
+HuggingFace renamed the upstream repo), the validator catches it and
+the partial download is removed. The agent never downloads at runtime
+or compile time — it only reads from the configured `model_path`.
+
+A signed-manifest fetcher (DESIGN.md §10) lands in a follow-up; for
+now the registry is hardcoded in source and bumped via code review.
 
 ### Build the agent with the feature
 
@@ -177,7 +190,7 @@ In `/etc/bowery/agent.toml`, add a `[llm.llama_cpp]` block:
 invocation_threshold = 0.7
 
 [llm.llama_cpp]
-model_path = "/var/lib/bowery/models/qwen3-0.6b-instruct-q4_k_m.gguf"
+model_path = "/var/lib/bowery/models/qwen3-0.6b-q4_k_m.gguf"
 n_ctx = 4096
 n_threads = 0       # 0 = llama.cpp default
 n_gpu_layers = 0    # 0 = pure CPU; CPU is plenty for 0.6B

@@ -26,6 +26,7 @@ ed25519-dalek = { workspace = true }
 humantime = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

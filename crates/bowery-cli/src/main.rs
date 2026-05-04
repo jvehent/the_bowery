@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 
 mod alerts;
 mod doctor;
+mod model;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -57,6 +58,35 @@ enum Command {
     Alerts {
         #[command(subcommand)]
         sub: AlertsCommand,
+    },
+
+    /// Fetch and validate LLM model artifacts (GGUF files) from a
+    /// curated registry. Models are written to a local cache directory
+    /// the agent reads at startup; nothing is downloaded at agent
+    /// runtime or compile time.
+    Model {
+        #[command(subcommand)]
+        sub: ModelCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelCommand {
+    /// List the curated set of known models.
+    List,
+    /// Download a model into the local cache (default
+    /// `$HOME/.bowery/models/`). Validates the GGUF magic + size and,
+    /// when the registry pins one, the sha256 hash.
+    Fetch {
+        /// Registry name (see `bowery model list`). E.g.
+        /// `qwen3-0.6b-q4_k_m`.
+        name: String,
+        /// Output directory. Defaults to `$HOME/.bowery/models/`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Re-download even if a same-named file is already present.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -169,6 +199,22 @@ impl Cli {
                     interval,
                     json,
                 ))?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::Model {
+                sub: ModelCommand::List,
+            } => {
+                model::list();
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::Model {
+                sub: ModelCommand::Fetch { name, out, force },
+            } => {
+                let out_dir = match out {
+                    Some(p) => p,
+                    None => model::default_out_dir()?,
+                };
+                model::fetch(&name, &out_dir, force)?;
                 Ok(ExitCode::SUCCESS)
             }
         }
