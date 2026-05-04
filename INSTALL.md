@@ -1,11 +1,13 @@
 # Installing The Bowery
 
-> **Status, 2026-05-03:** Phase 0–2 (userspace) is implemented. The agent
-> runs, gossips, and pins neighbors over QUIC; the event pipeline is wired
-> in but uses a `NoopEventSource` until the eBPF source lands. The KRSI
-> requirements below describe what the *finished* agent needs — you can
-> install today on a host that doesn't satisfy them and the agent will
-> still run, just without kernel visibility.
+> **Status:** Phase 0 → 6a complete (kernel events, baseline, analyzer,
+> LLM, whisper Q&A, operator alert inbox + tail CLI). The agent runs,
+> observes process exec / exit and outgoing TCP connects via eBPF,
+> pins peers over QUIC mTLS, gossips role vectors, asks similar peers
+> for corroboration on suspicious episodes, and surfaces high-suspicion
+> verdicts to roaming operators via a signed `Subscribe` flow. Phase 7
+> (response engine — kill / block) is open; the agent is observe-only
+> today.
 
 ---
 
@@ -119,9 +121,15 @@ Run the test suite:
 cargo test --workspace
 ```
 
-All 67 tests should pass. The end-to-end `two_agents_discover_pin_and_heartbeat`
-test is the most informative — it exercises chitchat, TOFU pinning, QUIC
-mTLS, and signed envelopes in ~1.3 s.
+~170 tests should pass. The most informative end-to-end tests are:
+- `two_agents_discover_pin_and_heartbeat` — chitchat + TOFU pinning +
+  QUIC mTLS + signed envelopes
+- `high_suspicion_exec_triggers_whisper_round_and_aggregates_beta_sighting`
+  — Phase-5 whisper Q&A round driven by a real `ProcessExec` event
+- `high_suspicion_exec_appears_in_operator_inbox_via_subscribe` —
+  Phase-6a alert inbox + signed `Subscribe`
+
+Each runs in seconds; run the full suite with `cargo test --workspace`.
 
 ---
 
@@ -300,30 +308,71 @@ sudo systemctl daemon-reload
 ## 5. Configuration
 
 Edit `/etc/bowery/agent.toml`. The example ships with sane defaults; the
-fields you'll typically tune:
+full surface as of Phase 6a:
 
 ```toml
-[mesh]
-listen_addr   = "0.0.0.0:9901"
-seeds         = ["seed1.internal:9901", "seed2.internal:9901", "seed3.internal:9901"]
-cluster_id    = "prod-us-east"
-# advertise_addr = "10.0.5.7:9901"   # set if listen != dialable
-
-[whisper]
-bind_addr = "0.0.0.0:9902"
-
-[heartbeat]
-interval = "30s"
+[identity]
+path = "/var/lib/bowery/identity.key"
 
 [known_neighbors]
 path             = "/var/lib/bowery/known_neighbors.json"
 bootstrap_window = "7d"
 
+[mesh]
+listen_addr = "0.0.0.0:9901"
+seeds       = ["seed1.internal:9901", "seed2.internal:9901", "seed3.internal:9901"]
+cluster_id  = "prod-us-east"
+# advertise_addr = "10.0.5.7:9901"   # set if listen != dialable
+
+[whisper]
+bind_addr = "0.0.0.0:9902"
+
+# Phase 5 — neighborhood Q&A
+[whisper.qa]
+threshold      = 0.6        # suspicion at which we ask peers
+fanout         = 5          # number of role-similar peers per round
+timeout        = "5s"
+min_similarity = 0.0        # cosine cutoff; raise for stricter neighborhoods
+
+[heartbeat]
+interval = "30s"
+
 [baseline]
 path = "/var/lib/bowery/baseline.db"
 
-[identity]
-path = "/var/lib/bowery/identity.key"
+[role]
+publish_interval = "60s"
+
+[llm]
+invocation_threshold = 0.5
+queue_capacity       = 32
+request_deadline     = "10s"
+
+# Optional: real Qwen3-0.6B inference (only loaded when the agent was
+# built with --features llm-llama-cpp). Without this block, the
+# default mock backend stands in.
+[llm.llama_cpp]
+model_path  = "/var/lib/bowery/models/qwen3-0.6b-q4_k_m.gguf"
+n_ctx       = 4096
+n_threads   = 0       # 0 = llama.cpp default
+n_gpu_layers = 0
+max_tokens  = 256
+temperature = 0.2
+
+# Phase 6a — operator I/O
+[operators]
+# Base64 of each authorised operator's 32-byte verifying key. Get the
+# value from `bowery key generate --out …` or `bowery key fingerprint`.
+pubkeys_b64 = [
+    "8KChxFSe2t0i91xtXDj7swk0QYL1cOCXGea3cx5kaqQ=",
+]
+
+[inbox]
+capacity  = 10000   # ring size; FIFO eviction at capacity
+retention = "72h"   # TTL on individual alerts (lazy sweep)
+
+[alerts]
+threshold = 0.7     # suspicion at which a verdict becomes an Alert
 ```
 
 ### Sizing notes
@@ -381,18 +430,62 @@ INFO bowery_agent::agent: received envelope sender=a3f2… nonce=…
 
 ## 7. Operator workstation
 
-The operator CLI does not need root. Install it as your normal user:
+The operator CLI does not need root and does not need to be on the same
+host as any agent. Install it as your normal user:
 
 ```bash
 mkdir -p ~/.bowery
 bowery key generate --out ~/.bowery/operator.key
-bowery key fingerprint ~/.bowery/operator.key
+# Output:
+#   wrote identity to /home/julien/.bowery/operator.key
+#   fingerprint: 4290a9c2efbe37aed0aa4dafe1d8535987d01c638156ef3c97f1bcde8f8e36c7
+#   pubkey_b64:  8KChxFSe2t0i91xtXDj7swk0QYL1cOCXGea3cx5kaqQ=
 ```
 
-The fingerprint is what the agent fleet will be configured to trust for
-signed commands (Phase 6+ — operator commands aren't wired up yet).
+Add the printed `pubkey_b64` to every agent's `[operators] pubkeys_b64`
+list and roll the config (a future phase will let you do this via a
+signed `add-operator` envelope; for now it's a config push).
+
 Treat the operator key as the most sensitive secret in your stack: it
-authorises mass actions across the mesh.
+authorises drains of every alert inbox in the mesh, and Phase 6b will
+extend it to action commands.
+
+### Reading alerts
+
+`bowery alerts tail` connects to a single agent, signs a `Subscribe`
+with the operator key, and streams back every Alert in that agent's
+inbox. With `--follow` it keeps re-polling forever; without, it exits
+after one batch.
+
+```bash
+bowery alerts tail \
+    --operator-key  ~/.bowery/operator.key \
+    --agent-addr    10.0.0.5:9902 \
+    --agent-fp      <agent_fp_hex> \
+    --agent-pubkey-b64 <agent_pubkey_b64> \
+    --follow --interval 5s
+```
+
+You need the agent's fingerprint and pubkey out-of-band — operators
+don't ride the TOFU pin store. Get them from `journalctl -u
+bowery-agent | grep 'identity'` on the agent host.
+
+### Models
+
+The agent expects an already-on-disk GGUF. Fetch one:
+
+```bash
+bowery model list
+bowery model fetch qwen3-0.6b-q4_k_m   # → ~/.bowery/models/qwen3-0.6b-q4_k_m.gguf
+```
+
+`fetch` validates the GGUF magic and approximate size before declaring
+success; if a HuggingFace mirror starts returning HTML error pages
+(we've seen it), the validator catches it and removes the partial. The
+agent never downloads at runtime or compile time.
+
+For the dev VM workflow, see `xtest run-agent --push-model` in
+[docs/REMOTE_TESTING.md](docs/REMOTE_TESTING.md).
 
 ---
 
@@ -482,16 +575,21 @@ sudo systemctl daemon-reload
 
 ## 10. What's not yet shipping
 
-For transparency, today's binary covers Phase 0–2 (userspace). The
-following are **not** wired up yet (per [DESIGN.md §13](DESIGN.md#13-phased-delivery)):
+Today's binary covers Phase 0 → 6a. **Not** wired up yet (per
+[DESIGN.md §13](DESIGN.md#13-phased-delivery)):
 
-- eBPF / KRSI program loading (Phase 2 BPF — the doctor checks the
-  kernel will *be able to* run them)
-- LLM analyzer (Phase 4)
-- Whisper Q&A with role-similarity peer selection (Phase 5)
-- Operator CLI commands beyond `key generate` / `fingerprint` / `doctor` (Phase 6)
-- Response engine — kill / block / quarantine (Phase 7)
+- **Phase 6b** — operator-issued `OperatorCommand` (e.g. `bowery
+  query 'select * from processes ...'`, `bowery action kill-process
+  ...`). The wire format placeholders exist; the agent's command
+  handler doesn't. OSQuery subprocess integration is in this phase.
+- **Phase 7** — response engine. The agent is observe-only today.
+  When this lands, BPF-LSM hooks will gate `kill_process`,
+  `block_open`, `block_connect`, etc. under standing authorisations
+  recorded in `/etc/bowery/policy.yaml`.
+- **Phase 8** — fuzzing, key rotation ceremony, neighbor add/remove
+  signing, Sybil-resistance hardening, multi-OS.
 
-The agent currently does: discover peers via gossip, TOFU-pin them, and
-exchange signed Heartbeat envelopes over QUIC mTLS. That's enough to
-validate cluster topology and identity infrastructure end-to-end.
+The whisper context built in Phase 5 (`AgentEvent::WhisperContextReady`)
+is observable via the broadcast channel but not yet fed into the LLM's
+`AnalysisContext.extra` — that's a small follow-up commit, deliberately
+staged separately so the protocol + observability hook landed first.

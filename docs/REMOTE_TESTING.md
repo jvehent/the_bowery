@@ -139,13 +139,52 @@ If any check fails, the doctor prints a remediation hint. See
 | `xtest doctor` | run `bowery doctor` on the target |
 | `xtest probe` | print kernel / distro / BPF readiness summary |
 | `xtest exec '<cmd>'` | run an arbitrary command in the workdir |
+| `xtest exec -t '<cmd>'` | same, with a pseudo-tty (needed for sudo prompts) |
 | `xtest shell` | interactive SSH session in the workdir |
+| `xtest push-model [NAME]` | rsync `~/.bowery/models/<NAME>.gguf` to the VM |
+| `xtest run-agent ...` | sync + (optional `--push-model`) + build BPF + build agent + run under sudo |
 | `xtest stop-ssh` | tear down the SSH ControlMaster |
 
 `xtest` keeps an SSH `ControlMaster` socket open for ~10 minutes after
 each session, so back-to-back commands amortise the TLS handshake.
 
-## 6. Tips
+## 6. Running the agent on the VM
+
+`xtest run-agent` is the one-shot for a normal dev iteration: sync,
+build the BPF object, build the agent (release, with `llm-llama-cpp`
+by default), then run it under sudo over a `ssh -tt` session so you
+see logs streaming until ctrl-c.
+
+```sh
+./scripts/xtest run-agent
+# Flags:
+#   --push-model [NAME]   rsync ~/.bowery/models/<NAME>.gguf to the VM first
+#                         (default NAME: qwen3-0.6b-q4_k_m). No-op when the
+#                         remote already has the same file.
+#   --no-bpf              skip BPF build; agent falls back to NoopEventSource
+#   --no-llm              build without --features llm-llama-cpp
+#   --config PATH         override config (default /tmp/bowery-agent.toml)
+#   --log FILTER          override RUST_LOG (default info)
+#   --                    everything after is forwarded to bowery-agent
+```
+
+A typical first-run sequence:
+
+```sh
+# Local: download once into ~/.bowery/models/ on the fast network
+cargo build --release -p bowery-cli
+./target/release/bowery model fetch qwen3-0.6b-q4_k_m
+
+# VM: sync + push model + build + run
+./scripts/xtest run-agent --push-model
+```
+
+`push-model` exists as a standalone subcommand too, useful when
+provisioning multiple VMs — `bowery model fetch` once, `xtest
+push-model` per VM. VirtualBox NAT bandwidth is bad enough that
+downloading from HuggingFace on each VM is unworkable.
+
+## 7. Tips
 
 - **First sync is slow.** `target/` is excluded, so the workspace is
   small (~few MB). Subsequent syncs are incremental and finish in <1s.
@@ -156,6 +195,7 @@ each session, so back-to-back commands amortise the TLS handshake.
   networking, you can spin up two VMs and let them gossip natively.
 - **Snapshot the VM** after `xtest setup` succeeds — rebuilding the
   Rust toolchain from scratch is otherwise painful.
-- **Phase 4b** (real Qwen3-0.6B inference) needs the same VM with
-  ~1 GB extra disk for the GGUF weights. The build deps are already
-  installed by `xtest setup`.
+- **The Cargo.lock asymmetry** — `xtest sync` only goes local→VM, so
+  if a `cargo build` on the VM updates `Cargo.lock` you need to copy
+  it back manually (`scp` or rsync the other direction). CI runs with
+  `--locked`, so an out-of-date local lockfile fails the workflow.
