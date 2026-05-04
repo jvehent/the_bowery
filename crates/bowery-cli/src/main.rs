@@ -17,6 +17,7 @@ use bowery_crypto::Identity;
 use clap::{Parser, Subcommand};
 
 mod alerts;
+mod audit;
 mod doctor;
 mod model;
 
@@ -67,6 +68,44 @@ enum Command {
     Model {
         #[command(subcommand)]
         sub: ModelCommand,
+    },
+
+    /// Validate an agent's signed audit log.
+    ///
+    /// The agent emits one Ed25519-signed envelope per action attempt
+    /// when `[response] audit_log_path` is configured. This command
+    /// verifies every line against the host's pubkey and exits non-
+    /// zero on the first failure (signature or parse error).
+    Audit {
+        #[command(subcommand)]
+        sub: AuditCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditCommand {
+    /// Verify every envelope in `path` against the agent's pubkey.
+    ///
+    /// Exit code is 0 when all entries verify and 1 when any entry
+    /// fails (signature mismatch, parse error, or fingerprint
+    /// mismatch). The host pubkey can be supplied either as base64
+    /// (paste from `bowery key info`) or via the agent's identity
+    /// file path.
+    Verify {
+        /// Path to the agent's audit log (newline-delimited JSON).
+        path: PathBuf,
+        /// Base64-encoded Ed25519 verifying key of the agent host.
+        /// Mutually exclusive with `--pubkey-from`.
+        #[arg(long)]
+        pubkey_b64: Option<String>,
+        /// Path to the agent's identity file. The pubkey is derived
+        /// from it. Mutually exclusive with `--pubkey-b64`.
+        #[arg(long)]
+        pubkey_from: Option<PathBuf>,
+        /// Emit one JSON object per audit line instead of human
+        /// output.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -229,6 +268,15 @@ impl Cli {
                 model::fetch(&name, &out_dir, force)?;
                 Ok(ExitCode::SUCCESS)
             }
+            Command::Audit {
+                sub:
+                    AuditCommand::Verify {
+                        path,
+                        pubkey_b64,
+                        pubkey_from,
+                        json,
+                    },
+            } => audit::verify(&path, pubkey_b64, pubkey_from, json),
         }
     }
 }

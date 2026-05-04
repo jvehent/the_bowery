@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 bowery-crypto = { workspace = true }
 bowery-proto = { workspace = true }
+bowery-response = { workspace = true }
 bowery-whisper = { workspace = true }
 
 anyhow = { workspace = true }
@@ -30,6 +31,9 @@ sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
