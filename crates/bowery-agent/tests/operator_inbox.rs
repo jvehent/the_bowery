@@ -34,11 +34,7 @@ fn reserve_udp_port() -> SocketAddr {
     socket.local_addr().expect("local_addr")
 }
 
-fn build_agent_config(
-    dir: &Path,
-    mesh_addr: SocketAddr,
-    operator_pubkey_b64: String,
-) -> Config {
+fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: String) -> Config {
     Config {
         identity: IdentityConfig {
             path: dir.join("identity.key"),
@@ -106,7 +102,9 @@ async fn high_suspicion_exec_appears_in_operator_inbox_via_subscribe() {
     let cfg = build_agent_config(workdir.path(), reserve_udp_port(), operator_pubkey_b64);
     let source = Box::new(MockEventSource::new(vec![make_exec(4242, payload_path)]));
 
-    let agent = Agent::start(cfg, agent_id, source).await.expect("start agent");
+    let agent = Agent::start(cfg, agent_id, source)
+        .await
+        .expect("start agent");
     let agent_whisper_addr = agent.whisper_addr().expect("whisper_addr");
 
     // Wait for the agent to emit the AlertEmitted event before
@@ -138,12 +136,9 @@ async fn high_suspicion_exec_appears_in_operator_inbox_via_subscribe() {
     let resolver = Arc::new(resolver);
 
     let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
-    let operator_endpoint = BoweryEndpoint::bind(
-        operator_id.clone(),
-        accept_verifier,
-        loopback_ephemeral(),
-    )
-    .expect("bind operator endpoint");
+    let operator_endpoint =
+        BoweryEndpoint::bind(operator_id.clone(), accept_verifier, loopback_ephemeral())
+            .expect("bind operator endpoint");
 
     let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), agent_fp));
     let conn = operator_endpoint
@@ -166,7 +161,10 @@ async fn high_suspicion_exec_appears_in_operator_inbox_via_subscribe() {
         other => panic!("unexpected body: {other:?}"),
     };
 
-    assert!(!alerts.items.is_empty(), "operator should have received at least one alert");
+    assert!(
+        !alerts.items.is_empty(),
+        "operator should have received at least one alert"
+    );
     let alert = alerts
         .items
         .iter()
@@ -190,7 +188,10 @@ async fn high_suspicion_exec_appears_in_operator_inbox_via_subscribe() {
         since_unix_ms: alerts.cursor_unix_ms,
         max_items: 0,
     }));
-    conn2.send_envelope(&outbound2).await.expect("send subscribe 2");
+    conn2
+        .send_envelope(&outbound2)
+        .await
+        .expect("send subscribe 2");
     let bytes2 = conn2.recv_envelope().await.expect("recv alerts 2");
     let opened2 = envelope_verifier.open(&bytes2).expect("verify alerts 2");
     let alerts2 = match opened2.payload.body {
@@ -227,7 +228,9 @@ async fn unauthorized_operator_subscribe_is_rejected() {
     let cfg = build_agent_config(workdir.path(), reserve_udp_port(), operator_pubkey_b64);
     let source = Box::new(MockEventSource::new(vec![make_exec(7, payload_path)]));
 
-    let agent = Agent::start(cfg, agent_id, source).await.expect("start agent");
+    let agent = Agent::start(cfg, agent_id, source)
+        .await
+        .expect("start agent");
     let agent_whisper_addr = agent.whisper_addr().expect("whisper_addr");
 
     let mut resolver = StaticResolver::new();
@@ -236,12 +239,9 @@ async fn unauthorized_operator_subscribe_is_rejected() {
     let resolver = Arc::new(resolver);
 
     let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
-    let stranger_endpoint = BoweryEndpoint::bind(
-        stranger_id.clone(),
-        accept_verifier,
-        loopback_ephemeral(),
-    )
-    .expect("bind stranger endpoint");
+    let stranger_endpoint =
+        BoweryEndpoint::bind(stranger_id.clone(), accept_verifier, loopback_ephemeral())
+            .expect("bind stranger endpoint");
 
     let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), agent_fp));
     // The TLS handshake should fail because the agent doesn't have
@@ -260,11 +260,8 @@ async fn unauthorized_operator_subscribe_is_rejected() {
         }));
         // Send may succeed (one-way uni stream); recv must error.
         let _ = conn.send_envelope(&outbound).await;
-        let recv_result = tokio::time::timeout(
-            Duration::from_millis(500),
-            conn.recv_envelope(),
-        )
-        .await;
+        let recv_result =
+            tokio::time::timeout(Duration::from_millis(500), conn.recv_envelope()).await;
         assert!(
             !matches!(recv_result, Ok(Ok(_))),
             "stranger must not receive Alerts; got {recv_result:?}"

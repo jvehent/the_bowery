@@ -84,10 +84,7 @@ pub struct WhisperContext {
 /// O(n) over the binary table; fine at fleet sizes we care about (a
 /// host's own binary set is bounded). If this becomes a hotspot we'll
 /// add an indexed `tier1` column to the baseline schema.
-pub fn aggregate_local_sighting(
-    baseline: &Baseline,
-    target: Tier1Fingerprint,
-) -> LocalSighting {
+pub fn aggregate_local_sighting(baseline: &Baseline, target: Tier1Fingerprint) -> LocalSighting {
     let mut seen_count = 0u64;
     let mut first_seen_unix_ms = u64::MAX;
     let mut last_seen_unix_ms = 0u64;

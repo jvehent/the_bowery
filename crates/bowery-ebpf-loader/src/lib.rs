@@ -160,9 +160,24 @@ async fn run(obj_path: &Path, tx: mpsc::Sender<Event>) -> Result<(), LoaderError
     // No log map => silently skip.
     let _ = aya_log::EbpfLogger::init(&mut ebpf);
 
-    attach_tp(&mut ebpf, "sched_process_exec", "sched", "sched_process_exec")?;
-    attach_tp(&mut ebpf, "sched_process_exit", "sched", "sched_process_exit")?;
-    attach_tp(&mut ebpf, "inet_sock_set_state", "sock", "inet_sock_set_state")?;
+    attach_tp(
+        &mut ebpf,
+        "sched_process_exec",
+        "sched",
+        "sched_process_exec",
+    )?;
+    attach_tp(
+        &mut ebpf,
+        "sched_process_exit",
+        "sched",
+        "sched_process_exit",
+    )?;
+    attach_tp(
+        &mut ebpf,
+        "inet_sock_set_state",
+        "sock",
+        "inet_sock_set_state",
+    )?;
 
     let exec_ring = take_ring(&mut ebpf, "EVENTS")?;
     let exit_ring = take_ring(&mut ebpf, "EXIT_EVENTS")?;
@@ -259,8 +274,7 @@ fn parse_exec(bytes: &[u8]) -> Option<Event> {
     // SAFETY: ringbuf records are aligned to 8 bytes and we've
     // size-checked above. RawExecEvent is repr(C) and contains only POD
     // scalars + byte arrays, so the read is safe.
-    let raw: RawExecEvent =
-        unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<RawExecEvent>()) };
+    let raw: RawExecEvent = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<RawExecEvent>()) };
 
     let comm = comm_to_string(&raw.comm);
     let exe_path = enrich::pid_exe_path(raw.pid);
@@ -284,8 +298,7 @@ fn parse_exit(bytes: &[u8]) -> Option<Event> {
         return None;
     }
     // SAFETY: same justification as parse_exec.
-    let raw: RawExitEvent =
-        unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<RawExitEvent>()) };
+    let raw: RawExitEvent = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<RawExitEvent>()) };
 
     Some(Event::ProcessExit(ProcessExit {
         pid: raw.pid,
@@ -387,7 +400,9 @@ mod tests {
     fn as_bytes<T: Copy>(value: &T) -> &[u8] {
         // SAFETY: T is Copy and repr(C) by contract of all callers; we
         // expose exactly size_of::<T> bytes pinned to value's lifetime.
-        unsafe { std::slice::from_raw_parts(std::ptr::from_ref(value).cast::<u8>(), size_of::<T>()) }
+        unsafe {
+            std::slice::from_raw_parts(std::ptr::from_ref(value).cast::<u8>(), size_of::<T>())
+        }
     }
 
     #[test]

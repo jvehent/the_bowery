@@ -199,8 +199,8 @@ impl Baseline {
         F: FnMut(&BinaryRecord),
     {
         let conn = self.inner.lock().expect("baseline mutex poisoned");
-        let mut stmt = conn
-            .prepare("SELECT sha256, first_seen, last_seen, seen_count FROM binaries")?;
+        let mut stmt =
+            conn.prepare("SELECT sha256, first_seen, last_seen, seen_count FROM binaries")?;
         let rows = stmt.query_map([], |row| {
             let sha_blob: Vec<u8> = row.get(0)?;
             let mut sha = [0u8; 32];

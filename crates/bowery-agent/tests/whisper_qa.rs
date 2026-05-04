@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bowery_agent::config::{
-    BaselineConfig, Config, HeartbeatConfig, IdentityConfig, KnownNeighborsConfig, LlmConfig,
-    MeshConfig, RoleConfig, WhisperConfig, WhisperQaConfig,
-    AlertsConfig, InboxConfig, OperatorsConfig,
+    AlertsConfig, BaselineConfig, Config, HeartbeatConfig, IdentityConfig, InboxConfig,
+    KnownNeighborsConfig, LlmConfig, MeshConfig, OperatorsConfig, RoleConfig, WhisperConfig,
+    WhisperQaConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_crypto::Identity;
@@ -150,7 +150,10 @@ async fn high_suspicion_exec_triggers_whisper_round_and_aggregates_beta_sighting
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let context = loop {
         let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(!timeout.is_zero(), "timed out waiting for WhisperContextReady");
+        assert!(
+            !timeout.is_zero(),
+            "timed out waiting for WhisperContextReady"
+        );
         match tokio::time::timeout(timeout, events.recv()).await {
             Ok(Ok(AgentEvent::WhisperContextReady(ctx))) => break ctx,
             Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}

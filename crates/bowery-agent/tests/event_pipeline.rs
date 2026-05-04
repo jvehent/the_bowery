@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bowery_agent::config::{
-    BaselineConfig, Config, HeartbeatConfig, IdentityConfig, KnownNeighborsConfig, LlmConfig,
-    MeshConfig, RoleConfig, WhisperConfig, WhisperQaConfig,
-    AlertsConfig, InboxConfig, OperatorsConfig,
+    AlertsConfig, BaselineConfig, Config, HeartbeatConfig, IdentityConfig, InboxConfig,
+    KnownNeighborsConfig, LlmConfig, MeshConfig, OperatorsConfig, RoleConfig, WhisperConfig,
+    WhisperQaConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_baseline::UpsertOutcome;

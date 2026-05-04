@@ -117,7 +117,9 @@ pub enum BloomError {
     #[error("k = {0} outside allowed range [{MIN_K}, {MAX_K}]")]
     BadK(u8),
 
-    #[error("byte buffer length {got} doesn't match bit_count {expected_bits} (expected {expected_bytes} bytes)")]
+    #[error(
+        "byte buffer length {got} doesn't match bit_count {expected_bits} (expected {expected_bytes} bytes)"
+    )]
     LengthMismatch {
         got: usize,
         expected_bits: usize,
@@ -354,7 +356,10 @@ mod tests {
     fn bloom_merge_rejects_mismatched_size() {
         let mut a = BloomFilter::new(1024, 6).unwrap();
         let b = BloomFilter::new(2048, 6).unwrap();
-        assert!(matches!(a.merge(&b), Err(BloomError::LengthMismatch { .. })));
+        assert!(matches!(
+            a.merge(&b),
+            Err(BloomError::LengthMismatch { .. })
+        ));
     }
 
     #[test]
@@ -387,7 +392,10 @@ mod tests {
 
     #[test]
     fn bloom_rejects_zero_k() {
-        assert!(matches!(BloomFilter::new(1024, 0), Err(BloomError::BadK(0))));
+        assert!(matches!(
+            BloomFilter::new(1024, 0),
+            Err(BloomError::BadK(0))
+        ));
     }
 
     #[test]

@@ -75,7 +75,9 @@ pub(crate) async fn run(
             .recv_envelope()
             .await
             .context("awaiting Alerts response")?;
-        let opened = envelope_verifier.open(&bytes).context("verifying Alerts envelope")?;
+        let opened = envelope_verifier
+            .open(&bytes)
+            .context("verifying Alerts envelope")?;
 
         let alerts = match opened.payload.body {
             Some(Body::Alerts(a)) => a,

@@ -5,6 +5,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_analysis::{Analyzer, Episode, RoleFeatures, RoleVector, Verdict};
 use bowery_baseline::{Baseline, UpsertOutcome};
 use bowery_crypto::{Fingerprint, Identity};
@@ -15,16 +17,12 @@ use bowery_llm::{
     MockMode, QueueConfig, ShedReason, Submitter,
 };
 use bowery_mesh::{KEY_ROLE_VECTOR, Mesh, MeshConfig, PeerInfo};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_proto::{Alert, Alerts, Body, Subscribe, WhisperPayload};
 use bowery_whisper::fingerprint::{TIER1_LEN, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::{BoweryConnection, BoweryEndpoint};
-use bowery_whisper::{
-    CompositeResolver, FingerprintResolver, Sealer, StaticResolver, Verifier,
-};
+use bowery_whisper::{CompositeResolver, FingerprintResolver, Sealer, StaticResolver, Verifier};
 use ed25519_dalek::VerifyingKey;
 
 use crate::inbox::{AlertInbox, current_unix_ms};
@@ -429,7 +427,9 @@ fn load_operators(pubkeys_b64: &[String]) -> Result<StaticResolver, AgentError> 
             ))
         })?;
         let vk = VerifyingKey::from_bytes(&arr).map_err(|e| {
-            AgentError::Config(format!("operator key `{s}` is not a valid Ed25519 key: {e}"))
+            AgentError::Config(format!(
+                "operator key `{s}` is not a valid Ed25519 key: {e}"
+            ))
         })?;
         resolver.insert(vk);
     }
@@ -475,8 +475,7 @@ fn spawn_pin_task(
     })
 }
 
-type ResolverArc =
-    Arc<CompositeResolver<Arc<KnownNeighbors>, Arc<StaticResolver>>>;
+type ResolverArc = Arc<CompositeResolver<Arc<KnownNeighbors>, Arc<StaticResolver>>>;
 
 #[allow(clippy::too_many_arguments)] // wiring kept explicit at the call site
 fn spawn_accept_task(
@@ -536,9 +535,7 @@ async fn handle_connection(
                 });
                 match env.payload.body {
                     Some(Body::Question(q)) => {
-                        if let Err(e) =
-                            respond_to_question(&conn, &sealer, &baseline, q).await
-                        {
+                        if let Err(e) = respond_to_question(&conn, &sealer, &baseline, q).await {
                             warn!(sender = %env.sender, error = %e, "whisper Q&A response failed");
                         }
                     }
@@ -629,14 +626,13 @@ async fn respond_to_subscribe(
 ) -> Result<(), bowery_whisper::transport::Error> {
     let max = usize::try_from(sub.max_items).unwrap_or(usize::MAX);
     let inbox = inbox.clone();
-    let (items, cursor) = tokio::task::spawn_blocking(move || {
-        inbox.read_since(sub.since_unix_ms, max)
-    })
-    .await
-    .unwrap_or_else(|e| {
-        warn!(error = %e, "inbox read task panicked");
-        (Vec::new(), sub.since_unix_ms)
-    });
+    let (items, cursor) =
+        tokio::task::spawn_blocking(move || inbox.read_since(sub.since_unix_ms, max))
+            .await
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "inbox read task panicked");
+                (Vec::new(), sub.since_unix_ms)
+            });
 
     let delivered = items.len();
     let response = Alerts {

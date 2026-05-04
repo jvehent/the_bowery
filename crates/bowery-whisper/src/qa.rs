@@ -532,10 +532,7 @@ mod tests {
         // signal for "no answer," and the agent's aggregator treats
         // them the same way.
         assert!(
-            matches!(
-                result,
-                Err(AskError::Timeout(_) | AskError::Transport(_))
-            ),
+            matches!(result, Err(AskError::Timeout(_) | AskError::Transport(_))),
             "{result:?}"
         );
 

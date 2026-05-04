@@ -109,12 +109,7 @@ mod tests {
     fn truncates_to_top_k() {
         let local = vec_from_dims([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         let peers: Vec<_> = (0..10)
-            .map(|i| {
-                (
-                    i,
-                    vec_from_dims([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-                )
-            })
+            .map(|i| (i, vec_from_dims([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])))
             .collect();
         let ranked = rank_by_similarity(&local, peers, 3, DEFAULT_MIN_SIMILARITY);
         assert_eq!(ranked.len(), 3);
@@ -125,8 +120,7 @@ mod tests {
         let local = vec_from_dims([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         let bad = vec_from_dims([-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         let good = vec_from_dims([0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        let ranked =
-            rank_by_similarity(&local, vec![("bad", bad), ("good", good)], 10, 0.5);
+        let ranked = rank_by_similarity(&local, vec![("bad", bad), ("good", good)], 10, 0.5);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].0, "good");
     }
@@ -161,8 +155,7 @@ mod tests {
         // against a zero peer.
         let local = vec_from_dims([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         let zero = RoleVector::from_features(&RoleFeatures::with_dims([0.0; 8], 0));
-        let ranked =
-            rank_by_similarity(&local, vec![("zero", zero)], 10, DEFAULT_MIN_SIMILARITY);
+        let ranked = rank_by_similarity(&local, vec![("zero", zero)], 10, DEFAULT_MIN_SIMILARITY);
         // cosine_similarity returns 0.0 for zero vectors; with
         // DEFAULT_MIN_SIMILARITY = 0.0 it survives. Filter at 0.1 to
         // confirm it does get dropped above threshold.
