@@ -20,4 +20,4 @@ pub use envelope::{
     Verifier,
 };
 pub use fingerprint::{BloomError, BloomFilter, Tier1Fingerprint};
-pub use replay::ReplayGuard;
+pub use replay::{Replay, ReplayGuard};
