@@ -203,8 +203,8 @@ fn which(bin: &str) -> bool {
 /// Validate that the file exists, starts with the GGUF magic, and (if
 /// the registry pinned a sha256) has the expected hash.
 fn validate(path: &Path, entry: &ModelEntry) -> Result<()> {
-    let mut file = File::open(path)
-        .with_context(|| format!("opening {} for validation", path.display()))?;
+    let mut file =
+        File::open(path).with_context(|| format!("opening {} for validation", path.display()))?;
 
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic)
@@ -282,4 +282,3 @@ fn with_extension(path: &Path, ext: &str) -> PathBuf {
     s.push(ext);
     PathBuf::from(s)
 }
-

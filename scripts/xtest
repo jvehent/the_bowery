@@ -455,10 +455,19 @@ cmd_run_agent() {
     fi
 
     # 2. Build the agent (release; with llm-llama-cpp unless --no-llm).
+    #
+    # When llama-cpp is enabled we set RUSTFLAGS="-C target-cpu=native"
+    # so llama-cpp-sys-2's build.rs activates GGML_NATIVE=ON and the
+    # bundled llama.cpp matches the build CPU's exact feature set. The
+    # default Rust target features for x86_64-unknown-linux-gnu are a
+    # generic baseline, but llama.cpp's runtime CPU dispatch can still
+    # pick an AVX path that the runtime CPU doesn't support, producing
+    # SIGILL with no Rust-level error message. Forcing target-cpu=native
+    # avoids the mismatch — safe here because build host == run host.
     echo
     if [[ $with_llm -eq 1 ]]; then
         echo "==> [2/3] cargo build --release -p bowery-agent --features llm-llama-cpp"
-        remote "cargo build --release -p bowery-agent --features llm-llama-cpp"
+        remote "RUSTFLAGS='-C target-cpu=native' cargo build --release -p bowery-agent --features llm-llama-cpp"
     else
         echo "==> [2/3] cargo build --release -p bowery-agent"
         remote "cargo build --release -p bowery-agent"
