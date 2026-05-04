@@ -22,7 +22,9 @@
 #   doctor      Build the CLI on the target, then run `bowery doctor`.
 #   probe       Print kernel, distro, and BPF readiness summary.
 #   shell       Open an interactive SSH session inside the synced workdir.
-#   exec ARG..  Run an arbitrary command on the target inside the workdir.
+#   exec [-t] ARG..
+#               Run an arbitrary command on the target inside the workdir.
+#               Pass -t / --tty to allocate a pseudo-tty (needed for sudo).
 #   stop-ssh    Tear down the SSH ControlMaster connection.
 #
 # Config is read from $REPO/.xtest.env, environment variables override:
@@ -122,8 +124,13 @@ cmd_help() {
 cmd_sync() {
     require_config
     echo "==> sync $REPO_ROOT/ -> $XTEST_USER@$XTEST_HOST:$XTEST_REMOTE_PATH/"
+    # `/target/` and `crates/*/target/` are anchored separately because
+    # bowery-ebpf is its own workspace with its own target/ — those build
+    # artifacts only exist on the VM (cross-compiled with bpf-linker) and
+    # rsync --delete would otherwise wipe them every sync.
     rsync -az --delete \
         --exclude='/target/' \
+        --exclude='/crates/*/target/' \
         --exclude='/.git/objects/' \
         --exclude='/.git/lfs/' \
         --exclude='*.swp' \
@@ -307,11 +314,27 @@ cmd_shell() {
 
 cmd_exec() {
     require_config
+    local tty=0
+    if [[ "${1:-}" == "-t" || "${1:-}" == "--tty" ]]; then
+        tty=1
+        shift
+    fi
     if [[ $# -eq 0 ]]; then
-        echo "usage: $0 exec <command> [args...]" >&2
+        echo "usage: $0 exec [-t] <command> [args...]" >&2
+        echo "  -t, --tty    allocate a pseudo-tty (needed for interactive sudo)" >&2
         exit 2
     fi
-    remote "$*"
+    if [[ $tty -eq 1 ]]; then
+        # ssh_cmd_tty bypasses ControlMaster on purpose: per-tty sudo
+        # timestamps mean a fresh tty is the only way to ensure
+        # password prompts work reliably.
+        ssh_cmd_tty "set -e
+            if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi
+            cd \"$XTEST_REMOTE_PATH\"
+            $*"
+    else
+        remote "$*"
+    fi
 }
 
 cmd_stop_ssh() {
