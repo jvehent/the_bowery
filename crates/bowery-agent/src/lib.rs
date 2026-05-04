@@ -7,6 +7,7 @@
 //! [`Agent::shutdown`] to stop it.
 
 pub mod agent;
+mod bloom_publisher;
 pub mod config;
 pub mod inbox;
 pub mod whisper_qa;

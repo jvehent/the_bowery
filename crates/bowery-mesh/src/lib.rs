@@ -31,6 +31,11 @@ const KEY_WHISPER_ADDR: &str = "whisper_addr";
 const KEY_VERIFYING_KEY: &str = "verifying_key";
 /// Key under which each node publishes its base64-encoded role vector.
 pub const KEY_ROLE_VECTOR: &str = "role_vec";
+/// Key under which each node publishes its base64-encoded
+/// `bowery_proto::BloomAdvert` (Phase 5: tier-1 fingerprint
+/// summary). Receivers compare epochs per peer and keep only the
+/// highest one they've seen.
+pub const KEY_BLOOM_ADVERT: &str = "bloom_advert";
 pub const DEFAULT_CLUSTER_ID: &str = "bowery";
 
 #[derive(Debug, Error)]
@@ -54,6 +59,10 @@ pub struct PeerInfo {
     /// Base64-encoded role vector published by the peer, if any. Decode
     /// with `bowery_analysis::RoleVector::from_base64`.
     pub role_vector: Option<String>,
+    /// Base64-encoded `bowery_proto::BloomAdvert` published by the peer,
+    /// if any. Decode by base64'ing then `prost::Message::decode`'ing
+    /// into `bowery_proto::BloomAdvert`. Phase 5.
+    pub bloom_advert: Option<String>,
 }
 
 #[derive(Debug)]
@@ -235,12 +244,14 @@ fn build_peer_infos(
                 return None;
             }
             let role_vector = state.get(KEY_ROLE_VECTOR).map(str::to_string);
+            let bloom_advert = state.get(KEY_BLOOM_ADVERT).map(str::to_string);
             Some(PeerInfo {
                 fingerprint: fp,
                 verifying_key: vk,
                 whisper_addr,
                 agent_version,
                 role_vector,
+                bloom_advert,
             })
         })
         .collect()

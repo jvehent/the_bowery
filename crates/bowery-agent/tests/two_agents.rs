@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bowery_agent::config::{
-    AlertsConfig, BaselineConfig, Config, HeartbeatConfig, IdentityConfig, InboxConfig,
-    KnownNeighborsConfig, LlmConfig, MeshConfig, OperatorsConfig, RoleConfig, WhisperConfig,
-    WhisperQaConfig,
+    AlertsConfig, BaselineConfig, BloomConfig, Config, HeartbeatConfig, IdentityConfig,
+    InboxConfig, KnownNeighborsConfig, LlmConfig, MeshConfig, OperatorsConfig, RoleConfig,
+    WhisperConfig, WhisperQaConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_crypto::Identity;
@@ -66,6 +66,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>) -> Config
         operators: OperatorsConfig::default(),
         inbox: InboxConfig::default(),
         alerts: AlertsConfig::default(),
+        bloom: BloomConfig::default(),
     }
 }
 

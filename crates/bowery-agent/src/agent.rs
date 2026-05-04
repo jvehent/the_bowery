@@ -25,6 +25,7 @@ use bowery_whisper::transport::{BoweryConnection, BoweryEndpoint};
 use bowery_whisper::{CompositeResolver, FingerprintResolver, Sealer, StaticResolver, Verifier};
 use ed25519_dalek::VerifyingKey;
 
+use crate::bloom_publisher;
 use crate::inbox::{AlertInbox, current_unix_ms};
 use crate::whisper_qa::{
     WhisperContext, WhisperQaTrigger, aggregate_local_sighting, spawn_whisper_qa_task,
@@ -94,6 +95,16 @@ pub enum AgentEvent {
         delivered: usize,
         cursor_unix_ms: u64,
     },
+    /// Phase 5 (advert publisher): the local bloom advert was rebuilt
+    /// from the baseline and pushed to mesh KV. `inserted_count` is
+    /// the number of distinct binaries that contributed; useful for
+    /// dashboards to confirm the publisher is making progress.
+    BloomAdvertPublished {
+        epoch: u64,
+        bit_count: usize,
+        k: u8,
+        inserted_count: u64,
+    },
 }
 
 /// Why an LLM request didn't produce a verdict.
@@ -146,6 +157,7 @@ pub struct Agent {
     heartbeat_task: JoinHandle<()>,
     pipeline_task: JoinHandle<()>,
     role_publisher_task: JoinHandle<()>,
+    bloom_publisher_task: JoinHandle<()>,
     llm_outcomes_task: JoinHandle<()>,
     whisper_qa_task: JoinHandle<()>,
     llm_queue: Option<InferenceQueue>,
@@ -317,6 +329,14 @@ impl Agent {
             baseline.clone(),
             config.role.publish_interval,
             events_tx.clone(),
+            shutdown_rx.clone(),
+        );
+
+        let bloom_publisher_task = bloom_publisher::spawn_bloom_publisher_task(
+            mesh.clone(),
+            baseline.clone(),
+            config.bloom.clone(),
+            events_tx.clone(),
             shutdown_rx,
         );
 
@@ -344,6 +364,7 @@ impl Agent {
             heartbeat_task,
             pipeline_task,
             role_publisher_task,
+            bloom_publisher_task,
             llm_outcomes_task,
             whisper_qa_task,
             llm_queue: Some(llm_queue),
@@ -396,6 +417,7 @@ impl Agent {
         let _ = self.heartbeat_task.await;
         let _ = self.pipeline_task.await;
         let _ = self.role_publisher_task.await;
+        let _ = self.bloom_publisher_task.await;
         let _ = self.llm_outcomes_task.await;
         let _ = self.whisper_qa_task.await;
         if let Some(llm_queue) = self.llm_queue.take() {

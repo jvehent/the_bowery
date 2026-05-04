@@ -41,6 +41,7 @@ clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures = { workspace = true }
 humantime-serde = "1"
+prost = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

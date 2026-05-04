@@ -46,6 +46,8 @@ pub struct Config {
     pub inbox: InboxConfig,
     #[serde(default)]
     pub alerts: AlertsConfig,
+    #[serde(default)]
+    pub bloom: BloomConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,6 +402,51 @@ impl Default for AlertsConfig {
 
 fn default_alert_threshold() -> f32 {
     0.7
+}
+
+/// Phase-5 bloom-advert publisher tunables.
+///
+/// Each agent periodically gossips a bloom filter of its local tier-1
+/// fingerprints via the mesh KV. Receivers compare epoch counters and
+/// keep only the highest-epoch advert per peer; the rest are
+/// discarded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BloomConfig {
+    /// How often to recompute and re-publish the local advert.
+    /// Default 60s — same cadence as role-vector publication.
+    #[serde(with = "humantime_serde", default = "default_bloom_publish_interval")]
+    pub publish_interval: Duration,
+    /// Filter size in bits. Must be a multiple of 8 and within
+    /// `bowery_whisper::fingerprint::MAX_BIT_COUNT`. Defaults to
+    /// 65 536 bits (8 KiB on the wire), tuned for ~1 % FP rate at
+    /// ~6 800 inserted items.
+    #[serde(default = "default_bloom_bit_count")]
+    pub bit_count: usize,
+    /// Number of hash positions per insert (k). Tuned alongside
+    /// `bit_count` for the same target FP rate. Defaults to 6.
+    #[serde(default = "default_bloom_k")]
+    pub k: u8,
+}
+
+impl Default for BloomConfig {
+    fn default() -> Self {
+        Self {
+            publish_interval: default_bloom_publish_interval(),
+            bit_count: default_bloom_bit_count(),
+            k: default_bloom_k(),
+        }
+    }
+}
+
+fn default_bloom_publish_interval() -> Duration {
+    Duration::from_mins(1)
+}
+fn default_bloom_bit_count() -> usize {
+    bowery_whisper::fingerprint::DEFAULT_BIT_COUNT
+}
+fn default_bloom_k() -> u8 {
+    bowery_whisper::fingerprint::DEFAULT_K
 }
 
 impl Config {

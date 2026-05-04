@@ -10,8 +10,9 @@ use std::time::{Duration, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_agent::config::{
-    AlertsConfig, BaselineConfig, Config, HeartbeatConfig, IdentityConfig, InboxConfig, LlmConfig,
-    MeshConfig, OperatorsConfig, RoleConfig, WhisperConfig, WhisperQaConfig,
+    AlertsConfig, BaselineConfig, BloomConfig, Config, HeartbeatConfig, IdentityConfig,
+    InboxConfig, LlmConfig, MeshConfig, OperatorsConfig, RoleConfig, WhisperConfig,
+    WhisperQaConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_crypto::Identity;
@@ -71,6 +72,7 @@ fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: St
             // First-time exec scores 1.0 — well above 0.5.
             threshold: 0.5,
         },
+        bloom: BloomConfig::default(),
     }
 }
 
