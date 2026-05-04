@@ -90,13 +90,79 @@ pub struct Heartbeat {
     pub agent_version: String,
 }
 
+// ---------------------------------------------------------------------------
+// Question / Answer — Phase 5 whisper Q&A.
+// ---------------------------------------------------------------------------
+
+/// Phase-5 whisper question: "have you seen something matching this
+/// tier-1 fingerprint?"
+///
+/// Tier-1 fingerprints are 64-bit truncations of `SHA256(domain ||
+/// tier2_sha256)`; see `bowery_whisper::fingerprint`. They permit
+/// collisions by design — peers can confirm or deny a *fuzzy* match
+/// without leaking the underlying hash to anyone who hasn't already
+/// independently observed it. Tier-2 (the full sha256) is exchanged
+/// inside the encrypted whisper envelope only after both sides have
+/// agreed the tier-1 hint is worth following up on.
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct Question {
+    /// 16-byte episode id (typically uuid v4) the asker uses to
+    /// correlate this question with the verdict that prompted it. We
+    /// don't trust it — the asker could re-use it across questions —
+    /// but it's a useful aggregation key in operator dashboards.
+    #[prost(bytes = "vec", tag = "1")]
+    pub episode_id: Vec<u8>,
+
+    /// 8-byte tier-1 fingerprint of the artifact in question.
+    #[prost(bytes = "vec", tag = "2")]
+    pub tier1_fp: Vec<u8>,
+
+    /// Hard deadline for responses, in milliseconds since the asker's
+    /// wall clock. Responders drop this question if their local clock
+    /// is past `ttl_ms` (with some skew tolerance applied separately
+    /// at envelope-verification time).
+    #[prost(uint64, tag = "3")]
+    pub ttl_ms: u64,
+
+    /// Optional short human-readable note (kept under 64 bytes by
+    /// convention; over-long values may be truncated by responders for
+    /// log-bloat reasons). Empty string means "no note".
+    #[prost(string, tag = "4")]
+    pub note: String,
+}
+
+/// Phase-5 whisper answer to a [`Question`]. Echoes the asker's
+/// `episode_id` and `tier1_fp` so multiplexed askers can demux without
+/// state-tracking, and so a malicious peer can't confuse one query with
+/// another by replying out-of-order.
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct Answer {
+    #[prost(bytes = "vec", tag = "1")]
+    pub episode_id: Vec<u8>,
+
+    #[prost(bytes = "vec", tag = "2")]
+    pub tier1_fp: Vec<u8>,
+
+    /// How many times the responder has independently observed something
+    /// matching this tier-1 fingerprint. Zero means "never seen".
+    #[prost(uint64, tag = "3")]
+    pub seen_count: u64,
+
+    /// First / last seen, milliseconds since unix epoch. Zero if
+    /// `seen_count == 0` (no observations).
+    #[prost(uint64, tag = "4")]
+    pub first_seen_unix_ms: u64,
+
+    #[prost(uint64, tag = "5")]
+    pub last_seen_unix_ms: u64,
+
+    /// Optional short note (rationale, role-tag of the responding host,
+    /// etc.). Over 256 bytes is truncated by the asker.
+    #[prost(string, tag = "6")]
+    pub note: String,
+}
+
 // Placeholders — populated in later phases.
-
-#[derive(Clone, PartialEq, Eq, ProstMessage)]
-pub struct Question {}
-
-#[derive(Clone, PartialEq, Eq, ProstMessage)]
-pub struct Answer {}
 
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
 pub struct Alert {}
@@ -111,6 +177,45 @@ pub struct OperatorResult {}
 pub struct NeighborOp {}
 
 // ---------------------------------------------------------------------------
+// Bloom advert — published to the mesh KV (chitchat), not via envelope.
+// ---------------------------------------------------------------------------
+
+/// A periodic "what tier-1 fingerprints have I seen" advert, gossiped
+/// through the mesh KV. Encoded as protobuf for compactness and
+/// schema-evolution; the KV value is base64'd by the mesh layer if
+/// needed for transport.
+///
+/// Privacy trade-off: this leaks a coarse view of every host's
+/// observation set in the public KV. Two mitigations:
+/// 1. Tier-1 fingerprints are 64-bit and intentionally collidable.
+/// 2. Bloom filters add a second layer of indistinguishability — a
+///    "yes" set-membership in the filter is consistent with collisions
+///    on top of collisions.
+///
+/// Tier-2 (the full sha256) only travels through the encrypted whisper
+/// envelope, after both sides agree the tier-1 hint is worth chasing.
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct BloomAdvert {
+    /// Monotonic epoch counter. Receivers keep only the highest epoch
+    /// from any given peer; lower-epoch adverts are stale.
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+
+    /// Filter size in bits. Must equal `bits.len() * 8`.
+    #[prost(uint32, tag = "2")]
+    pub bit_count: u32,
+
+    /// Number of hash positions per insert. Bounded at sender side; the
+    /// receiver should reject impossibly large values.
+    #[prost(uint32, tag = "3")]
+    pub k: u32,
+
+    /// Raw filter bytes (length = `bit_count / 8`).
+    #[prost(bytes = "vec", tag = "4")]
+    pub bits: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
 // Convenience helpers
 // ---------------------------------------------------------------------------
 
@@ -120,6 +225,18 @@ impl WhisperPayload {
             body: Some(Body::Heartbeat(Heartbeat {
                 agent_version: agent_version.into(),
             })),
+        }
+    }
+
+    pub fn question(q: Question) -> Self {
+        Self {
+            body: Some(Body::Question(q)),
+        }
+    }
+
+    pub fn answer(a: Answer) -> Self {
+        Self {
+            body: Some(Body::Answer(a)),
         }
     }
 }
@@ -138,6 +255,55 @@ mod tests {
             Some(Body::Heartbeat(hb)) => assert_eq!(hb.agent_version, "0.0.1"),
             other => panic!("unexpected body: {other:?}"),
         }
+    }
+
+    #[test]
+    fn question_roundtrip() {
+        let q = Question {
+            episode_id: vec![0xab; 16],
+            tier1_fp: vec![0xcd; 8],
+            ttl_ms: 60_000,
+            note: "binary scored 0.83".into(),
+        };
+        let original = WhisperPayload::question(q.clone());
+        let bytes = original.encode_to_vec();
+        let decoded = WhisperPayload::decode(bytes.as_slice()).unwrap();
+        match decoded.body {
+            Some(Body::Question(got)) => assert_eq!(got, q),
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn answer_roundtrip() {
+        let a = Answer {
+            episode_id: vec![0xab; 16],
+            tier1_fp: vec![0xcd; 8],
+            seen_count: 3,
+            first_seen_unix_ms: 1_700_000_000_000,
+            last_seen_unix_ms: 1_700_000_300_000,
+            note: "common across web tier".into(),
+        };
+        let original = WhisperPayload::answer(a.clone());
+        let bytes = original.encode_to_vec();
+        let decoded = WhisperPayload::decode(bytes.as_slice()).unwrap();
+        match decoded.body {
+            Some(Body::Answer(got)) => assert_eq!(got, a),
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bloom_advert_roundtrip() {
+        let advert = BloomAdvert {
+            epoch: 7,
+            bit_count: 1024,
+            k: 6,
+            bits: vec![0xff; 128],
+        };
+        let bytes = advert.encode_to_vec();
+        let decoded = BloomAdvert::decode(bytes.as_slice()).unwrap();
+        assert_eq!(advert, decoded);
     }
 
     #[test]

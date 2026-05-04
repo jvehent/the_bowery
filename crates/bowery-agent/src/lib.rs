@@ -8,6 +8,8 @@
 
 pub mod agent;
 pub mod config;
+pub mod whisper_qa;
 
 pub use agent::{Agent, AgentError, AgentEvent};
 pub use config::Config;
+pub use whisper_qa::{PeerSighting, WhisperContext};

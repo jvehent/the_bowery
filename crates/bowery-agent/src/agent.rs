@@ -15,11 +15,16 @@ use bowery_llm::{
     MockMode, QueueConfig, ShedReason, Submitter,
 };
 use bowery_mesh::{KEY_ROLE_VECTOR, Mesh, MeshConfig, PeerInfo};
-use bowery_proto::WhisperPayload;
+use bowery_proto::{Body, WhisperPayload};
+use bowery_whisper::fingerprint::{TIER1_LEN, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::{BoweryConnection, BoweryEndpoint};
 use bowery_whisper::{FingerprintResolver, Sealer, Verifier};
+
+use crate::whisper_qa::{
+    WhisperContext, WhisperQaTrigger, aggregate_local_sighting, spawn_whisper_qa_task,
+};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -66,6 +71,11 @@ pub enum AgentEvent {
         episode_id: String,
         reason: LlmShedReason,
     },
+    /// Phase 5: a whisper Q&A round completed for a verdict whose
+    /// suspicion crossed `whisper.qa.threshold`. The bundle carries
+    /// per-peer responses (or non-responses) so observers / dashboards
+    /// can surface neighborhood corroboration.
+    WhisperContextReady(WhisperContext),
 }
 
 /// Why an LLM request didn't produce a verdict.
@@ -119,6 +129,7 @@ pub struct Agent {
     pipeline_task: JoinHandle<()>,
     role_publisher_task: JoinHandle<()>,
     llm_outcomes_task: JoinHandle<()>,
+    whisper_qa_task: JoinHandle<()>,
     llm_queue: Option<InferenceQueue>,
 }
 
@@ -166,6 +177,7 @@ impl Agent {
         let accept_verifier = Arc::new(PinnedCertVerifier::new(known_neighbors.clone()));
         let endpoint =
             BoweryEndpoint::bind(identity.clone(), accept_verifier, config.whisper.bind_addr)?;
+        let sealer = Arc::new(Sealer::new(identity.clone()));
         let whisper_addr = endpoint
             .local_addr()
             .map_err(|e| AgentError::Config(format!("local_addr: {e}")))?;
@@ -200,6 +212,8 @@ impl Agent {
         let accept_task = spawn_accept_task(
             endpoint.clone(),
             known_neighbors.clone(),
+            sealer.clone(),
+            baseline.clone(),
             events_tx.clone(),
             shutdown_rx.clone(),
         );
@@ -208,7 +222,7 @@ impl Agent {
             endpoint.clone(),
             mesh.peers_watcher(),
             known_neighbors.clone(),
-            identity,
+            sealer.clone(),
             config.heartbeat.interval,
             events_tx.clone(),
             shutdown_rx.clone(),
@@ -225,12 +239,27 @@ impl Agent {
         let llm_outcomes_task =
             spawn_llm_outcomes_task(llm_out_rx, events_tx.clone(), shutdown_rx.clone());
 
+        let (whisper_qa_tx, whisper_qa_rx) = mpsc::channel::<WhisperQaTrigger>(64);
+        let whisper_qa_task = spawn_whisper_qa_task(
+            whisper_qa_rx,
+            endpoint.clone(),
+            known_neighbors.clone(),
+            sealer.clone(),
+            mesh.clone(),
+            baseline.clone(),
+            config.whisper.qa.clone(),
+            events_tx.clone(),
+            shutdown_rx.clone(),
+        );
+
         let pipeline_task = spawn_pipeline_task(
             event_source.start(),
             baseline.clone(),
             analyzer.clone(),
             llm_submitter,
             config.llm.invocation_threshold,
+            config.whisper.qa.threshold,
+            whisper_qa_tx,
             events_tx.clone(),
             shutdown_rx.clone(),
         );
@@ -267,6 +296,7 @@ impl Agent {
             pipeline_task,
             role_publisher_task,
             llm_outcomes_task,
+            whisper_qa_task,
             llm_queue: Some(llm_queue),
         })
     }
@@ -314,6 +344,7 @@ impl Agent {
         let _ = self.pipeline_task.await;
         let _ = self.role_publisher_task.await;
         let _ = self.llm_outcomes_task.await;
+        let _ = self.whisper_qa_task.await;
         if let Some(llm_queue) = self.llm_queue.take() {
             llm_queue.shutdown().await;
         }
@@ -377,6 +408,8 @@ fn spawn_pin_task(
 fn spawn_accept_task(
     endpoint: BoweryEndpoint,
     kn: Arc<KnownNeighbors>,
+    sealer: Arc<Sealer>,
+    baseline: Arc<Baseline>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -389,8 +422,10 @@ fn spawn_accept_task(
                     match connection_result {
                         Ok(conn) => {
                             let verifier = envelope_verifier.clone();
+                            let sealer = sealer.clone();
+                            let baseline = baseline.clone();
                             let events = events_tx.clone();
-                            tokio::spawn(handle_connection(conn, verifier, events));
+                            tokio::spawn(handle_connection(conn, verifier, sealer, baseline, events));
                         }
                         Err(e) => warn!(error = %e, "accept failed"),
                     }
@@ -404,6 +439,8 @@ fn spawn_accept_task(
 async fn handle_connection(
     conn: BoweryConnection,
     verifier: Arc<Verifier<Arc<KnownNeighbors>>>,
+    sealer: Arc<Sealer>,
+    baseline: Arc<Baseline>,
     events_tx: broadcast::Sender<AgentEvent>,
 ) {
     while let Ok(bytes) = conn.recv_envelope().await {
@@ -414,23 +451,73 @@ async fn handle_connection(
                     sender: env.sender,
                     nonce: env.nonce,
                 });
+                if let Some(Body::Question(q)) = env.payload.body
+                    && let Err(e) =
+                        respond_to_question(&conn, &sealer, &baseline, q).await
+                {
+                    warn!(sender = %env.sender, error = %e, "whisper Q&A response failed");
+                }
+                // After responding, the asker will close the connection.
+                // Subsequent recv_envelope will return an error and we'll
+                // exit the loop.
             }
             Err(e) => warn!(error = %e, "envelope verification failed"),
         }
     }
 }
 
+async fn respond_to_question(
+    conn: &BoweryConnection,
+    sealer: &Sealer,
+    baseline: &Arc<Baseline>,
+    question: bowery_proto::Question,
+) -> Result<(), bowery_whisper::transport::Error> {
+    if question.tier1_fp.len() != TIER1_LEN {
+        warn!(
+            len = question.tier1_fp.len(),
+            "received question with invalid tier1_fp length; ignoring"
+        );
+        return Ok(());
+    }
+    let mut fp_bytes = [0u8; TIER1_LEN];
+    fp_bytes.copy_from_slice(&question.tier1_fp);
+    let target = Tier1Fingerprint::from_bytes(fp_bytes);
+
+    let baseline = baseline.clone();
+    let sighting = match tokio::task::spawn_blocking(move || {
+        aggregate_local_sighting(&baseline, target)
+    })
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "baseline scan task panicked");
+            return Ok(());
+        }
+    };
+
+    let answer = bowery_proto::Answer {
+        episode_id: question.episode_id,
+        tier1_fp: question.tier1_fp,
+        seen_count: sighting.seen_count,
+        first_seen_unix_ms: sighting.first_seen_unix_ms,
+        last_seen_unix_ms: sighting.last_seen_unix_ms,
+        note: String::new(),
+    };
+    let outbound = sealer.seal(&WhisperPayload::answer(answer));
+    conn.send_envelope(&outbound).await
+}
+
 fn spawn_heartbeat_task(
     endpoint: BoweryEndpoint,
     peers_watcher: watch::Receiver<Vec<PeerInfo>>,
     kn: Arc<KnownNeighbors>,
-    identity: Arc<Identity>,
+    sealer: Arc<Sealer>,
     interval: Duration,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let sealer = Arc::new(Sealer::new(identity));
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -483,12 +570,15 @@ async fn send_heartbeat(
 // Event pipeline
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_pipeline_task(
     mut events: mpsc::Receiver<Event>,
     baseline: Arc<Baseline>,
     analyzer: Arc<Analyzer>,
     llm_submitter: Submitter,
     llm_threshold: f32,
+    whisper_threshold: f32,
+    whisper_qa_tx: mpsc::Sender<WhisperQaTrigger>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -497,7 +587,16 @@ fn spawn_pipeline_task(
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { break };
-                    process_event(&baseline, &analyzer, &llm_submitter, llm_threshold, &events_tx, event).await;
+                    process_event(
+                        &baseline,
+                        &analyzer,
+                        &llm_submitter,
+                        llm_threshold,
+                        whisper_threshold,
+                        &whisper_qa_tx,
+                        &events_tx,
+                        event,
+                    ).await;
                 }
                 _ = shutdown_rx.changed() => break,
             }
@@ -505,11 +604,14 @@ fn spawn_pipeline_task(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_event(
     baseline: &Arc<Baseline>,
     analyzer: &Arc<Analyzer>,
     llm_submitter: &Submitter,
     llm_threshold: f32,
+    whisper_threshold: f32,
+    whisper_qa_tx: &mpsc::Sender<WhisperQaTrigger>,
     events_tx: &broadcast::Sender<AgentEvent>,
     event: Event,
 ) {
@@ -521,6 +623,8 @@ async fn process_event(
             analyzer,
             llm_submitter,
             llm_threshold,
+            whisper_threshold,
+            whisper_qa_tx,
             events_tx,
             exec,
         )
@@ -528,11 +632,14 @@ async fn process_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_exec(
     baseline: &Arc<Baseline>,
     analyzer: &Arc<Analyzer>,
     llm_submitter: &Submitter,
     llm_threshold: f32,
+    whisper_threshold: f32,
+    whisper_qa_tx: &mpsc::Sender<WhisperQaTrigger>,
     events_tx: &broadcast::Sender<AgentEvent>,
     exec: ProcessExec,
 ) {
@@ -606,6 +713,21 @@ async fn process_exec(
                 reason: reason.into(),
             });
         }
+    }
+
+    // Phase 5: gate whisper Q&A on a (typically higher) suspicion
+    // threshold. The Q&A task consumes the trigger asynchronously so
+    // the pipeline doesn't block on neighborhood RTTs.
+    if verdict.suspicion >= whisper_threshold
+        && let Err(e) = whisper_qa_tx
+            .send(WhisperQaTrigger {
+                episode_id: verdict.episode_id.clone(),
+                sha,
+                suspicion: verdict.suspicion,
+            })
+            .await
+    {
+        debug!(error = %e, "whisper Q&A trigger channel closed");
     }
 
     let _ = events_tx.send(AgentEvent::EpisodeAnalyzed { verdict });

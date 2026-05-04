@@ -36,17 +36,13 @@ async fn main() -> anyhow::Result<()> {
             biased;
             () = &mut deadline => break,
             event = rx.recv() => {
-                match event {
-                    Some(e) => {
-                        count += 1;
-                        if count <= 20 {
-                            println!("event: {e:?}");
-                        }
-                    }
-                    None => {
-                        eprintln!("event channel closed");
-                        break;
-                    }
+                let Some(e) = event else {
+                    eprintln!("event channel closed");
+                    break;
+                };
+                count += 1;
+                if count <= 20 {
+                    println!("event: {e:?}");
                 }
             }
         }

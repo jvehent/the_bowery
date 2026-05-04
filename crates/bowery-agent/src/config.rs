@@ -119,18 +119,74 @@ pub struct WhisperConfig {
     /// UDP socket the QUIC server binds to. `0.0.0.0:9902` by default.
     #[serde(default = "default_whisper_bind_addr")]
     pub bind_addr: SocketAddr,
+    #[serde(default)]
+    pub qa: WhisperQaConfig,
 }
 
 impl Default for WhisperConfig {
     fn default() -> Self {
         Self {
             bind_addr: default_whisper_bind_addr(),
+            qa: WhisperQaConfig::default(),
         }
     }
 }
 
 fn default_whisper_bind_addr() -> SocketAddr {
     "0.0.0.0:9902".parse().expect("static addr parses")
+}
+
+/// Phase-5 whisper Q&A tunables.
+///
+/// On a verdict whose suspicion meets or exceeds `threshold`, the agent
+/// asks `fanout` of its most role-similar pinned peers whether they've
+/// observed the same artifact, with a hard `timeout` per peer. Lowering
+/// the threshold yields more queries (and more privacy spend); raising
+/// the fanout yields more corroboration but slower aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WhisperQaConfig {
+    /// Verdict suspicion at which we trigger a Q&A round. Defaults to
+    /// `0.6`, which is high enough to be uncommon during steady state
+    /// but low enough that something the LLM might want to weigh in on
+    /// will also trigger neighborhood corroboration.
+    #[serde(default = "default_whisper_qa_threshold")]
+    pub threshold: f32,
+    /// Number of peers to ask per round.
+    #[serde(default = "default_whisper_qa_fanout")]
+    pub fanout: usize,
+    /// Per-peer ask timeout.
+    #[serde(with = "humantime_serde", default = "default_whisper_qa_timeout")]
+    pub timeout: Duration,
+    /// Minimum cosine similarity for a peer to be considered. `0.0`
+    /// means "anything not anti-correlated"; raise it for stricter
+    /// neighborhood scoping.
+    #[serde(default = "default_whisper_qa_min_similarity")]
+    pub min_similarity: f32,
+}
+
+impl Default for WhisperQaConfig {
+    fn default() -> Self {
+        Self {
+            threshold: default_whisper_qa_threshold(),
+            fanout: default_whisper_qa_fanout(),
+            timeout: default_whisper_qa_timeout(),
+            min_similarity: default_whisper_qa_min_similarity(),
+        }
+    }
+}
+
+fn default_whisper_qa_threshold() -> f32 {
+    0.6
+}
+fn default_whisper_qa_fanout() -> usize {
+    5
+}
+fn default_whisper_qa_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+fn default_whisper_qa_min_similarity() -> f32 {
+    0.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

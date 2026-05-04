@@ -18,6 +18,7 @@ base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 prost = { workspace = true }
 quinn = { workspace = true }
+rand = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }

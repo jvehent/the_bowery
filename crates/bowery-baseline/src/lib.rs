@@ -189,6 +189,38 @@ impl Baseline {
         Ok(count)
     }
 
+    /// Visit every binary record in the baseline. The callback runs
+    /// while the connection mutex is held; keep it cheap (no blocking
+    /// I/O, no async). Used by the Phase-5 whisper responder to
+    /// aggregate sightings by tier-1 fingerprint without an extra
+    /// schema column.
+    pub fn for_each_binary<F>(&self, mut visit: F) -> Result<()>
+    where
+        F: FnMut(&BinaryRecord),
+    {
+        let conn = self.inner.lock().expect("baseline mutex poisoned");
+        let mut stmt = conn
+            .prepare("SELECT sha256, first_seen, last_seen, seen_count FROM binaries")?;
+        let rows = stmt.query_map([], |row| {
+            let sha_blob: Vec<u8> = row.get(0)?;
+            let mut sha = [0u8; 32];
+            if sha_blob.len() == 32 {
+                sha.copy_from_slice(&sha_blob);
+            }
+            Ok(BinaryRecord {
+                sha256: sha,
+                first_seen: secs_to_system_time(row.get::<_, i64>(1)?),
+                last_seen: secs_to_system_time(row.get::<_, i64>(2)?),
+                seen_count: row.get::<_, u64>(3)?,
+            })
+        })?;
+        for row in rows {
+            let rec = row?;
+            visit(&rec);
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------
     // process lineage
     // -----------------------------------------------------------------
@@ -332,6 +364,23 @@ mod tests {
         baseline.upsert_binary(&sha(2)).unwrap();
         baseline.upsert_binary(&sha(1)).unwrap(); // re-upsert
         assert_eq!(baseline.count_binaries().unwrap(), 2);
+    }
+
+    #[test]
+    fn for_each_binary_visits_every_row() {
+        let baseline = Baseline::open_in_memory().unwrap();
+        baseline.upsert_binary(&sha(1)).unwrap();
+        baseline.upsert_binary(&sha(2)).unwrap();
+        baseline.upsert_binary(&sha(2)).unwrap(); // bump count for sha(2)
+
+        let mut seen: Vec<([u8; 32], u64)> = Vec::new();
+        baseline
+            .for_each_binary(|rec| seen.push((rec.sha256, rec.seen_count)))
+            .unwrap();
+        seen.sort_by_key(|(s, _)| *s);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], (sha(1), 1));
+        assert_eq!(seen[1], (sha(2), 2));
     }
 
     #[test]

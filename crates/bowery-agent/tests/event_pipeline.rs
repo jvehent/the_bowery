@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use bowery_agent::config::{
     BaselineConfig, Config, HeartbeatConfig, IdentityConfig, KnownNeighborsConfig, LlmConfig,
-    MeshConfig, RoleConfig, WhisperConfig,
+    MeshConfig, RoleConfig, WhisperConfig, WhisperQaConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_baseline::UpsertOutcome;
@@ -45,6 +45,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr) -> Config {
             cluster_id: Some("bowery-test".to_string()),
         },
         whisper: WhisperConfig {
+            qa: WhisperQaConfig::default(),
             bind_addr: loopback_ephemeral(),
         },
         heartbeat: HeartbeatConfig {
