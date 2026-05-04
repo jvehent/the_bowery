@@ -1649,6 +1649,19 @@ twice; the fix is always "scp Cargo.lock back from the VM after
 building there" since that's where new deps actually get added to
 the lockfile.
 
+### 17.4 Fuzz harness
+
+[`fuzz/`](fuzz/) — separate workspace (excluded from the main one)
+with three `cargo-fuzz` targets covering the wire-format hot paths:
+`whisper_envelope_decode`, `sealer_open`, `audit_envelope_parse`.
+The contract is "must never panic"; every parse / signature / replay
+failure is a normal `Err`. See [`fuzz/README.md`](fuzz/README.md) for
+how to run.
+
+The fuzz crate keeps its own workspace because libfuzzer-sys
+requires nightly + sanitizer flags and we don't want either bleeding
+into the main dep graph.
+
 ## 18. Patterns we keep using
 
 ### 18.1 Owned Arc, not borrowed lifetimes

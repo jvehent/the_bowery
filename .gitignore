@@ -3,6 +3,13 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# cargo-fuzz artifacts (kept out of the main workspace by exclude)
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/Cargo.lock
+
 # Editor / OS
 .idea/
 .vscode/

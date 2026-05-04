@@ -1,0 +1,52 @@
+[package]
+name = "bowery-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "Phase-8 wire-format fuzz targets for The Bowery."
+
+# Its own workspace so the fuzz crate doesn't pull libfuzzer-sys into
+# the main workspace's dep graph (and so `cargo +nightly fuzz run`
+# doesn't have to walk the whole tree to resolve features).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+prost = "0.13"
+
+bowery-crypto = { path = "../crates/bowery-crypto" }
+bowery-proto = { path = "../crates/bowery-proto" }
+bowery-response = { path = "../crates/bowery-response" }
+bowery-whisper = { path = "../crates/bowery-whisper" }
+
+# Match the workspace's pin so the fuzz binary uses the same crypto
+# primitives the agent does.
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8"] }
+serde_json = "1"
+
+[[bin]]
+name = "whisper_envelope_decode"
+path = "fuzz_targets/whisper_envelope_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sealer_open"
+path = "fuzz_targets/sealer_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_envelope_parse"
+path = "fuzz_targets/audit_envelope_parse.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

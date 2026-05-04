@@ -15,7 +15,9 @@ members = [
     "crates/bowery-whisper",
 ]
 # bowery-ebpf is its own workspace (compiles for bpfel-unknown-none).
-exclude = ["crates/bowery-ebpf"]
+# fuzz/ is its own workspace so libfuzzer-sys doesn't infect the main
+# workspace dep graph (cargo-fuzz needs nightly + sanitizer flags).
+exclude = ["crates/bowery-ebpf", "fuzz"]
 
 [workspace.package]
 version = "0.0.1"
@@ -79,6 +81,7 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"
 
 # Test helpers
 tempfile = "3"
+proptest = "1"
 
 # Wire format
 prost = "0.13"
