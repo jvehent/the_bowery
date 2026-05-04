@@ -262,8 +262,33 @@ impl Agent {
         }
         let response_engine: Arc<dyn ResponseEngine> = match config.response.engine {
             ResponseEngineKind::Noop => Arc::new(NoopEngine::new(response_policy)),
-            ResponseEngineKind::ProcessKill => {
-                Arc::new(ProcessKillEngine::new(response_policy))
+            ResponseEngineKind::ProcessKill => Arc::new(ProcessKillEngine::new(response_policy)),
+            ResponseEngineKind::BpfLsm => {
+                // Find the BPF object via the same search path as the
+                // event source — env var, /usr/local/lib/bowery/, the
+                // in-tree dev build dir. Operators turning on
+                // `engine = bpf-lsm` are explicit about wanting it,
+                // so a missing BPF object or insufficient
+                // capabilities is a startup error rather than a
+                // silent fall-back to noop.
+                let obj_path = bowery_ebpf_loader::BpfEventSource::from_default_locations()
+                    .map_err(|e| {
+                        AgentError::Config(format!(
+                            "[response] engine = bpf-lsm but the BPF object isn't loadable: {e}"
+                        ))
+                    })?
+                    .obj_path()
+                    .to_path_buf();
+                let blocker = bowery_ebpf_loader::BpfBlocker::load(&obj_path).map_err(|e| {
+                    AgentError::Config(format!(
+                        "loading BPF blocker from {}: {e}",
+                        obj_path.display()
+                    ))
+                })?;
+                Arc::new(crate::response_bpf::BpfLsmEngine::new(
+                    response_policy,
+                    blocker,
+                ))
             }
         };
         info!(
@@ -951,7 +976,8 @@ async fn process_exec(
     // before submitting.
     let mut ctx = AnalysisContext::new(verdict.clone())
         .with_exe_sha256(&sha)
-        .with_exe_pid(exec.pid);
+        .with_exe_pid(exec.pid)
+        .with_exe_comm(exec.comm.clone());
     if let Some(p) = exec.exe_path.as_ref() {
         ctx = ctx.with_exe_path(p.clone());
     }
@@ -1128,7 +1154,7 @@ fn handle_llm_outcome(
             // editing the policy file, not by recompiling.
             for action_id in &verdict.suggested_actions {
                 let Some(action) =
-                    action::from_id(action_id, &episode_id, ctx.exe_pid)
+                    action::from_id(action_id, &episode_id, ctx.exe_pid, ctx.exe_comm.as_deref())
                 else {
                     debug!(action_id, episode = %episode_id, "unknown action id; skipping");
                     continue;

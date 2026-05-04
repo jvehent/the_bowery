@@ -50,9 +50,8 @@ impl ResponseEngine for ProcessKillEngine {
         }
         match action {
             Action::KillProcess { pid, episode_id } => {
-                let pid_i32 = i32::try_from(*pid).map_err(|_| {
-                    ActionError::Invalid(format!("pid {pid} doesn't fit in i32"))
-                })?;
+                let pid_i32 = i32::try_from(*pid)
+                    .map_err(|_| ActionError::Invalid(format!("pid {pid} doesn't fit in i32")))?;
                 let target = Pid::from_raw(pid_i32);
                 match kill(target, Signal::SIGKILL) {
                     Ok(()) => {
@@ -85,6 +84,9 @@ impl ResponseEngine for ProcessKillEngine {
                     }
                 }
             }
+            Action::BlockExec { .. } => Ok(ActionOutcome::suppressed(
+                "process-kill engine doesn't implement block_exec; switch to bpf-lsm",
+            )),
         }
     }
 

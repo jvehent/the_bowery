@@ -65,10 +65,7 @@ impl std::fmt::Debug for NoopEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NoopEngine")
             .field("policy.disabled", &self.policy.disabled)
-            .field(
-                "policy.allowed_actions",
-                &self.policy.allowed_actions.len(),
-            )
+            .field("policy.allowed_actions", &self.policy.allowed_actions.len())
             .finish_non_exhaustive()
     }
 }

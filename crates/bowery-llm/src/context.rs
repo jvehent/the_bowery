@@ -35,6 +35,10 @@ pub struct AnalysisContext {
     /// callers (replays, future synthetic episodes) won't have a
     /// real pid to point at.
     pub exe_pid: Option<u32>,
+    /// 1–15 character process name (`task->comm`) of the rooting
+    /// process, if known. Used by Phase 7's `BpfLsmEngine` to
+    /// materialise a `BlockExec` action.
+    pub exe_comm: Option<String>,
 }
 
 impl AnalysisContext {
@@ -47,6 +51,7 @@ impl AnalysisContext {
             local_role_summary: "host".to_string(),
             extra: Vec::new(),
             exe_pid: None,
+            exe_comm: None,
         }
     }
 
@@ -82,6 +87,12 @@ impl AnalysisContext {
     #[must_use]
     pub fn with_exe_pid(mut self, pid: u32) -> Self {
         self.exe_pid = Some(pid);
+        self
+    }
+
+    #[must_use]
+    pub fn with_exe_comm(mut self, comm: impl Into<String>) -> Self {
+        self.exe_comm = Some(comm.into());
         self
     }
 }

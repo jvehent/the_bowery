@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_agent::config::{
-    AlertsConfig, BaselineConfig, BloomConfig, ResponseConfig, Config, HeartbeatConfig, IdentityConfig,
-    InboxConfig, LlmConfig, MeshConfig, OperatorsConfig, RoleConfig, WhisperConfig,
+    AlertsConfig, BaselineConfig, BloomConfig, Config, HeartbeatConfig, IdentityConfig,
+    InboxConfig, LlmConfig, MeshConfig, OperatorsConfig, ResponseConfig, RoleConfig, WhisperConfig,
     WhisperQaConfig,
 };
 use bowery_agent::{Agent, AgentEvent};

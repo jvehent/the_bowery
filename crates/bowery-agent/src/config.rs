@@ -478,6 +478,11 @@ pub enum ResponseEngineKind {
     Noop,
     /// `SIGKILL`-via-`nix`. Real enforcement. Requires `CAP_KILL`.
     ProcessKill,
+    /// BPF-LSM `bprm_check_security` hook + userspace
+    /// `BLOCKED_COMMS` map. Implements `block_exec` autonomously.
+    /// Requires `CAP_BPF` + `CAP_SYS_ADMIN` and a kernel with
+    /// `CONFIG_BPF_LSM=y` and `bpf` in the active LSM cmdline.
+    BpfLsm,
 }
 fn default_bloom_bit_count() -> usize {
     bowery_whisper::fingerprint::DEFAULT_BIT_COUNT

@@ -37,11 +37,22 @@ pub enum Action {
         /// that motivated it.
         episode_id: String,
     },
+    /// Add `comm` to the kernel-side LSM blocklist so any subsequent
+    /// `execve` from a task whose `comm` matches gets `EPERM`.
+    /// Implemented by the `BpfLsmEngine` via `BLOCKED_COMMS` (see
+    /// `bowery-ebpf/src/main.rs`). Idempotent: re-adding an entry is
+    /// a no-op.
+    BlockExec {
+        /// The 1–15 character process name to block. Truncated /
+        /// nul-padded to 16 bytes by the kernel-facing layer.
+        comm: String,
+        episode_id: String,
+    },
     // Future variants — keep this comment up to date as Phase 7
     // progresses:
-    //   BlockExec    { sha256: [u8; 32], ttl: Duration }
-    //   BlockOpen    { path: PathBuf, ttl: Duration }
-    //   BlockConnect { addr: IpAddr, port: u16, ttl: Duration }
+    //   BlockExecBySha { sha256: [u8; 32], ttl: Duration }   // CO-RE
+    //   BlockOpen      { path: PathBuf,    ttl: Duration }
+    //   BlockConnect   { addr: IpAddr,     port: u16, ttl: Duration }
     //   QuarantineHost { ttl: Duration }
 }
 
@@ -52,13 +63,14 @@ impl Action {
     pub fn id(&self) -> &'static str {
         match self {
             Action::KillProcess { .. } => "kill_process",
+            Action::BlockExec { .. } => "block_exec",
         }
     }
 
     /// All action ids the engine knows how to execute today. Used by
     /// policy parsing to reject typos in `allowed_actions` early.
     pub fn known_ids() -> &'static [&'static str] {
-        &["kill_process"]
+        &["kill_process", "block_exec"]
     }
 }
 
@@ -119,10 +131,18 @@ pub enum ActionError {
 /// `pid` is taken from the originating event; callers that don't
 /// have one (e.g. per-host policy actions like `quarantine_host`)
 /// can pass 0 once those variants exist.
-pub fn from_id(id: &str, episode_id: &str, pid: Option<u32>) -> Option<Action> {
+///
+/// `comm` is the 1–15 character process name from the originating
+/// event, used by `block_exec`. When absent, `block_exec` is
+/// dropped (we don't have a sensible default to block).
+pub fn from_id(id: &str, episode_id: &str, pid: Option<u32>, comm: Option<&str>) -> Option<Action> {
     match id {
         "kill_process" => Some(Action::KillProcess {
             pid: pid?,
+            episode_id: episode_id.to_string(),
+        }),
+        "block_exec" => Some(Action::BlockExec {
+            comm: comm?.to_string(),
             episode_id: episode_id.to_string(),
         }),
         _ => None,
@@ -140,30 +160,51 @@ mod tests {
 
     #[test]
     fn id_roundtrips_through_from_id() {
-        let action = from_id("kill_process", "ep-x", Some(42)).unwrap();
+        let action = from_id("kill_process", "ep-x", Some(42), None).unwrap();
         assert_eq!(action.id(), "kill_process");
         match action {
             Action::KillProcess { pid, episode_id } => {
                 assert_eq!(pid, 42);
                 assert_eq!(episode_id, "ep-x");
             }
+            other @ Action::BlockExec { .. } => panic!("expected KillProcess, got {other:?}"),
         }
     }
 
     #[test]
     fn from_id_drops_unknown_actions() {
-        assert!(from_id("isolate_host", "ep", Some(1)).is_none());
-        assert!(from_id("page_oncall", "ep", Some(1)).is_none());
+        assert!(from_id("isolate_host", "ep", Some(1), None).is_none());
+        assert!(from_id("page_oncall", "ep", Some(1), None).is_none());
     }
 
     #[test]
     fn kill_process_requires_pid() {
-        assert!(from_id("kill_process", "ep", None).is_none());
+        assert!(from_id("kill_process", "ep", None, None).is_none());
     }
 
     #[test]
-    fn known_ids_lists_kill_process() {
-        assert!(Action::known_ids().contains(&"kill_process"));
+    fn block_exec_requires_comm() {
+        assert!(from_id("block_exec", "ep", Some(1), None).is_none());
+    }
+
+    #[test]
+    fn block_exec_roundtrips() {
+        let action = from_id("block_exec", "ep-y", None, Some("nc")).unwrap();
+        assert_eq!(action.id(), "block_exec");
+        match action {
+            Action::BlockExec { comm, episode_id } => {
+                assert_eq!(comm, "nc");
+                assert_eq!(episode_id, "ep-y");
+            }
+            other @ Action::KillProcess { .. } => panic!("expected BlockExec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_ids_lists_all_known() {
+        let ids = Action::known_ids();
+        assert!(ids.contains(&"kill_process"));
+        assert!(ids.contains(&"block_exec"));
     }
 
     #[test]

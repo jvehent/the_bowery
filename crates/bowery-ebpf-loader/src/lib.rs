@@ -471,9 +471,7 @@ impl BpfBlocker {
         AyaHashMap::try_from(map).map_err(|e| LoaderError::Aya(e.to_string()))
     }
 
-    fn blocked_comms_mut(
-        &mut self,
-    ) -> Result<AyaHashMap<&mut MapData, [u8; 16], u8>, LoaderError> {
+    fn blocked_comms_mut(&mut self) -> Result<AyaHashMap<&mut MapData, [u8; 16], u8>, LoaderError> {
         let map = self
             .ebpf
             .map_mut("BLOCKED_COMMS")

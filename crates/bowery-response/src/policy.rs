@@ -147,8 +147,8 @@ mod tests {
         let p = ResponsePolicy {
             allowed_actions: vec![
                 "kill_process".into(),
-                "isolate_host".into(),  // typo / future action
-                "page_oncall".into(),   // never supported
+                "isolate_host".into(), // typo / future action
+                "page_oncall".into(),  // never supported
             ],
             disabled: false,
         };
