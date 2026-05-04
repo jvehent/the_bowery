@@ -212,3 +212,93 @@ async fn high_suspicion_exec_triggers_whisper_round_and_aggregates_beta_sighting
     agent_alpha.shutdown().await.expect("shutdown alpha");
     agent_beta.shutdown().await.expect("shutdown beta");
 }
+
+/// Phase-5 asker-side bloom filter: beta has *not* observed the
+/// payload sha. Beta's bloom advert (gossiped via mesh KV) reflects
+/// that. Alpha's whisper round should skip beta entirely instead of
+/// dialing it, and report the skip in `peers_skipped_by_bloom`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whisper_round_skips_peers_whose_bloom_advert_excludes_tier1() {
+    let workdir_alpha = TempDir::new().unwrap();
+    let workdir_beta = TempDir::new().unwrap();
+
+    let payload_path = workdir_alpha.path().join("payload");
+    let payload_bytes = b"phase-5-asker-skip-test-binary";
+    std::fs::write(&payload_path, payload_bytes).unwrap();
+
+    let mesh_addr_alpha = reserve_udp_port();
+    let mesh_addr_beta = reserve_udp_port();
+
+    let id_alpha = Arc::new(Identity::generate());
+    let id_beta = Arc::new(Identity::generate());
+
+    // Configure both with a fast bloom publish_interval so beta has
+    // time to gossip its (empty) advert before alpha's exec event
+    // fires.
+    let mut cfg_alpha = build_config(
+        workdir_alpha.path(),
+        mesh_addr_alpha,
+        vec![mesh_addr_beta.to_string()],
+    );
+    cfg_alpha.bloom.publish_interval = Duration::from_millis(200);
+
+    let mut cfg_beta = build_config(
+        workdir_beta.path(),
+        mesh_addr_beta,
+        vec![mesh_addr_alpha.to_string()],
+    );
+    cfg_beta.bloom.publish_interval = Duration::from_millis(200);
+
+    // Alpha's exec event arrives 3s in, giving the bloom + role
+    // gossip several ticks to converge.
+    let alpha_source = Box::new(
+        MockEventSource::new(vec![make_exec(7777, payload_path)])
+            .with_delay(Duration::from_secs(3)),
+    );
+
+    let agent_alpha = Agent::start(cfg_alpha, id_alpha.clone(), alpha_source)
+        .await
+        .expect("start alpha");
+    let agent_beta = Agent::start(cfg_beta, id_beta.clone(), Box::new(NoopEventSource))
+        .await
+        .expect("start beta");
+
+    // Deliberately do NOT seed beta's baseline. Beta's advert will
+    // (correctly) tell alpha "I haven't seen anything matching this
+    // tier-1." Alpha should skip the dial.
+
+    let mut events = agent_alpha.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let context = loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !timeout.is_zero(),
+            "timed out waiting for WhisperContextReady"
+        );
+        match tokio::time::timeout(timeout, events.recv()).await {
+            Ok(Ok(AgentEvent::WhisperContextReady(ctx))) => break ctx,
+            Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
+            Ok(Err(RecvError::Closed)) => panic!("event channel closed early"),
+            Err(tokio::time::error::Elapsed { .. }) => {
+                panic!("timed out waiting for WhisperContextReady")
+            }
+        }
+    };
+
+    assert_eq!(
+        context.peers.len(),
+        0,
+        "expected no dial; got peers: {:?}",
+        context.peers.iter().map(|p| p.peer).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        context.peers_skipped_by_bloom, 1,
+        "expected exactly beta to be skipped by the bloom filter, got {}",
+        context.peers_skipped_by_bloom
+    );
+    assert_eq!(context.corroborating_peers, 0);
+    assert_eq!(context.total_seen_count, 0);
+
+    agent_alpha.shutdown().await.expect("shutdown alpha");
+    agent_beta.shutdown().await.expect("shutdown beta");
+}

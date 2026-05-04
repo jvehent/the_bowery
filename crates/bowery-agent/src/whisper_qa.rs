@@ -19,18 +19,22 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_analysis::{RoleFeatures, RoleVector, peer_select};
 use bowery_baseline::Baseline;
 use bowery_crypto::Fingerprint;
 use bowery_llm::{AnalysisContext, Submitter};
 use bowery_mesh::{Mesh, PeerInfo};
-use bowery_whisper::fingerprint::Tier1Fingerprint;
+use bowery_proto::BloomAdvert;
+use bowery_whisper::fingerprint::{BloomFilter, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::KnownNeighbors;
 use bowery_whisper::qa::{self, AskError, LocalSighting};
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::BoweryEndpoint;
 use bowery_whisper::{Sealer, Verifier};
 use futures::future::join_all;
+use prost::Message as _;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -78,6 +82,11 @@ pub struct WhisperContext {
     pub total_seen_count: u64,
     /// Number of peers whose `sighting.seen_count` is non-zero.
     pub corroborating_peers: usize,
+    /// Number of role-similar candidates we skipped *before* dialing
+    /// because their bloom advert ruled out the tier-1 fingerprint.
+    /// Useful for sizing how much round-trip budget the asker-side
+    /// bloom check is saving in production.
+    pub peers_skipped_by_bloom: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +257,7 @@ async fn run_round(
             peers: Vec::new(),
             total_seen_count: 0,
             corroborating_peers: 0,
+            peers_skipped_by_bloom: 0,
         };
         finish_round(
             trigger,
@@ -266,6 +276,29 @@ async fn run_round(
         qa_cfg.fanout,
         qa_cfg.min_similarity,
     );
+
+    // Asker-side bloom-advert filter. A peer whose advert is present
+    // and parseable AND `!contains(tier1)` definitely hasn't seen the
+    // artifact (modulo bloom collisions, which are vanishingly rare in
+    // the *negative* direction — bloom filters never produce false
+    // negatives). Skipping these saves a QUIC dial per peer.
+    let mut peers_skipped_by_bloom = 0usize;
+    let ranked: Vec<_> = ranked
+        .into_iter()
+        .filter(|(peer, _)| {
+            if bloom_says_definitely_no(peer, tier1) {
+                peers_skipped_by_bloom += 1;
+                debug!(
+                    episode = %trigger.episode_id,
+                    peer = %peer.fingerprint,
+                    "skipping dial — peer advert excludes this tier1"
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
 
     let envelope_verifier = Arc::new(Verifier::new(kn.clone()));
 
@@ -336,6 +369,7 @@ async fn run_round(
         peers = peers.len(),
         corroborating = corroborating_peers,
         total_seen = total_seen_count,
+        skipped_by_bloom = peers_skipped_by_bloom,
         "whisper Q&A round complete"
     );
 
@@ -345,6 +379,7 @@ async fn run_round(
         peers,
         total_seen_count,
         corroborating_peers,
+        peers_skipped_by_bloom,
     };
     finish_round(
         trigger,
@@ -447,6 +482,45 @@ async fn ask_one(
 }
 
 // ---------------------------------------------------------------------------
+// Asker-side bloom-advert filter
+// ---------------------------------------------------------------------------
+
+/// Returns `true` only when `peer`'s bloom advert is present, fully
+/// parseable, and `!contains(tier1)` — i.e. the peer has *definitely*
+/// not observed anything matching this tier-1 fingerprint. Bloom
+/// filters can produce false positives (peer says yes, actually no)
+/// but never false negatives (peer says no, actually yes), so a `true`
+/// return here is safe to act on.
+///
+/// In every uncertain case (no advert published yet, base64 decode
+/// fails, prost decode fails, advert dimensions reject) we return
+/// `false` and the asker proceeds with a normal dial. The optimization
+/// is best-effort.
+fn bloom_says_definitely_no(peer: &PeerInfo, tier1: Tier1Fingerprint) -> bool {
+    let Some(advert_b64) = peer.bloom_advert.as_deref() else {
+        return false;
+    };
+    let Ok(raw) = BASE64.decode(advert_b64.as_bytes()) else {
+        warn!(peer = %peer.fingerprint, "peer published a non-base64 bloom advert; ignoring");
+        return false;
+    };
+    let Ok(advert) = BloomAdvert::decode(raw.as_slice()) else {
+        warn!(peer = %peer.fingerprint, "peer published a malformed bloom advert; ignoring");
+        return false;
+    };
+    let Ok(k) = u8::try_from(advert.k) else {
+        warn!(peer = %peer.fingerprint, k = advert.k, "peer's advert k out of range");
+        return false;
+    };
+    let bit_count = advert.bit_count as usize;
+    let Ok(filter) = BloomFilter::from_bytes(advert.bits, bit_count, k) else {
+        warn!(peer = %peer.fingerprint, "peer's bloom advert dimensions rejected");
+        return false;
+    };
+    !filter.contains(tier1)
+}
+
+// ---------------------------------------------------------------------------
 // Helper: KnownNeighbors lookup wrapper.
 // ---------------------------------------------------------------------------
 
@@ -508,6 +582,83 @@ mod tests {
         assert_eq!(s.seen_count, 0);
     }
 
+    /// Build a `PeerInfo` whose `bloom_advert` is a base64'd
+    /// `BloomAdvert` containing exactly the listed tier-1 fingerprints.
+    /// Returns `(peer_info, tier1_in, tier1_out)` so the test can ask
+    /// "what's a member?" and "what's not?" without rebuilding the
+    /// filter.
+    fn peer_with_bloom(seeds: &[&[u8]]) -> PeerInfo {
+        use bowery_proto::BloomAdvert;
+        use prost::Message as _;
+
+        let mut filter = BloomFilter::with_defaults();
+        for s in seeds {
+            filter.insert(Tier1Fingerprint::derive(s));
+        }
+        let advert = BloomAdvert {
+            epoch: 1,
+            bit_count: u32::try_from(filter.bit_count()).unwrap(),
+            k: u32::from(filter.k()),
+            bits: filter.as_bytes().to_vec(),
+        };
+        let b64 = BASE64.encode(advert.encode_to_vec());
+        PeerInfo {
+            fingerprint: bowery_crypto::Fingerprint::from_bytes([0xab; 32]),
+            verifying_key: ed25519_dalek::VerifyingKey::from_bytes(&[
+                // Arbitrary valid Ed25519 public key; the helper
+                // doesn't care about it. Generated once via
+                // `Identity::generate()`.
+                0x3a, 0x4f, 0x77, 0x16, 0xd5, 0x3e, 0x9c, 0x6c, 0x76, 0x4b, 0x44, 0x49, 0x12, 0x91,
+                0xfa, 0x9d, 0x6f, 0x1b, 0xea, 0x4d, 0x21, 0x66, 0xa2, 0xa6, 0xc5, 0xe4, 0xa1, 0xab,
+                0x6b, 0x06, 0xc9, 0x07,
+            ])
+            .expect("valid pubkey"),
+            whisper_addr: "127.0.0.1:0".parse().unwrap(),
+            agent_version: "0.0.1".into(),
+            role_vector: None,
+            bloom_advert: Some(b64),
+        }
+    }
+
+    #[test]
+    fn bloom_says_definitely_no_skips_only_proven_negatives() {
+        let peer = peer_with_bloom(&[b"alpha", b"beta"]);
+        // Members → maybe-yes, don't skip.
+        assert!(!bloom_says_definitely_no(
+            &peer,
+            Tier1Fingerprint::derive(b"alpha")
+        ));
+        assert!(!bloom_says_definitely_no(
+            &peer,
+            Tier1Fingerprint::derive(b"beta")
+        ));
+        // Non-member → definite no, skip.
+        assert!(bloom_says_definitely_no(
+            &peer,
+            Tier1Fingerprint::derive(b"never-inserted-payload")
+        ));
+    }
+
+    #[test]
+    fn bloom_says_definitely_no_returns_false_when_advert_absent() {
+        let mut peer = peer_with_bloom(&[]);
+        peer.bloom_advert = None;
+        assert!(!bloom_says_definitely_no(
+            &peer,
+            Tier1Fingerprint::derive(b"anything")
+        ));
+    }
+
+    #[test]
+    fn bloom_says_definitely_no_returns_false_on_garbage_advert() {
+        let mut peer = peer_with_bloom(&[]);
+        peer.bloom_advert = Some("not!base64!at!all".into());
+        assert!(!bloom_says_definitely_no(
+            &peer,
+            Tier1Fingerprint::derive(b"anything")
+        ));
+    }
+
     #[test]
     fn inject_whisper_context_adds_neighborhood_summary() {
         use bowery_analysis::{BinaryScore, Verdict};
@@ -556,6 +707,7 @@ mod tests {
             ],
             total_seen_count: 12,
             corroborating_peers: 1,
+            peers_skipped_by_bloom: 0,
         };
 
         inject_whisper_context(&mut ctx, &context);
