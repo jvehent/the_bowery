@@ -254,14 +254,44 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
 ///
 /// The hook returns `0` to allow and a negative errno to deny. The
 /// verifier requires the return type to be `i32`.
+///
+/// Trailing-whitespace normalisation: writing to `/proc/<pid>/comm`
+/// via `echo` includes the trailing `\n` from the shell, so the
+/// kernel stores e.g. `b"bash\n\0\0..."`. We don't want that to
+/// silently mismatch a userspace blocklist entry inserted as
+/// `b"bash\0\0\0..."`. Zero out trailing whitespace bytes before the
+/// map lookup so both `echo "x" > /proc/<pid>/comm` and
+/// `printf "x" > /proc/<pid>/comm` produce the same key.
 #[lsm(hook = "bprm_check_security")]
 pub fn block_exec(_ctx: LsmContext) -> i32 {
-    let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    let mut comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    normalise_comm(&mut comm);
     // SAFETY: `BLOCKED_COMMS.get` reads through aya-ebpf's lookup
     // helper; kernel side enforces no aliasing for us. Returning a
     // borrowed pointer that we immediately discriminate on is safe.
     let blocked = unsafe { BLOCKED_COMMS.get(&comm) }.is_some();
     if blocked { -1 } else { 0 }
+}
+
+/// Zero trailing ASCII whitespace bytes (`\n`, `\r`, `\t`, space).
+/// Stops at the first non-whitespace byte from the right; interior
+/// whitespace is preserved (the kernel itself prevents `\0` interior
+/// bytes via the `__set_task_comm` strncpy semantics, so anything
+/// past the first `\0` is already irrelevant). Bounded `for` loop
+/// keeps the BPF verifier happy without unrolled branches.
+#[inline(always)]
+fn normalise_comm(comm: &mut [u8; 16]) {
+    // Iterate right-to-left over a fixed-size array; the verifier
+    // can prove termination because the loop bound is a compile-time
+    // constant.
+    let mut i = comm.len();
+    while i > 0 {
+        i -= 1;
+        match comm[i] {
+            b'\n' | b'\r' | b'\t' | b' ' | 0 => comm[i] = 0,
+            _ => break,
+        }
+    }
 }
 
 #[cfg(not(test))]
