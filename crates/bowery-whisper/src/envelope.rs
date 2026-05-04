@@ -101,6 +101,32 @@ impl<T: FingerprintResolver + ?Sized> FingerprintResolver for Arc<T> {
     }
 }
 
+/// Resolver that consults two backing stores in order. Useful for
+/// agents that need to accept signatures from both pinned peer agents
+/// (`KnownNeighbors`) and configured operators (a [`StaticResolver`]
+/// built from `[operators]` config), without conflating the two stores.
+#[derive(Debug, Clone)]
+pub struct CompositeResolver<A, B> {
+    primary: A,
+    secondary: B,
+}
+
+impl<A, B> CompositeResolver<A, B> {
+    pub fn new(primary: A, secondary: B) -> Self {
+        Self { primary, secondary }
+    }
+}
+
+impl<A: FingerprintResolver, B: FingerprintResolver> FingerprintResolver
+    for CompositeResolver<A, B>
+{
+    fn resolve(&self, fp: &Fingerprint) -> Option<VerifyingKey> {
+        self.primary
+            .resolve(fp)
+            .or_else(|| self.secondary.resolve(fp))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sealer
 // ---------------------------------------------------------------------------
@@ -155,7 +181,7 @@ impl Sealer {
 // Verifier
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedEnvelope {
     pub sender: Fingerprint,
     pub nonce: u64,

@@ -16,7 +16,8 @@ pub mod tls;
 pub mod transport;
 
 pub use envelope::{
-    Error, FingerprintResolver, Sealer, StaticResolver, VerifiedEnvelope, Verifier,
+    CompositeResolver, Error, FingerprintResolver, Sealer, StaticResolver, VerifiedEnvelope,
+    Verifier,
 };
 pub use fingerprint::{BloomError, BloomFilter, Tier1Fingerprint};
 pub use replay::ReplayGuard;

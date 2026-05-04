@@ -40,6 +40,12 @@ pub struct Config {
     pub role: RoleConfig,
     #[serde(default)]
     pub llm: LlmConfig,
+    #[serde(default)]
+    pub operators: OperatorsConfig,
+    #[serde(default)]
+    pub inbox: InboxConfig,
+    #[serde(default)]
+    pub alerts: AlertsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +330,76 @@ fn default_llm_queue_capacity() -> usize {
 
 fn default_llm_request_deadline() -> Duration {
     Duration::from_secs(DEFAULT_LLM_REQUEST_DEADLINE_SECS)
+}
+
+// ---------------------------------------------------------------------------
+// Operator I/O — Phase 6a.
+// ---------------------------------------------------------------------------
+
+/// Trusted operator public keys. Each entry is a base64-encoded
+/// 32-byte Ed25519 verifying key (the same format `bowery key
+/// fingerprint` prints alongside the fingerprint). The agent will
+/// accept signed `Subscribe` envelopes from any of these keys; all
+/// other senders are rejected, even if the connection's TLS cert
+/// successfully completed (operators can ride the same accept loop
+/// as peer agents thanks to `CompositeResolver`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorsConfig {
+    /// Base64-encoded operator verifying keys.
+    #[serde(default)]
+    pub pubkeys_b64: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxConfig {
+    /// Maximum number of buffered alerts. Older entries are evicted
+    /// FIFO at capacity.
+    #[serde(default = "default_inbox_capacity")]
+    pub capacity: usize,
+    /// Per-alert TTL in the inbox.
+    #[serde(with = "humantime_serde", default = "default_inbox_retention")]
+    pub retention: Duration,
+}
+
+impl Default for InboxConfig {
+    fn default() -> Self {
+        Self {
+            capacity: default_inbox_capacity(),
+            retention: default_inbox_retention(),
+        }
+    }
+}
+
+fn default_inbox_capacity() -> usize {
+    crate::inbox::DEFAULT_CAPACITY
+}
+fn default_inbox_retention() -> Duration {
+    crate::inbox::DEFAULT_RETENTION
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertsConfig {
+    /// Suspicion threshold (in `[0, 1]`) at which an LLM verdict is
+    /// transcribed into an Alert and pushed to the operator inbox.
+    /// Defaults to `0.7` — high enough that low-noise verdicts don't
+    /// fill the inbox during steady state.
+    #[serde(default = "default_alert_threshold")]
+    pub threshold: f32,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            threshold: default_alert_threshold(),
+        }
+    }
+}
+
+fn default_alert_threshold() -> f32 {
+    0.7
 }
 
 impl Config {

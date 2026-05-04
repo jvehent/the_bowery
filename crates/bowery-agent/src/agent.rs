@@ -15,13 +15,19 @@ use bowery_llm::{
     MockMode, QueueConfig, ShedReason, Submitter,
 };
 use bowery_mesh::{KEY_ROLE_VECTOR, Mesh, MeshConfig, PeerInfo};
-use bowery_proto::{Body, WhisperPayload};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use bowery_proto::{Alert, Alerts, Body, Subscribe, WhisperPayload};
 use bowery_whisper::fingerprint::{TIER1_LEN, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::{BoweryConnection, BoweryEndpoint};
-use bowery_whisper::{FingerprintResolver, Sealer, Verifier};
+use bowery_whisper::{
+    CompositeResolver, FingerprintResolver, Sealer, StaticResolver, Verifier,
+};
+use ed25519_dalek::VerifyingKey;
 
+use crate::inbox::{AlertInbox, current_unix_ms};
 use crate::whisper_qa::{
     WhisperContext, WhisperQaTrigger, aggregate_local_sighting, spawn_whisper_qa_task,
 };
@@ -76,6 +82,20 @@ pub enum AgentEvent {
     /// per-peer responses (or non-responses) so observers / dashboards
     /// can surface neighborhood corroboration.
     WhisperContextReady(WhisperContext),
+    /// Phase 6: an alert was appended to the operator inbox. Lets
+    /// tests + dashboards observe inbox writes without polling.
+    AlertEmitted {
+        episode_id: String,
+        suspicion: f32,
+    },
+    /// Phase 6: a subscriber drained the inbox. `delivered` is the
+    /// number of alerts handed back; useful for ops to confirm the
+    /// roaming-operator path works.
+    AlertsDelivered {
+        operator: Fingerprint,
+        delivered: usize,
+        cursor_unix_ms: u64,
+    },
 }
 
 /// Why an LLM request didn't produce a verdict.
@@ -131,6 +151,8 @@ pub struct Agent {
     llm_outcomes_task: JoinHandle<()>,
     whisper_qa_task: JoinHandle<()>,
     llm_queue: Option<InferenceQueue>,
+    #[allow(dead_code)] // exposed via inbox() accessor; held alive at agent scope
+    inbox: Arc<AlertInbox>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -171,10 +193,23 @@ impl Agent {
             config.known_neighbors.bootstrap_window,
         )?);
 
+        let operators = Arc::new(load_operators(&config.operators.pubkeys_b64)?);
+        // Composite resolver: pinned peer agents AND configured
+        // operators. Both can dial us — peers for heartbeats / Q&A,
+        // operators for `Subscribe` against the alert inbox.
+        let resolver = Arc::new(CompositeResolver::new(
+            known_neighbors.clone(),
+            operators.clone(),
+        ));
+
         let baseline = Arc::new(open_baseline(&config.baseline.path)?);
         let analyzer = Arc::new(Analyzer::with_default_rules(baseline.clone()));
+        let inbox = Arc::new(AlertInbox::new(
+            config.inbox.capacity,
+            config.inbox.retention,
+        ));
 
-        let accept_verifier = Arc::new(PinnedCertVerifier::new(known_neighbors.clone()));
+        let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
         let endpoint =
             BoweryEndpoint::bind(identity.clone(), accept_verifier, config.whisper.bind_addr)?;
         let sealer = Arc::new(Sealer::new(identity.clone()));
@@ -211,9 +246,11 @@ impl Agent {
 
         let accept_task = spawn_accept_task(
             endpoint.clone(),
-            known_neighbors.clone(),
+            resolver.clone(),
+            operators.clone(),
             sealer.clone(),
             baseline.clone(),
+            inbox.clone(),
             events_tx.clone(),
             shutdown_rx.clone(),
         );
@@ -260,6 +297,10 @@ impl Agent {
             config.llm.invocation_threshold,
             config.whisper.qa.threshold,
             whisper_qa_tx,
+            inbox.clone(),
+            fingerprint,
+            config.alerts.threshold,
+            llm.name().to_string(),
             events_tx.clone(),
             shutdown_rx.clone(),
         );
@@ -288,6 +329,7 @@ impl Agent {
             analyzer,
             endpoint,
             mesh,
+            inbox,
             shutdown_tx,
             events_tx,
             pin_task,
@@ -335,6 +377,10 @@ impl Agent {
         &self.mesh
     }
 
+    pub fn inbox(&self) -> &Arc<AlertInbox> {
+        &self.inbox
+    }
+
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         let _ = self.shutdown_tx.send(true);
         self.endpoint.close().await;
@@ -364,6 +410,30 @@ fn open_baseline(path: &std::path::Path) -> bowery_baseline::Result<Baseline> {
     } else {
         Baseline::open(path)
     }
+}
+
+/// Build a [`StaticResolver`] from a list of base64-encoded operator
+/// verifying keys. Empty list ⇒ empty resolver (operators are
+/// optional; an agent with no configured operators simply ignores any
+/// `Subscribe` request).
+fn load_operators(pubkeys_b64: &[String]) -> Result<StaticResolver, AgentError> {
+    let mut resolver = StaticResolver::new();
+    for s in pubkeys_b64 {
+        let bytes = BASE64
+            .decode(s.as_bytes())
+            .map_err(|e| AgentError::Config(format!("operator key `{s}` not base64: {e}")))?;
+        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            AgentError::Config(format!(
+                "operator key `{s}` has {} bytes; expected 32",
+                bytes.len()
+            ))
+        })?;
+        let vk = VerifyingKey::from_bytes(&arr).map_err(|e| {
+            AgentError::Config(format!("operator key `{s}` is not a valid Ed25519 key: {e}"))
+        })?;
+        resolver.insert(vk);
+    }
+    Ok(resolver)
 }
 
 // ---------------------------------------------------------------------------
@@ -405,16 +475,22 @@ fn spawn_pin_task(
     })
 }
 
+type ResolverArc =
+    Arc<CompositeResolver<Arc<KnownNeighbors>, Arc<StaticResolver>>>;
+
+#[allow(clippy::too_many_arguments)] // wiring kept explicit at the call site
 fn spawn_accept_task(
     endpoint: BoweryEndpoint,
-    kn: Arc<KnownNeighbors>,
+    resolver: ResolverArc,
+    operators: Arc<StaticResolver>,
     sealer: Arc<Sealer>,
     baseline: Arc<Baseline>,
+    inbox: Arc<AlertInbox>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let envelope_verifier = Arc::new(Verifier::new(kn));
+        let envelope_verifier = Arc::new(Verifier::new(resolver));
         loop {
             tokio::select! {
                 accept = endpoint.accept() => {
@@ -422,10 +498,14 @@ fn spawn_accept_task(
                     match connection_result {
                         Ok(conn) => {
                             let verifier = envelope_verifier.clone();
+                            let operators = operators.clone();
                             let sealer = sealer.clone();
                             let baseline = baseline.clone();
+                            let inbox = inbox.clone();
                             let events = events_tx.clone();
-                            tokio::spawn(handle_connection(conn, verifier, sealer, baseline, events));
+                            tokio::spawn(handle_connection(
+                                conn, verifier, operators, sealer, baseline, inbox, events,
+                            ));
                         }
                         Err(e) => warn!(error = %e, "accept failed"),
                     }
@@ -436,11 +516,14 @@ fn spawn_accept_task(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     conn: BoweryConnection,
-    verifier: Arc<Verifier<Arc<KnownNeighbors>>>,
+    verifier: Arc<Verifier<ResolverArc>>,
+    operators: Arc<StaticResolver>,
     sealer: Arc<Sealer>,
     baseline: Arc<Baseline>,
+    inbox: Arc<AlertInbox>,
     events_tx: broadcast::Sender<AgentEvent>,
 ) {
     while let Ok(bytes) = conn.recv_envelope().await {
@@ -451,15 +534,43 @@ async fn handle_connection(
                     sender: env.sender,
                     nonce: env.nonce,
                 });
-                if let Some(Body::Question(q)) = env.payload.body
-                    && let Err(e) =
-                        respond_to_question(&conn, &sealer, &baseline, q).await
-                {
-                    warn!(sender = %env.sender, error = %e, "whisper Q&A response failed");
+                match env.payload.body {
+                    Some(Body::Question(q)) => {
+                        if let Err(e) =
+                            respond_to_question(&conn, &sealer, &baseline, q).await
+                        {
+                            warn!(sender = %env.sender, error = %e, "whisper Q&A response failed");
+                        }
+                    }
+                    Some(Body::Subscribe(s)) => {
+                        // Only configured operators can drain the
+                        // inbox. The envelope verifier already checked
+                        // the signature against the *composite*
+                        // resolver, but that includes peer agents — we
+                        // need the stricter "is this an operator?"
+                        // check before handing back alerts.
+                        if operators.resolve(&env.sender).is_none() {
+                            warn!(
+                                sender = %env.sender,
+                                "rejecting Subscribe from non-operator sender"
+                            );
+                            continue;
+                        }
+                        if let Err(e) =
+                            respond_to_subscribe(&conn, &sealer, &inbox, env.sender, s, &events_tx)
+                                .await
+                        {
+                            warn!(sender = %env.sender, error = %e, "Subscribe response failed");
+                        }
+                    }
+                    _ => {
+                        // Heartbeat / other bodies: nothing to do beyond
+                        // emitting EnvelopeReceived above.
+                    }
                 }
-                // After responding, the asker will close the connection.
-                // Subsequent recv_envelope will return an error and we'll
-                // exit the loop.
+                // After responding (or no-op), the asker closes the
+                // connection. Subsequent recv_envelope returns an
+                // error and we exit the loop.
             }
             Err(e) => warn!(error = %e, "envelope verification failed"),
         }
@@ -506,6 +617,41 @@ async fn respond_to_question(
     };
     let outbound = sealer.seal(&WhisperPayload::answer(answer));
     conn.send_envelope(&outbound).await
+}
+
+async fn respond_to_subscribe(
+    conn: &BoweryConnection,
+    sealer: &Sealer,
+    inbox: &Arc<AlertInbox>,
+    operator: Fingerprint,
+    sub: Subscribe,
+    events_tx: &broadcast::Sender<AgentEvent>,
+) -> Result<(), bowery_whisper::transport::Error> {
+    let max = usize::try_from(sub.max_items).unwrap_or(usize::MAX);
+    let inbox = inbox.clone();
+    let (items, cursor) = tokio::task::spawn_blocking(move || {
+        inbox.read_since(sub.since_unix_ms, max)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "inbox read task panicked");
+        (Vec::new(), sub.since_unix_ms)
+    });
+
+    let delivered = items.len();
+    let response = Alerts {
+        items,
+        cursor_unix_ms: cursor,
+    };
+    let outbound = sealer.seal(&WhisperPayload::alerts(response));
+    conn.send_envelope(&outbound).await?;
+
+    let _ = events_tx.send(AgentEvent::AlertsDelivered {
+        operator,
+        delivered,
+        cursor_unix_ms: cursor,
+    });
+    Ok(())
 }
 
 fn spawn_heartbeat_task(
@@ -579,6 +725,10 @@ fn spawn_pipeline_task(
     llm_threshold: f32,
     whisper_threshold: f32,
     whisper_qa_tx: mpsc::Sender<WhisperQaTrigger>,
+    inbox: Arc<AlertInbox>,
+    originator_fp: Fingerprint,
+    alert_threshold: f32,
+    backend_label: String,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -594,6 +744,10 @@ fn spawn_pipeline_task(
                         llm_threshold,
                         whisper_threshold,
                         &whisper_qa_tx,
+                        &inbox,
+                        originator_fp,
+                        alert_threshold,
+                        &backend_label,
                         &events_tx,
                         event,
                     ).await;
@@ -612,6 +766,10 @@ async fn process_event(
     llm_threshold: f32,
     whisper_threshold: f32,
     whisper_qa_tx: &mpsc::Sender<WhisperQaTrigger>,
+    inbox: &Arc<AlertInbox>,
+    originator_fp: Fingerprint,
+    alert_threshold: f32,
+    backend_label: &str,
     events_tx: &broadcast::Sender<AgentEvent>,
     event: Event,
 ) {
@@ -625,6 +783,10 @@ async fn process_event(
             llm_threshold,
             whisper_threshold,
             whisper_qa_tx,
+            inbox,
+            originator_fp,
+            alert_threshold,
+            backend_label,
             events_tx,
             exec,
         )
@@ -632,7 +794,7 @@ async fn process_event(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn process_exec(
     baseline: &Arc<Baseline>,
     analyzer: &Arc<Analyzer>,
@@ -640,6 +802,10 @@ async fn process_exec(
     llm_threshold: f32,
     whisper_threshold: f32,
     whisper_qa_tx: &mpsc::Sender<WhisperQaTrigger>,
+    inbox: &Arc<AlertInbox>,
+    originator_fp: Fingerprint,
+    alert_threshold: f32,
+    backend_label: &str,
     events_tx: &broadcast::Sender<AgentEvent>,
     exec: ProcessExec,
 ) {
@@ -730,7 +896,54 @@ async fn process_exec(
         debug!(error = %e, "whisper Q&A trigger channel closed");
     }
 
+    // Phase 6: append an Alert to the operator inbox if the verdict
+    // crosses the alert threshold. We use the *pre-verdict's*
+    // suspicion + rule rationale here; a later phase can re-emit a
+    // refined alert when the LLM's verdict comes back.
+    if verdict.suspicion >= alert_threshold {
+        let rationale = first_rule_message(&verdict)
+            .unwrap_or_else(|| "pre-filter score above threshold".to_string());
+        let alert = Alert {
+            originator_fp: originator_fp.as_bytes().to_vec(),
+            episode_id: verdict.episode_id.clone(),
+            exe_sha256_hex: sha_to_hex(&sha),
+            exe_path: exec
+                .exe_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            suspicion: verdict.suspicion,
+            rationale,
+            suggested_actions: Vec::new(), // populated by the LLM enrichment, later phase
+            ts_unix_ms: current_unix_ms(),
+            backend: backend_label.to_string(),
+        };
+        let episode_id = alert.episode_id.clone();
+        let suspicion = alert.suspicion;
+        inbox.append(alert);
+        let _ = events_tx.send(AgentEvent::AlertEmitted {
+            episode_id,
+            suspicion,
+        });
+    }
+
     let _ = events_tx.send(AgentEvent::EpisodeAnalyzed { verdict });
+}
+
+fn first_rule_message(verdict: &Verdict) -> Option<String> {
+    verdict
+        .rule_hits
+        .first()
+        .map(|h| format!("{}: {}", h.rule_id, h.reason))
+}
+
+fn sha_to_hex(sha: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in sha {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------

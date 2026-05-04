@@ -54,13 +54,13 @@ pub const CANONICAL_SIG_DOMAIN: &[u8] = b"bowery/whisper/envelope/v1";
 // ---------------------------------------------------------------------------
 
 /// The inner payload, with one variant per message type.
-#[derive(Clone, PartialEq, Eq, ProstMessage)]
+#[derive(Clone, PartialEq, ProstMessage)]
 pub struct WhisperPayload {
-    #[prost(oneof = "Body", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
     pub body: Option<Body>,
 }
 
-#[derive(Clone, PartialEq, Eq, Oneof)]
+#[derive(Clone, PartialEq, Oneof)]
 pub enum Body {
     #[prost(message, tag = "1")]
     Question(Question),
@@ -76,6 +76,10 @@ pub enum Body {
     Heartbeat(Heartbeat),
     #[prost(message, tag = "7")]
     NeighborOp(NeighborOp),
+    #[prost(message, tag = "8")]
+    Subscribe(Subscribe),
+    #[prost(message, tag = "9")]
+    Alerts(Alerts),
 }
 
 // ---------------------------------------------------------------------------
@@ -162,10 +166,100 @@ pub struct Answer {
     pub note: String,
 }
 
-// Placeholders — populated in later phases.
+// ---------------------------------------------------------------------------
+// Operator I/O — Phase 6 alerts + subscribe.
+// ---------------------------------------------------------------------------
 
+/// A high-suspicion verdict surfaced to an operator. Authored by the
+/// agent that observed the episode (`originator_fp`) and either pushed
+/// into a per-agent inbox (where roaming operators pick it up via
+/// [`Subscribe`]) or, in later phases, replicated into the mesh KV for
+/// neighborhood-wide visibility.
+///
+/// Phase 6a only emits Alerts in response to LLM verdicts; Phase 7 may
+/// also emit them for response-engine actions taken.
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct Alert {
+    /// 32-byte fingerprint of the agent that observed the episode. The
+    /// operator-side CLI uses this to know which host to ask follow-up
+    /// questions about (a future `bowery hunt` flow).
+    #[prost(bytes = "vec", tag = "1")]
+    pub originator_fp: Vec<u8>,
+
+    /// Episode id from the analyzer (`bowery_analysis::Verdict::episode_id`),
+    /// echoed all the way through. Stable across the alert + any later
+    /// operator-issued follow-up commands.
+    #[prost(string, tag = "2")]
+    pub episode_id: String,
+
+    /// Hex-encoded sha256 of the offending exe, if known. Empty when
+    /// the agent couldn't enrich the event with a binary hash.
+    #[prost(string, tag = "3")]
+    pub exe_sha256_hex: String,
+
+    /// Resolved exe path of the rooting process, if any.
+    #[prost(string, tag = "4")]
+    pub exe_path: String,
+
+    /// Refined suspicion in `[0, 1]` from the LLM analyzer (or, when
+    /// the LLM was bypassed, the pre-filter's aggregated suspicion).
+    #[prost(float, tag = "5")]
+    pub suspicion: f32,
+
+    /// One- or two-sentence rationale.
+    #[prost(string, tag = "6")]
+    pub rationale: String,
+
+    /// Action ids the LLM (or the agent's policy) suggested. The
+    /// operator side renders these as advisory; nothing is executed
+    /// until Phase 7's response engine.
+    #[prost(string, repeated, tag = "7")]
+    pub suggested_actions: Vec<String>,
+
+    /// Wall-clock time when the alert was authored (ms since unix
+    /// epoch). Used by the inbox cursor + retention sweeper.
+    #[prost(uint64, tag = "8")]
+    pub ts_unix_ms: u64,
+
+    /// Backend label (`mock/echo`, `llama-cpp/qwen3-0.6b`, etc.). Lets
+    /// dashboards segment alerts by analyzer when a fleet runs mixed
+    /// LLM backends.
+    #[prost(string, tag = "9")]
+    pub backend: String,
+}
+
+/// Operator-issued request to drain the agent's local inbox. Sent on a
+/// fresh whisper connection from the operator's CLI; the agent answers
+/// with an [`Alerts`] payload on the same connection.
+///
+/// `since_unix_ms` is the cursor returned by the previous `Alerts`
+/// response (or 0 on first connect). The agent returns every
+/// not-yet-evicted alert with `ts_unix_ms >= since_unix_ms`.
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
-pub struct Alert {}
+pub struct Subscribe {
+    #[prost(uint64, tag = "1")]
+    pub since_unix_ms: u64,
+    /// Soft cap on the number of alerts the agent should bundle into a
+    /// single response. Zero means "no cap; return everything".
+    #[prost(uint32, tag = "2")]
+    pub max_items: u32,
+}
+
+/// Bundle of alerts the agent is returning to a subscribed operator.
+///
+/// `cursor_unix_ms` is the value the operator should pass as
+/// `since_unix_ms` on the next `Subscribe`; it equals the largest
+/// `Alert.ts_unix_ms + 1` in `items` (or echoes the request's value
+/// when `items` is empty).
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct Alerts {
+    #[prost(message, repeated, tag = "1")]
+    pub items: Vec<Alert>,
+    #[prost(uint64, tag = "2")]
+    pub cursor_unix_ms: u64,
+}
+
+// Placeholders — populated in later phases.
 
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
 pub struct OperatorCommand {}
@@ -239,6 +333,24 @@ impl WhisperPayload {
             body: Some(Body::Answer(a)),
         }
     }
+
+    pub fn alert(a: Alert) -> Self {
+        Self {
+            body: Some(Body::Alert(a)),
+        }
+    }
+
+    pub fn subscribe(s: Subscribe) -> Self {
+        Self {
+            body: Some(Body::Subscribe(s)),
+        }
+    }
+
+    pub fn alerts(a: Alerts) -> Self {
+        Self {
+            body: Some(Body::Alerts(a)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +401,61 @@ mod tests {
         let decoded = WhisperPayload::decode(bytes.as_slice()).unwrap();
         match decoded.body {
             Some(Body::Answer(got)) => assert_eq!(got, a),
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alert_roundtrip() {
+        let alert = Alert {
+            originator_fp: vec![0xaa; 32],
+            episode_id: "ep-7".into(),
+            exe_sha256_hex: "abcdef".repeat(8),
+            exe_path: "/tmp/payload".into(),
+            suspicion: 0.92,
+            rationale: "writable-path exec".into(),
+            suggested_actions: vec!["alert".into(), "kill_process".into()],
+            ts_unix_ms: 1_730_000_000_000,
+            backend: "mock/echo".into(),
+        };
+        let original = WhisperPayload::alert(alert.clone());
+        let bytes = original.encode_to_vec();
+        let decoded = WhisperPayload::decode(bytes.as_slice()).unwrap();
+        match decoded.body {
+            Some(Body::Alert(got)) => assert_eq!(got, alert),
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subscribe_and_alerts_roundtrip() {
+        let sub = Subscribe {
+            since_unix_ms: 1_700_000_000_000,
+            max_items: 100,
+        };
+        let bytes = WhisperPayload::subscribe(sub.clone()).encode_to_vec();
+        match WhisperPayload::decode(bytes.as_slice()).unwrap().body {
+            Some(Body::Subscribe(got)) => assert_eq!(got, sub),
+            other => panic!("unexpected body: {other:?}"),
+        }
+
+        let resp = Alerts {
+            items: vec![Alert {
+                originator_fp: vec![1; 32],
+                episode_id: "x".into(),
+                exe_sha256_hex: "deadbeef".into(),
+                exe_path: "/x".into(),
+                suspicion: 0.5,
+                rationale: "y".into(),
+                suggested_actions: vec![],
+                ts_unix_ms: 7,
+                backend: "test".into(),
+            }],
+            cursor_unix_ms: 8,
+        };
+        let bytes = WhisperPayload::alerts(resp.clone()).encode_to_vec();
+        match WhisperPayload::decode(bytes.as_slice()).unwrap().body {
+            Some(Body::Alerts(got)) => assert_eq!(got, resp),
             other => panic!("unexpected body: {other:?}"),
         }
     }

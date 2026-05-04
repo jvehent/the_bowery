@@ -266,6 +266,8 @@ fn body_kind(body: &Body) -> &'static str {
         Body::OperatorResult(_) => "OperatorResult",
         Body::Heartbeat(_) => "Heartbeat",
         Body::NeighborOp(_) => "NeighborOp",
+        Body::Subscribe(_) => "Subscribe",
+        Body::Alerts(_) => "Alerts",
     }
 }
 

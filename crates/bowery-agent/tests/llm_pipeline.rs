@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime};
 use bowery_agent::config::{
     BaselineConfig, Config, HeartbeatConfig, IdentityConfig, KnownNeighborsConfig, LlmConfig,
     MeshConfig, RoleConfig, WhisperConfig, WhisperQaConfig,
+    AlertsConfig, InboxConfig, OperatorsConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_crypto::Identity;
@@ -63,6 +64,9 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, llm_threshold: f32) -> Config
             request_deadline: Duration::from_secs(2),
             llama_cpp: None,
         },
+        operators: OperatorsConfig::default(),
+        inbox: InboxConfig::default(),
+        alerts: AlertsConfig::default(),
     }
 }
 

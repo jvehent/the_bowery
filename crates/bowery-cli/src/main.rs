@@ -5,13 +5,16 @@
 //! Subsequent phases add `query`, `hunt`, `alerts tail`, `action ...`,
 //! `authorization grant`, `model push`, etc.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bowery_crypto::Identity;
 use clap::{Parser, Subcommand};
 
+mod alerts;
 mod doctor;
 
 #[derive(Parser, Debug)]
@@ -42,6 +45,57 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Drain (and optionally follow) an agent's operator inbox.
+    ///
+    /// Authenticates with the operator key (must be configured on the
+    /// target agent's `[operators] pubkeys_b64` list). The agent's TLS
+    /// fingerprint and pubkey must be passed explicitly — operators
+    /// don't ride the TOFU pin store.
+    Alerts {
+        #[command(subcommand)]
+        sub: AlertsCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AlertsCommand {
+    /// Print every alert in the agent's inbox since the cursor, then exit
+    /// (or, with --follow, re-poll every `--interval`).
+    Tail {
+        /// Path to the operator's identity key file.
+        #[arg(long)]
+        operator_key: PathBuf,
+        /// Agent's whisper bind address (e.g. `127.0.0.1:9902`).
+        #[arg(long)]
+        agent_addr: SocketAddr,
+        /// Hex-encoded fingerprint of the agent's identity key.
+        #[arg(long)]
+        agent_fp: String,
+        /// Base64-encoded Ed25519 verifying key of the agent (the
+        /// pubkey half of its identity). Used for the TLS pinning.
+        #[arg(long)]
+        agent_pubkey_b64: String,
+        /// Cursor: only return alerts with `ts_unix_ms >= since-ms`.
+        /// `0` means "the entire inbox".
+        #[arg(long, default_value_t = 0)]
+        since_ms: u64,
+        /// Re-poll the agent every `--interval` instead of exiting.
+        #[arg(long)]
+        follow: bool,
+        /// Polling interval for `--follow`. Accepts humantime
+        /// expressions like `2s`, `500ms`.
+        #[arg(long, default_value = "2s", value_parser = parse_duration)]
+        interval: Duration,
+        /// Emit alerts as one JSON object per line instead of human-
+        /// readable.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    humantime::parse_duration(s).map_err(|e| e.to_string())
 }
 
 #[derive(Subcommand, Debug)]
@@ -81,6 +135,40 @@ impl Cli {
                 Ok(ExitCode::SUCCESS)
             }
             Command::Doctor { json } => doctor_cmd(json),
+            Command::Alerts {
+                sub:
+                    AlertsCommand::Tail {
+                        operator_key,
+                        agent_addr,
+                        agent_fp,
+                        agent_pubkey_b64,
+                        since_ms,
+                        follow,
+                        interval,
+                        json,
+                    },
+            } => {
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::WARN)
+                    .with_target(false)
+                    .with_writer(std::io::stderr)
+                    .init();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building tokio runtime")?;
+                runtime.block_on(alerts::run(
+                    operator_key,
+                    agent_addr,
+                    agent_fp,
+                    agent_pubkey_b64,
+                    since_ms,
+                    follow,
+                    interval,
+                    json,
+                ))?;
+                Ok(ExitCode::SUCCESS)
+            }
         }
     }
 }
