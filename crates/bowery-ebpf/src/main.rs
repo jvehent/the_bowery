@@ -7,6 +7,14 @@
 //!   ringbuf, filtered to outgoing TCP connect attempts
 //!   (`oldstate=TCP_CLOSE` → `newstate=TCP_SYN_SENT`)
 //!
+//! Phase 7 surface (this expansion):
+//! - `lsm/bprm_check_security` → consults `BLOCKED_COMMS` (hash map of
+//!   16-byte `comm` keys); returns `-EPERM` when the *calling task*'s
+//!   comm is in the map. Userspace populates / depopulates the map
+//!   via the loader's `BpfBlocker`. This is the simplest dimension
+//!   the LSM hook can match on without CO-RE struct walking; richer
+//!   keys (sha256 of binary, inode) come in follow-up commits.
+//!
 //! The user-space loader (`bowery-ebpf-loader`) drains all three ring
 //! buffers concurrently, enriches the records with `/proc` data, and
 //! emits typed [`bowery_events::Event`] records into the agent pipeline.
@@ -18,8 +26,8 @@
 //!   args — no struct-sock walking required
 //! - it fires on both TCP v4 and v6 in process context, so
 //!   `bpf_get_current_pid_tgid` is the connecting task
-//! - observe-only matches Phase 2's mandate; blocking belongs to the
-//!   response engine (Phase 7), which is where LSM hooks come in
+//! - observe-only matches Phase 2's mandate; LSM hooks below now
+//!   provide the blocking surface for Phase 7
 
 #![no_std]
 #![no_main]
@@ -27,9 +35,9 @@
 
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid},
-    macros::{map, tracepoint},
-    maps::RingBuf,
-    programs::TracePointContext,
+    macros::{lsm, map, tracepoint},
+    maps::{HashMap, RingBuf},
+    programs::{LsmContext, TracePointContext},
 };
 
 // ---------------------------------------------------------------------------
@@ -86,6 +94,17 @@ static EXIT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 /// so match the exec ring at 256 KiB.
 #[map]
 static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Phase-7 LSM blocklist keyed by 16-byte `comm` (Linux kernel's
+/// `task->comm`). Userspace inserts an entry to forbid the matching
+/// process from execing anything new — `block_exec` returns `-EPERM`
+/// from the `bprm_check_security` LSM hook.
+///
+/// Capacity 256 is comfortable for "block this compromised shell"
+/// style use; later phases will pair this with an inode-keyed map for
+/// "block this binary across the host" semantics.
+#[map]
+static BLOCKED_COMMS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(256, 0);
 
 // ---------------------------------------------------------------------------
 // Programs.
@@ -216,6 +235,33 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
     }
     entry.submit(0);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// LSM hook — Phase 7 enforcement.
+// ---------------------------------------------------------------------------
+
+/// Block exec when the calling task's `comm` is in `BLOCKED_COMMS`.
+///
+/// The kernel's `bprm_check_security` LSM hook fires *during* the
+/// `execve` syscall, before the new program image is committed.
+/// `bpf_get_current_comm()` here returns the **calling task's**
+/// comm — i.e. the parent that's trying to exec. This gives us the
+/// "block this compromised shell from spawning more processes"
+/// semantics. Matching on the *new* binary requires walking
+/// `bprm->file->f_inode->i_ino` (struct chain → CO-RE territory), and
+/// lands in a follow-up commit.
+///
+/// The hook returns `0` to allow and a negative errno to deny. The
+/// verifier requires the return type to be `i32`.
+#[lsm(hook = "bprm_check_security")]
+pub fn block_exec(_ctx: LsmContext) -> i32 {
+    let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    // SAFETY: `BLOCKED_COMMS.get` reads through aya-ebpf's lookup
+    // helper; kernel side enforces no aliasing for us. Returning a
+    // borrowed pointer that we immediately discriminate on is safe.
+    let blocked = unsafe { BLOCKED_COMMS.get(&comm) }.is_some();
+    if blocked { -1 } else { 0 }
 }
 
 #[cfg(not(test))]

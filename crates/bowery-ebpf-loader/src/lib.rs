@@ -12,6 +12,11 @@
 //! - `sock/inet_sock_set_state` → [`bowery_events::Event::NetworkConnect`]
 //!   (filtered to outgoing TCP connect attempts)
 //!
+//! Phase 7 surface ([`BpfBlocker`]):
+//! - `lsm/bprm_check_security` → returns `-EPERM` when the calling
+//!   task's `comm` is in `BLOCKED_COMMS`. Userspace populates the map
+//!   via [`BpfBlocker::block_comm`] / [`BpfBlocker::unblock_comm`].
+//!
 //! Each tracepoint owns its own ring buffer; we spawn one async drain
 //! per ring, all feeding the same [`bowery_events::Event`] mpsc channel.
 //!
@@ -33,9 +38,10 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use aya::Ebpf;
-use aya::maps::MapData;
 use aya::maps::ring_buf::RingBuf;
-use aya::programs::TracePoint;
+use aya::maps::{HashMap as AyaHashMap, MapData};
+use aya::programs::{Lsm, TracePoint};
+use aya::{Btf, BtfError};
 use bowery_events::source::{DEFAULT_CHANNEL_CAPACITY, EventSource};
 use bowery_events::{Event, NetFamily, NetworkConnect, ProcessExec, ProcessExit, enrich};
 use thiserror::Error;
@@ -91,6 +97,8 @@ pub enum LoaderError {
     Aya(String),
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    #[error("btf: {0}")]
+    Btf(#[from] BtfError),
 }
 
 /// Event source backed by The Bowery's three Phase-2 tracepoints.
@@ -347,6 +355,144 @@ fn comm_to_string(comm: &[u8; 16]) -> String {
     String::from_utf8_lossy(&comm[..end]).into_owned()
 }
 
+// ---------------------------------------------------------------------------
+// Phase 7: BPF-LSM blocker.
+// ---------------------------------------------------------------------------
+
+/// Holds a loaded BPF object, an attached `lsm/bprm_check_security`
+/// program (as [`block_exec`](https://github.com/jvehent/the_bowery/blob/main/crates/bowery-ebpf/src/main.rs)),
+/// and a handle to the kernel-side `BLOCKED_COMMS` hash map.
+///
+/// On drop the LSM program is detached: the agent shutting down stops
+/// enforcing. Persisting blocks across agent restarts means pinning
+/// the program to bpffs, which we do not yet do (Phase 8 hardening).
+///
+/// # Why a separate Ebpf instance?
+///
+/// `BpfEventSource` already loads the same ELF and attaches its
+/// tracepoints. Loading the ELF twice keeps the lifecycles
+/// independent: the event source can crash and restart without
+/// affecting blocks, and vice versa. The duplicated kernel state is a
+/// few KiB — not worth the refactor cost in slice 3a.
+pub struct BpfBlocker {
+    // The Ebpf instance owns the program + maps; dropping it drops the
+    // attach link and removes the kernel-side state.
+    ebpf: Ebpf,
+}
+
+impl std::fmt::Debug for BpfBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BpfBlocker").finish_non_exhaustive()
+    }
+}
+
+impl BpfBlocker {
+    /// Load the BPF object at `obj_path`, attach the LSM program, and
+    /// return a handle that can update the blocklist map.
+    ///
+    /// Requires:
+    /// - kernel compiled with `CONFIG_BPF_LSM=y` and `CONFIG_DEBUG_INFO_BTF=y`
+    /// - `bpf` listed in the active LSM cmdline (`/sys/kernel/security/lsm`)
+    /// - the calling process to have `CAP_BPF` + `CAP_SYS_ADMIN`
+    ///   (typically: running as root or under the shipped systemd unit)
+    pub fn load(obj_path: &Path) -> Result<Self, LoaderError> {
+        info!(path = %obj_path.display(), "loading BPF object for LSM blocker");
+        let mut ebpf = Ebpf::load_file(obj_path).map_err(|e| LoaderError::Aya(e.to_string()))?;
+
+        // BTF is required by the kernel verifier for LSM programs even
+        // when our hook doesn't use any CO-RE relocations directly:
+        // the verifier checks that the program signature matches the
+        // hook signature it's attaching to.
+        let btf = Btf::from_sys_fs().map_err(LoaderError::Btf)?;
+
+        let program: &mut Lsm = ebpf
+            .program_mut("block_exec")
+            .ok_or_else(|| LoaderError::Aya("program 'block_exec' not found".into()))?
+            .try_into()
+            .map_err(|e: aya::programs::ProgramError| LoaderError::Aya(e.to_string()))?;
+        program
+            .load("bprm_check_security", &btf)
+            .map_err(|e| LoaderError::Aya(e.to_string()))?;
+        program
+            .attach()
+            .map_err(|e| LoaderError::Aya(e.to_string()))?;
+        info!("attached lsm/bprm_check_security");
+
+        Ok(Self { ebpf })
+    }
+
+    /// Add `comm` to the blocklist. Truncates / null-pads to 16 bytes
+    /// to match the kernel `task->comm` layout. Idempotent: re-adding
+    /// the same comm is a no-op.
+    pub fn block_comm(&mut self, comm: &str) -> Result<(), LoaderError> {
+        let key = comm_key(comm);
+        let mut map = self.blocked_comms_mut()?;
+        map.insert(key, 1u8, 0)
+            .map_err(|e| LoaderError::Aya(format!("BLOCKED_COMMS insert: {e}")))?;
+        debug!(comm, "added to BLOCKED_COMMS");
+        Ok(())
+    }
+
+    /// Remove `comm` from the blocklist. Returns `Ok(false)` if the
+    /// comm wasn't present.
+    pub fn unblock_comm(&mut self, comm: &str) -> Result<bool, LoaderError> {
+        let key = comm_key(comm);
+        let mut map = self.blocked_comms_mut()?;
+        match map.remove(&key) {
+            Ok(()) => {
+                debug!(comm, "removed from BLOCKED_COMMS");
+                Ok(true)
+            }
+            Err(aya::maps::MapError::KeyNotFound) => Ok(false),
+            Err(e) => Err(LoaderError::Aya(format!("BLOCKED_COMMS remove: {e}"))),
+        }
+    }
+
+    /// Number of comm entries currently in the blocklist.
+    pub fn len(&self) -> Result<usize, LoaderError> {
+        let map = self.blocked_comms()?;
+        let mut n = 0usize;
+        for k in map.keys() {
+            let _ = k.map_err(|e| LoaderError::Aya(format!("BLOCKED_COMMS scan: {e}")))?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    pub fn is_empty(&self) -> Result<bool, LoaderError> {
+        Ok(self.len()? == 0)
+    }
+
+    fn blocked_comms(&self) -> Result<AyaHashMap<&MapData, [u8; 16], u8>, LoaderError> {
+        let map = self
+            .ebpf
+            .map("BLOCKED_COMMS")
+            .ok_or_else(|| LoaderError::Aya("BLOCKED_COMMS map not found".into()))?;
+        AyaHashMap::try_from(map).map_err(|e| LoaderError::Aya(e.to_string()))
+    }
+
+    fn blocked_comms_mut(
+        &mut self,
+    ) -> Result<AyaHashMap<&mut MapData, [u8; 16], u8>, LoaderError> {
+        let map = self
+            .ebpf
+            .map_mut("BLOCKED_COMMS")
+            .ok_or_else(|| LoaderError::Aya("BLOCKED_COMMS map not found".into()))?;
+        AyaHashMap::try_from(map).map_err(|e| LoaderError::Aya(e.to_string()))
+    }
+}
+
+/// Convert a string to a 16-byte `task->comm` key. Truncates to 15
+/// bytes (leaves a trailing null) so the result is always
+/// nul-terminated, matching the kernel's invariant for `comm`.
+fn comm_key(comm: &str) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    let bytes = comm.as_bytes();
+    let n = bytes.len().min(15);
+    key[..n].copy_from_slice(&bytes[..n]);
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +632,20 @@ mod tests {
     fn parse_exec_short_record_returns_none() {
         let bytes = [0u8; 4];
         assert!(parse_exec(&bytes).is_none());
+    }
+
+    #[test]
+    fn comm_key_pads_short_strings_with_nuls() {
+        let key = comm_key("bash");
+        assert_eq!(&key[..4], b"bash");
+        assert!(key[4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn comm_key_truncates_long_strings_and_keeps_trailing_nul() {
+        let key = comm_key("a-very-long-comm-name-that-exceeds-fifteen");
+        // Last byte must be 0 (kernel invariant).
+        assert_eq!(key[15], 0);
+        assert_eq!(&key[..15], b"a-very-long-com");
     }
 }
