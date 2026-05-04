@@ -181,6 +181,33 @@ async fn high_suspicion_exec_triggers_whisper_round_and_aggregates_beta_sighting
     assert_eq!(context.corroborating_peers, 1);
     assert_eq!(context.total_seen_count, 2);
 
+    // After the whisper round, the agent should have submitted the
+    // verdict to the LLM with the neighborhood sightings folded into
+    // ctx.extra. We assert by waiting for LlmVerdict — its presence
+    // proves whisper_qa_task did the LLM submission. (The mock LLM
+    // doesn't roundtrip ctx.extra into its rationale; the prompt
+    // contents are tested directly in the unit test for
+    // `inject_whisper_context`.)
+    let deadline_llm = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let timeout = deadline_llm.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!timeout.is_zero(), "timed out waiting for LlmVerdict");
+        match tokio::time::timeout(timeout, events.recv()).await {
+            Ok(Ok(AgentEvent::LlmVerdict { episode_id, .. })) => {
+                assert_eq!(episode_id, context.episode_id);
+                break;
+            }
+            Ok(Ok(AgentEvent::LlmShed { reason, .. })) => {
+                panic!("LLM shed unexpectedly after whisper round: {reason:?}")
+            }
+            Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
+            Ok(Err(RecvError::Closed)) => panic!("event channel closed early"),
+            Err(tokio::time::error::Elapsed { .. }) => {
+                panic!("timed out waiting for LlmVerdict")
+            }
+        }
+    }
+
     agent_alpha.shutdown().await.expect("shutdown alpha");
     agent_beta.shutdown().await.expect("shutdown beta");
 }

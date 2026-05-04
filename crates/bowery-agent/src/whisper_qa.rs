@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bowery_analysis::{RoleFeatures, RoleVector, peer_select};
 use bowery_baseline::Baseline;
 use bowery_crypto::Fingerprint;
+use bowery_llm::{AnalysisContext, Submitter};
 use bowery_mesh::{Mesh, PeerInfo};
 use bowery_whisper::fingerprint::Tier1Fingerprint;
 use bowery_whisper::known_neighbors::KnownNeighbors;
@@ -34,7 +35,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::agent::AgentEvent;
+use crate::agent::{AgentEvent, LlmShedReason};
 use crate::config::WhisperQaConfig;
 
 // ---------------------------------------------------------------------------
@@ -43,12 +44,18 @@ use crate::config::WhisperQaConfig;
 
 /// Trigger emitted by the pipeline when a verdict crosses the Q&A
 /// suspicion threshold. The Q&A task computes the tier-1 fingerprint
-/// from `sha`, picks peers, and runs the round.
+/// from `sha`, runs the whisper round, then submits the carried
+/// [`AnalysisContext`] to the LLM with peer sightings injected as
+/// `extra` entries — so the LLM's rationale can reference
+/// neighborhood corroboration.
+///
+/// `episode_id` is duplicated from `ctx.pre_verdict.episode_id` so
+/// log messages don't have to deref through the verdict.
 #[derive(Debug, Clone)]
 pub(crate) struct WhisperQaTrigger {
     pub episode_id: String,
     pub sha: [u8; 32],
-    pub suspicion: f32,
+    pub ctx: AnalysisContext,
 }
 
 /// Per-peer summary of a single round. `None` for `sighting` means the
@@ -135,6 +142,8 @@ pub(crate) fn spawn_whisper_qa_task(
     mesh: Arc<Mesh>,
     baseline: Arc<Baseline>,
     qa_cfg: WhisperQaConfig,
+    llm_submitter: Submitter,
+    llm_threshold: f32,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -149,6 +158,7 @@ pub(crate) fn spawn_whisper_qa_task(
                     let mesh = mesh.clone();
                     let baseline = baseline.clone();
                     let qa_cfg = qa_cfg.clone();
+                    let llm_submitter = llm_submitter.clone();
                     let events_tx = events_tx.clone();
                     // Each round runs in its own task so a slow peer
                     // can't block the next trigger.
@@ -161,6 +171,8 @@ pub(crate) fn spawn_whisper_qa_task(
                             mesh,
                             baseline,
                             qa_cfg,
+                            llm_submitter,
+                            llm_threshold,
                             events_tx,
                         )
                         .await;
@@ -181,12 +193,15 @@ async fn run_round(
     mesh: Arc<Mesh>,
     baseline: Arc<Baseline>,
     qa_cfg: WhisperQaConfig,
+    llm_submitter: Submitter,
+    llm_threshold: f32,
     events_tx: broadcast::Sender<AgentEvent>,
 ) {
     let tier1 = Tier1Fingerprint::derive(&trigger.sha);
+    let pre_suspicion = trigger.ctx.pre_verdict.suspicion;
     debug!(
         episode = %trigger.episode_id,
-        suspicion = trigger.suspicion,
+        suspicion = pre_suspicion,
         tier1 = %tier1,
         "starting whisper Q&A round"
     );
@@ -227,13 +242,21 @@ async fn run_round(
 
     if candidates.is_empty() {
         debug!(episode = %trigger.episode_id, "no candidate peers for whisper Q&A round");
-        let _ = events_tx.send(AgentEvent::WhisperContextReady(WhisperContext {
-            episode_id: trigger.episode_id,
+        let context = WhisperContext {
+            episode_id: trigger.episode_id.clone(),
             tier1_fp: tier1,
             peers: Vec::new(),
             total_seen_count: 0,
             corroborating_peers: 0,
-        }));
+        };
+        finish_round(
+            trigger,
+            context,
+            pre_suspicion,
+            &llm_submitter,
+            llm_threshold,
+            &events_tx,
+        );
         return;
     }
 
@@ -316,13 +339,92 @@ async fn run_round(
         "whisper Q&A round complete"
     );
 
-    let _ = events_tx.send(AgentEvent::WhisperContextReady(WhisperContext {
-        episode_id: trigger.episode_id,
+    let context = WhisperContext {
+        episode_id: trigger.episode_id.clone(),
         tier1_fp: tier1,
         peers,
         total_seen_count,
         corroborating_peers,
-    }));
+    };
+    finish_round(
+        trigger,
+        context,
+        pre_suspicion,
+        &llm_submitter,
+        llm_threshold,
+        &events_tx,
+    );
+}
+
+/// After the whisper round, broadcast the [`WhisperContext`] event,
+/// inject neighborhood sightings into the trigger's `AnalysisContext`,
+/// and submit to the LLM if the verdict still clears the LLM
+/// threshold. Pulled out of `run_round` so both the empty-candidates
+/// fast path and the normal path share a single decision point.
+fn finish_round(
+    trigger: WhisperQaTrigger,
+    context: WhisperContext,
+    pre_suspicion: f32,
+    llm_submitter: &Submitter,
+    llm_threshold: f32,
+    events_tx: &broadcast::Sender<AgentEvent>,
+) {
+    let mut ctx = trigger.ctx;
+    inject_whisper_context(&mut ctx, &context);
+
+    // Broadcast the round result for observers (tests, dashboards). We
+    // emit *before* the LLM submission so subscribers see the round
+    // even when the LLM is shed or the threshold isn't met.
+    let _ = events_tx.send(AgentEvent::WhisperContextReady(context));
+
+    if pre_suspicion >= llm_threshold {
+        let episode_id = ctx.pre_verdict.episode_id.clone();
+        if let Err(reason) = llm_submitter.submit(ctx) {
+            let _ = events_tx.send(AgentEvent::LlmShed {
+                episode_id,
+                reason: LlmShedReason::from(reason),
+            });
+        }
+    }
+}
+
+/// Render a [`WhisperContext`] as `extra` entries on an
+/// [`AnalysisContext`] so the LLM prompt picks them up. The renderer
+/// keeps the summary terse — one `neighborhood` line for the round as
+/// a whole, plus one line per corroborating peer with its similarity
+/// score and observation count. Non-corroborating responders and
+/// non-responders are intentionally omitted to keep the prompt focused.
+pub(crate) fn inject_whisper_context(ctx: &mut AnalysisContext, ctx_in: &WhisperContext) {
+    let asked = ctx_in.peers.len();
+    let summary = format!(
+        "asked {asked} peer{plural}, {corroborating} corroborating, {total} total observations across them",
+        plural = if asked == 1 { "" } else { "s" },
+        corroborating = ctx_in.corroborating_peers,
+        total = ctx_in.total_seen_count,
+    );
+    ctx.extra.push(("neighborhood".to_string(), summary));
+
+    for peer in &ctx_in.peers {
+        let Some(sighting) = peer.sighting else {
+            continue;
+        };
+        if sighting.seen_count == 0 {
+            continue;
+        }
+        let key = format!("peer.{}", short_fp(&peer.peer));
+        let value = format!(
+            "seen {} times (similarity {:.2})",
+            sighting.seen_count, peer.similarity,
+        );
+        ctx.extra.push((key, value));
+    }
+}
+
+/// First 16 hex chars of a fingerprint — short enough for log lines
+/// and prompt entries, long enough to disambiguate within a fleet.
+fn short_fp(fp: &Fingerprint) -> String {
+    let s = fp.to_string();
+    s.chars().take(16).collect()
 }
 
 async fn ask_one(
@@ -404,5 +506,76 @@ mod tests {
         let unrelated = Tier1Fingerprint::derive(b"not present");
         let s = aggregate_local_sighting(&baseline, unrelated);
         assert_eq!(s.seen_count, 0);
+    }
+
+    #[test]
+    fn inject_whisper_context_adds_neighborhood_summary() {
+        use bowery_analysis::{BinaryScore, Verdict};
+
+        let pre_verdict = Verdict {
+            episode_id: "ep-1".into(),
+            suspicion: 0.9,
+            score: BinaryScore {
+                value: 1.0,
+                baseline_seen_count: 0,
+                reason: "x".into(),
+            },
+            rule_hits: Vec::new(),
+        };
+        let mut ctx = AnalysisContext::new(pre_verdict);
+
+        let corroborating = bowery_crypto::Fingerprint::from_bytes([0xaa; 32]);
+        let zero_sighting = bowery_crypto::Fingerprint::from_bytes([0xbb; 32]);
+        let no_response = bowery_crypto::Fingerprint::from_bytes([0xcc; 32]);
+        let context = WhisperContext {
+            episode_id: "ep-1".into(),
+            tier1_fp: Tier1Fingerprint::derive(b"x"),
+            peers: vec![
+                PeerSighting {
+                    peer: corroborating,
+                    similarity: 0.95,
+                    sighting: Some(LocalSighting {
+                        seen_count: 12,
+                        first_seen_unix_ms: 1,
+                        last_seen_unix_ms: 2,
+                    }),
+                    note: String::new(),
+                },
+                PeerSighting {
+                    peer: zero_sighting,
+                    similarity: 0.80,
+                    sighting: Some(LocalSighting::default()), // no observation
+                    note: String::new(),
+                },
+                PeerSighting {
+                    peer: no_response,
+                    similarity: 0.70,
+                    sighting: None, // didn't reply
+                    note: String::new(),
+                },
+            ],
+            total_seen_count: 12,
+            corroborating_peers: 1,
+        };
+
+        inject_whisper_context(&mut ctx, &context);
+
+        let nbr = ctx
+            .extra
+            .iter()
+            .find(|(k, _)| k == "neighborhood")
+            .expect("neighborhood entry");
+        assert!(nbr.1.contains("3 peers"));
+        assert!(nbr.1.contains("1 corroborating"));
+        assert!(nbr.1.contains("12"));
+
+        let peer_keys: Vec<&str> = ctx
+            .extra
+            .iter()
+            .filter_map(|(k, _)| k.strip_prefix("peer."))
+            .collect();
+        // Only the corroborating peer (seen_count > 0) shows up.
+        assert_eq!(peer_keys.len(), 1);
+        assert!(peer_keys[0].starts_with(&corroborating.to_string()[..16]));
     }
 }

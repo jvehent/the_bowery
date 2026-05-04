@@ -290,6 +290,8 @@ impl Agent {
             mesh.clone(),
             baseline.clone(),
             config.whisper.qa.clone(),
+            llm_submitter.clone(),
+            config.llm.invocation_threshold,
             events_tx.clone(),
             shutdown_rx.clone(),
         );
@@ -866,17 +868,27 @@ async fn process_exec(
 
     let _ = events_tx.send(AgentEvent::BinaryRecorded { sha, outcome });
 
-    // Phase 4: gate LLM invocation on aggregated suspicion.
-    if verdict.suspicion >= llm_threshold {
-        let mut ctx = AnalysisContext::new(verdict.clone()).with_exe_sha256(&sha);
-        if let Some(p) = exec.exe_path.as_ref() {
-            ctx = ctx.with_exe_path(p.clone());
-        }
-        if !exec.args.is_empty() {
-            ctx = ctx.with_args(exec.args.clone());
-        }
+    // Build the LLM context once. Both paths (direct LLM submission
+    // below, and the whisper-mediated submission performed by
+    // whisper_qa_task) consume the same shape; whisper_qa_task
+    // additionally injects neighborhood sightings into `ctx.extra`
+    // before submitting.
+    let mut ctx = AnalysisContext::new(verdict.clone()).with_exe_sha256(&sha);
+    if let Some(p) = exec.exe_path.as_ref() {
+        ctx = ctx.with_exe_path(p.clone());
+    }
+    if !exec.args.is_empty() {
+        ctx = ctx.with_args(exec.args.clone());
+    }
+
+    // Phase 4 + 5 routing: when the whisper threshold is met, defer
+    // the LLM submission to whisper_qa_task so the LLM sees peer
+    // sightings. Otherwise (LLM threshold met but whisper threshold
+    // not), submit directly with no neighborhood context.
+    let going_through_whisper = verdict.suspicion >= whisper_threshold;
+    if !going_through_whisper && verdict.suspicion >= llm_threshold {
         let episode_id = verdict.episode_id.clone();
-        if let Err(reason) = llm_submitter.submit(ctx) {
+        if let Err(reason) = llm_submitter.submit(ctx.clone()) {
             let _ = events_tx.send(AgentEvent::LlmShed {
                 episode_id,
                 reason: reason.into(),
@@ -884,15 +896,12 @@ async fn process_exec(
         }
     }
 
-    // Phase 5: gate whisper Q&A on a (typically higher) suspicion
-    // threshold. The Q&A task consumes the trigger asynchronously so
-    // the pipeline doesn't block on neighborhood RTTs.
-    if verdict.suspicion >= whisper_threshold
+    if going_through_whisper
         && let Err(e) = whisper_qa_tx
             .send(WhisperQaTrigger {
                 episode_id: verdict.episode_id.clone(),
                 sha,
-                suspicion: verdict.suspicion,
+                ctx: ctx.clone(),
             })
             .await
     {
