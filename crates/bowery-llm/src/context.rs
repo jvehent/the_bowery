@@ -29,6 +29,12 @@ pub struct AnalysisContext {
     /// Free-form additional context the agent wants to surface (e.g.
     /// recent peer answers when whisper Q&A lands).
     pub extra: Vec<(String, String)>,
+    /// PID of the rooting process, if known. Phase 7's response
+    /// engine uses this when materialising a `KillProcess` action
+    /// from the LLM's `suggested_actions`. Optional because some
+    /// callers (replays, future synthetic episodes) won't have a
+    /// real pid to point at.
+    pub exe_pid: Option<u32>,
 }
 
 impl AnalysisContext {
@@ -40,6 +46,7 @@ impl AnalysisContext {
             args: Vec::new(),
             local_role_summary: "host".to_string(),
             extra: Vec::new(),
+            exe_pid: None,
         }
     }
 
@@ -69,6 +76,12 @@ impl AnalysisContext {
     #[must_use]
     pub fn with_role_summary(mut self, summary: impl Into<String>) -> Self {
         self.local_role_summary = summary.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_exe_pid(mut self, pid: u32) -> Self {
+        self.exe_pid = Some(pid);
         self
     }
 }

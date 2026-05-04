@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bowery_agent::config::{
-    AlertsConfig, BaselineConfig, BloomConfig, Config, HeartbeatConfig, IdentityConfig,
+    AlertsConfig, BaselineConfig, BloomConfig, ResponseConfig, Config, HeartbeatConfig, IdentityConfig,
     InboxConfig, KnownNeighborsConfig, LlmConfig, MeshConfig, OperatorsConfig, RoleConfig,
     WhisperConfig, WhisperQaConfig,
 };
@@ -68,6 +68,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, llm_threshold: f32) -> Config
         inbox: InboxConfig::default(),
         alerts: AlertsConfig::default(),
         bloom: BloomConfig::default(),
+        response: ResponseConfig::default(),
     }
 }
 

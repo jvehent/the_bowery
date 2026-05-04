@@ -18,6 +18,9 @@ use bowery_llm::{
 };
 use bowery_mesh::{KEY_ROLE_VECTOR, Mesh, MeshConfig, PeerInfo};
 use bowery_proto::{Alert, Alerts, Body, Subscribe, WhisperPayload};
+use bowery_response::{
+    ActionOutcome, NoopEngine, ResponseEngine, ResponsePolicy, action,
+};
 use bowery_whisper::fingerprint::{TIER1_LEN, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
 use bowery_whisper::tls::PinnedCertVerifier;
@@ -105,6 +108,16 @@ pub enum AgentEvent {
         k: u8,
         inserted_count: u64,
     },
+    /// Phase 7: the response engine accepted (or suppressed) an
+    /// action that the LLM verdict suggested. The variant fires
+    /// regardless of whether the engine actually did anything — the
+    /// outcome carries the discriminator. Operators tail this to
+    /// audit autonomous enforcement.
+    ActionAttempted {
+        episode_id: String,
+        action_id: &'static str,
+        outcome: ActionOutcome,
+    },
 }
 
 /// Why an LLM request didn't produce a verdict.
@@ -163,6 +176,11 @@ pub struct Agent {
     llm_queue: Option<InferenceQueue>,
     #[allow(dead_code)] // exposed via inbox() accessor; held alive at agent scope
     inbox: Arc<AlertInbox>,
+    /// Phase-7 response engine. `Arc<dyn ResponseEngine>` so tests can
+    /// substitute a recording engine without going through the
+    /// agent's normal config-loading path. Held alive at agent scope.
+    #[allow(dead_code)]
+    response_engine: Arc<dyn ResponseEngine>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -218,6 +236,30 @@ impl Agent {
             config.inbox.capacity,
             config.inbox.retention,
         ));
+
+        // Phase 7: load the response policy + instantiate an engine.
+        // Today the only engine variant is NoopEngine (observe-only);
+        // turning on enforcement is a future commit's job, not a
+        // config knob. The startup log line makes the engine name
+        // explicit so operators can audit which hosts are observe-only
+        // vs. live.
+        let response_policy = match config.response.policy_path.as_deref() {
+            Some(path) => ResponsePolicy::load(path).map_err(|e| {
+                AgentError::Config(format!(
+                    "loading response policy from {}: {e}",
+                    path.display()
+                ))
+            })?,
+            None => ResponsePolicy::default(),
+        };
+        for typo in response_policy.warnings() {
+            warn!(
+                action_id = %typo,
+                "[response] allowed_actions entry doesn't match any known action id; ignored"
+            );
+        }
+        let response_engine: Arc<dyn ResponseEngine> =
+            Arc::new(NoopEngine::new(response_policy));
 
         let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
         let endpoint =
@@ -289,6 +331,7 @@ impl Agent {
             fingerprint,
             config.alerts.threshold,
             llm.name().to_string(),
+            response_engine.clone(),
             events_tx.clone(),
             shutdown_rx.clone(),
         );
@@ -368,6 +411,7 @@ impl Agent {
             llm_outcomes_task,
             whisper_qa_task,
             llm_queue: Some(llm_queue),
+            response_engine,
         })
     }
 
@@ -895,7 +939,9 @@ async fn process_exec(
     // whisper_qa_task) consume the same shape; whisper_qa_task
     // additionally injects neighborhood sightings into `ctx.extra`
     // before submitting.
-    let mut ctx = AnalysisContext::new(verdict.clone()).with_exe_sha256(&sha);
+    let mut ctx = AnalysisContext::new(verdict.clone())
+        .with_exe_sha256(&sha)
+        .with_exe_pid(exec.pid);
     if let Some(p) = exec.exe_path.as_ref() {
         ctx = ctx.with_exe_path(p.clone());
     }
@@ -991,6 +1037,7 @@ fn spawn_llm_outcomes_task(
     originator_fp: Fingerprint,
     alert_threshold: f32,
     backend_label: String,
+    response_engine: Arc<dyn ResponseEngine>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -1005,6 +1052,7 @@ fn spawn_llm_outcomes_task(
                         originator_fp,
                         alert_threshold,
                         &backend_label,
+                        &response_engine,
                         outcome,
                     );
                 }
@@ -1014,12 +1062,14 @@ fn spawn_llm_outcomes_task(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_llm_outcome(
     events_tx: &broadcast::Sender<AgentEvent>,
     inbox: &Arc<AlertInbox>,
     originator_fp: Fingerprint,
     alert_threshold: f32,
     backend_label: &str,
+    response_engine: &Arc<dyn ResponseEngine>,
     outcome: InferenceOutcome,
 ) {
     match outcome {
@@ -1060,6 +1110,49 @@ fn handle_llm_outcome(
                     suspicion: verdict.suspicion,
                 });
             }
+            // Phase 7: route every suggested action through the
+            // response engine. The engine is policy-gated (defaults
+            // deny-all), so on a freshly-installed agent this only
+            // generates AlertEmitted-style observability and never
+            // touches the host. Operators turn enforcement on by
+            // editing the policy file, not by recompiling.
+            for action_id in &verdict.suggested_actions {
+                let Some(action) =
+                    action::from_id(action_id, &episode_id, ctx.exe_pid)
+                else {
+                    debug!(action_id, episode = %episode_id, "unknown action id; skipping");
+                    continue;
+                };
+                let engine = response_engine.clone();
+                let events_tx_inner = events_tx.clone();
+                let episode = episode_id.clone();
+                let id = action.id();
+                tokio::spawn(async move {
+                    match engine.execute(&action).await {
+                        Ok(outcome) => {
+                            let _ = events_tx_inner.send(AgentEvent::ActionAttempted {
+                                episode_id: episode,
+                                action_id: id,
+                                outcome,
+                            });
+                        }
+                        Err(e) => {
+                            warn!(
+                                action_id = id,
+                                episode = %episode,
+                                error = %e,
+                                "response engine returned an error"
+                            );
+                            let _ = events_tx_inner.send(AgentEvent::ActionAttempted {
+                                episode_id: episode,
+                                action_id: id,
+                                outcome: ActionOutcome::suppressed(format!("error: {e}")),
+                            });
+                        }
+                    }
+                });
+            }
+
             let _ = events_tx.send(AgentEvent::LlmVerdict {
                 episode_id,
                 verdict: *verdict,

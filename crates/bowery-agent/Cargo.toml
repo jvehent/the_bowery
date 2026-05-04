@@ -33,6 +33,7 @@ bowery-events = { workspace = true }
 bowery-llm = { workspace = true }
 bowery-mesh = { workspace = true }
 bowery-proto = { workspace = true }
+bowery-response = { workspace = true }
 bowery-whisper = { workspace = true }
 
 anyhow = { workspace = true }
@@ -50,6 +51,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 bowery-analysis = { workspace = true }
 bowery-llm = { workspace = true }
 sha2 = { workspace = true }

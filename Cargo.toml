@@ -11,6 +11,7 @@ members = [
     "crates/bowery-llm",
     "crates/bowery-mesh",
     "crates/bowery-proto",
+    "crates/bowery-response",
     "crates/bowery-whisper",
 ]
 # bowery-ebpf is its own workspace (compiles for bpfel-unknown-none).
@@ -36,6 +37,7 @@ bowery-events = { path = "crates/bowery-events", version = "0.0.1" }
 bowery-llm = { path = "crates/bowery-llm", version = "0.0.1" }
 bowery-mesh = { path = "crates/bowery-mesh", version = "0.0.1" }
 bowery-proto = { path = "crates/bowery-proto", version = "0.0.1" }
+bowery-response = { path = "crates/bowery-response", version = "0.0.1" }
 bowery-whisper = { path = "crates/bowery-whisper", version = "0.0.1" }
 
 # Crypto

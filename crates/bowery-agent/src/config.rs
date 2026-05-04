@@ -48,6 +48,8 @@ pub struct Config {
     pub alerts: AlertsConfig,
     #[serde(default)]
     pub bloom: BloomConfig,
+    #[serde(default)]
+    pub response: ResponseConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,6 +443,24 @@ impl Default for BloomConfig {
 
 fn default_bloom_publish_interval() -> Duration {
     Duration::from_mins(1)
+}
+
+/// Phase-7 response-engine config.
+///
+/// Default is observe-only: the agent loads a deny-all policy and
+/// uses the [`bowery_response::NoopEngine`]. Operators opting into
+/// real enforcement set `policy_path` to a TOML file listing
+/// `allowed_actions`. The kernel-side blocking engine arrives in a
+/// later phase; for now the only thing flipping it on changes is
+/// what shows up in `AgentEvent::ActionAttempted`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseConfig {
+    /// Path to a TOML policy file. When unset, the agent uses
+    /// `ResponsePolicy::default()` (deny-all) without touching the
+    /// filesystem.
+    #[serde(default)]
+    pub policy_path: Option<PathBuf>,
 }
 fn default_bloom_bit_count() -> usize {
     bowery_whisper::fingerprint::DEFAULT_BIT_COUNT
