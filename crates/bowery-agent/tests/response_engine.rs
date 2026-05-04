@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use bowery_agent::config::{
     AlertsConfig, BaselineConfig, BloomConfig, Config, HeartbeatConfig, IdentityConfig, InboxConfig,
-    KnownNeighborsConfig, LlmConfig, MeshConfig, OperatorsConfig, ResponseConfig, RoleConfig,
-    WhisperConfig, WhisperQaConfig,
+    KnownNeighborsConfig, LlmConfig, MeshConfig, OperatorsConfig, ResponseConfig,
+    ResponseEngineKind, RoleConfig, WhisperConfig, WhisperQaConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_crypto::Identity;
@@ -189,6 +189,88 @@ async fn default_policy_suppresses_all_actions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn process_kill_engine_actually_kills_a_real_child() {
+    // End-to-end: a high-suspicion exec event for a *real* spawned
+    // child process. The agent's ProcessKillEngine — gated on a
+    // permissive policy — actually delivers SIGKILL.
+    let workdir = TempDir::new().unwrap();
+    let payload_path = workdir.path().join("payload");
+    std::fs::write(&payload_path, b"phase-7-real-kill-test").unwrap();
+
+    let policy_path = workdir.path().join("policy.toml");
+    std::fs::write(&policy_path, r#"allowed_actions = ["kill_process"]"#).unwrap();
+
+    // Spawn a long-running child; we'll feed its pid to the agent's
+    // ProcessExec event so the engine has a real target.
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    let target_pid = child.id();
+
+    let identity = Arc::new(Identity::generate());
+    let cfg = build_config(
+        workdir.path(),
+        reserve_udp_port(),
+        ResponseConfig {
+            policy_path: Some(policy_path),
+            engine: ResponseEngineKind::ProcessKill,
+        },
+    );
+    let source = Box::new(
+        MockEventSource::new(vec![make_exec(target_pid, payload_path)])
+            .with_delay(Duration::from_millis(200)),
+    );
+    let llm: Arc<dyn LlmAnalyzer> = Arc::new(AlwaysKillAnalyzer);
+
+    let agent = Agent::start_with_llm(cfg, identity, source, llm)
+        .await
+        .expect("start agent");
+
+    // Wait for ActionAttempted with Executed outcome.
+    let mut events = agent.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let outcome = loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!timeout.is_zero(), "timed out waiting for ActionAttempted");
+        match tokio::time::timeout(timeout, events.recv()).await {
+            Ok(Ok(AgentEvent::ActionAttempted {
+                action_id: "kill_process",
+                outcome,
+                ..
+            })) => break outcome,
+            Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
+            Ok(Err(RecvError::Closed)) => panic!("event channel closed"),
+            Err(tokio::time::error::Elapsed { .. }) => panic!("ActionAttempted timeout"),
+        }
+    };
+
+    match outcome {
+        ActionOutcome::Executed { at_unix_ms } => assert!(at_unix_ms > 0),
+        other => {
+            // Reap the child even on test failure to avoid leaking
+            // zombie processes in CI.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("expected Executed, got {other:?}");
+        }
+    }
+
+    // The child should now be reapable — SIGKILL doesn't yield a
+    // success() exit status.
+    let status = child.wait().expect("wait child");
+    assert!(
+        !status.success(),
+        "child should have been killed; got {status:?}"
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn permissive_policy_routes_through_observe_only_engine() {
     let workdir = TempDir::new().unwrap();
     let policy_path = workdir.path().join("policy.toml");
@@ -196,6 +278,7 @@ async fn permissive_policy_routes_through_observe_only_engine() {
 
     let response = ResponseConfig {
         policy_path: Some(policy_path),
+        engine: ResponseEngineKind::Noop,
     };
     let attempted = run_scenario(response).await;
     assert_eq!(attempted.len(), 1);

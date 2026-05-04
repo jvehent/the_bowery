@@ -100,6 +100,11 @@ aya = "0.13"
 aya-log = "0.2"
 libc = "0.2"
 
+# Phase-7 response engine — POSIX signal delivery.
+# Linux-only by design; the agent has no macOS/Windows story yet, so
+# this doesn't constrain the platform matrix.
+nix = { version = "0.29", default-features = false, features = ["signal"] }
+
 # Optional LLM backend (compiled when bowery-llm/llama-cpp is enabled).
 # Builds llama.cpp from C++ at build time; needs cmake + a C++ compiler.
 llama-cpp-2 = { version = "0.1", default-features = false }

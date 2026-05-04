@@ -447,20 +447,37 @@ fn default_bloom_publish_interval() -> Duration {
 
 /// Phase-7 response-engine config.
 ///
-/// Default is observe-only: the agent loads a deny-all policy and
-/// uses the [`bowery_response::NoopEngine`]. Operators opting into
-/// real enforcement set `policy_path` to a TOML file listing
-/// `allowed_actions`. The kernel-side blocking engine arrives in a
-/// later phase; for now the only thing flipping it on changes is
-/// what shows up in `AgentEvent::ActionAttempted`.
+/// `engine` selects the executor implementation:
+/// - `"noop"` (default) — observe-only. Records every action request
+///   as `Suppressed { reason }` and never touches the host. The right
+///   default for any newly-rolled host until the operator has
+///   validated the LLM's `suggested_actions` quality.
+/// - `"process-kill"` — wraps `nix::sys::signal::kill`. On a
+///   permitted `KillProcess` action, sends `SIGKILL` to the target
+///   pid. The agent process needs `CAP_KILL` (root) to signal
+///   processes it doesn't own.
+///
+/// `policy_path` points at a TOML policy file. When unset, the
+/// agent uses `ResponsePolicy::default()` (deny-all) — i.e. even the
+/// `process-kill` engine never actually signals anyone until an
+/// operator has spelled out which action ids are permitted.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseConfig {
-    /// Path to a TOML policy file. When unset, the agent uses
-    /// `ResponsePolicy::default()` (deny-all) without touching the
-    /// filesystem.
     #[serde(default)]
     pub policy_path: Option<PathBuf>,
+    #[serde(default)]
+    pub engine: ResponseEngineKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResponseEngineKind {
+    /// Observe-only. Never executes.
+    #[default]
+    Noop,
+    /// `SIGKILL`-via-`nix`. Real enforcement. Requires `CAP_KILL`.
+    ProcessKill,
 }
 fn default_bloom_bit_count() -> usize {
     bowery_whisper::fingerprint::DEFAULT_BIT_COUNT

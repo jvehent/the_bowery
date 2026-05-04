@@ -19,8 +19,10 @@ use bowery_llm::{
 use bowery_mesh::{KEY_ROLE_VECTOR, Mesh, MeshConfig, PeerInfo};
 use bowery_proto::{Alert, Alerts, Body, Subscribe, WhisperPayload};
 use bowery_response::{
-    ActionOutcome, NoopEngine, ResponseEngine, ResponsePolicy, action,
+    ActionOutcome, NoopEngine, ProcessKillEngine, ResponseEngine, ResponsePolicy, action,
 };
+
+use crate::config::ResponseEngineKind;
 use bowery_whisper::fingerprint::{TIER1_LEN, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
 use bowery_whisper::tls::PinnedCertVerifier;
@@ -258,8 +260,16 @@ impl Agent {
                 "[response] allowed_actions entry doesn't match any known action id; ignored"
             );
         }
-        let response_engine: Arc<dyn ResponseEngine> =
-            Arc::new(NoopEngine::new(response_policy));
+        let response_engine: Arc<dyn ResponseEngine> = match config.response.engine {
+            ResponseEngineKind::Noop => Arc::new(NoopEngine::new(response_policy)),
+            ResponseEngineKind::ProcessKill => {
+                Arc::new(ProcessKillEngine::new(response_policy))
+            }
+        };
+        info!(
+            engine = response_engine.name(),
+            "response engine initialised"
+        );
 
         let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
         let endpoint =

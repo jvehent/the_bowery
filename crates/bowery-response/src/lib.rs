@@ -29,7 +29,9 @@
 pub mod action;
 pub mod engine;
 pub mod policy;
+pub mod process_kill;
 
 pub use action::{Action, ActionError, ActionOutcome};
 pub use engine::{NoopEngine, ResponseEngine};
 pub use policy::ResponsePolicy;
+pub use process_kill::ProcessKillEngine;
