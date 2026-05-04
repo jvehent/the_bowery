@@ -100,7 +100,13 @@ async fn high_suspicion_exec_appears_in_operator_inbox_via_subscribe() {
     let agent_vk = agent_id.verifying_key();
 
     let cfg = build_agent_config(workdir.path(), reserve_udp_port(), operator_pubkey_b64);
-    let source = Box::new(MockEventSource::new(vec![make_exec(4242, payload_path)]));
+    // Delay the event so the test has time to subscribe before the
+    // pipeline emits AlertEmitted. See the refined-alert test below
+    // for the broadcast::Receiver race writeup.
+    let source = Box::new(
+        MockEventSource::new(vec![make_exec(4242, payload_path)])
+            .with_delay(Duration::from_millis(200)),
+    );
 
     let agent = Agent::start(cfg, agent_id, source)
         .await
@@ -302,7 +308,16 @@ async fn llm_verdict_re_emits_refined_alert_into_inbox() {
         llama_cpp: None,
     };
 
-    let source = Box::new(MockEventSource::new(vec![make_exec(4242, payload_path)]));
+    // Delay the event so the test has time to subscribe before any
+    // AlertEmitted broadcast fires. Without this, fast runners (CI) can
+    // race the entire process_exec pipeline to completion in the few
+    // microseconds between Agent::start_with_llm returning and
+    // agent.subscribe() being called, and broadcast::Receiver doesn't
+    // replay messages sent before it was created.
+    let source = Box::new(
+        MockEventSource::new(vec![make_exec(4242, payload_path)])
+            .with_delay(Duration::from_millis(200)),
+    );
     let llm: Arc<dyn LlmAnalyzer> = Arc::new(MockLlmAnalyzer::new(MockMode::Echo));
 
     let agent = Agent::start_with_llm(cfg, agent_id, source, llm)
