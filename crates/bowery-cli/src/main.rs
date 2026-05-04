@@ -11,6 +11,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_crypto::Identity;
 use clap::{Parser, Subcommand};
 
@@ -178,8 +180,10 @@ fn key_generate(path: &PathBuf) -> Result<()> {
     identity
         .save(path)
         .with_context(|| format!("writing identity to {}", path.display()))?;
+    let pubkey_b64 = BASE64.encode(identity.verifying_key().as_bytes());
     println!("wrote identity to {}", path.display());
     println!("fingerprint: {}", identity.fingerprint());
+    println!("pubkey_b64:  {pubkey_b64}");
     Ok(())
 }
 
