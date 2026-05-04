@@ -14,6 +14,7 @@ Thumbs.db
 # Bowery runtime artifacts (when running locally)
 /run/
 /var-lib/
+/local-bin/        # ad-hoc binary stash for cross-host CLI usage
 *.key
 !**/testdata/**/*.key
 

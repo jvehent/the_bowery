@@ -143,6 +143,14 @@ enum KeyCommand {
         /// Path to the key file.
         path: PathBuf,
     },
+    /// Print fingerprint + base64 pubkey for an existing key file.
+    /// Useful when populating an agent's `[operators] pubkeys_b64`
+    /// list or wiring `bowery alerts tail`'s `--agent-pubkey-b64`
+    /// flag.
+    Info {
+        /// Path to the key file.
+        path: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -164,6 +172,10 @@ impl Cli {
             }
             Command::Key(KeyCommand::Fingerprint { path }) => {
                 key_fingerprint(&path)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::Key(KeyCommand::Info { path }) => {
+                key_info(&path)?;
                 Ok(ExitCode::SUCCESS)
             }
             Command::Doctor { json } => doctor_cmd(json),
@@ -237,6 +249,16 @@ fn key_fingerprint(path: &PathBuf) -> Result<()> {
     let identity = Identity::load(path)
         .with_context(|| format!("loading identity from {}", path.display()))?;
     println!("{}", identity.fingerprint());
+    Ok(())
+}
+
+fn key_info(path: &PathBuf) -> Result<()> {
+    let identity = Identity::load(path)
+        .with_context(|| format!("loading identity from {}", path.display()))?;
+    let pubkey_b64 = BASE64.encode(identity.verifying_key().as_bytes());
+    println!("path:        {}", path.display());
+    println!("fingerprint: {}", identity.fingerprint());
+    println!("pubkey_b64:  {pubkey_b64}");
     Ok(())
 }
 
