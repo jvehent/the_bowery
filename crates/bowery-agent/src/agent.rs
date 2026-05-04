@@ -19,7 +19,8 @@ use bowery_llm::{
 use bowery_mesh::{KEY_ROLE_VECTOR, Mesh, MeshConfig, PeerInfo};
 use bowery_proto::{Alert, Alerts, Body, Subscribe, WhisperPayload};
 use bowery_response::{
-    ActionOutcome, NoopEngine, ProcessKillEngine, ResponseEngine, ResponsePolicy, action,
+    ActionOutcome, AuditSink, JsonlFileSink, NoopEngine, NoopSink, ProcessKillEngine,
+    ResponseEngine, ResponsePolicy, action, audit,
 };
 
 use crate::config::ResponseEngineKind;
@@ -296,6 +297,25 @@ impl Agent {
             "response engine initialised"
         );
 
+        // Phase-7 slice 4: signed audit log. Off by default — operators
+        // who turn it on get one fsynced JSON line per action attempt,
+        // signed with the agent's identity key.
+        let audit_sink: Arc<dyn AuditSink> = match config.response.audit_log_path.as_ref() {
+            Some(path) => match JsonlFileSink::open(path).await {
+                Ok(sink) => {
+                    info!(path = %path.display(), "audit log opened");
+                    Arc::new(sink)
+                }
+                Err(e) => {
+                    return Err(AgentError::Config(format!(
+                        "opening audit log {}: {e}",
+                        path.display()
+                    )));
+                }
+            },
+            None => Arc::new(NoopSink),
+        };
+
         let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
         let endpoint =
             BoweryEndpoint::bind(identity.clone(), accept_verifier, config.whisper.bind_addr)?;
@@ -367,6 +387,8 @@ impl Agent {
             config.alerts.threshold,
             llm.name().to_string(),
             response_engine.clone(),
+            audit_sink.clone(),
+            identity.clone(),
             events_tx.clone(),
             shutdown_rx.clone(),
         );
@@ -1074,6 +1096,8 @@ fn spawn_llm_outcomes_task(
     alert_threshold: f32,
     backend_label: String,
     response_engine: Arc<dyn ResponseEngine>,
+    audit_sink: Arc<dyn AuditSink>,
+    identity: Arc<Identity>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -1089,6 +1113,8 @@ fn spawn_llm_outcomes_task(
                         alert_threshold,
                         &backend_label,
                         &response_engine,
+                        &audit_sink,
+                        &identity,
                         outcome,
                     );
                 }
@@ -1106,6 +1132,8 @@ fn handle_llm_outcome(
     alert_threshold: f32,
     backend_label: &str,
     response_engine: &Arc<dyn ResponseEngine>,
+    audit_sink: &Arc<dyn AuditSink>,
+    identity: &Arc<Identity>,
     outcome: InferenceOutcome,
 ) {
     match outcome {
@@ -1160,17 +1188,21 @@ fn handle_llm_outcome(
                     continue;
                 };
                 let engine = response_engine.clone();
+                let audit_sink = audit_sink.clone();
+                let identity = identity.clone();
                 let events_tx_inner = events_tx.clone();
                 let episode = episode_id.clone();
                 let id = action.id();
+                let engine_name = engine.name();
                 tokio::spawn(async move {
-                    match engine.execute(&action).await {
+                    let outcome_to_audit = match engine.execute(&action).await {
                         Ok(outcome) => {
                             let _ = events_tx_inner.send(AgentEvent::ActionAttempted {
-                                episode_id: episode,
+                                episode_id: episode.clone(),
                                 action_id: id,
-                                outcome,
+                                outcome: outcome.clone(),
                             });
+                            outcome
                         }
                         Err(e) => {
                             warn!(
@@ -1179,13 +1211,24 @@ fn handle_llm_outcome(
                                 error = %e,
                                 "response engine returned an error"
                             );
+                            let outcome = ActionOutcome::suppressed(format!("error: {e}"));
                             let _ = events_tx_inner.send(AgentEvent::ActionAttempted {
-                                episode_id: episode,
+                                episode_id: episode.clone(),
                                 action_id: id,
-                                outcome: ActionOutcome::suppressed(format!("error: {e}")),
+                                outcome: outcome.clone(),
                             });
+                            outcome
                         }
-                    }
+                    };
+                    audit::record(
+                        &audit_sink,
+                        &identity,
+                        engine_name,
+                        &episode,
+                        action,
+                        outcome_to_audit,
+                    )
+                    .await;
                 });
             }
 

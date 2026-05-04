@@ -468,6 +468,14 @@ pub struct ResponseConfig {
     pub policy_path: Option<PathBuf>,
     #[serde(default)]
     pub engine: ResponseEngineKind,
+    /// Phase-7 slice 4: signed audit-envelope log. When set, every
+    /// `execute(&action)` call produces an Ed25519-signed
+    /// [`AuditEnvelope`](bowery_response::AuditEnvelope) appended to
+    /// this newline-delimited JSON file. When unset, the agent uses
+    /// the [`NoopSink`](bowery_response::NoopSink) and emits no
+    /// audit log.
+    #[serde(default)]
+    pub audit_log_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

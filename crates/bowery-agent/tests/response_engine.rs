@@ -25,7 +25,7 @@ use bowery_crypto::Identity;
 use bowery_events::source::MockEventSource;
 use bowery_events::{Event, ProcessExec};
 use bowery_llm::{AnalysisContext, LlmAnalyzer, LlmError, LlmVerdict};
-use bowery_response::ActionOutcome;
+use bowery_response::{ActionOutcome, AuditEnvelope};
 use tempfile::TempDir;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -216,6 +216,7 @@ async fn process_kill_engine_actually_kills_a_real_child() {
         ResponseConfig {
             policy_path: Some(policy_path),
             engine: ResponseEngineKind::ProcessKill,
+            audit_log_path: None,
         },
     );
     let source = Box::new(
@@ -277,6 +278,7 @@ async fn permissive_policy_routes_through_observe_only_engine() {
     let response = ResponseConfig {
         policy_path: Some(policy_path),
         engine: ResponseEngineKind::Noop,
+        audit_log_path: None,
     };
     let attempted = run_scenario(response).await;
     assert_eq!(attempted.len(), 1);
@@ -291,4 +293,74 @@ async fn permissive_policy_routes_through_observe_only_engine() {
         }
         other => panic!("expected Suppressed/observe-only, got {other:?}"),
     }
+}
+
+/// Phase-7 slice 4: when `audit_log_path` is set, every action attempt
+/// produces a signed envelope on disk. Verify the envelope round-trips
+/// through the host's verifying key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_log_records_signed_envelope_per_action() {
+    let workdir = TempDir::new().unwrap();
+    let payload_path = workdir.path().join("payload");
+    std::fs::write(&payload_path, b"phase-7-audit-test").unwrap();
+    let audit_path = workdir.path().join("audit.jsonl");
+
+    let identity = Arc::new(Identity::generate());
+    let vk = identity.verifying_key();
+
+    let response = ResponseConfig {
+        policy_path: None,
+        engine: ResponseEngineKind::Noop,
+        audit_log_path: Some(audit_path.clone()),
+    };
+    let cfg = build_config(workdir.path(), reserve_udp_port(), response);
+    let source = Box::new(
+        MockEventSource::new(vec![make_exec(31338, payload_path)])
+            .with_delay(Duration::from_millis(200)),
+    );
+    let llm: Arc<dyn LlmAnalyzer> = Arc::new(AlwaysKillAnalyzer);
+
+    let agent = Agent::start_with_llm(cfg, identity, source, llm)
+        .await
+        .expect("start");
+
+    // Wait for the action attempt so we know the audit write has had a
+    // chance to land. The audit write happens after the AgentEvent is
+    // emitted, so loop briefly until the file is non-empty.
+    let mut events = agent.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!timeout.is_zero(), "timed out waiting for ActionAttempted");
+        if let Ok(Ok(AgentEvent::ActionAttempted { .. })) =
+            tokio::time::timeout(timeout, events.recv()).await
+        {
+            break;
+        }
+    }
+    // The audit write happens in the same tokio::spawn that emitted the
+    // event, but on a separate await point. Poll briefly.
+    let audit_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if std::fs::metadata(&audit_path).is_ok_and(|m| m.len() > 0) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() <= audit_deadline,
+            "audit file never grew: {}",
+            audit_path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    agent.shutdown().await.expect("shutdown");
+
+    let contents = std::fs::read_to_string(&audit_path).expect("read audit log");
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "expected one audit line, got {lines:?}");
+    let env: AuditEnvelope = serde_json::from_str(lines[0]).expect("parse envelope");
+    env.verify(&vk)
+        .expect("envelope verifies under the host vk");
+    assert_eq!(env.record.action_id, "kill_process");
+    assert_eq!(env.record.engine, "noop");
 }

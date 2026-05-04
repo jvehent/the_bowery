@@ -272,6 +272,7 @@ dependencies = [
  "humantime-serde",
  "prost",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
@@ -410,8 +411,12 @@ name = "bowery-response"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "bowery-crypto",
+ "ed25519-dalek",
+ "hex",
  "nix",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2056,6 +2061,7 @@ version = "1.52.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",

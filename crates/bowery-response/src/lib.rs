@@ -27,11 +27,15 @@
 //! on for a small subset of hosts.
 
 pub mod action;
+pub mod audit;
 pub mod engine;
 pub mod policy;
 pub mod process_kill;
 
 pub use action::{Action, ActionError, ActionOutcome};
+pub use audit::{
+    AUDIT_SIG_DOMAIN, AuditEnvelope, AuditError, AuditRecord, AuditSink, JsonlFileSink, NoopSink,
+};
 pub use engine::{NoopEngine, ResponseEngine};
 pub use policy::ResponsePolicy;
 pub use process_kill::ProcessKillEngine;

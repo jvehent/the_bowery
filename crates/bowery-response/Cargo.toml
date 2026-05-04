@@ -11,10 +11,16 @@ homepage.workspace = true
 readme.workspace = true
 
 [dependencies]
+bowery-crypto = { workspace = true }
+
 async-trait = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
 nix = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 

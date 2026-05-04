@@ -55,6 +55,7 @@ tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 bowery-analysis = { workspace = true }
 bowery-llm = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net"] }
