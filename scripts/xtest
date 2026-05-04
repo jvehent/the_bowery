@@ -25,10 +25,18 @@
 #   exec [-t] ARG..
 #               Run an arbitrary command on the target inside the workdir.
 #               Pass -t / --tty to allocate a pseudo-tty (needed for sudo).
-#   run-agent [--config PATH] [--no-bpf] [--no-llm] [--log FILTER] [-- ARGS...]
-#               sync + build the BPF object + build the agent (release,
-#               with llm-llama-cpp by default) + run it with sudo. Streams
-#               agent stdout/stderr to your terminal until you ctrl-c.
+#   push-model [NAME]
+#               rsync a model from $HOME/.bowery/models/<NAME>.gguf locally
+#               to the same path on the target. Default NAME is
+#               `qwen3-0.6b-q4_k_m`. No-op when the remote already has the
+#               same file (rsync size + mtime check). Local copy must
+#               already exist; run `bowery model fetch <NAME>` to get one.
+#   run-agent [--push-model [NAME]] [--config PATH] [--no-bpf] [--no-llm] \
+#             [--log FILTER] [-- ARGS...]
+#               sync + (optional) push-model + build the BPF object + build
+#               the agent (release, with llm-llama-cpp by default) + run
+#               it with sudo. Streams agent stdout/stderr to your terminal
+#               until you ctrl-c.
 #   stop-ssh    Tear down the SSH ControlMaster connection.
 #
 # Config is read from $REPO/.xtest.env, environment variables override:
@@ -122,7 +130,13 @@ remote() {
 # --- Subcommands -------------------------------------------------------------
 
 cmd_help() {
-    sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+    # Print the file's leading banner — every line of `# …` comments
+    # before the first blank-or-code line. Lets us add subcommand help
+    # without remembering to bump a hardcoded line range.
+    awk 'BEGIN { in_banner=1 }
+         in_banner && /^#/ { sub(/^# ?/, ""); print; next }
+         in_banner && /^$/ { exit }
+         { exit }' "${BASH_SOURCE[0]}"
 }
 
 cmd_sync() {
@@ -341,12 +355,44 @@ cmd_exec() {
     fi
 }
 
+cmd_push_model() {
+    require_config
+    local name="${1:-qwen3-0.6b-q4_k_m}"
+    local local_path="$HOME/.bowery/models/${name}.gguf"
+    if [[ ! -f "$local_path" ]]; then
+        echo "error: $local_path not found locally" >&2
+        echo "       run: bowery model fetch $name" >&2
+        exit 2
+    fi
+    local remote_dir="/home/$XTEST_USER/.bowery/models"
+    local remote_path="$remote_dir/${name}.gguf"
+    local size_bytes
+    size_bytes=$(stat -c %s "$local_path" 2>/dev/null || stat -f %z "$local_path")
+    local size_h
+    if (( size_bytes >= 1 << 30 )); then
+        size_h="$(awk "BEGIN { printf \"%.1f GiB\", $size_bytes / (1024*1024*1024) }")"
+    else
+        size_h="$(( size_bytes >> 20 )) MiB"
+    fi
+    echo "==> push-model $name ($size_h) -> $XTEST_USER@$XTEST_HOST:$remote_path"
+    ssh_cmd "mkdir -p '$remote_dir'"
+    # `--info=progress2` gives a single overall progress line; default
+    # rsync size+mtime check makes this a near-instant no-op on
+    # subsequent runs when the file hasn't changed locally.
+    rsync -aH --info=progress2 \
+        -e "$(rsync_rsh)" \
+        "$local_path" \
+        "$XTEST_USER@$XTEST_HOST:$remote_path"
+}
+
 cmd_run_agent() {
     require_config
     local config="/tmp/bowery-agent.toml"
     local with_bpf=1
     local with_llm=1
     local log="info,bowery_agent=info,bowery_ebpf_loader=info"
+    local push_model=0
+    local push_model_name="qwen3-0.6b-q4_k_m"
     local agent_args=()
 
     while [[ $# -gt 0 ]]; do
@@ -367,6 +413,17 @@ cmd_run_agent() {
                 log="${2:?--log needs a filter}"
                 shift 2
                 ;;
+            --push-model)
+                push_model=1
+                # Optional trailing NAME: take it if the next arg
+                # doesn't look like another flag.
+                if [[ -n "${2:-}" && ! "${2:-}" == --* ]]; then
+                    push_model_name="$2"
+                    shift 2
+                else
+                    shift 1
+                fi
+                ;;
             --)
                 shift
                 agent_args+=("$@")
@@ -374,13 +431,18 @@ cmd_run_agent() {
                 ;;
             *)
                 echo "error: unknown run-agent flag '$1'" >&2
-                echo "usage: $0 run-agent [--config PATH] [--no-bpf] [--no-llm] [--log FILTER] [-- ARGS...]" >&2
+                echo "usage: $0 run-agent [--push-model [NAME]] [--config PATH] [--no-bpf] [--no-llm] [--log FILTER] [-- ARGS...]" >&2
                 exit 2
                 ;;
         esac
     done
 
     cmd_sync
+
+    if [[ $push_model -eq 1 ]]; then
+        echo
+        cmd_push_model "$push_model_name"
+    fi
 
     # 1. Build the BPF object (separate workspace, nightly toolchain).
     if [[ $with_bpf -eq 1 ]]; then
@@ -460,6 +522,7 @@ case "$sub" in
     probe)      cmd_probe ;;
     shell)      cmd_shell ;;
     exec)       cmd_exec "$@" ;;
+    push-model) cmd_push_model "$@" ;;
     run-agent)  cmd_run_agent "$@" ;;
     stop-ssh)   cmd_stop_ssh ;;
     *)
