@@ -6,9 +6,9 @@ how those decisions land in code, the patterns we reach for, and the
 specific tradeoffs taken at each layer. If you're new to the project,
 read [README.md](README.md) first for orientation, then this for depth.
 
-This document tracks Phase 0 → 6a, which is everything currently
-implemented. Phase 7 (response engine) and Phase 6b (operator command
-issuance) sections will be added when those phases land.
+This document tracks Phase 0 → 7, which is everything currently
+implemented. Phase 6b (operator command issuance) and Phase 8
+(hardening) sections will be added when those phases land.
 
 ## Contents
 
@@ -27,9 +27,10 @@ issuance) sections will be added when those phases land.
 13. [Whisper Q&A](#13-whisper-qa)
 14. [Operator inbox and Subscribe](#14-operator-inbox-and-subscribe)
 15. [Operator CLI](#15-operator-cli)
-16. [Build and test infrastructure](#16-build-and-test-infrastructure)
-17. [Patterns we keep using](#17-patterns-we-keep-using)
-18. [What we explicitly don't do](#18-what-we-explicitly-dont-do)
+16. [Response engine](#16-response-engine)
+17. [Build and test infrastructure](#17-build-and-test-infrastructure)
+18. [Patterns we keep using](#18-patterns-we-keep-using)
+19. [What we explicitly don't do](#19-what-we-explicitly-dont-do)
 
 ---
 
@@ -1085,9 +1086,14 @@ bit_count` for `i ∈ 0..k`. This avoids extra hashing per insert; with
 default `k=6` and `bit_count=2^16` it gives ~1% FP rate at ~6800
 inserted items.
 
-The bloom advert isn't on the wire yet — Phase 5 only ships the
-primitive. Adverts will land in a later commit and gossip via mesh KV
-(per DESIGN.md §8.5).
+The advert *is* on the wire (Phase 5 polish, see §13.5):
+[`bloom_publisher.rs`](crates/bowery-agent/src/bloom_publisher.rs)
+periodically rebuilds a filter over the local baseline's tier-1
+fingerprints and publishes it to mesh KV. Askers consult that filter
+before dialling — a `false` bit at a candidate's tier-1 index proves
+the peer hasn't seen the artifact, so we skip them. False positives
+flow through to a normal Q&A round-trip; false negatives don't
+exist by construction.
 
 ### 13.3 Asker / Responder
 
@@ -1148,6 +1154,8 @@ receives them on an mpsc, and for each:
 7. Aggregate replies into a `WhisperContext { tier1_fp, peers,
    total_seen_count, corroborating_peers }`.
 8. Emit `AgentEvent::WhisperContextReady`.
+9. Stash the context against `episode_id` so the LLM analyzer can
+   pick it up when it dequeues that episode.
 
 Each round runs in its own `tokio::spawn` so a slow peer can't block
 the next trigger. The aggregator is liberal on errors — a peer that
@@ -1157,6 +1165,34 @@ the rest of the round proceeds.
 The responder side lives in [`crates/bowery-agent/src/agent.rs::handle_connection`](crates/bowery-agent/src/agent.rs):
 when an inbound envelope's body is `Question`, we run a baseline scan
 in `spawn_blocking` and reply. Same connection, same envelope crypto.
+
+The asker pre-flight (Phase 5 polish): before each dial, look up the
+peer's published bloom advert in mesh KV and check if our tier-1 hits
+*any* of the advertised filter bits. If not, skip — the peer can't
+have seen the artifact. This is the only place in the agent that
+shortcuts a network round-trip on a probabilistic structure; the
+correctness argument is one-sided (no false negatives) so worst-case
+we lose a single peer's `total_seen_count` contribution.
+
+### 13.5 Bloom advert publisher
+
+[`crates/bowery-agent/src/bloom_publisher.rs`](crates/bowery-agent/src/bloom_publisher.rs).
+
+A periodic background task (interval from `[bloom]` config). Each
+tick:
+
+1. `Baseline::for_each_binary` scans every binary's sha256.
+2. For each, derive its tier-1 fingerprint, insert into a fresh
+   `BloomFilter`.
+3. Encode the bit array + epoch + (`bit_count`, `k`) parameters and
+   `mesh.set_state(KEY_BLOOM_ADVERT, ...)`.
+4. Emit `AgentEvent::BloomAdvertPublished` with the inserted count
+   for dashboards.
+
+Off-bus rebuild — the publisher reads the baseline through the same
+read-only API as everything else, so no extra locking. Filter
+parameters are part of the published payload so an asker doesn't need
+to know what the responder is using.
 
 ## 14. Operator inbox and Subscribe
 
@@ -1231,9 +1267,13 @@ Alert {
 ```
 
 We emit on the *pre-verdict* so an alert exists immediately, even
-when the LLM is shed or slow. A planned follow-up: when the LLM
-verdict arrives, *re-emit* the alert with the refined rationale +
-suggested_actions.
+when the LLM is shed or slow. The LLM-outcomes bridge then *re-emits*
+a refined Alert when the model's verdict lands, carrying the
+rationale + `suggested_actions` (see [`agent.rs::handle_llm_outcome`](crates/bowery-agent/src/agent.rs)).
+Operators see two entries per episode_id; ops dashboards dedup on
+episode_id at display time if they want a single record. The LLM may
+have lowered the suspicion below `alerts.threshold` — in that case we
+don't append the second entry.
 
 ## 15. Operator CLI
 
@@ -1242,10 +1282,11 @@ Single binary, `bowery`. Subcommands:
 
 | Subcommand | Module |
 |---|---|
-| `key generate / fingerprint` | inline in main.rs |
+| `key {generate, fingerprint, info}` | inline in main.rs |
 | `doctor` | [`doctor.rs`](crates/bowery-cli/src/doctor.rs) |
 | `alerts tail` | [`alerts.rs`](crates/bowery-cli/src/alerts.rs) |
 | `model {list, fetch}` | [`model.rs`](crates/bowery-cli/src/model.rs) |
+| `audit verify` | [`audit.rs`](crates/bowery-cli/src/audit.rs) |
 
 ### 15.1 doctor
 
@@ -1311,9 +1352,216 @@ old curl in INSTALL.md saved that as the "model file", and the agent
 crashed on startup with no error visible from Rust. The magic + size
 check catches that immediately and removes the partial.
 
-## 16. Build and test infrastructure
+### 15.4 audit verify
 
-### 16.1 The xtest script
+[`crates/bowery-cli/src/audit.rs`](crates/bowery-cli/src/audit.rs).
+Operator-side validator for the JSONL audit log the agent emits when
+`[response] audit_log_path` is configured (see §16.5). Walks every
+line, verifies under the host's pubkey, exits 0 on full pass and 1
+on the first signature/parse failure.
+
+The pubkey can come from `--pubkey-b64` (paste from `bowery key
+info` on the agent host) or `--pubkey-from <agent identity file>`.
+`--json` emits one `LineReport { line, ok, error?, episode_id?,
+action_id?, engine? }` per audit line for ops dashboards.
+
+The fail-loud-on-first-bad-line stance is deliberate: tamper
+evidence is only useful if operators *act on* a mismatch. A noisy
+exit code in CI / cron is the right shape for that.
+
+## 16. Response engine
+
+Phase 7. Three crates collaborate: [`bowery-response`](crates/bowery-response)
+owns the typed [`Action`] / [`ActionOutcome`] / [`ResponsePolicy`]
+types and the `ResponseEngine` trait, [`bowery-ebpf`](crates/bowery-ebpf)
+adds the BPF-LSM `bprm_check_security` hook, and
+[`bowery-ebpf-loader`](crates/bowery-ebpf-loader) exposes a
+`BpfBlocker` userspace helper that manages the kernel-side
+`BLOCKED_COMMS` map.
+
+### 16.1 Three engines, one trait
+
+[`crates/bowery-response/src/engine.rs`](crates/bowery-response/src/engine.rs).
+
+```rust
+#[async_trait]
+pub trait ResponseEngine: Send + Sync {
+    async fn execute(&self, action: &Action) -> Result<ActionOutcome, ActionError>;
+    fn policy(&self) -> &ResponsePolicy;
+    fn name(&self) -> &'static str;
+}
+```
+
+Selected by config (`[response] engine = "noop" | "process-kill" |
+"bpf-lsm"`):
+
+- **`NoopEngine`** — observe-only. Returns `Suppressed { reason:
+  "observe-only engine" }` for every permitted action, `policy
+  denied` otherwise. The default; always safe to deploy.
+- **`ProcessKillEngine`** — `kill(2)`-via-`nix`. Maps `KillProcess`
+  to `SIGKILL` delivery. Returns `AlreadyGone` on `ESRCH` (the
+  target died between LLM inference and signal delivery — *not* an
+  error). Other errnos surface as `ActionError::KillFailed`.
+- **`BpfLsmEngine`** — kernel-side blocking. Lives in
+  [`crates/bowery-agent/src/response_bpf.rs`](crates/bowery-agent/src/response_bpf.rs)
+  rather than `bowery-response` so the aya + loader dep graph
+  doesn't infect the response crate.
+
+Each engine handles only the actions it implements; non-applicable
+variants return `Suppressed { reason: "<engine> doesn't implement
+<action>; switch to <other-engine>" }`. That suppress-with-reason
+shape (rather than an error) keeps the audit-log story uniform —
+every `execute` call produces an `ActionOutcome`.
+
+### 16.2 Action / Policy types
+
+[`crates/bowery-response/src/action.rs`](crates/bowery-response/src/action.rs).
+
+```rust
+pub enum Action {
+    KillProcess { pid: u32, episode_id: String },
+    BlockExec { comm: String, episode_id: String },
+}
+```
+
+Action ids on the wire (in `LlmVerdict.suggested_actions`) are
+strings the LLM was prompted to choose from. `from_id(id, episode,
+pid, comm) -> Option<Action>` turns those strings into typed
+actions. Unknown ids return `None` so an LLM that hallucinates
+`isolate_host` doesn't crash the pipeline.
+
+[`crates/bowery-response/src/policy.rs`](crates/bowery-response/src/policy.rs)
+is a deliberately tiny default-deny gate:
+
+```rust
+pub struct ResponsePolicy {
+    pub allowed_actions: Vec<String>,
+    pub disabled: bool,
+}
+```
+
+`permits(id)` answers "may this id execute autonomously?" — `false`
+when `disabled` or when `id ∉ allowed_actions`. Future work
+(DESIGN.md §9.2) adds per-host conditions, ttl-bounded standing
+authorisations, and signed updates; we ship strings today so the
+migration is `String → struct` and not a schema overhaul.
+
+### 16.3 BPF-LSM hook
+
+[`crates/bowery-ebpf/src/main.rs::block_exec`](crates/bowery-ebpf/src/main.rs).
+
+```rust
+#[lsm(hook = "bprm_check_security")]
+pub fn block_exec(_ctx: LsmContext) -> i32 {
+    let mut comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    normalise_comm(&mut comm);
+    if unsafe { BLOCKED_COMMS.get(&comm) }.is_some() {
+        -1   // EPERM
+    } else {
+        0
+    }
+}
+```
+
+`bprm_check_security` is called on every `execve`. We look the
+task's 16-byte `comm` up in a `HashMap<[u8; 16], u8>` and return
+`-EPERM` on a hit. Loader-side, [`BpfBlocker`](crates/bowery-ebpf-loader/src/lib.rs)
+attaches the program via `aya::Btf::from_sys_fs()` and exposes
+`block_comm(name)` / `unblock_comm(name)` on the map.
+
+The `normalise_comm` step zeros trailing whitespace bytes. We learned
+the hard way that `echo bowery-blocked` ends up with a trailing
+newline in `comm` (the kernel populates it from `argv[0]` with
+shell-quoted whitespace), and a literal-bytes `HashMap` lookup misses.
+Normalising at the BPF side rather than userspace means an attacker
+can't sneak past by appending whitespace to their argv.
+
+Capability-wise: `BpfLsmEngine` startup needs `CAP_BPF` +
+`CAP_SYS_ADMIN` and a kernel built with `CONFIG_BPF_LSM=y` and
+`bpf` listed in the boot cmdline's `lsm=` enumeration. `bowery
+doctor` flags any of those missing — the engine refuses to start
+otherwise rather than silently downgrading.
+
+### 16.4 The response_bpf module
+
+[`crates/bowery-agent/src/response_bpf.rs`](crates/bowery-agent/src/response_bpf.rs).
+
+Wraps `BpfBlocker` behind a `tokio::sync::Mutex`. aya's
+`HashMap::insert/remove` borrow the underlying `MapData` mutably,
+so concurrent `execute()` calls would race without serialisation.
+Lock hold time is microseconds (one `bpf` syscall) — contention is
+irrelevant at realistic action rates.
+
+`Action::KillProcess` returns `Suppressed` (delegated to the
+process-kill engine); `Action::BlockExec { comm, .. }` calls
+`blocker.block_comm(comm)` and returns `Executed { at_unix_ms }`.
+Map operations that fail (e.g. map full) surface as
+`ActionError::Invalid` rather than panicking.
+
+### 16.5 Signed audit envelopes
+
+[`crates/bowery-response/src/audit.rs`](crates/bowery-response/src/audit.rs).
+
+Every successful or suppressed `execute` call produces an
+[`AuditRecord`] which is then signed with the agent's identity to
+form an [`AuditEnvelope`]. The point isn't secrecy (the operator
+reading the local sink already trusts the host) — it's *tamper
+evidence*. A future per-host attacker who can write the audit log
+can't forge entries without the signing key, and operators can
+verify a sample of envelopes against the host's pinned verifying key
+to confirm the action stream wasn't selectively edited.
+
+```rust
+pub struct AuditRecord {
+    pub version: u32,
+    pub host_fp_hex: String,
+    pub engine: String,
+    pub episode_id: String,
+    pub action_id: String,
+    pub action: Action,
+    pub outcome: ActionOutcome,
+    pub recorded_at_unix_ms: u64,
+}
+```
+
+Canonical encoding is `serde_json::to_vec` with fields in
+declaration order. The signature covers `AUDIT_SIG_DOMAIN ||
+canonical_record_bytes`, where `AUDIT_SIG_DOMAIN =
+b"bowery/audit/envelope/v1"` — the per-payload domain separator
+pattern (§18.5) keeps this signing context disjoint from envelope
+sigs and any future Ed25519 use.
+
+`AuditSink` is a tiny trait with two impls today:
+
+- `NoopSink` — drop silently (the default).
+- `JsonlFileSink` — newline-delimited JSON, fsynced after each line.
+  Holds the file behind a mutex so concurrent action attempts don't
+  interleave bytes.
+
+The sink is `Arc<dyn AuditSink>` so tests can drop in a recording
+sink without going through config-file plumbing. Operators turn it
+on with `[response] audit_log_path = "/var/log/bowery/audit.jsonl"`.
+
+`audit::record(&sink, &identity, engine_name, episode, action,
+outcome)` is the single funnel from `handle_llm_outcome` — sink
+errors are logged but never propagated, so a transient disk problem
+can't stall the LLM-outcomes loop.
+
+### 16.6 Why the engine lives in two crates
+
+`bowery-response` is small and dependency-light (`async-trait`,
+`nix`, `serde`, `tokio`). `BpfLsmEngine` would force the response
+crate to depend on `aya` + the loader's whole graph (LLVM, btf,
+mio, ...) just to expose one extra trait impl. Splitting it keeps
+`bowery-response` reusable from CLI tools and tests; agents that
+actually want kernel blocking pull in
+[`crates/bowery-agent/src/response_bpf.rs`](crates/bowery-agent/src/response_bpf.rs)
+which is gated behind the engine-selection match in the agent's
+config.
+
+## 17. Build and test infrastructure
+
+### 17.1 The xtest script
 
 [`scripts/xtest`](scripts/xtest) is an SSH-based driver that turns a
 remote Linux VM into a transparent build/test target. It exists
@@ -1342,7 +1590,7 @@ the target — Ubuntu/Debian package names, the IPv4-forced apt config
 distros are technically supported via manual setup; the script just
 doesn't automate them yet.
 
-### 16.2 The BPF subworkspace
+### 17.2 The BPF subworkspace
 
 The `crates/bowery-ebpf/` workspace is built differently from
 everything else:
@@ -1382,7 +1630,7 @@ Three things that make it different from a normal Rust crate:
 The output is a single ELF file at `target/bpfel-unknown-none/release/bowery-ebpf`
 that the userspace loader mmaps + parses with aya.
 
-### 16.3 CI
+### 17.3 CI
 
 `.github/workflows/` (not in scope here) runs:
 
@@ -1401,9 +1649,9 @@ twice; the fix is always "scp Cargo.lock back from the VM after
 building there" since that's where new deps actually get added to
 the lockfile.
 
-## 17. Patterns we keep using
+## 18. Patterns we keep using
 
-### 17.1 Owned Arc, not borrowed lifetimes
+### 18.1 Owned Arc, not borrowed lifetimes
 
 Long-lived resources are `Arc<T>` and cheaply cloned into the tasks
 that need them:
@@ -1419,14 +1667,14 @@ to the outer scope without `'static` bounds, and pinning the
 references properly turns into a tower of `for<'a>` types nobody
 enjoys. `Arc<T>` is cheap enough.
 
-### 17.2 spawn_blocking for sync I/O on hot paths
+### 18.2 spawn_blocking for sync I/O on hot paths
 
 Every SQLite call, every `enrich::sha256_file`, every baseline scan
 runs in `tokio::task::spawn_blocking`. That keeps the tokio runtime's
 worker threads free for actual async work and lets the OS schedule
 the blocking work on dedicated blocking-pool threads.
 
-### 17.3 broadcast::Sender for observability
+### 18.3 broadcast::Sender for observability
 
 `AgentEvent` is a broadcast channel. Every observable thing gets
 emitted (PeerPinned, EpisodeAnalyzed, AlertEmitted, …). Tests
@@ -1436,7 +1684,7 @@ subscribe before triggering and assert on what they see; an eventual
 Broadcast is lossy on slow consumers — that's a feature here, not a
 bug. We never want a stalled subscriber to backpressure the agent.
 
-### 17.4 Generic peer-handle types
+### 18.4 Generic peer-handle types
 
 Peer-ranking, sealed-envelope tests, and similar utilities take a
 generic `T` for "whatever the caller wants back" instead of pinning
@@ -1444,7 +1692,7 @@ to one specific concrete type. Lets the analyzer crate stay free of
 mesh dependencies, lets tests use string identifiers, and the agent
 plug in `PeerInfo` at the call site.
 
-### 17.5 Per-payload domain separators
+### 18.5 Per-payload domain separators
 
 Every signed/hashed value gets a domain prefix:
 
@@ -1456,7 +1704,7 @@ The `/v1` suffix gives us a path to rotate the domain (and thus
 invalidate everything signed under the old one) if we ever need to.
 Cheap insurance.
 
-### 17.6 Mock-first design for I/O traits
+### 18.6 Mock-first design for I/O traits
 
 Every external integration starts with a mock implementation:
 
@@ -1472,7 +1720,7 @@ mesh+envelope+pipeline+heartbeat surface against `NoopEventSource`,
 because what's being tested is the surrounding wiring, not the BPF
 events themselves.
 
-### 17.7 `#[non_exhaustive]` … not yet
+### 18.7 `#[non_exhaustive]` … not yet
 
 We intentionally don't `#[non_exhaustive]` our public enums. The
 project is small enough that breaking match patterns on a new variant
@@ -1482,7 +1730,7 @@ new event type.
 If the project grows past the point where every consumer is in this
 repo, we'll revisit.
 
-## 18. What we explicitly don't do
+## 19. What we explicitly don't do
 
 A few approaches we've ruled out, with reasoning:
 
