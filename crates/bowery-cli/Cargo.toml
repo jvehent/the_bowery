@@ -37,3 +37,38 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+# ---------------------------------------------------------------------------
+# Packaging metadata.
+#
+# The CLI ships as a single static binary at /usr/bin/bowery. No daemon,
+# no config, no system state. Operators install it on their workstation
+# (or a jumpbox) and use it to manage the agent fleet.
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+name = "bowery"
+section = "admin"
+priority = "optional"
+depends = "$auto, ca-certificates"
+extended-description = """
+The Bowery operator CLI — issues signed messages into the mesh.
+Use it to manage operator identity keys, drain alert inboxes from
+agents, fetch LLM model artifacts, verify signed audit logs, and
+check host readiness with `bowery doctor`.
+"""
+assets = [
+  ["target/release/bowery",                "usr/bin/",                       "755"],
+  ["target/release/pkg/README.md",         "usr/share/doc/bowery/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "bowery"
+summary = "The Bowery operator CLI"
+license = "MPL-2.0"
+url = "https://github.com/jvehent/the_bowery"
+requires = { ca-certificates = "*" }
+assets = [
+  { source = "target/release/bowery",         dest = "/usr/bin/bowery",                 mode = "755" },
+  { source = "target/release/pkg/README.md",  dest = "/usr/share/doc/bowery/README.md", mode = "644", doc = true },
+]

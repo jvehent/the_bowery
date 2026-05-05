@@ -1,0 +1,247 @@
+name: release
+
+# Triggers:
+#   - Pushed tag matching `v*` (typical "release this version" flow).
+#   - Manual via Actions tab (handy for cutting an unscheduled build).
+#
+# Outputs (uploaded as workflow artifacts AND, on tag pushes, attached
+# to the GitHub Release):
+#   bowery-agent_<version>_amd64.deb
+#   bowery-agent-<version>-1.x86_64.rpm
+#   bowery_<version>_amd64.deb
+#   bowery-<version>-1.x86_64.rpm
+#
+# The agent binary is built with `--features llm-llama-cpp` so the
+# LLM analyzer path works out of the box. The Qwen3 model is NOT
+# bundled — operators run `bowery model fetch` post-install to
+# pull the GGUF separately.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # llama.cpp's build pipeline calls cmake; we let it auto-detect the
+  # bundled libraries on the runner (libssl-dev, libclang, etc.).
+  LLAMA_CPP_BACKEND_BUNDLED: 1
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-bpf:
+    name: Build eBPF object
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + rust-src + bpf-linker
+        run: |
+          rustup toolchain install nightly --component rust-src
+          cargo install bpf-linker --locked
+
+      - name: Build BPF object
+        run: bash scripts/build-ebpf
+
+      - name: Stash BPF object for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: bowery-ebpf
+          path: crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf
+          retention-days: 7
+          if-no-files-found: error
+
+  build-userspace:
+    name: Build userspace binaries
+    runs-on: ubuntu-latest
+    # Doesn't depend on build-bpf — the agent loads the BPF object at
+    # runtime, not link-time, so userspace and BPF compile in parallel.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        # llama-cpp-2 builds C++ via cmake. clang is the default toolchain
+        # on Ubuntu's cmake; install both explicitly so the build is
+        # deterministic across runner image refreshes.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libclang-dev libssl-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build agent (with llm-llama-cpp)
+        # `RUSTFLAGS=-C target-cpu=native` would be nice for raw perf
+        # but breaks portability — the .deb / .rpm should run on any
+        # x86_64-v2 host. Default flags it is.
+        run: cargo build --release --locked -p bowery-agent --features llm-llama-cpp
+
+      - name: Build CLI
+        run: cargo build --release --locked -p bowery-cli
+
+      - name: Stash binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bowery-binaries
+          path: |
+            target/release/bowery-agent
+            target/release/bowery
+          retention-days: 7
+          if-no-files-found: error
+
+  package-deb:
+    name: Build .deb packages
+    runs-on: ubuntu-latest
+    needs: [build-bpf, build-userspace]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Pull BPF object
+        uses: actions/download-artifact@v4
+        with:
+          name: bowery-ebpf
+          path: crates/bowery-ebpf/target/bpfel-unknown-none/release/
+
+      - name: Pull binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bowery-binaries
+          path: target/release/
+
+      - name: Stage package assets
+        # cargo-deb and cargo-generate-rpm disagree on relative-path
+        # resolution. Staging every non-binary asset under
+        # target/release/pkg/ lets the per-crate Cargo.toml metadata
+        # use a single workspace-rooted convention that both tools
+        # accept. (The binaries themselves already live at
+        # target/release/, which both tools recognise as the
+        # workspace target dir.)
+        run: |
+          mkdir -p target/release/pkg
+          cp crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf target/release/pkg/
+          cp deploy/systemd/bowery-agent.service                                target/release/pkg/
+          cp deploy/systemd/bowery.slice                                        target/release/pkg/
+          cp deploy/agent.toml.example                                          target/release/pkg/
+          cp README.md INSTALL.md                                               target/release/pkg/
+          chmod 0755 target/release/bowery-agent target/release/bowery
+          chmod 0644 target/release/pkg/*
+
+      - name: cargo deb (agent)
+        # --no-build skips a rebuild — cargo-deb just stages the
+        # already-built binary from target/release/. The
+        # --features flag isn't needed here since the binary is
+        # already feature-built; cargo-deb only consults metadata.
+        run: cargo deb --no-build -p bowery-agent
+
+      - name: cargo deb (cli)
+        run: cargo deb --no-build -p bowery-cli
+
+      - name: Upload .deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bowery-deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  package-rpm:
+    name: Build .rpm packages
+    runs-on: ubuntu-latest
+    needs: [build-bpf, build-userspace]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+
+      - name: Pull BPF object
+        uses: actions/download-artifact@v4
+        with:
+          name: bowery-ebpf
+          path: crates/bowery-ebpf/target/bpfel-unknown-none/release/
+
+      - name: Pull binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bowery-binaries
+          path: target/release/
+
+      - name: Stage package assets
+        run: |
+          mkdir -p target/release/pkg
+          cp crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf target/release/pkg/
+          cp deploy/systemd/bowery-agent.service                                target/release/pkg/
+          cp deploy/systemd/bowery.slice                                        target/release/pkg/
+          cp deploy/agent.toml.example                                          target/release/pkg/
+          cp README.md INSTALL.md                                               target/release/pkg/
+          chmod 0755 target/release/bowery-agent target/release/bowery
+          chmod 0644 target/release/pkg/*
+
+      - name: generate-rpm (agent)
+        run: cargo generate-rpm -p bowery-agent
+
+      - name: generate-rpm (cli)
+        run: cargo generate-rpm -p bowery-cli
+
+      - name: Upload .rpm artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bowery-rpm
+          path: target/generate-rpm/*.rpm
+          if-no-files-found: error
+
+  release:
+    name: Attach packages to GitHub Release
+    runs-on: ubuntu-latest
+    needs: [package-deb, package-rpm]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Pull .deb
+        uses: actions/download-artifact@v4
+        with:
+          name: bowery-deb
+          path: dist/
+
+      - name: Pull .rpm
+        uses: actions/download-artifact@v4
+        with:
+          name: bowery-rpm
+          path: dist/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ### Install
+
+            **Debian / Ubuntu:**
+            ```sh
+            sudo dpkg -i bowery-agent_*_amd64.deb
+            # operator workstation:
+            sudo dpkg -i bowery_*_amd64.deb
+            ```
+
+            **RHEL / Fedora:**
+            ```sh
+            sudo rpm -i bowery-agent-*.x86_64.rpm
+            # operator workstation:
+            sudo rpm -i bowery-*.x86_64.rpm
+            ```
+
+            The LLM model is NOT bundled. After installing the agent:
+            ```sh
+            sudo bowery model fetch qwen3-0.6b-q4_k_m
+            ```
+
+            See `INSTALL.md` for full setup including identity key, mesh
+            seeds, and operator pubkey configuration.

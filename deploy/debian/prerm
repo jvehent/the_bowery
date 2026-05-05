@@ -1,0 +1,25 @@
+#!/bin/sh
+# prerm — bowery-agent
+#
+# Stop the service before package removal so we don't leave an
+# orphaned process holding kernel resources (eBPF programs).
+
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl --no-reload disable --now bowery-agent.service >/dev/null 2>&1 || true
+        fi
+        ;;
+
+    failed-upgrade)
+        ;;
+
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

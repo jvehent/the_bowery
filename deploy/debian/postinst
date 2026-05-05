@@ -1,0 +1,69 @@
+#!/bin/sh
+# postinst — bowery-agent
+#
+# Creates the bowery system user, runtime directories, and reloads
+# systemd so the operator can `systemctl enable --now bowery-agent`.
+# We deliberately do NOT enable or start the service automatically:
+# the agent reads /etc/bowery/agent.toml which the operator must
+# author from the bundled .example file.
+
+set -e
+
+case "$1" in
+    configure)
+        # System group + user. shell=nologin and home=/var/lib/bowery
+        # so the account is unusable for login but still owns its
+        # state directories.
+        if ! getent group bowery >/dev/null 2>&1; then
+            addgroup --system bowery
+        fi
+        if ! getent passwd bowery >/dev/null 2>&1; then
+            adduser --system \
+                --ingroup bowery \
+                --home /var/lib/bowery \
+                --no-create-home \
+                --shell /usr/sbin/nologin \
+                --gecos "Bowery agent" \
+                bowery
+        fi
+
+        # State + log dirs. 0750 means "world-traversal blocked, group
+        # read for ops debugging." The systemd unit also sets
+        # ConfigurationDirectory + StateDirectory + LogsDirectory but
+        # those run after the daemon starts; pre-create here so the
+        # operator can drop a config in before first start.
+        install -d -m 0750 -o bowery -g bowery /var/lib/bowery
+        install -d -m 0750 -o bowery -g bowery /var/log/bowery
+        install -d -m 0755 /etc/bowery
+
+        # Refresh systemd's unit cache so `systemctl status
+        # bowery-agent` works immediately after install.
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+
+        cat <<'EOF'
+
+bowery-agent installed. To start the agent:
+
+  1. cp /etc/bowery/agent.toml.example /etc/bowery/agent.toml
+  2. edit /etc/bowery/agent.toml — set [mesh] seeds + [operators] pubkeys
+  3. (optional) bowery model fetch qwen3-0.6b-q4_k_m
+  4. systemctl enable --now bowery-agent
+
+The LLM model is intentionally not bundled. Without it the agent
+falls back to a deterministic mock analyzer; rule + baseline
+scoring still works.
+EOF
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

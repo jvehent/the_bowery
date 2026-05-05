@@ -1,0 +1,45 @@
+#!/bin/sh
+# postrm — bowery-agent
+#
+# Reload systemd after the unit files are gone. We intentionally do
+# NOT remove /var/lib/bowery on `remove` — the identity key and
+# baseline DB are valuable and the operator may want them back on
+# reinstall. `purge` removes everything.
+
+set -e
+
+case "$1" in
+    remove)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+
+    purge)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        # State + logs only on purge. /etc/bowery is handled by
+        # dpkg-conffile machinery.
+        rm -rf /var/lib/bowery /var/log/bowery
+        # System user removal is best-effort: leave it if other
+        # files reference it (operator may have manually placed
+        # files under /var/lib/bowery).
+        if getent passwd bowery >/dev/null 2>&1; then
+            deluser --system bowery >/dev/null 2>&1 || true
+        fi
+        if getent group bowery >/dev/null 2>&1; then
+            delgroup --system bowery >/dev/null 2>&1 || true
+        fi
+        ;;
+
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

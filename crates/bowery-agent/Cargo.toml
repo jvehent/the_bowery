@@ -63,3 +63,84 @@ tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
+
+# ---------------------------------------------------------------------------
+# Packaging metadata.
+#
+# The agent ships as a system service: binary at /usr/bin/bowery-agent,
+# eBPF object at /usr/lib/bowery/bowery-ebpf, systemd unit + slice
+# under /lib/systemd/system, and an example config at
+# /etc/bowery/agent.toml.example. The LLM model is intentionally NOT
+# bundled — operators fetch it post-install via `bowery model fetch`.
+#
+# Both .deb and .rpm produce identical layout. Built via:
+#   cargo deb -p bowery-agent --no-build --features llm-llama-cpp
+#   cargo generate-rpm -p bowery-agent --features llm-llama-cpp
+# in CI (see .github/workflows/release.yml).
+# ---------------------------------------------------------------------------
+
+#
+# Convention: all asset source paths live under `target/release/` (or
+# its `pkg/` subdir for non-binary files). The release workflow stages
+# the BPF object, systemd units, example config, and docs into
+# `target/release/pkg/` so cargo-deb and cargo-generate-rpm — which
+# disagree on relative-path resolution rules — see the same paths.
+
+[package.metadata.deb]
+name = "bowery-agent"
+maintainer-scripts = "../../deploy/debian"
+section = "admin"
+priority = "optional"
+depends = "$auto, adduser, libssl3, ca-certificates"
+extended-description = """
+The Bowery is a distributed Linux EDR. Each agent observes its host
+via eBPF, scores anomalies with a local rule + baseline + (optional)
+LLM pipeline, and validates findings against neighbor agents over a
+peer-to-peer mesh — no central backend required.
+
+This package installs the agent daemon, its eBPF tracepoint object,
+a systemd unit, and an example config. The LLM model is fetched
+separately with `bowery model fetch` so the package stays small.
+"""
+assets = [
+  ["target/release/bowery-agent",                "usr/bin/",                                   "755"],
+  ["target/release/pkg/bowery-ebpf",             "usr/lib/bowery/bowery-ebpf",                 "644"],
+  ["target/release/pkg/bowery-agent.service",    "lib/systemd/system/bowery-agent.service",    "644"],
+  ["target/release/pkg/bowery.slice",            "lib/systemd/system/bowery.slice",            "644"],
+  ["target/release/pkg/agent.toml.example",      "etc/bowery/agent.toml.example",              "644"],
+  ["target/release/pkg/README.md",               "usr/share/doc/bowery-agent/README.md",       "644"],
+  ["target/release/pkg/INSTALL.md",              "usr/share/doc/bowery-agent/INSTALL.md",      "644"],
+]
+conf-files = ["/etc/bowery/agent.toml.example"]
+
+[package.metadata.generate-rpm]
+name = "bowery-agent"
+summary = "The Bowery agent daemon"
+license = "MPL-2.0"
+url = "https://github.com/jvehent/the_bowery"
+requires = { systemd = "*", openssl-libs = "*", ca-certificates = "*" }
+assets = [
+  { source = "target/release/bowery-agent",             dest = "/usr/bin/bowery-agent",                       mode = "755" },
+  { source = "target/release/pkg/bowery-ebpf",          dest = "/usr/lib/bowery/bowery-ebpf",                 mode = "644" },
+  { source = "target/release/pkg/bowery-agent.service", dest = "/lib/systemd/system/bowery-agent.service",   mode = "644" },
+  { source = "target/release/pkg/bowery.slice",         dest = "/lib/systemd/system/bowery.slice",            mode = "644" },
+  { source = "target/release/pkg/agent.toml.example",   dest = "/etc/bowery/agent.toml.example",              mode = "644", config = true },
+  { source = "target/release/pkg/README.md",            dest = "/usr/share/doc/bowery-agent/README.md",       mode = "644", doc = true },
+  { source = "target/release/pkg/INSTALL.md",           dest = "/usr/share/doc/bowery-agent/INSTALL.md",      mode = "644", doc = true },
+]
+post_install_script = """
+getent group bowery >/dev/null || groupadd --system bowery
+getent passwd bowery >/dev/null || useradd --system --gid bowery --home-dir /var/lib/bowery --shell /sbin/nologin --comment 'Bowery agent' bowery
+install -d -m 0750 -o bowery -g bowery /var/lib/bowery
+install -d -m 0750 -o bowery -g bowery /var/log/bowery
+install -d -m 0755 /etc/bowery
+systemctl daemon-reload || true
+"""
+pre_uninstall_script = """
+if [ "$1" = "0" ]; then
+    systemctl --no-reload disable --now bowery-agent.service >/dev/null 2>&1 || true
+fi
+"""
+post_uninstall_script = """
+systemctl daemon-reload || true
+"""
