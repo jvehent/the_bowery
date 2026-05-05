@@ -1987,6 +1987,14 @@ osquery JSON verbatim.
   `trigger-baseline-rescan`, and operator-signed grants for the
   Phase-7 response engine all extend the same pattern: add a oneof
   variant to `OperatorCommandBody`, wire a handler in the router.
+- **Replacing osquery with a native SQL engine.** Scoped in
+  [`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md) — pure-Rust
+  rusqlite-vtab surface over 15 core tables, streaming results
+  per-row, multi-agent fan-out via a relay pattern. ~10 weeks
+  of focused work; triggers when the bundled osqueryi cost
+  starts mattering or operator workflows reach for Bowery-native
+  tables (`bowery_peers`, `bowery_audit`, etc.) that no osquery
+  extension could expose.
 
 ---
 
