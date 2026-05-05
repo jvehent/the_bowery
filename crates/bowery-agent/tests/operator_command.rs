@@ -10,6 +10,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use prost::Message as _;
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_agent::config::{
@@ -148,6 +150,7 @@ async fn sysquery_command_round_trips_with_shim_handler() {
     let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
 
     let cmd = OperatorCommand {
+        forwarded_from_operator: Vec::new(),
         request_id: "test-req-1".into(),
         timeout_ms: 5_000,
         command: Some(OperatorCommandBody::Sysquery(SysqueryQuery {
@@ -243,6 +246,7 @@ async fn sysquery_command_returns_policy_denied_when_disabled() {
     let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
 
     let cmd = OperatorCommand {
+        forwarded_from_operator: Vec::new(),
         request_id: "denied-req".into(),
         timeout_ms: 5_000,
         command: Some(OperatorCommandBody::Sysquery(SysqueryQuery {
@@ -322,6 +326,7 @@ async fn non_operator_sender_is_rejected() {
 
     let sealer = Sealer::new(stranger_id);
     let cmd = OperatorCommand {
+        forwarded_from_operator: Vec::new(),
         request_id: "stranger-req".into(),
         timeout_ms: 1_000,
         command: Some(OperatorCommandBody::Sysquery(SysqueryQuery {
@@ -387,6 +392,7 @@ async fn sql_command_streams_chunked_response() {
     let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
 
     let cmd = OperatorCommand {
+        forwarded_from_operator: Vec::new(),
         request_id: "sql-req-1".into(),
         timeout_ms: 5_000,
         command: Some(OperatorCommandBody::Sql(SqlQuery {
@@ -504,6 +510,7 @@ async fn sql_syntax_error_returns_structured_error() {
     let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
 
     let cmd = OperatorCommand {
+        forwarded_from_operator: Vec::new(),
         request_id: "sql-req-err".into(),
         timeout_ms: 5_000,
         command: Some(OperatorCommandBody::Sql(SqlQuery {
@@ -573,8 +580,8 @@ async fn fanout_streams_rows_from_relay_and_peer() {
     let id_beta = Arc::new(Identity::generate());
     let operator_id = Arc::new(Identity::generate());
 
-    let pub_alpha = BASE64.encode(id_alpha.verifying_key().as_bytes());
-    let pub_beta = BASE64.encode(id_beta.verifying_key().as_bytes());
+    let _pub_alpha = BASE64.encode(id_alpha.verifying_key().as_bytes());
+    let _pub_beta = BASE64.encode(id_beta.verifying_key().as_bytes());
     let pub_op = BASE64.encode(operator_id.verifying_key().as_bytes());
 
     let cfg_alpha = Config {
@@ -606,11 +613,13 @@ async fn fanout_streams_rows_from_relay_and_peer() {
             publish_interval: Duration::from_millis(500),
         },
         llm: LlmConfig::default(),
-        // Both agents authorize the operator AND the other agent
-        // as operators — the relay leg signs commands as itself,
-        // and the peer must accept those.
+        // Phase-9 final-1: each agent only authorises the
+        // operator, NOT the other agent. The relay no longer
+        // signs commands "as the operator" — it forwards an
+        // operator-signed authorisation that the peer verifies
+        // against its own [operators] set.
         operators: OperatorsConfig {
-            pubkeys_b64: vec![pub_op.clone(), pub_beta.clone()],
+            pubkeys_b64: vec![pub_op.clone()],
         },
         inbox: InboxConfig::default(),
         alerts: AlertsConfig::default(),
@@ -648,7 +657,7 @@ async fn fanout_streams_rows_from_relay_and_peer() {
         },
         llm: LlmConfig::default(),
         operators: OperatorsConfig {
-            pubkeys_b64: vec![pub_op.clone(), pub_alpha.clone()],
+            pubkeys_b64: vec![pub_op.clone()],
         },
         inbox: InboxConfig::default(),
         alerts: AlertsConfig::default(),
@@ -701,14 +710,21 @@ async fn fanout_streams_rows_from_relay_and_peer() {
     let sealer = Sealer::new(operator_id.clone());
     let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
 
+    // Phase-9 final-1: build the operator-signed authorisation
+    // that lets the relay forward the query to its peers without
+    // the peers needing the relay in their [operators] set.
+    let body = OperatorCommandBody::Sql(SqlQuery {
+        sql: "SELECT 1 AS one".into(),
+        fanout: true,
+        peers: Vec::new(),
+    });
+    let authorization =
+        bowery_whisper::forwarding::sign_operator_authorization(&operator_id, "fanout-1", &body);
     let cmd = OperatorCommand {
+        forwarded_from_operator: authorization.encode_to_vec(),
         request_id: "fanout-1".into(),
         timeout_ms: 8_000,
-        command: Some(OperatorCommandBody::Sql(SqlQuery {
-            sql: "SELECT 1 AS one".into(),
-            fanout: true,
-            peers: Vec::new(), // every pinned peer
-        })),
+        command: Some(body),
     };
     let outbound = sealer.seal_for(&alpha_fp, &WhisperPayload::operator_command(cmd));
     conn.send_envelope(&outbound)
@@ -879,6 +895,7 @@ async fn bowery_peers_table_surfaces_pinned_peers() {
     let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
 
     let cmd = OperatorCommand {
+        forwarded_from_operator: Vec::new(),
         request_id: "bonus-peers".into(),
         timeout_ms: 5_000,
         command: Some(OperatorCommandBody::Sql(SqlQuery {

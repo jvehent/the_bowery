@@ -298,6 +298,26 @@ pub struct OperatorCommand {
     /// subprocess) and the CLI uses it to size its receive timeout.
     #[prost(uint32, tag = "2")]
     pub timeout_ms: u32,
+    /// Phase-9 final-1: when non-empty, this command is being
+    /// forwarded by a relay on behalf of an original operator.
+    /// The bytes are the operator's *original* signed
+    /// `WhisperEnvelope` (encoded via prost). The peer verifies
+    /// the inner envelope under its own `[operators]` set,
+    /// extracts the original operator's fingerprint as
+    /// `inner.sender`, and uses *that* identity (not the relay's)
+    /// as both the authority for the command and the recipient
+    /// for sealed `SqlChunk` responses.
+    ///
+    /// Cycle prevention: when this field is non-empty, the peer
+    /// rejects any inner command with `fanout = true`. Combined
+    /// with the relay always forwarding `fanout = false`, this
+    /// caps fan-out at one hop without trusting the relay.
+    ///
+    /// Backward compat: empty bytes preserve the slice-6 shape;
+    /// the receiver uses today's "sender must be in `[operators]`"
+    /// gate.
+    #[prost(bytes = "vec", tag = "3")]
+    pub forwarded_from_operator: Vec<u8>,
     /// One of the typed command bodies.
     #[prost(oneof = "OperatorCommandBody", tags = "10, 11")]
     pub command: Option<OperatorCommandBody>,
@@ -332,6 +352,83 @@ pub struct SysqueryQuery {
     /// permit.
     #[prost(string, tag = "1")]
     pub sql: String,
+}
+
+/// Phase-9 final-1: operator-signed delegation that authorises a
+/// relay to forward a `SqlQuery` to its pinned peers.
+///
+/// Carried inside [`OperatorCommand::forwarded_from_operator`]
+/// (encoded via prost). The peer verifies:
+///
+/// 1. The signature over `signing_input(operator_fp, ts_unix_ms,
+///    request_id, command_digest)` against the operator's pubkey
+///    (must be in the peer's `[operators]` set).
+/// 2. `request_id` matches the outer `OperatorCommand.request_id`.
+/// 3. `command_digest = SHA-256(prost-encoded
+///    OperatorCommandBody)` matches the actual outer command.
+/// 4. `ts_unix_ms` is within the same skew window as the envelope
+///    layer.
+///
+/// On success the peer treats `operator_fp` as the authority for
+/// the command and seals every `SqlChunk` response for it (rather
+/// than for the relay it received the envelope from). The relay
+/// forwards peer envelope bytes verbatim — F-1 / F-2 / F-3
+/// closure: the relay can drop peer chunks but cannot fabricate
+/// or tamper with their contents.
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct OperatorAuthorization {
+    /// 32-byte fingerprint of the original operator. The peer
+    /// looks this up in its `[operators]` resolver.
+    #[prost(bytes = "vec", tag = "1")]
+    pub operator_fp: Vec<u8>,
+    /// Authorisation timestamp, ms since UNIX epoch. Subject to
+    /// the same skew check as envelope `ts_unix_ms`.
+    #[prost(uint64, tag = "2")]
+    pub ts_unix_ms: u64,
+    /// Echoes the outer `OperatorCommand.request_id` so the peer
+    /// can confirm the authorisation matches the command it's
+    /// processing.
+    #[prost(string, tag = "3")]
+    pub request_id: String,
+    /// SHA-256 of the prost-encoded `OperatorCommandBody` the
+    /// peer will execute. Binds the authorisation to a specific
+    /// command — the relay can't substitute a different SQL
+    /// string under an authorisation issued for some other
+    /// query.
+    #[prost(bytes = "vec", tag = "4")]
+    pub command_digest: Vec<u8>,
+    /// Ed25519 signature over `OPERATOR_AUTHORIZATION_DOMAIN ||
+    /// operator_fp || ts_be || request_id_len_be || request_id ||
+    /// command_digest`.
+    #[prost(bytes = "vec", tag = "5")]
+    pub signature: Vec<u8>,
+}
+
+/// Domain-separation prefix for [`OperatorAuthorization`]
+/// signatures. Bumped if the canonical input ever changes.
+pub const OPERATOR_AUTHORIZATION_DOMAIN: &[u8] = b"bowery/operator-authorization/v1";
+
+impl OperatorAuthorization {
+    /// Build the canonical bytes that the operator's Ed25519 key
+    /// signs over. Mirror this layout in [`Self::verify`].
+    pub fn signing_input(
+        operator_fp: &[u8; 32],
+        ts_unix_ms: u64,
+        request_id: &str,
+        command_digest: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            OPERATOR_AUTHORIZATION_DOMAIN.len() + 32 + 8 + 4 + request_id.len() + 32,
+        );
+        buf.extend_from_slice(OPERATOR_AUTHORIZATION_DOMAIN);
+        buf.extend_from_slice(operator_fp);
+        buf.extend_from_slice(&ts_unix_ms.to_be_bytes());
+        let req_len = u32::try_from(request_id.len()).unwrap_or(u32::MAX);
+        buf.extend_from_slice(&req_len.to_be_bytes());
+        buf.extend_from_slice(request_id.as_bytes());
+        buf.extend_from_slice(command_digest);
+        buf
+    }
 }
 
 /// Phase-9 SQL command body. See [`OperatorCommandBody::Sql`].
@@ -765,6 +862,7 @@ mod tests {
         let cmd = OperatorCommand {
             request_id: "q-7".into(),
             timeout_ms: 5_000,
+            forwarded_from_operator: Vec::new(),
             command: Some(OperatorCommandBody::Sql(SqlQuery {
                 sql: "SELECT pid FROM processes LIMIT 5".into(),
                 fanout: false,

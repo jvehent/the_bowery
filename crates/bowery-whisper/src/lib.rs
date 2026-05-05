@@ -9,6 +9,7 @@
 
 mod envelope;
 pub mod fingerprint;
+pub mod forwarding;
 pub mod known_neighbors;
 pub mod qa;
 mod replay;

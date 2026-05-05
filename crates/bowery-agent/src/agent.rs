@@ -399,7 +399,6 @@ impl Agent {
             endpoint: endpoint.clone(),
             known_neighbors: known_neighbors.clone(),
             peers_watcher: mesh.peers_watcher(),
-            resolver: resolver.clone(),
         });
         // Bonus tables (Phase-9 slice 8) — Bowery-internal state
         // exposed as SQL views. Each table holds an Arc to its
@@ -734,10 +733,6 @@ pub(crate) struct RelayContext {
     pub endpoint: BoweryEndpoint,
     pub known_neighbors: Arc<KnownNeighbors>,
     pub peers_watcher: watch::Receiver<Vec<PeerInfo>>,
-    /// Resolver used to verify peers' response envelopes. The
-    /// composite resolver covers both pinned peers (via
-    /// `KnownNeighbors`) and configured operators.
-    pub resolver: ResolverArc,
 }
 
 impl std::fmt::Debug for RelayContext {
@@ -836,9 +831,19 @@ async fn handle_connection(
                         }
                     }
                     Some(Body::OperatorCommand(c)) => {
-                        // Same operator-only gate as Subscribe — peers
-                        // mustn't be able to issue operator commands.
-                        if operators.resolve(&env.sender).is_none() {
+                        // Two acceptable callers (Phase-9 final-1):
+                        //   1. The envelope sender is a configured
+                        //      operator (direct-dial path).
+                        //   2. The envelope sender is a pinned peer
+                        //      AND `forwarded_from_operator` carries
+                        //      a delegation we can verify against
+                        //      `[operators]` further inside
+                        //      `respond_to_operator_command`. F-2
+                        //      closure — peers no longer need the
+                        //      relay listed in `[operators]`.
+                        let is_direct_operator = operators.resolve(&env.sender).is_some();
+                        let is_relay_forward = !c.forwarded_from_operator.is_empty();
+                        if !is_direct_operator && !is_relay_forward {
                             warn!(
                                 sender = %env.sender,
                                 "rejecting OperatorCommand from non-operator sender"
@@ -851,6 +856,7 @@ async fn handle_connection(
                             env.sender,
                             c,
                             &op_router,
+                            &operators,
                             &events_tx,
                         )
                         .await
@@ -967,12 +973,14 @@ async fn respond_to_subscribe(
 /// New commands are added by extending the match — never by
 /// smuggling free-form strings, so each command's surface stays
 /// visible at code-review time.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // wiring kept explicit
 async fn respond_to_operator_command(
     conn: &BoweryConnection,
     sealer: Arc<Sealer>,
-    operator: Fingerprint,
+    sender: Fingerprint,
     cmd: bowery_proto::OperatorCommand,
     op_router: &OperatorCommandRouter,
+    operators: &Arc<StaticResolver>,
     events_tx: &broadcast::Sender<AgentEvent>,
 ) -> Result<(), bowery_whisper::transport::Error> {
     use bowery_proto::{
@@ -985,6 +993,68 @@ async fn respond_to_operator_command(
         Some(OperatorCommandBody::Sql(_)) => "sql",
         None => "<empty>",
     };
+
+    // Phase-9 final-1: resolve the *effective* operator. Two cases:
+    //
+    // 1. Direct operator dial: envelope sender is in [operators];
+    //    forwarded_from_operator may be set or empty (the operator
+    //    pre-signs an authorisation when it wants the relay to fan
+    //    out). The effective operator is the envelope sender; the
+    //    authorisation field is parsed only to validate it.
+    //
+    // 2. Relay-forwarded: envelope sender is a pinned peer (NOT in
+    //    [operators]) and forwarded_from_operator MUST be set. We
+    //    verify the operator's signature, recompute the
+    //    command_digest, and use the operator_fp from the
+    //    authorisation as the effective operator. Sealed responses
+    //    flow back to that operator, not to the relay.
+    let is_direct_operator = operators.resolve(&sender).is_some();
+    let operator = match resolve_effective_operator(&cmd, &request_id, operators, sender) {
+        Ok(fp) => fp,
+        Err(reason) => {
+            warn!(
+                sender = %sender,
+                request_id = %request_id,
+                reason,
+                "rejecting OperatorCommand: forwarded_from_operator failed verification"
+            );
+            return send_sql_error(
+                conn,
+                &sealer,
+                &sender,
+                &request_id,
+                "forwarding_invalid",
+                reason,
+            )
+            .await;
+        }
+    };
+
+    // Cycle prevention: only the originally-dialled relay (which
+    // received the command directly from a configured operator)
+    // may fan out. A relay-forwarded command (i.e. one whose
+    // envelope sender is NOT in [operators]) requesting further
+    // fanout is rejected — that's a malicious relay trying to
+    // multi-hop amplify.
+    if !is_direct_operator
+        && let Some(OperatorCommandBody::Sql(q)) = &cmd.command
+        && q.fanout
+    {
+        warn!(
+            sender = %sender,
+            request_id = %request_id,
+            "rejecting forwarded SqlQuery with fanout=true (cycle prevention)"
+        );
+        return send_sql_error(
+            conn,
+            &sealer,
+            &sender,
+            &request_id,
+            "policy_denied",
+            "forwarded SqlQuery may not request fanout (one-hop cap)",
+        )
+        .await;
+    }
     // Clamp the operator's requested timeout to our configured cap.
     // The operator can ask for less; they can't ask for more.
     let requested = Duration::from_millis(u64::from(cmd.timeout_ms));
@@ -1019,6 +1089,7 @@ async fn respond_to_operator_command(
             &q.sql,
             q.fanout,
             &q.peers,
+            &cmd.forwarded_from_operator,
             relay.as_ref(),
             effective_timeout,
         )
@@ -1107,6 +1178,7 @@ async fn stream_sql_response(
     sql: &str,
     fanout: bool,
     peer_filter: &[Vec<u8>],
+    forwarded_authorization: &[u8],
     relay: Option<&Arc<RelayContext>>,
     timeout: Duration,
 ) -> Result<(), bowery_whisper::transport::Error> {
@@ -1145,14 +1217,16 @@ async fn stream_sql_response(
         .map(|r| r.columns.iter().map(|(name, _)| name.clone()).collect())
         .unwrap_or_default();
 
-    // For fan-out, populate agent_fp so the operator can attribute
-    // rows. For single-agent mode, leave it empty — the operator
-    // already knows whom they dialled.
-    let agent_fp_bytes = if fanout {
-        self_fp.as_bytes().to_vec()
-    } else {
-        Vec::new()
-    };
+    // Always populate `agent_fp = self_fp`. With Phase-9 final-1
+    // e2e signing, peer chunks are sealed for the operator
+    // directly, so the operator can also recover attribution
+    // from `envelope.sender` and is encouraged to cross-check.
+    // We still set the chunk-level field so:
+    //   - the operator-side decoder doesn't have to plumb
+    //     envelope.sender into the chunk struct, and
+    //   - tests + CLI can render attribution without a
+    //     verifier-roundtrip.
+    let agent_fp_bytes = self_fp.as_bytes().to_vec();
 
     if rows.is_empty() {
         let chunk = SqlChunk {
@@ -1199,6 +1273,7 @@ async fn stream_sql_response(
             request_id,
             sql,
             peer_filter,
+            forwarded_authorization,
             relay,
             timeout,
         )
@@ -1267,6 +1342,7 @@ async fn relay_to_peers(
     request_id: &str,
     sql: &str,
     peer_filter: &[Vec<u8>],
+    forwarded_authorization: &[u8],
     relay: &Arc<RelayContext>,
     timeout: Duration,
 ) -> Result<(), bowery_whisper::transport::Error> {
@@ -1302,109 +1378,112 @@ async fn relay_to_peers(
     }
 
     // Spawn one task per peer onto a JoinSet so we can abort the
-    // whole batch if the operator disconnects. SECURITY-AUDIT-PHASE9
-    // F-16: previously bare `tokio::spawn` left peer tasks running
-    // long after the operator dropped the connection — each kept
-    // dialing its peer + reading the full response stream. With a
-    // JoinSet, the `abort_all()` on drop (or on the first
-    // operator-side send failure) terminates them at the next .await
-    // point.
-    let (chunk_tx, mut chunk_rx) =
-        mpsc::channel::<(Fingerprint, Result<SqlChunk, OperatorError>)>(64);
+    // whole batch if the operator disconnects (SECURITY-AUDIT-PHASE9
+    // F-16). The channel now carries opaque envelope **bytes** —
+    // peers seal `SqlChunk` directly for the operator (Phase-9
+    // final-1 / F-1), so the relay forwards them verbatim.
+    let (bytes_tx, mut bytes_rx) =
+        mpsc::channel::<(Fingerprint, Result<Vec<u8>, OperatorError>)>(64);
     let per_peer_timeout = timeout;
     let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     for peer in peers {
-        let chunk_tx = chunk_tx.clone();
+        let bytes_tx = bytes_tx.clone();
         let endpoint = relay.endpoint.clone();
         let kn = relay.known_neighbors.clone();
-        let resolver = relay.resolver.clone();
         let sealer_clone = sealer.clone();
         let sql = sql.to_string();
         let request_id = request_id.to_string();
+        let auth = forwarded_authorization.to_vec();
         join_set.spawn(async move {
             run_peer_query(
                 endpoint,
                 kn,
-                resolver,
                 &sealer_clone,
                 peer,
+                auth,
                 &sql,
                 &request_id,
                 per_peer_timeout,
-                chunk_tx,
+                bytes_tx,
             )
             .await;
         });
     }
-    drop(chunk_tx); // close the channel so chunk_rx ends when all peers finish
+    drop(bytes_tx); // close the channel so bytes_rx ends when all peers finish
 
-    // Drain peer chunks; rewrite agent_fp; forward to operator.
-    // On per-peer error, synthesise a terminal chunk so the operator
-    // still sees the EOF. If the operator-side send fails (the
-    // operator dropped the connection), abort every peer task —
-    // they'd otherwise keep dialing peers and reading their
-    // responses with nowhere to send them.
+    // Drain peer envelope bytes; forward verbatim to operator. On
+    // per-peer error, synthesise a relay-signed terminal chunk so
+    // the operator still sees the EOF. If the operator-side send
+    // fails (operator dropped), abort every peer task.
     let drain_outcome: Result<(), bowery_whisper::transport::Error> = async {
-        while let Some((peer_fp, outcome)) = chunk_rx.recv().await {
-            let chunk = match outcome {
-                Ok(mut c) => {
-                    c.agent_fp = peer_fp.as_bytes().to_vec();
-                    c
-                }
-                Err(_) => SqlChunk {
+        while let Some((peer_fp, outcome)) = bytes_rx.recv().await {
+            if let Ok(bytes) = outcome {
+                // Peer sealed this for the operator's fp; the
+                // operator's verifier will check it. We just
+                // ship the bytes through.
+                conn.send_envelope(&bytes).await?;
+            } else {
+                // Synthesise a relay-signed terminal chunk for
+                // the failed peer. agent_fp is informational;
+                // the operator can detect "this came from the
+                // relay, not the peer" because the envelope is
+                // signed by the relay rather than the peer.
+                let chunk = SqlChunk {
                     columns: Vec::new(),
                     rows: Vec::new(),
                     end: true,
                     agent_fp: peer_fp.as_bytes().to_vec(),
-                },
-            };
-            send_chunk(conn, sealer, &operator, request_id, chunk).await?;
+                };
+                send_chunk(conn, sealer, &operator, request_id, chunk).await?;
+            }
         }
         Ok(())
     }
     .await;
 
-    // Always tear down spawned peer tasks. Three regimes:
-    //   - drain finished cleanly → abort_all is a no-op (tasks are
-    //     done since chunk_rx ended).
-    //   - send_chunk failed mid-drain → abort the in-flight peer
-    //     tasks so they don't keep working on a dead connection.
-    //   - this future itself is dropped (e.g. parent task cancelled)
-    //     → JoinSet's Drop impl calls abort_all automatically.
     join_set.abort_all();
     while join_set.join_next().await.is_some() {}
     drain_outcome
 }
 
-/// One peer's leg of the fan-out. Dials the peer, sends a
-/// `SqlQuery { fanout: false }`, reads chunks back, and forwards
-/// them through `chunk_tx`. Errors collapse to a single
-/// `OperatorError` enqueued on the channel so the multiplexer can
-/// emit a synthetic EOF.
+/// One peer's leg of the fan-out. Dials the peer, sends an
+/// `OperatorCommand { forwarded_from_operator, … }`, reads
+/// **opaque** envelope bytes back, and forwards them through
+/// `chunk_tx`. Each envelope is sealed by the peer for the
+/// *original operator's* fingerprint, so the relay cannot
+/// verify the signature — only operator-side verification can.
+/// The relay still peeks into the inner `WhisperPayload`
+/// (plaintext per Phase-1a wire format) to detect end-of-stream
+/// per peer.
+///
+/// On dial / send failure, an `OperatorError` is enqueued so the
+/// multiplexer can emit a synthetic EOF chunk to the operator
+/// (sealed by the relay — operators see a labelled "this peer
+/// failed" rather than silence).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_peer_query(
     endpoint: BoweryEndpoint,
     kn: Arc<KnownNeighbors>,
-    resolver: ResolverArc,
     sealer: &Arc<Sealer>,
     peer: PeerInfo,
+    forwarded_authorization: Vec<u8>,
     sql: &str,
     request_id: &str,
     timeout: Duration,
-    chunk_tx: mpsc::Sender<(
-        Fingerprint,
-        Result<bowery_proto::SqlChunk, bowery_proto::OperatorError>,
-    )>,
+    bytes_tx: mpsc::Sender<(Fingerprint, Result<Vec<u8>, bowery_proto::OperatorError>)>,
 ) {
     use bowery_proto::{
         Body, OperatorCommand, OperatorCommandBody, OperatorError, OperatorResultBody, SqlQuery,
+        WhisperEnvelope,
     };
+    use prost::Message as _;
 
     let peer_fp = peer.fingerprint;
     let cmd = OperatorCommand {
         request_id: request_id.to_string(),
         timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+        forwarded_from_operator: forwarded_authorization,
         command: Some(OperatorCommandBody::Sql(SqlQuery {
             sql: sql.to_string(),
             fanout: false, // cycle prevention
@@ -1418,7 +1497,7 @@ async fn run_peer_query(
         Ok(c) => c,
         Err(e) => {
             warn!(peer = %peer_fp, error = %e, "fanout dial failed");
-            let _ = chunk_tx
+            let _ = bytes_tx
                 .send((
                     peer_fp,
                     Err(OperatorError {
@@ -1432,7 +1511,7 @@ async fn run_peer_query(
     };
     if let Err(e) = conn.send_envelope(&outbound).await {
         warn!(peer = %peer_fp, error = %e, "fanout send failed");
-        let _ = chunk_tx
+        let _ = bytes_tx
             .send((
                 peer_fp,
                 Err(OperatorError {
@@ -1444,58 +1523,52 @@ async fn run_peer_query(
         return;
     }
 
-    let envelope_verifier = Verifier::new(resolver, sealer.fingerprint());
     let exchange = async {
         loop {
             let bytes = conn
                 .recv_envelope()
                 .await
                 .map_err(|e| format!("recv: {e}"))?;
-            let opened = envelope_verifier
-                .open(&bytes)
-                .map_err(|e| format!("verify: {e}"))?;
-            let result = match opened.payload.body {
-                Some(Body::OperatorResult(r)) => r,
-                other => return Err(format!("unexpected body: {other:?}")),
-            };
-            if result.request_id != request_id {
+            // Peek at the envelope just enough to (a) verify the
+            // sender claim and (b) detect end-of-stream. The
+            // signature is *not* verified here — it's sealed for
+            // the original operator, not the relay. Operator-side
+            // verification is the authoritative integrity check.
+            let env = WhisperEnvelope::decode(bytes.as_slice())
+                .map_err(|e| format!("envelope decode: {e}"))?;
+            if env.sender_fingerprint.as_slice() != peer_fp.as_bytes().as_slice() {
                 return Err(format!(
-                    "request_id mismatch: got {:?}, want {:?}",
-                    result.request_id, request_id
+                    "envelope sender mismatch: peer {peer_fp} responded with sender_fingerprint {:x?}",
+                    env.sender_fingerprint
                 ));
             }
-            match result.result {
-                Some(OperatorResultBody::SqlChunk(chunk)) => {
-                    let end = chunk.end;
-                    if chunk_tx.send((peer_fp, Ok(chunk))).await.is_err() {
-                        return Ok(());
-                    }
-                    if end {
-                        return Ok(());
-                    }
-                }
-                Some(OperatorResultBody::Error(e)) => {
-                    let _ = chunk_tx.send((peer_fp, Err(e))).await;
-                    return Ok(());
-                }
-                Some(other) => return Err(format!("unexpected result body: {other:?}")),
-                None => return Err("OperatorResult with no body".to_string()),
+            let payload = WhisperPayload::decode(env.payload.as_slice())
+                .map_err(|e| format!("payload decode: {e}"))?;
+            let is_end_of_stream = matches!(
+                &payload.body,
+                Some(Body::OperatorResult(r))
+                    if matches!(
+                        &r.result,
+                        Some(OperatorResultBody::SqlChunk(c)) if c.end
+                    ) || matches!(&r.result, Some(OperatorResultBody::Error(_)))
+            );
+            if bytes_tx.send((peer_fp, Ok(bytes))).await.is_err() {
+                return Ok(());
+            }
+            if is_end_of_stream {
+                return Ok(());
             }
         }
     };
-    let outcome = tokio::time::timeout(timeout + Duration::from_secs(2), exchange).await;
+    let outcome: Result<Result<(), String>, tokio::time::error::Elapsed> =
+        tokio::time::timeout(timeout + Duration::from_secs(2), exchange).await;
     if let Err(_) | Ok(Err(_)) = outcome {
-        let kind = match &outcome {
-            Err(_) => "timeout",
-            Ok(Err(_)) => "peer_error",
+        let (kind, message) = match outcome {
+            Err(_) => ("timeout", format!("peer {peer_fp} timed out")),
+            Ok(Err(e)) => ("peer_error", e),
             _ => unreachable!(),
         };
-        let message = match outcome {
-            Err(_) => format!("peer {peer_fp} timed out"),
-            Ok(Err(e)) => e,
-            _ => unreachable!(),
-        };
-        let _ = chunk_tx
+        let _ = bytes_tx
             .send((
                 peer_fp,
                 Err(OperatorError {
@@ -1505,6 +1578,94 @@ async fn run_peer_query(
             ))
             .await;
     }
+}
+
+/// Phase-9 final-1: resolve the effective operator for an
+/// `OperatorCommand`. Returns either the envelope sender (for
+/// direct operator dials) or the operator embedded in a verified
+/// `forwarded_from_operator` authorisation. Errors back-propagate
+/// as `&'static str` reasons so the caller can surface them in a
+/// structured `OperatorError`.
+fn resolve_effective_operator(
+    cmd: &bowery_proto::OperatorCommand,
+    request_id: &str,
+    operators: &Arc<StaticResolver>,
+    sender: Fingerprint,
+) -> Result<Fingerprint, &'static str> {
+    use prost::Message as _;
+
+    if cmd.forwarded_from_operator.is_empty() {
+        return Ok(sender);
+    }
+    let auth = bowery_proto::OperatorAuthorization::decode(cmd.forwarded_from_operator.as_slice())
+        .map_err(|_| "forwarded_from_operator decode failed")?;
+    if auth.operator_fp.len() != 32 {
+        return Err("forwarded_from_operator: bad operator_fp length");
+    }
+    if auth.command_digest.len() != 32 {
+        return Err("forwarded_from_operator: bad command_digest length");
+    }
+    if auth.signature.len() != 64 {
+        return Err("forwarded_from_operator: bad signature length");
+    }
+    if auth.request_id != request_id {
+        return Err("forwarded_from_operator: request_id mismatch");
+    }
+    let mut operator_fp_arr = [0u8; 32];
+    operator_fp_arr.copy_from_slice(&auth.operator_fp);
+    let operator_fp = Fingerprint::from_bytes(operator_fp_arr);
+
+    // Operator must be in [operators] to authorise a query.
+    let Some(vk) = operators.resolve(&operator_fp) else {
+        return Err("forwarded_from_operator: operator not in [operators]");
+    };
+
+    // Bind authorisation to the actual command we're about to run:
+    // peer recomputes SHA-256 of the encoded OperatorCommandBody and
+    // compares against the digest signed by the operator. A relay
+    // can't substitute a different SQL string under an authorisation
+    // issued for some other query.
+    let body = cmd
+        .command
+        .as_ref()
+        .ok_or("forwarded_from_operator: empty command")?;
+    let actual_digest = command_body_digest(body);
+    if actual_digest.as_slice() != auth.command_digest.as_slice() {
+        return Err("forwarded_from_operator: command_digest mismatch");
+    }
+
+    // ts_unix_ms skew check: same window envelopes use (5 minutes).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let skew = now.abs_diff(auth.ts_unix_ms);
+    if skew > 5 * 60 * 1000 {
+        return Err("forwarded_from_operator: ts_unix_ms outside skew window");
+    }
+
+    let mut digest_arr = [0u8; 32];
+    digest_arr.copy_from_slice(&auth.command_digest);
+    let signing_input = bowery_proto::OperatorAuthorization::signing_input(
+        &operator_fp_arr,
+        auth.ts_unix_ms,
+        &auth.request_id,
+        &digest_arr,
+    );
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&auth.signature);
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    if vk.verify_strict(&signing_input, &sig).is_err() {
+        return Err("forwarded_from_operator: signature verification failed");
+    }
+    Ok(operator_fp)
+}
+
+/// SHA-256 of a *normalised* `OperatorCommandBody`. Delegates
+/// to [`bowery_whisper::forwarding::command_body_digest`] so
+/// peer + operator + relay all agree on the same hash; see that
+/// function's doc-comment for the normalisation rules.
+fn command_body_digest(body: &bowery_proto::OperatorCommandBody) -> [u8; 32] {
+    bowery_whisper::forwarding::command_body_digest(body)
 }
 
 fn encode_row(row: &bowery_sql::Row) -> bowery_proto::SqlRow {

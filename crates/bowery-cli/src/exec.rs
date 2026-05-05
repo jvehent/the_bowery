@@ -81,6 +81,7 @@ pub(crate) async fn sysquery(
     let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
 
     let cmd = OperatorCommand {
+        forwarded_from_operator: Vec::new(),
         request_id: request_id.clone(),
         timeout_ms,
         command: Some(OperatorCommandBody::Sysquery(SysqueryQuery { sql })),
@@ -151,6 +152,7 @@ pub(crate) async fn sql(
     target_addr: SocketAddr,
     target_fp_hex: String,
     target_pubkey_b64: String,
+    peer_pubkeys_b64: Vec<String>,
     sql: String,
     timeout: Duration,
     fanout: bool,
@@ -168,6 +170,17 @@ pub(crate) async fn sql(
     if inserted_fp != target_fp {
         bail!("target_pubkey_b64 fingerprint {inserted_fp} doesn't match --agent-fp {target_fp}");
     }
+    // Phase-9 final-1: with fanout=true, peers seal their chunks
+    // directly for us; we need each peer's pubkey to verify them.
+    // Pre-load the resolver with every operator-supplied peer
+    // pubkey. Peers whose pubkey isn't here will surface as
+    // `BadSignature` envelope-verify errors — visible failure
+    // mode rather than silent drop.
+    for b64 in &peer_pubkeys_b64 {
+        let vk = parse_verifying_key(b64)
+            .with_context(|| format!("parsing --peer-pubkey-b64 {b64:?}"))?;
+        resolver.insert(vk);
+    }
     let resolver = Arc::new(resolver);
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -176,7 +189,7 @@ pub(crate) async fn sql(
         .context("binding operator-side endpoint")?;
 
     let operator_fp = identity.fingerprint();
-    let sealer = Sealer::new(identity);
+    let sealer = Sealer::new(identity.clone());
     let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
 
     let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), target_fp));
@@ -188,14 +201,27 @@ pub(crate) async fn sql(
     let request_id = format!("op-{}", current_unix_ms());
     let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
 
+    // Phase-9 final-1: when fanout is requested, sign an
+    // OperatorAuthorization that the relay can forward to peers.
+    // The peer verifies the operator's signature against its
+    // [operators] set — no relay-as-operator trust required.
+    let body = OperatorCommandBody::Sql(SqlQuery {
+        sql,
+        fanout,
+        peers: Vec::new(),
+    });
+    let forwarded = if fanout {
+        let auth =
+            bowery_whisper::forwarding::sign_operator_authorization(&identity, &request_id, &body);
+        prost::Message::encode_to_vec(&auth)
+    } else {
+        Vec::new()
+    };
     let cmd = OperatorCommand {
+        forwarded_from_operator: forwarded,
         request_id: request_id.clone(),
         timeout_ms,
-        command: Some(OperatorCommandBody::Sql(SqlQuery {
-            sql,
-            fanout,
-            peers: Vec::new(),
-        })),
+        command: Some(body),
     };
     let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
 

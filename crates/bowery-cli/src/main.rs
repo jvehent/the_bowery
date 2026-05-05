@@ -128,8 +128,22 @@ enum ExecCommand {
         /// agent's fingerprint (extra `_agent_fp` column in
         /// output). Without this flag, only the directly-dialled
         /// agent runs the query.
+        ///
+        /// Phase-9 final-1: with fanout=true, each peer seals its
+        /// `SqlChunk` envelopes for the operator directly, so the
+        /// operator must know the peer's pubkey to verify the
+        /// signature. Pass `--peer-pubkey-b64 <base64>` once per
+        /// peer you expect to respond. Peers whose pubkey isn't
+        /// supplied will surface as `BadSignature` rejections.
         #[arg(long)]
         fanout: bool,
+        /// Base64-encoded Ed25519 verifying key of a peer that may
+        /// respond to a fan-out query. Repeat for each peer you
+        /// trust; the operator-side verifier registers all of
+        /// them in its resolver. Ignored unless `--fanout` is
+        /// set.
+        #[arg(long = "peer-pubkey-b64")]
+        peer_pubkeys_b64: Vec<String>,
         /// Output format. `tsv` (default) streams one row per
         /// line, tab-separated. `json` streams one object per
         /// line preceded by a column-name array. `table` buffers
@@ -430,6 +444,7 @@ impl Cli {
                         sql,
                         timeout,
                         fanout,
+                        peer_pubkeys_b64,
                         format,
                     },
             } => {
@@ -447,6 +462,7 @@ impl Cli {
                     agent_addr,
                     agent_fp,
                     agent_pubkey_b64,
+                    peer_pubkeys_b64,
                     sql,
                     timeout,
                     fanout,
