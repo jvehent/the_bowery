@@ -248,9 +248,20 @@ impl<R: FingerprintResolver> Verifier<R> {
             });
         }
 
+        // Recover from a poisoned mutex rather than panic. The replay
+        // guard's per-sender bitmap+highest state is monotone (forward
+        // jumps clear bits, in-window holes are set-once), so even if a
+        // previous holder panicked mid-update, the inner state is still
+        // a valid prefix of the intended one — at worst we accept one
+        // duplicate from an in-flight nonce. Panicking here would let a
+        // single thread crash bring down the whole whisper layer for
+        // every connected peer.
         self.replay
             .lock()
-            .expect("replay guard poisoned")
+            .unwrap_or_else(|poison| {
+                tracing::error!("replay guard mutex was poisoned; recovering");
+                poison.into_inner()
+            })
             .check_and_record(sender, env.nonce)?;
 
         let payload =
