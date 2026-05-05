@@ -262,17 +262,25 @@ Build:
 
 At runtime the agent looks for the object in this order:
 
-1. `$BOWERY_BPF_OBJ_PATH` (env var)
-2. `/usr/local/lib/bowery/bowery-ebpf`
-3. `/usr/lib/bowery/bowery-ebpf`
-4. `crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf`
-   (handy when running from a workspace checkout)
+1. `/usr/local/lib/bowery/bowery-ebpf`
+2. `/usr/lib/bowery/bowery-ebpf`
+3. `$BOWERY_BPF_OBJ_PATH` (env var) — only honored when
+   `BOWERY_BPF_DEV_MODE=1` is also set; production agents reject the
+   override.
+
+Each candidate path is integrity-checked (Phase-8 H8) and rejected
+unless: it exists as a regular file (not a symlink), is owned by
+uid 0, and has mode `0o644` or stricter (no group/world write).
+The cwd-relative dev fallback was removed — `xtest run-agent` sets
+both `BOWERY_BPF_DEV_MODE` and `BOWERY_BPF_OBJ_PATH` so the
+in-tree build still works for development.
 
 For production install:
 
 ```sh
 sudo install -d -m 0755 /usr/local/lib/bowery
-sudo install -m 0644 crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf \
+sudo install -m 0644 -o root -g root \
+    crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf \
     /usr/local/lib/bowery/bowery-ebpf
 ```
 
@@ -316,7 +324,8 @@ path = "/var/lib/bowery/identity.key"
 
 [known_neighbors]
 path             = "/var/lib/bowery/known_neighbors.json"
-bootstrap_window = "7d"
+bootstrap_window = "2h"
+max_pinned_peers = 1024
 
 [mesh]
 listen_addr = "0.0.0.0:9901"
@@ -384,9 +393,14 @@ threshold = 0.7     # suspicion at which a verdict becomes an Alert
   they share a network.
 - `[known_neighbors] bootstrap_window`: during this window, every peer
   the mesh discovers is auto-pinned. After it closes, only operator-signed
-  add-neighbor messages can extend the pin set (Phase 5+). Pick a window
-  that comfortably exceeds the time it takes to roll out the agent across
-  the fleet — 7 days is a conservative default.
+  add-neighbor messages can extend the pin set (Phase 5+). The default is
+  **2 hours** post Phase-8 hardening (was 7 days) — short enough that
+  bootstrap is a deliberate operator activity, long enough for fleet
+  rollouts. Lengthen it temporarily for staged deployments; do not set
+  it back to multi-day defaults in production.
+- `[known_neighbors] max_pinned_peers`: hard cap on the pin set (default
+  1024). Defends against chitchat-mesh-flood attacks that race-publish
+  synthetic identities during the bootstrap window.
 
 ### Identity key
 

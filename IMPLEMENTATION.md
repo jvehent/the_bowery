@@ -6,9 +6,10 @@ how those decisions land in code, the patterns we reach for, and the
 specific tradeoffs taken at each layer. If you're new to the project,
 read [README.md](README.md) first for orientation, then this for depth.
 
-This document tracks Phase 0 → 7, which is everything currently
-implemented. Phase 6b (operator command issuance) and Phase 8
-(hardening) sections will be added when those phases land.
+This document tracks Phase 0 → 8, which is everything currently
+implemented. Phase 6b (operator command issuance) and Phase 9
+(deferred Tier-2 follow-ups: race-free pidfd kill + LSM
+inode-keyed blocking) sections will be added when those land.
 
 ## Contents
 
@@ -31,6 +32,7 @@ implemented. Phase 6b (operator command issuance) and Phase 8
 17. [Build and test infrastructure](#17-build-and-test-infrastructure)
 18. [Patterns we keep using](#18-patterns-we-keep-using)
 19. [What we explicitly don't do](#19-what-we-explicitly-dont-do)
+20. [Phase 8 hardening](#20-phase-8-hardening)
 
 ---
 
@@ -347,10 +349,10 @@ signature.
 ### 5.3 Signing input
 
 ```text
-domain ‖ sender_fingerprint ‖ nonce_be ‖ ts_be ‖ payload_bytes
+domain ‖ recipient_fingerprint ‖ sender_fingerprint ‖ nonce_be ‖ ts_be ‖ payload_bytes
 ```
 
-Domain prefix `b"bowery/whisper/envelope/v1"` ([`CANONICAL_SIG_DOMAIN`](crates/bowery-proto/src/lib.rs))
+Domain prefix `b"bowery/whisper/envelope/v2"` ([`CANONICAL_SIG_DOMAIN`](crates/bowery-proto/src/lib.rs))
 is the standard Ed25519 domain separation trick: if our keys are ever
 loaded into another protocol, that protocol's signature inputs won't
 collide with ours.
@@ -358,6 +360,18 @@ collide with ours.
 The big-endian fixed-width encoding makes the canonical string
 unambiguous regardless of endianness. We include both nonce and ts so
 neither one can be tampered with.
+
+`recipient_fingerprint` was added in Phase-8 (H1) to defend against
+cross-recipient replay: an envelope captured from Alice→Bob can no
+longer be replayed against Carol within the 5-min skew window, even
+though both Bob and Carol pin Alice. The recipient_fp is **not** on
+the wire — each receiver supplies its own self-fp when computing the
+canonical input. A signature for Bob therefore cannot verify under
+Carol's input. The Sealer takes recipient_fp per
+`seal_for(recipient, payload)` call; the Verifier takes self_fp at
+construction. Domain bumped from `v1` → `v2` so any pre-fix peer
+fails loudly with `BadSignature` rather than confusing the operator
+with a "not pinned" error.
 
 ### 5.4 Verifier checks
 
@@ -621,10 +635,18 @@ the agent will fall back to NoopEventSource if the BPF source exits.
 
 The agent looks for the BPF object in this order:
 
-1. `BOWERY_BPF_OBJ_PATH` env var
-2. `/usr/local/lib/bowery/bowery-ebpf`
-3. `/usr/lib/bowery/bowery-ebpf`
-4. `crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf` (in-tree dev)
+1. `/usr/local/lib/bowery/bowery-ebpf`
+2. `/usr/lib/bowery/bowery-ebpf`
+3. `BOWERY_BPF_OBJ_PATH` env var — only when `BOWERY_BPF_DEV_MODE=1`
+   is also set (Phase-8 H8). Production agents reject the override.
+
+Each candidate is integrity-checked at load: must exist as a
+regular file (no symlinks; `symlink_metadata`, not `metadata`),
+owned by uid 0, mode `0o644` or stricter. Anything failing those
+checks returns `LoaderError::InsecureObject` and the agent falls
+back to `NoopEventSource`. The cwd-relative dev fallback is gone —
+`xtest run-agent` sets both env vars so in-tree development still
+works.
 
 Missing → `NoopEventSource` and a WARN log. The agent keeps running;
 mesh + heartbeat + Q&A still work, the pipeline is just idle.
@@ -1792,6 +1814,54 @@ A few approaches we've ruled out, with reasoning:
   `AgentEvent` broadcast for structured events. Metrics (Prometheus,
   StatsD) and distributed tracing are deferred until there's a real
   ops story for a deployed fleet.
+
+## 20. Phase 8 hardening
+
+A security audit on 2026-05-04 produced 1 critical / 14 high /
+~25 medium findings across the stack. The fixes shipped in two
+tiers as 13 logical commits; this section is a map of what landed
+where, so readers don't have to grep `git log` to find the security
+posture as of v0.1.
+
+### 20.1 Tier 1 — fail-shut wins, immediate impact
+
+| Finding | Fix | Files |
+|---|---|---|
+| **C1+H13 prompt injection** via `argv` / `exe_path` / `comm` / rule reasons | `sanitise(s, max_len)` neutralises chatml token leadins (`<|...|>` → zero-width-space split), replaces control chars with visible glyphs, truncates per-field at safe caps. | [`bowery-llm/src/prompt.rs`](crates/bowery-llm/src/prompt.rs) |
+| **H2 Ed25519 lenient verify** at three call sites | Switched to `verify_strict` (RFC 8032 §5.1.7); added a malleability-test that constructs `s' = s + L`. | [`bowery-whisper/src/envelope.rs`](crates/bowery-whisper/src/envelope.rs), [`bowery-crypto/src/lib.rs`](crates/bowery-crypto/src/lib.rs), [`bowery-response/src/audit.rs`](crates/bowery-response/src/audit.rs) |
+| **H3 mutex panic on poison** | `unwrap_or_else(into_inner)` recovery + `tracing::error!`. The replay-guard's bitmap is monotone, so recovering yields a valid (slightly stale) state. | [`bowery-whisper/src/envelope.rs`](crates/bowery-whisper/src/envelope.rs) |
+| **M31 NaN suspicion** bypassing every threshold | `is_nan()` gate before `clamp` returns `BadResponse`; ±Inf still saturates. | [`bowery-llm/src/parse.rs`](crates/bowery-llm/src/parse.rs) |
+| **M20+M21+M22 LLM channel** correctness | Bounded mpsc to the llama worker (32 deep); `analyze` honors `LlamaCppConfig.max_tokens`; doc updated to call shedding "shed-newest" honestly. | [`bowery-llm/src/llama_cpp.rs`](crates/bowery-llm/src/llama_cpp.rs), [`bowery-llm/src/queue.rs`](crates/bowery-llm/src/queue.rs) |
+| **H10 pid-reuse / kill-init** risk | Forbidden-pid skip-list (0/1/2 + `std::process::id()`); pre-kill `/proc/<pid>/comm` cross-check refuses kills on critical-service comms. | [`bowery-response/src/process_kill.rs`](crates/bowery-response/src/process_kill.rs) |
+| **H11 BlockExec comm-spoofing** DoSing critical services | `permits_block_exec_comm` deny-list with built-in defaults (sshd, systemd, login, etc.) plus operator extensions; `BpfLsmEngine` consults it before every `block_comm`. | [`bowery-response/src/policy.rs`](crates/bowery-response/src/policy.rs), [`bowery-agent/src/response_bpf.rs`](crates/bowery-agent/src/response_bpf.rs) |
+
+### 20.2 Tier 2 — architectural changes
+
+| Finding | Fix | Files |
+|---|---|---|
+| **H4+H5 TOFU/QUIC** resource-exhaustion | Default `bootstrap_window` 7d → 2h. New `KnownNeighborsConfig.max_pinned_peers` (default 1024) with `PinOutcome::AtCapacity`. Quinn `TransportConfig` adds `max_idle_timeout=30s`, `keep_alive_interval=10s`, `max_concurrent_uni_streams=8`. `MAX_FRAME_BYTES` 1MiB → 64KiB. | [`bowery-whisper/src/transport.rs`](crates/bowery-whisper/src/transport.rs), [`bowery-whisper/src/known_neighbors.rs`](crates/bowery-whisper/src/known_neighbors.rs), [`bowery-agent/src/config.rs`](crates/bowery-agent/src/config.rs) |
+| **H7+H8 BPF map + loader** | `BLOCKED_COMMS`: `HashMap` → `LruHashMap`, capacity 256 → 4096. Loader integrity check (root-owned, mode `0o644`, no symlinks) on every candidate path. `BOWERY_BPF_OBJ_PATH` env var only honored when `BOWERY_BPF_DEV_MODE=1`. `Ebpf::load_file` wrapped in `catch_unwind`. | [`bowery-ebpf/src/main.rs`](crates/bowery-ebpf/src/main.rs), [`bowery-ebpf-loader/src/lib.rs`](crates/bowery-ebpf-loader/src/lib.rs) |
+| **H9 audit log deletion-blind** | Hash-chain via new signed fields `seq: u64` + `prev_sig_hex`. `JsonlFileSink` recovers chain state on `open()`. `bowery audit verify` detects gaps and broken links. Schema bumped 1 → 2. | [`bowery-response/src/audit.rs`](crates/bowery-response/src/audit.rs), [`bowery-cli/src/audit.rs`](crates/bowery-cli/src/audit.rs) |
+| **H1 envelope cross-recipient replay** | Signing input now includes `recipient_fp`; not on the wire, each side computes it locally. `Sealer::seal_for(recipient, payload)` and `Verifier::new(resolver, self_fp)`. Domain `v1` → `v2`. | [`bowery-proto/src/lib.rs`](crates/bowery-proto/src/lib.rs), [`bowery-whisper/src/envelope.rs`](crates/bowery-whisper/src/envelope.rs), [`bowery-whisper/src/qa.rs`](crates/bowery-whisper/src/qa.rs), [`bowery-agent/src/agent.rs`](crates/bowery-agent/src/agent.rs) |
+
+### 20.3 Deferred to Phase 9
+
+Two items the audit flagged that need bigger scope than fail-shut
+fixes:
+
+- **P9-1: race-free pidfd kill.** Tier-1 H10 closes the
+  catastrophic case; the residual race (pid recycled between
+  `/proc` snapshot and `kill(2)`) wants `pidfd_open` +
+  `pidfd_send_signal`. Needs `pid_starttime` plumbing through
+  `Action::KillProcess`.
+- **P9-2: H6 LSM keys on inode.** Today's BPF-LSM hook keys on the
+  caller's `comm`, defeated by `prctl(PR_SET_NAME)`. Tier-1+2
+  defense (critical-comm deny-list, forbidden-pid list, LRU map,
+  integrity-checked loader) blocks the catastrophic outcomes; the
+  full fix needs aya CO-RE access to `bprm->file->f_inode->i_ino`
+  and a wire-format change for the action.
+
+Tracking: `memory/project_phase9_remaining.md`.
 
 ---
 
