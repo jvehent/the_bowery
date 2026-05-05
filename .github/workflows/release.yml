@@ -184,10 +184,11 @@ jobs:
           chmod 0644 target/release/pkg/*
 
       - name: generate-rpm (agent)
-        run: cargo generate-rpm -p bowery-agent
+        # cargo-generate-rpm's `-p` is a *path*, not a package name.
+        run: cargo generate-rpm -p crates/bowery-agent
 
       - name: generate-rpm (cli)
-        run: cargo generate-rpm -p bowery-cli
+        run: cargo generate-rpm -p crates/bowery-cli
 
       - name: Upload .rpm artifacts
         uses: actions/upload-artifact@v4
