@@ -20,9 +20,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use bowery_crypto::{Fingerprint, Identity};
 use bowery_proto::{
-    Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, SqlChunk, SqlQuery,
+    Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, SqlChunk, SqlQuery, SqlRow,
     SqlValueKind, SysqueryQuery, WhisperPayload,
 };
+
+use crate::SqlFormat;
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::BoweryEndpoint;
 use bowery_whisper::{Sealer, StaticResolver, Verifier};
@@ -152,7 +154,7 @@ pub(crate) async fn sql(
     sql: String,
     timeout: Duration,
     fanout: bool,
-    json: bool,
+    format: SqlFormat,
 ) -> Result<()> {
     let identity = Arc::new(
         Identity::load(&operator_key)
@@ -198,6 +200,7 @@ pub(crate) async fn sql(
     let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
 
     let exchange_timeout = timeout + Duration::from_secs(2);
+    let mut sink = make_sink(format, fanout);
     let exchange = async {
         conn.send_envelope(&outbound)
             .await
@@ -210,7 +213,6 @@ pub(crate) async fn sql(
         // on the first `end = true`. We index column lists per
         // agent_fp so each peer's first chunk's column names
         // survive across that peer's batches.
-        let mut printed_header = false;
         let mut columns_by_agent: HashMap<Vec<u8>, Vec<String>> = HashMap::new();
         let mut last_columns: Vec<String> = Vec::new();
         loop {
@@ -248,23 +250,19 @@ pub(crate) async fn sql(
                         end,
                         agent_fp,
                     } = chunk;
-                    let columns: &Vec<String> = if !chunk_cols.is_empty() {
-                        columns_by_agent.insert(agent_fp.clone(), chunk_cols.clone());
-                        last_columns = chunk_cols;
-                        &last_columns
-                    } else if let Some(existing) = columns_by_agent.get(&agent_fp) {
-                        existing
+                    let columns: Vec<String> = if chunk_cols.is_empty() {
+                        columns_by_agent
+                            .get(&agent_fp)
+                            .cloned()
+                            .unwrap_or_else(|| last_columns.clone())
                     } else {
-                        // No columns for this peer yet (rare:
-                        // empty terminal chunk before any rows).
-                        &last_columns
+                        columns_by_agent.insert(agent_fp.clone(), chunk_cols.clone());
+                        last_columns.clone_from(&chunk_cols);
+                        chunk_cols
                     };
-                    if !printed_header && !columns.is_empty() {
-                        print_sql_header(columns, json);
-                        printed_header = true;
-                    }
+                    sink.header(&columns);
                     for row in rows {
-                        print_sql_row(columns, &row, &agent_fp, fanout, json);
+                        sink.row(&columns, &agent_fp, &row);
                     }
                     if end && !fanout {
                         return Ok::<(), anyhow::Error>(());
@@ -283,42 +281,97 @@ pub(crate) async fn sql(
     drop(conn);
     endpoint.close().await;
     match outcome {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => {
+            sink.finish();
+            Ok(())
+        }
         Ok(Err(e)) => Err(e),
         Err(_) => bail!("sql query timed out after {exchange_timeout:?}"),
     }
 }
 
-fn print_sql_header(columns: &[String], json: bool) {
-    if json {
-        // First line is a JSON array of column names so consumers
-        // can demux the rest as `{col: val}` dicts. agent_fp is
-        // emitted per row (when fan-out), not in this header — the
-        // shape is intentionally identical between single-agent
-        // and fan-out modes; the agent column appears as an extra
-        // first cell when fan-out is on.
+/// Output sink for SQL rows. Streaming sinks (`tsv`, `json`) print
+/// directly in `header`/`row`; the buffered `table` sink defers
+/// every print until `finish` so it can compute column widths.
+trait SqlSink {
+    fn header(&mut self, columns: &[String]);
+    fn row(&mut self, columns: &[String], agent_fp: &[u8], row: &SqlRow);
+    fn finish(&mut self);
+}
+
+fn make_sink(format: SqlFormat, fanout: bool) -> Box<dyn SqlSink> {
+    match format {
+        SqlFormat::Tsv => Box::new(TsvSink {
+            printed_header: false,
+            fanout,
+        }),
+        SqlFormat::Json => Box::new(JsonSink {
+            printed_header: false,
+            fanout,
+        }),
+        SqlFormat::Table => Box::new(TableSink {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            fanout,
+        }),
+    }
+}
+
+struct TsvSink {
+    printed_header: bool,
+    fanout: bool,
+}
+
+impl SqlSink for TsvSink {
+    fn header(&mut self, columns: &[String]) {
+        if self.printed_header || columns.is_empty() {
+            return;
+        }
+        let mut head: Vec<String> = Vec::with_capacity(columns.len() + usize::from(self.fanout));
+        if self.fanout {
+            head.push("_agent_fp".to_string());
+        }
+        head.extend(columns.iter().cloned());
+        println!("{}", head.join("\t"));
+        self.printed_header = true;
+    }
+
+    fn row(&mut self, _columns: &[String], agent_fp: &[u8], row: &SqlRow) {
+        let mut cells: Vec<String> =
+            Vec::with_capacity(row.values.len() + usize::from(self.fanout));
+        if self.fanout {
+            cells.push(hex_fp(agent_fp));
+        }
+        cells.extend(row.values.iter().map(value_to_text));
+        println!("{}", cells.join("\t"));
+    }
+
+    fn finish(&mut self) {}
+}
+
+struct JsonSink {
+    printed_header: bool,
+    fanout: bool,
+}
+
+impl SqlSink for JsonSink {
+    fn header(&mut self, columns: &[String]) {
+        if self.printed_header || columns.is_empty() {
+            return;
+        }
         let escaped: Vec<String> = columns
             .iter()
             .map(|c| format!("\"{}\"", escape_json_string(c)))
             .collect();
         println!("[{}]", escaped.join(","));
-    } else {
-        println!("{}", columns.join("\t"));
+        self.printed_header = true;
     }
-}
 
-fn print_sql_row(
-    columns: &[String],
-    row: &bowery_proto::SqlRow,
-    agent_fp: &[u8],
-    fanout: bool,
-    json: bool,
-) {
-    let agent_hex = hex_fp(agent_fp);
-    if json {
-        let mut parts: Vec<String> = Vec::with_capacity(row.values.len() + usize::from(fanout));
-        if fanout {
-            parts.push(format!("\"_agent_fp\":\"{agent_hex}\""));
+    fn row(&mut self, columns: &[String], agent_fp: &[u8], row: &SqlRow) {
+        let mut parts: Vec<String> =
+            Vec::with_capacity(row.values.len() + usize::from(self.fanout));
+        if self.fanout {
+            parts.push(format!("\"_agent_fp\":\"{}\"", hex_fp(agent_fp)));
         }
         for (i, v) in row.values.iter().enumerate() {
             let key = columns.get(i).map_or("", String::as_str);
@@ -329,13 +382,85 @@ fn print_sql_row(
             ));
         }
         println!("{{{}}}", parts.join(","));
-    } else {
-        let mut cells: Vec<String> = Vec::with_capacity(row.values.len() + usize::from(fanout));
-        if fanout {
-            cells.push(agent_hex);
+    }
+
+    fn finish(&mut self) {}
+}
+
+/// Buffered ASCII-table sink. Holds the full result set in memory
+/// so it can compute column widths before printing. Don't use
+/// against multi-million-row queries — the `tsv` / `json` modes
+/// stream and stay constant-memory.
+struct TableSink {
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+    fanout: bool,
+}
+
+impl SqlSink for TableSink {
+    fn header(&mut self, columns: &[String]) {
+        if !self.columns.is_empty() || columns.is_empty() {
+            return;
+        }
+        if self.fanout {
+            self.columns.push("_agent_fp".to_string());
+        }
+        self.columns.extend(columns.iter().cloned());
+    }
+
+    fn row(&mut self, _columns: &[String], agent_fp: &[u8], row: &SqlRow) {
+        let mut cells: Vec<String> =
+            Vec::with_capacity(row.values.len() + usize::from(self.fanout));
+        if self.fanout {
+            cells.push(hex_fp(agent_fp));
         }
         cells.extend(row.values.iter().map(value_to_text));
-        println!("{}", cells.join("\t"));
+        self.rows.push(cells);
+    }
+
+    fn finish(&mut self) {
+        if self.columns.is_empty() {
+            return;
+        }
+        // Compute per-column max width across header + body.
+        let mut widths: Vec<usize> = self.columns.iter().map(|c| c.chars().count()).collect();
+        for row in &self.rows {
+            for (i, cell) in row.iter().enumerate() {
+                if i < widths.len() {
+                    widths[i] = widths[i].max(cell.chars().count());
+                }
+            }
+        }
+        let pad = |s: &str, w: usize| {
+            let n = s.chars().count();
+            let pad = w.saturating_sub(n);
+            format!("{s}{}", " ".repeat(pad))
+        };
+        let sep: String = widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("-+-");
+
+        let header_row: String = self
+            .columns
+            .iter()
+            .zip(widths.iter())
+            .map(|(c, w)| pad(c, *w))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        println!("{header_row}");
+        println!("{sep}");
+        for row in &self.rows {
+            let line: String = row
+                .iter()
+                .zip(widths.iter())
+                .map(|(c, w)| pad(c, *w))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            println!("{line}");
+        }
+        println!("({} rows)", self.rows.len());
     }
 }
 

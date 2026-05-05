@@ -70,6 +70,7 @@ pub(crate) fn run() -> Report {
         check_bpffs(),
         check_lsm_cmdline(),
         check_kernel_config(),
+        check_sql_smoke(),
     ];
     let any_fail = checks.iter().any(|c| c.status == Status::Fail);
     let verdict = if any_fail {
@@ -78,6 +79,54 @@ pub(crate) fn run() -> Report {
         Verdict::Ready
     };
     Report { checks, verdict }
+}
+
+/// Phase-9 slice 8: confirm the native SQL surface is wirable —
+/// build an in-memory `bowery-sql` engine, run `SELECT 1`, and
+/// fail the check if either step errors. Catches build-time
+/// breakage (missing rusqlite features, schema regressions in
+/// `bowery-tables`, etc.) without requiring a running agent.
+fn check_sql_smoke() -> Check {
+    use std::time::Duration;
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            return Check {
+                name: "Phase-9 SQL surface",
+                status: Status::Fail,
+                detail: format!("tokio runtime build failed: {e}"),
+                fix: None,
+            };
+        }
+    };
+    let outcome = runtime.block_on(async {
+        let sql = bowery_sql::Sql::new();
+        sql.query("SELECT 1 AS one", Duration::from_secs(2)).await
+    });
+    match outcome {
+        Ok(rows) => {
+            let label = match rows.first().and_then(|r| r.columns.first()) {
+                Some((_, bowery_sql::Value::Integer(1))) => "ok",
+                _ => "ran but unexpected shape",
+            };
+            Check {
+                name: "Phase-9 SQL surface",
+                status: Status::Pass,
+                detail: format!("SELECT 1 → {label}"),
+                fix: None,
+            }
+        }
+        Err(e) => Check {
+            name: "Phase-9 SQL surface",
+            status: Status::Fail,
+            detail: format!("SELECT 1 failed: {e}"),
+            fix: Some("rebuild with `cargo build` and re-run `bowery doctor`".into()),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------

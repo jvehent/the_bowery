@@ -11,6 +11,7 @@ mod bloom_publisher;
 pub mod config;
 pub mod inbox;
 pub mod response_bpf;
+pub mod sql_tables;
 pub mod whisper_qa;
 
 pub use agent::{Agent, AgentError, AgentEvent};

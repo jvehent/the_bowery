@@ -18,6 +18,7 @@ path = "src/main.rs"
 bowery-crypto = { workspace = true }
 bowery-proto = { workspace = true }
 bowery-response = { workspace = true }
+bowery-sql = { workspace = true }
 bowery-whisper = { workspace = true }
 
 anyhow = { workspace = true }

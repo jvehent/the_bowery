@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_crypto::Identity;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 mod alerts;
 mod audit;
@@ -130,10 +130,14 @@ enum ExecCommand {
         /// agent runs the query.
         #[arg(long)]
         fanout: bool,
-        /// Emit one JSON object per row instead of a tab-separated
-        /// table. The first line is a JSON array of column names.
-        #[arg(long)]
-        json: bool,
+        /// Output format. `tsv` (default) streams one row per
+        /// line, tab-separated. `json` streams one object per
+        /// line preceded by a column-name array. `table` buffers
+        /// the full result and renders an aligned ASCII table at
+        /// the end (don't use with multi-million-row queries —
+        /// it'll OOM the operator's terminal).
+        #[arg(long, default_value_t = SqlFormat::Tsv)]
+        format: SqlFormat,
     },
     /// Run a SQL query via the agent's optional subprocess
     /// `sysquery` handler (must be enabled in the agent config and
@@ -252,6 +256,27 @@ enum AlertsCommand {
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| e.to_string())
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum SqlFormat {
+    /// Tab-separated values, one row per line. Streams.
+    Tsv,
+    /// One JSON object per row, column-name array on first line.
+    /// Streams.
+    Json,
+    /// Aligned ASCII table. Buffered — emitted on stream close.
+    Table,
+}
+
+impl std::fmt::Display for SqlFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Tsv => "tsv",
+            Self::Json => "json",
+            Self::Table => "table",
+        })
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -405,7 +430,7 @@ impl Cli {
                         sql,
                         timeout,
                         fanout,
-                        json,
+                        format,
                     },
             } => {
                 tracing_subscriber::fmt()
@@ -425,7 +450,7 @@ impl Cli {
                     sql,
                     timeout,
                     fanout,
-                    json,
+                    format,
                 ))?;
                 Ok(ExitCode::SUCCESS)
             }

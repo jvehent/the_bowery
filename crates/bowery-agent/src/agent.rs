@@ -401,9 +401,25 @@ impl Agent {
             peers_watcher: mesh.peers_watcher(),
             resolver: resolver.clone(),
         });
+        // Bonus tables (Phase-9 slice 8) — Bowery-internal state
+        // exposed as SQL views. Each table holds an Arc to its
+        // data source and re-reads on every query.
+        let sql_engine = bowery_sql::Sql::new()
+            .with_extra_table(Arc::new(crate::sql_tables::BoweryPeersTable::new(
+                known_neighbors.clone(),
+            )))
+            .with_extra_table(Arc::new(
+                crate::sql_tables::BoweryBaselineBinariesTable::new(baseline.clone()),
+            ))
+            .with_extra_table(Arc::new(crate::sql_tables::BoweryAlertsTable::new(
+                inbox.clone(),
+            )))
+            .with_extra_table(Arc::new(crate::sql_tables::BoweryAuditTable::new(
+                config.response.audit_log_path.clone(),
+            )));
         let op_router = Arc::new(OperatorCommandRouter {
             sysquery: sysquery_handle,
-            sql: Some(Arc::new(bowery_sql::Sql::new())),
+            sql: Some(Arc::new(sql_engine)),
             relay: Some(relay_ctx),
             max_timeout: config.sysquery.max_timeout,
         });

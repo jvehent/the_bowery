@@ -31,8 +31,10 @@
 
 #![warn(unreachable_pub)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use bowery_tables::BoweryTable;
 use rusqlite::Connection;
 pub use rusqlite::types::Value;
 use thiserror::Error;
@@ -72,16 +74,31 @@ pub struct Row {
 
 /// SQL engine handle. Cheap to construct; the actual connection
 /// lives only inside `query()`. Hold one per agent or per call —
-/// it makes no difference.
-#[derive(Debug, Clone, Default)]
+/// it makes no difference. `extra_tables` are registered on every
+/// connection alongside the default Phase-9 set; this is how
+/// agent-state-aware tables (`bowery_peers`, `bowery_alerts`,
+/// etc.) get plumbed in without bowery-tables having to depend
+/// on the agent crate.
+#[derive(Clone, Default)]
 pub struct Sql {
     row_cap: usize,
+    extra_tables: Vec<Arc<dyn BoweryTable>>,
+}
+
+impl std::fmt::Debug for Sql {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sql")
+            .field("row_cap", &self.row_cap)
+            .field("extra_table_count", &self.extra_tables.len())
+            .finish()
+    }
 }
 
 impl Sql {
     pub fn new() -> Self {
         Self {
             row_cap: DEFAULT_ROW_CAP,
+            extra_tables: Vec::new(),
         }
     }
 
@@ -91,12 +108,25 @@ impl Sql {
         self
     }
 
+    /// Register an additional table on every query connection.
+    /// Use this for tables whose data source needs agent-specific
+    /// state (`bowery-baseline` handle, `KnownNeighbors`, the
+    /// alert inbox, etc.) that `bowery-tables` doesn't depend on.
+    /// Order is preserved across calls but irrelevant — each table
+    /// owns its own schema.
+    #[must_use]
+    pub fn with_extra_table(mut self, table: Arc<dyn BoweryTable>) -> Self {
+        self.extra_tables.push(table);
+        self
+    }
+
     /// Run `sql` against the registered table set, capped at
     /// `timeout` wall-clock and `self.row_cap` rows.
     pub async fn query(&self, sql: &str, timeout: Duration) -> Result<Vec<Row>, SqlError> {
         let row_cap = self.row_cap;
         let sql = sql.to_string();
-        let join = tokio::task::spawn_blocking(move || run_blocking(&sql, row_cap));
+        let extras = self.extra_tables.clone();
+        let join = tokio::task::spawn_blocking(move || run_blocking(&sql, row_cap, &extras));
         match tokio::time::timeout(timeout, join).await {
             Ok(Ok(result)) => result,
             Ok(Err(_join_err)) => Err(SqlError::Cancelled),
@@ -106,10 +136,18 @@ impl Sql {
 }
 
 /// Synchronous query runner — opens a connection, registers every
-/// table, prepares + steps the user's SQL, collects rows.
-fn run_blocking(sql: &str, row_cap: usize) -> Result<Vec<Row>, SqlError> {
+/// table (default set + caller-supplied extras), prepares + steps
+/// the user's SQL, collects rows.
+fn run_blocking(
+    sql: &str,
+    row_cap: usize,
+    extras: &[Arc<dyn BoweryTable>],
+) -> Result<Vec<Row>, SqlError> {
     let conn = Connection::open_in_memory()?;
     bowery_tables::register_all(&conn)?;
+    for extra in extras {
+        extra.register(&conn)?;
+    }
     debug!(
         sql_preview = sql.chars().take(80).collect::<String>(),
         "running SQL"

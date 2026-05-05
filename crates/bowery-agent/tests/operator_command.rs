@@ -792,3 +792,138 @@ async fn wait_for_pin(
         }
     }
 }
+
+/// Phase-9 slice 8: end-to-end test that the agent's bonus
+/// `bowery_peers` table sees the relay's pinned-peer set after
+/// mutual mesh discovery. This exercises the full vertical slice:
+///
+/// 1. Two agents discover each other and pin via TOFU.
+/// 2. Operator dials `agent_alpha`, runs
+///    `SELECT fingerprint_hex FROM bowery_peers`.
+/// 3. The streaming SQL path delivers the row, and the
+///    `fingerprint_hex` matches `agent_beta`'s actual fp.
+///
+/// This is the canonical "Bowery-internal state surfaced as SQL"
+/// smoke test — the table only exists because slice 8a wired the
+/// agent's `KnownNeighbors` handle into a `BoweryTable` impl.
+#[allow(clippy::too_many_lines)] // multi-agent fixture is inherently long
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bowery_peers_table_surfaces_pinned_peers() {
+    let dir_alpha = TempDir::new().unwrap();
+    let dir_beta = TempDir::new().unwrap();
+
+    let mesh_addr_alpha = reserve_udp_port();
+    let mesh_addr_beta = reserve_udp_port();
+
+    let id_alpha = Arc::new(Identity::generate());
+    let id_beta = Arc::new(Identity::generate());
+    let operator_id = Arc::new(Identity::generate());
+    let operator_pub = BASE64.encode(operator_id.verifying_key().as_bytes());
+
+    let mut cfg_alpha = build_agent_config(
+        dir_alpha.path(),
+        mesh_addr_alpha,
+        operator_pub.clone(),
+        SysqueryConfig::default(),
+    );
+    cfg_alpha.mesh.seeds = vec![mesh_addr_beta.to_string()];
+    cfg_alpha.mesh.cluster_id = Some("bowery-bonus-test".into());
+    cfg_alpha.heartbeat.interval = Duration::from_millis(200);
+
+    let mut cfg_beta = build_agent_config(
+        dir_beta.path(),
+        mesh_addr_beta,
+        operator_pub.clone(),
+        SysqueryConfig::default(),
+    );
+    cfg_beta.mesh.seeds = vec![mesh_addr_alpha.to_string()];
+    cfg_beta.mesh.cluster_id = Some("bowery-bonus-test".into());
+    cfg_beta.heartbeat.interval = Duration::from_millis(200);
+
+    let agent_alpha = Agent::start(cfg_alpha, id_alpha.clone(), Box::new(NoopEventSource))
+        .await
+        .expect("start alpha");
+    let agent_beta = Agent::start(cfg_beta, id_beta.clone(), Box::new(NoopEventSource))
+        .await
+        .expect("start beta");
+
+    let alpha_fp = agent_alpha.fingerprint();
+    let beta_fp = agent_beta.fingerprint();
+    let alpha_addr = agent_alpha.whisper_addr().expect("alpha whisper addr");
+
+    // Wait for alpha to pin beta so bowery_peers has something to
+    // surface. Beta's pinning of alpha doesn't matter for this test.
+    let pinned_alpha_rx = agent_alpha.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        wait_for_pin(pinned_alpha_rx, beta_fp),
+    )
+    .await
+    .expect("alpha must pin beta");
+
+    let mut resolver = StaticResolver::new();
+    resolver.insert(id_alpha.verifying_key());
+    let resolver = Arc::new(resolver);
+    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
+    let operator_endpoint =
+        BoweryEndpoint::bind(operator_id.clone(), accept_verifier, loopback_ephemeral())
+            .expect("bind operator endpoint");
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), alpha_fp));
+    let conn = operator_endpoint
+        .dial(dial_verifier, alpha_addr)
+        .await
+        .expect("operator dial alpha");
+
+    let operator_fp = operator_id.fingerprint();
+    let sealer = Sealer::new(operator_id.clone());
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
+
+    let cmd = OperatorCommand {
+        request_id: "bonus-peers".into(),
+        timeout_ms: 5_000,
+        command: Some(OperatorCommandBody::Sql(SqlQuery {
+            sql: "SELECT fingerprint_hex FROM bowery_peers".into(),
+            fanout: false,
+            peers: Vec::new(),
+        })),
+    };
+    let outbound = sealer.seal_for(&alpha_fp, &WhisperPayload::operator_command(cmd));
+    conn.send_envelope(&outbound).await.expect("send");
+
+    // Read until first end=true; collect fingerprint_hex strings.
+    let mut seen_fps: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let bytes = tokio::time::timeout(timeout, conn.recv_envelope())
+            .await
+            .expect("recv in time")
+            .expect("recv");
+        let opened = envelope_verifier.open(&bytes).expect("verify");
+        let result = match opened.payload.body {
+            Some(Body::OperatorResult(r)) => r,
+            other => panic!("unexpected body: {other:?}"),
+        };
+        let chunk = match result.result {
+            Some(OperatorResultBody::SqlChunk(c)) => c,
+            other => panic!("expected SqlChunk, got {other:?}"),
+        };
+        for row in &chunk.rows {
+            if let Some(SqlValueKind::Text(s)) = &row.values[0].value {
+                seen_fps.push(s.clone());
+            }
+        }
+        if chunk.end {
+            break;
+        }
+    }
+    assert!(
+        seen_fps.iter().any(|fp| fp == &beta_fp.to_string()),
+        "bowery_peers must include beta's fingerprint; got {seen_fps:?}"
+    );
+
+    drop(conn);
+    operator_endpoint.close().await;
+    agent_alpha.shutdown().await.expect("shutdown alpha");
+    agent_beta.shutdown().await.expect("shutdown beta");
+}
