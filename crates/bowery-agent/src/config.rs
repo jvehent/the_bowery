@@ -14,7 +14,13 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_IDENTITY_PATH: &str = "/var/lib/bowery/identity.key";
 const DEFAULT_KNOWN_NEIGHBORS_PATH: &str = "/var/lib/bowery/known_neighbors.json";
 const DEFAULT_BASELINE_PATH: &str = "/var/lib/bowery/baseline.db";
-const DEFAULT_BOOTSTRAP_WINDOW_HOURS: u64 = 24 * 7; // 7 days
+// Phase-8 hardening (H4): a 7-day default TOFU window meant any
+// attacker on the chitchat UDP port had a week to race-publish a
+// synthetic identity and get permanently pinned. 2 hours is short
+// enough that bootstrap must be a deliberate operator activity but
+// long enough that fleet-wide rolling restarts don't all need to
+// happen within minutes.
+const DEFAULT_BOOTSTRAP_WINDOW_HOURS: u64 = 2;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const DEFAULT_ROLE_PUBLISH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_LLM_INVOCATION_THRESHOLD: f32 = 0.7;
@@ -76,6 +82,11 @@ pub struct KnownNeighborsConfig {
     /// on disk so restarts don't reset it.
     #[serde(with = "humantime_serde", default = "default_bootstrap_window")]
     pub bootstrap_window: Duration,
+    /// Hard cap on the number of pinned peers. Defends against
+    /// chitchat-mesh-flood attacks that race-publish synthetic
+    /// identities during the bootstrap window. Default 1024.
+    #[serde(default = "default_max_pinned_peers")]
+    pub max_pinned_peers: usize,
 }
 
 impl Default for KnownNeighborsConfig {
@@ -83,8 +94,13 @@ impl Default for KnownNeighborsConfig {
         Self {
             path: PathBuf::from(DEFAULT_KNOWN_NEIGHBORS_PATH),
             bootstrap_window: default_bootstrap_window(),
+            max_pinned_peers: default_max_pinned_peers(),
         }
     }
+}
+
+fn default_max_pinned_peers() -> usize {
+    1024
 }
 
 fn default_bootstrap_window() -> Duration {

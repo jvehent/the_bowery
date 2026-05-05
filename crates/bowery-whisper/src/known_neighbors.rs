@@ -58,6 +58,9 @@ pub enum PinOutcome {
     NewlyPinned,
     AlreadyPinned,
     BootstrapClosed,
+    /// Pin store is at its maximum capacity. Defends against a
+    /// chitchat-mesh flood pinning unbounded synthetic identities.
+    AtCapacity,
 }
 
 #[derive(Debug, Clone)]
@@ -66,12 +69,25 @@ struct Peer {
     pinned_at: SystemTime,
 }
 
+/// Hard cap on the number of pinned peers. An attacker who can reach
+/// the chitchat UDP port can otherwise flood synthetic identities
+/// during the bootstrap window and cause unbounded memory growth +
+/// quadratic `save()` I/O (each insert rewrites the whole JSON).
+///
+/// 1024 is well above the documented design ceiling of ~5k nodes per
+/// neighborhood (one neighborhood is split across multiple agents,
+/// and a single agent only pins peers it actually talks to).
+/// Operators with larger fleets should partition into smaller
+/// neighborhoods rather than raise this number.
+const DEFAULT_MAX_PINNED_PEERS: usize = 1024;
+
 /// Persistent set of pinned neighbor fingerprints.
 #[derive(Debug)]
 pub struct KnownNeighbors {
     path: PathBuf,
     state: RwLock<HashMap<Fingerprint, Peer>>,
     bootstrap_until: SystemTime,
+    max_pinned: usize,
 }
 
 impl KnownNeighbors {
@@ -87,6 +103,7 @@ impl KnownNeighbors {
                 path,
                 state: RwLock::new(HashMap::new()),
                 bootstrap_until: SystemTime::now() + bootstrap_window,
+                max_pinned: DEFAULT_MAX_PINNED_PEERS,
             });
         }
 
@@ -135,6 +152,7 @@ impl KnownNeighbors {
             path,
             state: RwLock::new(state),
             bootstrap_until,
+            max_pinned: DEFAULT_MAX_PINNED_PEERS,
         })
     }
 
@@ -181,6 +199,11 @@ impl KnownNeighbors {
             if state.contains_key(&fp) {
                 return Ok(PinOutcome::AlreadyPinned);
             }
+            // Hard cap. Defends against unbounded mesh-driven pinning
+            // during the bootstrap window.
+            if state.len() >= self.max_pinned {
+                return Ok(PinOutcome::AtCapacity);
+            }
             state.insert(
                 fp,
                 Peer {
@@ -191,6 +214,15 @@ impl KnownNeighbors {
         }
         self.save()?;
         Ok(PinOutcome::NewlyPinned)
+    }
+
+    /// Override the default `max_pinned` cap. Operators tune this via
+    /// `[known_neighbors] max_pinned` in agent.toml; tests use it to
+    /// exercise the at-capacity branch without pinning 1024 keys.
+    #[must_use]
+    pub fn with_max_pinned(mut self, max_pinned: usize) -> Self {
+        self.max_pinned = max_pinned.max(1);
+        self
     }
 
     fn save(&self) -> Result<()> {
@@ -446,5 +478,37 @@ mod tests {
         store.try_pin(&id.verifying_key()).unwrap();
         assert_eq!(store.resolve(&id.fingerprint()), Some(id.verifying_key()));
         assert_eq!(store.resolve(&Identity::generate().fingerprint()), None);
+    }
+
+    /// Phase-8 hardening (H4): pin set has a hard cap that defends
+    /// against chitchat-mesh flood attacks. Once at capacity, new
+    /// peers are rejected with `AtCapacity` (not silently accepted).
+    #[test]
+    fn at_capacity_rejects_new_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KnownNeighbors::open(store_path(&dir), Duration::from_mins(1))
+            .unwrap()
+            .with_max_pinned(2);
+
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let c = Identity::generate();
+
+        assert_eq!(
+            store.try_pin(&a.verifying_key()).unwrap(),
+            PinOutcome::NewlyPinned
+        );
+        assert_eq!(
+            store.try_pin(&b.verifying_key()).unwrap(),
+            PinOutcome::NewlyPinned
+        );
+        // The third pin within the bootstrap window hits the cap.
+        assert_eq!(
+            store.try_pin(&c.verifying_key()).unwrap(),
+            PinOutcome::AtCapacity
+        );
+        // Already-pinned keys still resolve.
+        assert!(store.resolve(&a.fingerprint()).is_some());
+        assert!(store.resolve(&c.fingerprint()).is_none());
     }
 }

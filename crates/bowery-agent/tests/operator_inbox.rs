@@ -43,6 +43,7 @@ fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: St
         known_neighbors: bowery_agent::config::KnownNeighborsConfig {
             path: dir.join("known_neighbors.json"),
             bootstrap_window: Duration::from_hours(1),
+            max_pinned_peers: 1024,
         },
         mesh: MeshConfig {
             listen_addr: mesh_addr,

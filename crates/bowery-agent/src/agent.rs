@@ -219,10 +219,13 @@ impl Agent {
         let fingerprint = identity.fingerprint();
         info!(fingerprint = %fingerprint, "starting agent");
 
-        let known_neighbors = Arc::new(KnownNeighbors::open(
-            &config.known_neighbors.path,
-            config.known_neighbors.bootstrap_window,
-        )?);
+        let known_neighbors = Arc::new(
+            KnownNeighbors::open(
+                &config.known_neighbors.path,
+                config.known_neighbors.bootstrap_window,
+            )?
+            .with_max_pinned(config.known_neighbors.max_pinned_peers),
+        );
 
         let operators = Arc::new(load_operators(&config.operators.pubkeys_b64)?);
         // Composite resolver: pinned peer agents AND configured
@@ -594,6 +597,12 @@ fn spawn_pin_task(
                     Ok(PinOutcome::AlreadyPinned) => {}
                     Ok(PinOutcome::BootstrapClosed) => {
                         debug!(peer = %peer.fingerprint, "ignoring unknown peer (bootstrap closed)");
+                    }
+                    Ok(PinOutcome::AtCapacity) => {
+                        warn!(
+                            peer = %peer.fingerprint,
+                            "pin store at capacity; ignoring new neighbor (possible mesh flood)"
+                        );
                     }
                     Err(e) => warn!(error = %e, "pin failed"),
                 }

@@ -11,10 +11,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bowery_crypto::{Fingerprint, Identity};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig, TokioRuntime};
+use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig, TokioRuntime, TransportConfig};
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::ServerName;
 use rustls::server::danger::ClientCertVerifier;
@@ -26,9 +27,30 @@ use crate::tls::{self, PinnedCertVerifier, TlsMaterial};
 /// ALPN identifier — pinned per major protocol version.
 pub const ALPN: &[u8] = b"bowery/1";
 
-/// Hard cap on a single envelope length-prefix. 1 MiB is far above any
-/// reasonable message and well below memory-pressure territory.
-const MAX_FRAME_BYTES: usize = 1 << 20;
+/// Hard cap on a single envelope length-prefix. 64 KiB is well above
+/// any expected envelope today (heartbeats are ~150 B; the largest
+/// `Alerts` response is bounded by inbox capacity × per-alert size,
+/// typically a few hundred KiB but capped per-Subscribe). The
+/// previous 1 MiB cap was excessive — under no per-peer connection
+/// or per-conn stream limit, a single peer could amplify ~100 MiB of
+/// pre-fill buffer per connection.
+const MAX_FRAME_BYTES: usize = 64 * 1024;
+
+/// QUIC idle timeout — connections sitting silent for this long are
+/// dropped. Defends against slow-loris attacks where a peer completes
+/// the TLS handshake then never sends an envelope, holding state.
+const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// QUIC keepalive cadence. Below the idle timeout so legitimate-but-
+/// quiet connections don't get torn down.
+const QUIC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum concurrent unidirectional streams per connection. The
+/// agent's protocol uses one stream per envelope, sequentially, so
+/// the legitimate cap is well below 100 (the Quinn default). Lowering
+/// this caps the per-connection memory amplification a malicious peer
+/// can drive.
+const MAX_CONCURRENT_UNI_STREAMS: u32 = 8;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -222,6 +244,35 @@ impl BoweryConnection {
 // Internal config builders
 // ---------------------------------------------------------------------------
 
+/// Build the hardened `TransportConfig` shared by server and client.
+///
+/// Two connection-level caps:
+///
+/// - `max_idle_timeout`: connections silent for `QUIC_IDLE_TIMEOUT`
+///   are dropped. Without this, a peer that completes the TLS
+///   handshake but never sends an envelope holds state forever
+///   (slow-loris).
+/// - `keep_alive_interval`: keeps legitimate-but-idle connections
+///   alive without the operator having to think about it.
+///
+/// Plus `max_concurrent_uni_streams` to cap per-connection
+/// fan-out — the protocol is sequential one-stream-per-envelope so
+/// 8 is plenty.
+fn hardened_transport_config() -> TransportConfig {
+    let mut cfg = TransportConfig::default();
+    cfg.max_idle_timeout(Some(
+        QUIC_IDLE_TIMEOUT
+            .try_into()
+            .expect("QUIC_IDLE_TIMEOUT fits in VarInt"),
+    ));
+    cfg.keep_alive_interval(Some(QUIC_KEEPALIVE_INTERVAL));
+    cfg.max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into());
+    // Defense in depth — bidirectional streams aren't used today, but
+    // future protocol additions might. Cap them at the same value.
+    cfg.max_concurrent_bidi_streams(MAX_CONCURRENT_UNI_STREAMS.into());
+    cfg
+}
+
 fn build_server_config<R>(
     material: &Arc<TlsMaterial>,
     client_verifier: Arc<PinnedCertVerifier<R>>,
@@ -238,7 +289,9 @@ where
     rustls_cfg.alpn_protocols = vec![ALPN.to_vec()];
 
     let quic_cfg = QuicServerConfig::try_from(rustls_cfg).map_err(Error::NoQuicCrypto)?;
-    Ok(ServerConfig::with_crypto(Arc::new(quic_cfg)))
+    let mut server = ServerConfig::with_crypto(Arc::new(quic_cfg));
+    server.transport_config(Arc::new(hardened_transport_config()));
+    Ok(server)
 }
 
 fn build_client_config<R>(
@@ -258,7 +311,9 @@ where
     rustls_cfg.alpn_protocols = vec![ALPN.to_vec()];
 
     let quic_cfg = QuicClientConfig::try_from(rustls_cfg).map_err(Error::NoQuicCrypto)?;
-    Ok(ClientConfig::new(Arc::new(quic_cfg)))
+    let mut client = ClientConfig::new(Arc::new(quic_cfg));
+    client.transport_config(Arc::new(hardened_transport_config()));
+    Ok(client)
 }
 
 // ---------------------------------------------------------------------------
