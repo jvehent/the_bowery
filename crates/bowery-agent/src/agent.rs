@@ -395,9 +395,16 @@ impl Agent {
         } else {
             None
         };
+        let relay_ctx = Arc::new(RelayContext {
+            endpoint: endpoint.clone(),
+            known_neighbors: known_neighbors.clone(),
+            peers_watcher: mesh.peers_watcher(),
+            resolver: resolver.clone(),
+        });
         let op_router = Arc::new(OperatorCommandRouter {
             sysquery: sysquery_handle,
             sql: Some(Arc::new(bowery_sql::Sql::new())),
+            relay: Some(relay_ctx),
             max_timeout: config.sysquery.max_timeout,
         });
 
@@ -688,9 +695,39 @@ pub(crate) struct OperatorCommandRouter {
     /// itself is `Clone`; it preserves a single canonical
     /// configuration owned by the agent.
     pub sql: Option<Arc<bowery_sql::Sql>>,
+    /// Phase-9 slice 7: relay context. Populated when the agent
+    /// has a mesh peer set and can act as a fan-out relay for
+    /// operator-issued `SqlQuery { fanout: true }`. `None` falls
+    /// back to local-only execution (the operator's `fanout` flag
+    /// is silently ignored — the result still streams correctly,
+    /// just without per-peer rows).
+    pub relay: Option<Arc<RelayContext>>,
     /// Hard ceiling on per-query timeout, applied to every
     /// command kind.
     pub max_timeout: Duration,
+}
+
+/// Phase-9 slice 7: handles needed to dial pinned peers from
+/// inside an operator-command handler.
+///
+/// Held inside an `Arc` so cloning the router across spawned
+/// tasks doesn't deep-copy the endpoint. The fields are exactly
+/// what `send_heartbeat` already needs — the relay path reuses
+/// the same dial primitives.
+pub(crate) struct RelayContext {
+    pub endpoint: BoweryEndpoint,
+    pub known_neighbors: Arc<KnownNeighbors>,
+    pub peers_watcher: watch::Receiver<Vec<PeerInfo>>,
+    /// Resolver used to verify peers' response envelopes. The
+    /// composite resolver covers both pinned peers (via
+    /// `KnownNeighbors`) and configured operators.
+    pub resolver: ResolverArc,
+}
+
+impl std::fmt::Debug for RelayContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayContext").finish_non_exhaustive()
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // wiring kept explicit at the call site
@@ -793,7 +830,12 @@ async fn handle_connection(
                             continue;
                         }
                         if let Err(e) = respond_to_operator_command(
-                            &conn, &sealer, env.sender, c, &op_router, &events_tx,
+                            &conn,
+                            sealer.clone(),
+                            env.sender,
+                            c,
+                            &op_router,
+                            &events_tx,
                         )
                         .await
                         {
@@ -911,7 +953,7 @@ async fn respond_to_subscribe(
 /// visible at code-review time.
 async fn respond_to_operator_command(
     conn: &BoweryConnection,
-    sealer: &Sealer,
+    sealer: Arc<Sealer>,
     operator: Fingerprint,
     cmd: bowery_proto::OperatorCommand,
     op_router: &OperatorCommandRouter,
@@ -947,13 +989,21 @@ async fn respond_to_operator_command(
     // OperatorResultBody and fall through to the unified send below.
     if let Some(OperatorCommandBody::Sql(q)) = &cmd.command {
         let sql_engine = op_router.sql.clone();
+        let relay = if q.fanout {
+            op_router.relay.clone()
+        } else {
+            None
+        };
         let outcome = stream_sql_response(
             conn,
-            sealer,
+            &sealer,
             operator,
             &request_id,
             sql_engine.as_ref(),
             &q.sql,
+            q.fanout,
+            &q.peers,
+            relay.as_ref(),
             effective_timeout,
         )
         .await;
@@ -1020,26 +1070,33 @@ async fn respond_to_operator_command(
 const SQL_CHUNK_ROW_LIMIT: usize = 256;
 
 /// Drive the streaming SQL response. On success, emits one or
-/// more `OperatorResult { SqlChunk }` envelopes (terminated by a
-/// chunk with `end = true`); on failure, emits a single
+/// more `OperatorResult { SqlChunk }` envelopes (each with `end =
+/// true` per agent contributing rows); on failure, emits a single
 /// `OperatorResult { Error }` and stops. Each envelope is sealed
 /// independently for the operator and rides its own QUIC stream.
+///
+/// In fan-out mode (`fanout = true` and `relay = Some`), the
+/// relay also dispatches the query to its pinned peers in
+/// parallel and multiplexes their chunks back to the operator,
+/// rewriting each chunk's `agent_fp` to the peer's fingerprint so
+/// the operator can attribute rows. Cycle prevention: the relay
+/// always sends `fanout = false` to peers.
+#[allow(clippy::too_many_arguments)] // wiring kept explicit
 async fn stream_sql_response(
     conn: &BoweryConnection,
-    sealer: &Sealer,
+    sealer: &Arc<Sealer>,
     operator: Fingerprint,
     request_id: &str,
     sql_engine: Option<&Arc<bowery_sql::Sql>>,
     sql: &str,
+    fanout: bool,
+    peer_filter: &[Vec<u8>],
+    relay: Option<&Arc<RelayContext>>,
     timeout: Duration,
 ) -> Result<(), bowery_whisper::transport::Error> {
     use bowery_proto::{OperatorError, OperatorResult, OperatorResultBody, SqlChunk};
 
     let Some(engine) = sql_engine else {
-        // Unreachable in practice — the agent always wires `sql`
-        // alongside the router — but kept defensive so a future
-        // operator-config gate flowing in here surfaces a clean
-        // policy_denied instead of a panic.
         let err = OperatorResultBody::Error(OperatorError {
             kind: "policy_denied".into(),
             message: "SQL engine not configured on this agent".into(),
@@ -1052,6 +1109,9 @@ async fn stream_sql_response(
         return conn.send_envelope(&outbound).await;
     };
 
+    let self_fp = sealer.fingerprint();
+
+    // -- Phase 1: stream the relay's own rows. --
     let rows = match engine.query(sql, timeout).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -1079,47 +1139,322 @@ async fn stream_sql_response(
         .map(|r| r.columns.iter().map(|(name, _)| name.clone()).collect())
         .unwrap_or_default();
 
-    // No rows: still send exactly one terminal chunk so the
-    // operator-side loop has something to terminate on.
+    // For fan-out, populate agent_fp so the operator can attribute
+    // rows. For single-agent mode, leave it empty — the operator
+    // already knows whom they dialled.
+    let agent_fp_bytes = if fanout {
+        self_fp.as_bytes().to_vec()
+    } else {
+        Vec::new()
+    };
+
     if rows.is_empty() {
         let chunk = SqlChunk {
             columns,
             rows: Vec::new(),
             end: true,
+            agent_fp: agent_fp_bytes.clone(),
         };
-        let response = OperatorResult {
-            request_id: request_id.to_string(),
-            result: Some(OperatorResultBody::SqlChunk(chunk)),
-        };
-        let outbound = sealer.seal_for(&operator, &WhisperPayload::operator_result(response));
-        return conn.send_envelope(&outbound).await;
+        send_chunk(conn, sealer, &operator, request_id, chunk).await?;
+    } else {
+        let mut sent = 0usize;
+        while sent < rows.len() {
+            let take = SQL_CHUNK_ROW_LIMIT.min(rows.len() - sent);
+            let batch = &rows[sent..sent + take];
+            let proto_rows: Vec<bowery_proto::SqlRow> = batch.iter().map(encode_row).collect();
+            let chunk_columns = if sent == 0 {
+                columns.clone()
+            } else {
+                Vec::new()
+            };
+            let end = sent + take == rows.len();
+            let chunk = SqlChunk {
+                columns: chunk_columns,
+                rows: proto_rows,
+                end,
+                agent_fp: agent_fp_bytes.clone(),
+            };
+            send_chunk(conn, sealer, &operator, request_id, chunk).await?;
+            sent += take;
+        }
     }
 
-    let mut sent = 0usize;
-    while sent < rows.len() {
-        let take = SQL_CHUNK_ROW_LIMIT.min(rows.len() - sent);
-        let batch = &rows[sent..sent + take];
-        let proto_rows: Vec<bowery_proto::SqlRow> = batch.iter().map(encode_row).collect();
-        let chunk_columns = if sent == 0 {
-            columns.clone()
-        } else {
-            Vec::new()
-        };
-        let end = sent + take == rows.len();
-        let chunk = SqlChunk {
-            columns: chunk_columns,
-            rows: proto_rows,
-            end,
-        };
-        let response = OperatorResult {
-            request_id: request_id.to_string(),
-            result: Some(OperatorResultBody::SqlChunk(chunk)),
-        };
-        let outbound = sealer.seal_for(&operator, &WhisperPayload::operator_result(response));
-        conn.send_envelope(&outbound).await?;
-        sent += take;
+    // -- Phase 2: fan-out to peers (if requested + relay-capable). --
+    //
+    // No relay context (mesh disabled / no peers) silently collapses
+    // to local-only — the operator still got the local rows; just no
+    // extra peer streams. The operator can distinguish via the
+    // per-chunk agent_fp set.
+    if fanout && let Some(relay) = relay {
+        relay_to_peers(
+            conn,
+            sealer,
+            operator,
+            request_id,
+            sql,
+            peer_filter,
+            relay,
+            timeout,
+        )
+        .await?;
     }
     Ok(())
+}
+
+/// Helper to seal + send one `SqlChunk` envelope.
+async fn send_chunk(
+    conn: &BoweryConnection,
+    sealer: &Sealer,
+    operator: &Fingerprint,
+    request_id: &str,
+    chunk: bowery_proto::SqlChunk,
+) -> Result<(), bowery_whisper::transport::Error> {
+    use bowery_proto::{OperatorResult, OperatorResultBody};
+    let response = OperatorResult {
+        request_id: request_id.to_string(),
+        result: Some(OperatorResultBody::SqlChunk(chunk)),
+    };
+    let outbound = sealer.seal_for(operator, &WhisperPayload::operator_result(response));
+    conn.send_envelope(&outbound).await
+}
+
+/// Phase-9 slice 7: dispatch the query to every selected pinned
+/// peer in parallel, multiplexing their chunks back to the
+/// operator. Each peer's chunks have their `agent_fp` rewritten
+/// to the peer's fingerprint before forwarding so the operator
+/// can attribute rows.
+///
+/// Per-peer failures (dial failed, peer error, peer timeout) are
+/// surfaced as a synthetic terminal chunk for that peer with no
+/// rows — the operator still sees the EOF and knows that peer
+/// didn't contribute. We don't propagate per-peer errors as a
+/// stream-wide failure; the relay best-efforts every peer
+/// independently.
+#[allow(clippy::too_many_arguments)]
+async fn relay_to_peers(
+    conn: &BoweryConnection,
+    sealer: &Arc<Sealer>,
+    operator: Fingerprint,
+    request_id: &str,
+    sql: &str,
+    peer_filter: &[Vec<u8>],
+    relay: &Arc<RelayContext>,
+    timeout: Duration,
+) -> Result<(), bowery_whisper::transport::Error> {
+    use bowery_proto::{OperatorError, SqlChunk};
+
+    // Snapshot the current peer set; turn the filter (if any) into
+    // a HashSet of fingerprints for O(1) membership checks.
+    let peers: Vec<PeerInfo> = relay.peers_watcher.borrow().clone();
+    let peers: Vec<PeerInfo> = if peer_filter.is_empty() {
+        peers
+            .into_iter()
+            .filter(|p| relay.known_neighbors.resolve(&p.fingerprint).is_some())
+            .filter(|p| p.fingerprint != sealer.fingerprint())
+            .collect()
+    } else {
+        let mut wanted: std::collections::HashSet<[u8; 32]> =
+            std::collections::HashSet::with_capacity(peer_filter.len());
+        for fp in peer_filter {
+            if let Ok(arr) = <[u8; 32]>::try_from(fp.as_slice()) {
+                wanted.insert(arr);
+            }
+        }
+        peers
+            .into_iter()
+            .filter(|p| wanted.contains(p.fingerprint.as_bytes()))
+            .filter(|p| relay.known_neighbors.resolve(&p.fingerprint).is_some())
+            .filter(|p| p.fingerprint != sealer.fingerprint())
+            .collect()
+    };
+
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    // Spawn one task per peer. Each task dials, sends a non-fanout
+    // SqlQuery, reads chunks back, and forwards them through an
+    // mpsc channel to the multiplexer. The buffer is small — the
+    // multiplexer should keep up with the operator-side QUIC
+    // stream rate.
+    let (chunk_tx, mut chunk_rx) =
+        mpsc::channel::<(Fingerprint, Result<SqlChunk, OperatorError>)>(64);
+    let per_peer_timeout = timeout;
+
+    for peer in peers {
+        let chunk_tx = chunk_tx.clone();
+        let endpoint = relay.endpoint.clone();
+        let kn = relay.known_neighbors.clone();
+        let resolver = relay.resolver.clone();
+        let sealer_clone = sealer.clone();
+        let sql = sql.to_string();
+        let request_id = request_id.to_string();
+        tokio::spawn(async move {
+            run_peer_query(
+                endpoint,
+                kn,
+                resolver,
+                &sealer_clone,
+                peer,
+                &sql,
+                &request_id,
+                per_peer_timeout,
+                chunk_tx,
+            )
+            .await;
+        });
+    }
+    drop(chunk_tx); // close the channel so chunk_rx ends when all peers finish
+
+    // Drain peer chunks; rewrite agent_fp; forward to operator.
+    // On per-peer error, synthesise a terminal chunk so the operator
+    // still sees the EOF.
+    while let Some((peer_fp, outcome)) = chunk_rx.recv().await {
+        let chunk = match outcome {
+            Ok(mut c) => {
+                c.agent_fp = peer_fp.as_bytes().to_vec();
+                c
+            }
+            Err(_) => SqlChunk {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                end: true,
+                agent_fp: peer_fp.as_bytes().to_vec(),
+            },
+        };
+        send_chunk(conn, sealer, &operator, request_id, chunk).await?;
+    }
+    Ok(())
+}
+
+/// One peer's leg of the fan-out. Dials the peer, sends a
+/// `SqlQuery { fanout: false }`, reads chunks back, and forwards
+/// them through `chunk_tx`. Errors collapse to a single
+/// `OperatorError` enqueued on the channel so the multiplexer can
+/// emit a synthetic EOF.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_peer_query(
+    endpoint: BoweryEndpoint,
+    kn: Arc<KnownNeighbors>,
+    resolver: ResolverArc,
+    sealer: &Arc<Sealer>,
+    peer: PeerInfo,
+    sql: &str,
+    request_id: &str,
+    timeout: Duration,
+    chunk_tx: mpsc::Sender<(
+        Fingerprint,
+        Result<bowery_proto::SqlChunk, bowery_proto::OperatorError>,
+    )>,
+) {
+    use bowery_proto::{
+        Body, OperatorCommand, OperatorCommandBody, OperatorError, OperatorResultBody, SqlQuery,
+    };
+
+    let peer_fp = peer.fingerprint;
+    let cmd = OperatorCommand {
+        request_id: request_id.to_string(),
+        timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+        command: Some(OperatorCommandBody::Sql(SqlQuery {
+            sql: sql.to_string(),
+            fanout: false, // cycle prevention
+            peers: Vec::new(),
+        })),
+    };
+    let outbound = sealer.seal_for(&peer_fp, &WhisperPayload::operator_command(cmd));
+
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(kn, peer_fp));
+    let conn = match endpoint.dial(dial_verifier, peer.whisper_addr).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(peer = %peer_fp, error = %e, "fanout dial failed");
+            let _ = chunk_tx
+                .send((
+                    peer_fp,
+                    Err(OperatorError {
+                        kind: "dial_failed".into(),
+                        message: e.to_string(),
+                    }),
+                ))
+                .await;
+            return;
+        }
+    };
+    if let Err(e) = conn.send_envelope(&outbound).await {
+        warn!(peer = %peer_fp, error = %e, "fanout send failed");
+        let _ = chunk_tx
+            .send((
+                peer_fp,
+                Err(OperatorError {
+                    kind: "send_failed".into(),
+                    message: e.to_string(),
+                }),
+            ))
+            .await;
+        return;
+    }
+
+    let envelope_verifier = Verifier::new(resolver, sealer.fingerprint());
+    let exchange = async {
+        loop {
+            let bytes = conn
+                .recv_envelope()
+                .await
+                .map_err(|e| format!("recv: {e}"))?;
+            let opened = envelope_verifier
+                .open(&bytes)
+                .map_err(|e| format!("verify: {e}"))?;
+            let result = match opened.payload.body {
+                Some(Body::OperatorResult(r)) => r,
+                other => return Err(format!("unexpected body: {other:?}")),
+            };
+            if result.request_id != request_id {
+                return Err(format!(
+                    "request_id mismatch: got {:?}, want {:?}",
+                    result.request_id, request_id
+                ));
+            }
+            match result.result {
+                Some(OperatorResultBody::SqlChunk(chunk)) => {
+                    let end = chunk.end;
+                    if chunk_tx.send((peer_fp, Ok(chunk))).await.is_err() {
+                        return Ok(());
+                    }
+                    if end {
+                        return Ok(());
+                    }
+                }
+                Some(OperatorResultBody::Error(e)) => {
+                    let _ = chunk_tx.send((peer_fp, Err(e))).await;
+                    return Ok(());
+                }
+                Some(other) => return Err(format!("unexpected result body: {other:?}")),
+                None => return Err("OperatorResult with no body".to_string()),
+            }
+        }
+    };
+    let outcome = tokio::time::timeout(timeout + Duration::from_secs(2), exchange).await;
+    if let Err(_) | Ok(Err(_)) = outcome {
+        let kind = match &outcome {
+            Err(_) => "timeout",
+            Ok(Err(_)) => "peer_error",
+            _ => unreachable!(),
+        };
+        let message = match outcome {
+            Err(_) => format!("peer {peer_fp} timed out"),
+            Ok(Err(e)) => e,
+            _ => unreachable!(),
+        };
+        let _ = chunk_tx
+            .send((
+                peer_fp,
+                Err(OperatorError {
+                    kind: kind.into(),
+                    message,
+                }),
+            ))
+            .await;
+    }
 }
 
 fn encode_row(row: &bowery_sql::Row) -> bowery_proto::SqlRow {

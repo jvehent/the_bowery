@@ -11,6 +11,7 @@
 //!   per-command body) instead of `Alerts`.
 //! - One round-trip per invocation; no follow mode.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -142,7 +143,7 @@ pub(crate) async fn sysquery(
 /// supplied timeout plus a small slack — the agent enforces its
 /// own timeout server-side and is the authority on "how long
 /// before this query is killed".
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn sql(
     operator_key: PathBuf,
     target_addr: SocketAddr,
@@ -150,6 +151,7 @@ pub(crate) async fn sql(
     target_pubkey_b64: String,
     sql: String,
     timeout: Duration,
+    fanout: bool,
     json: bool,
 ) -> Result<()> {
     let identity = Arc::new(
@@ -187,7 +189,11 @@ pub(crate) async fn sql(
     let cmd = OperatorCommand {
         request_id: request_id.clone(),
         timeout_ms,
-        command: Some(OperatorCommandBody::Sql(SqlQuery { sql })),
+        command: Some(OperatorCommandBody::Sql(SqlQuery {
+            sql,
+            fanout,
+            peers: Vec::new(),
+        })),
     };
     let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
 
@@ -197,13 +203,29 @@ pub(crate) async fn sql(
             .await
             .context("sending OperatorCommand")?;
 
-        let mut columns: Vec<String> = Vec::new();
+        // In fan-out mode the relay multiplexes per-peer streams,
+        // each terminated with its own `end = true`; we keep
+        // reading until the connection closes (the relay drops it
+        // after all peers finished). In single-agent mode we stop
+        // on the first `end = true`. We index column lists per
+        // agent_fp so each peer's first chunk's column names
+        // survive across that peer's batches.
         let mut printed_header = false;
+        let mut columns_by_agent: HashMap<Vec<u8>, Vec<String>> = HashMap::new();
+        let mut last_columns: Vec<String> = Vec::new();
         loop {
-            let bytes = conn
-                .recv_envelope()
-                .await
-                .context("awaiting SqlChunk envelope")?;
+            let recv = conn.recv_envelope().await;
+            let bytes = match recv {
+                Ok(b) => b,
+                Err(e) => {
+                    if fanout {
+                        // Connection close terminates the fan-out
+                        // stream — the relay's done with peers.
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    return Err(anyhow::Error::from(e).context("awaiting SqlChunk envelope"));
+                }
+            };
             let opened = envelope_verifier
                 .open(&bytes)
                 .context("verifying SqlChunk envelope")?;
@@ -224,18 +246,27 @@ pub(crate) async fn sql(
                         columns: chunk_cols,
                         rows,
                         end,
+                        agent_fp,
                     } = chunk;
-                    if !chunk_cols.is_empty() {
-                        columns = chunk_cols;
-                    }
-                    if !printed_header {
-                        print_sql_header(&columns, json);
+                    let columns: &Vec<String> = if !chunk_cols.is_empty() {
+                        columns_by_agent.insert(agent_fp.clone(), chunk_cols.clone());
+                        last_columns = chunk_cols;
+                        &last_columns
+                    } else if let Some(existing) = columns_by_agent.get(&agent_fp) {
+                        existing
+                    } else {
+                        // No columns for this peer yet (rare:
+                        // empty terminal chunk before any rows).
+                        &last_columns
+                    };
+                    if !printed_header && !columns.is_empty() {
+                        print_sql_header(columns, json);
                         printed_header = true;
                     }
                     for row in rows {
-                        print_sql_row(&columns, &row, json);
+                        print_sql_row(columns, &row, &agent_fp, fanout, json);
                     }
-                    if end {
+                    if end && !fanout {
                         return Ok::<(), anyhow::Error>(());
                     }
                 }
@@ -261,7 +292,11 @@ pub(crate) async fn sql(
 fn print_sql_header(columns: &[String], json: bool) {
     if json {
         // First line is a JSON array of column names so consumers
-        // can demux the rest as `{col: val}` dicts.
+        // can demux the rest as `{col: val}` dicts. agent_fp is
+        // emitted per row (when fan-out), not in this header — the
+        // shape is intentionally identical between single-agent
+        // and fan-out modes; the agent column appears as an extra
+        // first cell when fan-out is on.
         let escaped: Vec<String> = columns
             .iter()
             .map(|c| format!("\"{}\"", escape_json_string(c)))
@@ -272,9 +307,19 @@ fn print_sql_header(columns: &[String], json: bool) {
     }
 }
 
-fn print_sql_row(columns: &[String], row: &bowery_proto::SqlRow, json: bool) {
+fn print_sql_row(
+    columns: &[String],
+    row: &bowery_proto::SqlRow,
+    agent_fp: &[u8],
+    fanout: bool,
+    json: bool,
+) {
+    let agent_hex = hex_fp(agent_fp);
     if json {
-        let mut parts: Vec<String> = Vec::with_capacity(row.values.len());
+        let mut parts: Vec<String> = Vec::with_capacity(row.values.len() + usize::from(fanout));
+        if fanout {
+            parts.push(format!("\"_agent_fp\":\"{agent_hex}\""));
+        }
         for (i, v) in row.values.iter().enumerate() {
             let key = columns.get(i).map_or("", String::as_str);
             parts.push(format!(
@@ -285,9 +330,22 @@ fn print_sql_row(columns: &[String], row: &bowery_proto::SqlRow, json: bool) {
         }
         println!("{{{}}}", parts.join(","));
     } else {
-        let cells: Vec<String> = row.values.iter().map(value_to_text).collect();
+        let mut cells: Vec<String> = Vec::with_capacity(row.values.len() + usize::from(fanout));
+        if fanout {
+            cells.push(agent_hex);
+        }
+        cells.extend(row.values.iter().map(value_to_text));
         println!("{}", cells.join("\t"));
     }
+}
+
+fn hex_fp(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 fn value_to_text(v: &bowery_proto::SqlValue) -> String {

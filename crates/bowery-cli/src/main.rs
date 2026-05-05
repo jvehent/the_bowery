@@ -122,6 +122,14 @@ enum ExecCommand {
         /// humantime expressions (`5s`, `30s`, `2m`).
         #[arg(long, default_value = "10s", value_parser = parse_duration)]
         timeout: Duration,
+        /// Phase-9 slice 7: when set, the dialled agent acts as a
+        /// **relay** and dispatches the query to its pinned peers
+        /// in parallel. Rows from each agent are tagged with the
+        /// agent's fingerprint (extra `_agent_fp` column in
+        /// output). Without this flag, only the directly-dialled
+        /// agent runs the query.
+        #[arg(long)]
+        fanout: bool,
         /// Emit one JSON object per row instead of a tab-separated
         /// table. The first line is a JSON array of column names.
         #[arg(long)]
@@ -396,6 +404,7 @@ impl Cli {
                         agent_pubkey_b64,
                         sql,
                         timeout,
+                        fanout,
                         json,
                     },
             } => {
@@ -415,6 +424,7 @@ impl Cli {
                     agent_pubkey_b64,
                     sql,
                     timeout,
+                    fanout,
                     json,
                 ))?;
                 Ok(ExitCode::SUCCESS)

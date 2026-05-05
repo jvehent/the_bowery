@@ -4,6 +4,7 @@
 //! correct end-to-end (proto → handler → seal → operator-side parse)
 //! before the real sysquery handler arrives in slice 2.
 
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -396,6 +397,8 @@ async fn sql_command_streams_chunked_response() {
                   (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 600) \
                   SELECT x AS counter FROM c"
                 .into(),
+            fanout: false,
+            peers: Vec::new(),
         })),
     };
     let outbound = sealer.seal_for(&agent_fp, &WhisperPayload::operator_command(cmd));
@@ -505,6 +508,8 @@ async fn sql_syntax_error_returns_structured_error() {
         timeout_ms: 5_000,
         command: Some(OperatorCommandBody::Sql(SqlQuery {
             sql: "SELECT * FROM does_not_exist".into(),
+            fanout: false,
+            peers: Vec::new(),
         })),
     };
     let outbound = sealer.seal_for(&agent_fp, &WhisperPayload::operator_command(cmd));
@@ -536,4 +541,254 @@ async fn sql_syntax_error_returns_structured_error() {
     drop(conn);
     operator_endpoint.close().await;
     agent.shutdown().await.expect("shutdown");
+}
+
+/// Phase-9 slice 7: two agents discover each other via the mesh,
+/// pin each other, then the operator dials one of them with
+/// `OperatorCommand::Sql { fanout: true }`. The relay must:
+/// 1. Run the query locally and emit chunks tagged with its own fp.
+/// 2. Dispatch the query to its pinned peer (with fanout=false to
+///    prevent recursion) and forward that peer's chunks tagged
+///    with the peer's fp.
+/// 3. Drop the connection once both peer streams are done.
+///
+/// This is the canonical multi-agent test: real QUIC handshake
+/// across two agents + a third operator, mesh discovery, pinning,
+/// fan-out, end-to-end signature verification at every hop.
+#[allow(clippy::too_many_lines)] // multi-agent fixture is inherently long
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fanout_streams_rows_from_relay_and_peer() {
+    // Two agents, both with the operator authorized + each
+    // authorizing the other (relay must be in peer's [operators]
+    // for the fan-out leg; peer must be in relay's [operators]
+    // strictly speaking only matters for the reverse direction,
+    // but symmetric setup is simpler).
+    let dir_alpha = TempDir::new().unwrap();
+    let dir_beta = TempDir::new().unwrap();
+
+    let mesh_addr_alpha = reserve_udp_port();
+    let mesh_addr_beta = reserve_udp_port();
+
+    let id_alpha = Arc::new(Identity::generate());
+    let id_beta = Arc::new(Identity::generate());
+    let operator_id = Arc::new(Identity::generate());
+
+    let pub_alpha = BASE64.encode(id_alpha.verifying_key().as_bytes());
+    let pub_beta = BASE64.encode(id_beta.verifying_key().as_bytes());
+    let pub_op = BASE64.encode(operator_id.verifying_key().as_bytes());
+
+    let cfg_alpha = Config {
+        identity: IdentityConfig {
+            path: dir_alpha.path().join("identity.key"),
+        },
+        known_neighbors: bowery_agent::config::KnownNeighborsConfig {
+            path: dir_alpha.path().join("known_neighbors.json"),
+            bootstrap_window: Duration::from_hours(1),
+            max_pinned_peers: 1024,
+        },
+        mesh: MeshConfig {
+            listen_addr: mesh_addr_alpha,
+            advertise_addr: Some(mesh_addr_alpha),
+            seeds: vec![mesh_addr_beta.to_string()],
+            cluster_id: Some("bowery-fanout-test".to_string()),
+        },
+        whisper: WhisperConfig {
+            qa: WhisperQaConfig::default(),
+            bind_addr: loopback_ephemeral(),
+        },
+        heartbeat: HeartbeatConfig {
+            interval: Duration::from_millis(200),
+        },
+        baseline: BaselineConfig {
+            path: ":memory:".into(),
+        },
+        role: RoleConfig {
+            publish_interval: Duration::from_millis(500),
+        },
+        llm: LlmConfig::default(),
+        // Both agents authorize the operator AND the other agent
+        // as operators — the relay leg signs commands as itself,
+        // and the peer must accept those.
+        operators: OperatorsConfig {
+            pubkeys_b64: vec![pub_op.clone(), pub_beta.clone()],
+        },
+        inbox: InboxConfig::default(),
+        alerts: AlertsConfig::default(),
+        bloom: BloomConfig::default(),
+        response: ResponseConfig::default(),
+        sysquery: bowery_agent::config::SysqueryConfig::default(),
+    };
+    let cfg_beta = Config {
+        identity: IdentityConfig {
+            path: dir_beta.path().join("identity.key"),
+        },
+        known_neighbors: bowery_agent::config::KnownNeighborsConfig {
+            path: dir_beta.path().join("known_neighbors.json"),
+            bootstrap_window: Duration::from_hours(1),
+            max_pinned_peers: 1024,
+        },
+        mesh: MeshConfig {
+            listen_addr: mesh_addr_beta,
+            advertise_addr: Some(mesh_addr_beta),
+            seeds: vec![mesh_addr_alpha.to_string()],
+            cluster_id: Some("bowery-fanout-test".to_string()),
+        },
+        whisper: WhisperConfig {
+            qa: WhisperQaConfig::default(),
+            bind_addr: loopback_ephemeral(),
+        },
+        heartbeat: HeartbeatConfig {
+            interval: Duration::from_millis(200),
+        },
+        baseline: BaselineConfig {
+            path: ":memory:".into(),
+        },
+        role: RoleConfig {
+            publish_interval: Duration::from_millis(500),
+        },
+        llm: LlmConfig::default(),
+        operators: OperatorsConfig {
+            pubkeys_b64: vec![pub_op.clone(), pub_alpha.clone()],
+        },
+        inbox: InboxConfig::default(),
+        alerts: AlertsConfig::default(),
+        bloom: BloomConfig::default(),
+        response: ResponseConfig::default(),
+        sysquery: bowery_agent::config::SysqueryConfig::default(),
+    };
+
+    let agent_alpha = Agent::start(cfg_alpha, id_alpha.clone(), Box::new(NoopEventSource))
+        .await
+        .expect("start alpha");
+    let agent_beta = Agent::start(cfg_beta, id_beta.clone(), Box::new(NoopEventSource))
+        .await
+        .expect("start beta");
+
+    let alpha_fp = agent_alpha.fingerprint();
+    let beta_fp = agent_beta.fingerprint();
+    let alpha_addr = agent_alpha.whisper_addr().expect("alpha whisper addr");
+
+    // Wait for both agents to mutually pin each other so the
+    // relay's KnownNeighbors actually contains beta when we
+    // dispatch the fan-out.
+    let pinned_alpha_rx = agent_alpha.subscribe();
+    let pinned_beta_rx = agent_beta.subscribe();
+    tokio::time::timeout(Duration::from_secs(15), async move {
+        tokio::join!(
+            wait_for_pin(pinned_alpha_rx, beta_fp),
+            wait_for_pin(pinned_beta_rx, alpha_fp),
+        )
+    })
+    .await
+    .expect("agents must pin each other before fanout dispatch");
+
+    // Operator-side QUIC stack — pinned to alpha (the relay).
+    let mut resolver = StaticResolver::new();
+    resolver.insert(id_alpha.verifying_key());
+    resolver.insert(id_beta.verifying_key());
+    let resolver = Arc::new(resolver);
+    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
+    let operator_endpoint =
+        BoweryEndpoint::bind(operator_id.clone(), accept_verifier, loopback_ephemeral())
+            .expect("bind operator endpoint");
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), alpha_fp));
+    let conn = operator_endpoint
+        .dial(dial_verifier, alpha_addr)
+        .await
+        .expect("operator dial relay");
+
+    let operator_fp = operator_id.fingerprint();
+    let sealer = Sealer::new(operator_id.clone());
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
+
+    let cmd = OperatorCommand {
+        request_id: "fanout-1".into(),
+        timeout_ms: 8_000,
+        command: Some(OperatorCommandBody::Sql(SqlQuery {
+            sql: "SELECT 1 AS one".into(),
+            fanout: true,
+            peers: Vec::new(), // every pinned peer
+        })),
+    };
+    let outbound = sealer.seal_for(&alpha_fp, &WhisperPayload::operator_command(cmd));
+    conn.send_envelope(&outbound)
+        .await
+        .expect("send fanout cmd");
+
+    // Read until connection closes; track per-agent EOFs.
+    let mut ended_agents: HashSet<Vec<u8>> = HashSet::new();
+    let mut rows_per_agent: HashMap<Vec<u8>, Vec<i64>> = HashMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if timeout.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(timeout, conn.recv_envelope()).await {
+            Ok(Ok(bytes)) => {
+                let opened = envelope_verifier.open(&bytes).expect("verify chunk");
+                let result = match opened.payload.body {
+                    Some(Body::OperatorResult(r)) => r,
+                    other => panic!("unexpected body: {other:?}"),
+                };
+                assert_eq!(result.request_id, "fanout-1");
+                let chunk = match result.result {
+                    Some(OperatorResultBody::SqlChunk(c)) => c,
+                    other => panic!("expected SqlChunk, got {other:?}"),
+                };
+                for row in &chunk.rows {
+                    if let Some(SqlValueKind::Integer(i)) = &row.values[0].value {
+                        rows_per_agent
+                            .entry(chunk.agent_fp.clone())
+                            .or_default()
+                            .push(*i);
+                    }
+                }
+                if chunk.end {
+                    ended_agents.insert(chunk.agent_fp.clone());
+                }
+                // Stop once both agents have produced an EOF.
+                if ended_agents.len() == 2 {
+                    break;
+                }
+            }
+            // Connection closed or deadline expired — both end the loop.
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    assert_eq!(
+        ended_agents.len(),
+        2,
+        "expected EOF from both agents, got {}: {:?}",
+        ended_agents.len(),
+        ended_agents
+    );
+    assert!(
+        ended_agents.contains(alpha_fp.as_bytes().as_slice()),
+        "missing relay's own EOF"
+    );
+    assert!(
+        ended_agents.contains(beta_fp.as_bytes().as_slice()),
+        "missing peer's EOF"
+    );
+    assert_eq!(rows_per_agent[alpha_fp.as_bytes().as_slice()], vec![1]);
+    assert_eq!(rows_per_agent[beta_fp.as_bytes().as_slice()], vec![1]);
+
+    drop(conn);
+    operator_endpoint.close().await;
+    agent_alpha.shutdown().await.expect("shutdown alpha");
+    agent_beta.shutdown().await.expect("shutdown beta");
+}
+
+async fn wait_for_pin(
+    mut rx: tokio::sync::broadcast::Receiver<AgentEvent>,
+    expected: bowery_crypto::Fingerprint,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(AgentEvent::PeerPinned(fp)) if fp == expected => return,
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => panic!("agent event channel closed before pinning"),
+        }
+    }
 }

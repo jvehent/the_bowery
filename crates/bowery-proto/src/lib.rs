@@ -344,6 +344,23 @@ pub struct SqlQuery {
     /// other channels.
     #[prost(string, tag = "1")]
     pub sql: String,
+    /// Phase-9 slice 7: when true, the dialled agent acts as a
+    /// **relay** — it runs the query locally *and* dispatches it
+    /// to its pinned peers, multiplexing every peer's chunks back
+    /// over the same operator connection. When false, only the
+    /// directly-dialled agent runs the query (slice-6 shape).
+    ///
+    /// Cycle prevention: the relay always sends `fanout = false`
+    /// to peers, so a peer never recurses. Operators set this to
+    /// `true` for one-hop fan-out.
+    #[prost(bool, tag = "2")]
+    pub fanout: bool,
+    /// Optional explicit peer-fingerprint filter for fanout. Each
+    /// entry is a 32-byte fingerprint. Empty = every pinned peer
+    /// the relay has in `KnownNeighbors`. Ignored when `fanout =
+    /// false`.
+    #[prost(bytes = "vec", repeated, tag = "3")]
+    pub peers: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ProstMessage)]
@@ -404,19 +421,31 @@ pub struct SysqueryResult {
 /// must accept either as a stream terminator.
 #[derive(Clone, PartialEq, ProstMessage)]
 pub struct SqlChunk {
-    /// Column names — populated only on the first chunk. Empty on
-    /// every subsequent chunk so we don't pay for the names on the
-    /// wire repeatedly.
+    /// Column names — populated only on the first chunk *per
+    /// agent*. In fan-out mode, every distinct agent's first chunk
+    /// carries column names; subsequent chunks from the same agent
+    /// leave it empty.
     #[prost(string, repeated, tag = "1")]
     pub columns: Vec<String>,
     /// Row batch. Each row's `values` length matches `columns`
-    /// length from the first chunk.
+    /// length from the first chunk that carried them.
     #[prost(message, repeated, tag = "2")]
     pub rows: Vec<SqlRow>,
-    /// Terminator flag. The decoder stops reading further chunks
-    /// once it observes `end = true` (or an `Error` body).
+    /// Terminator flag *for this agent's stream*. In single-agent
+    /// (non-fanout) mode, this is the stream terminator full-stop.
+    /// In fan-out mode, the relay multiplexes per-peer streams and
+    /// emits one chunk with `end = true` per peer (including
+    /// itself); the operator-side decoder counts EOFs against the
+    /// expected peer set.
     #[prost(bool, tag = "3")]
     pub end: bool,
+    /// Phase-9 slice 7: 32-byte fingerprint of the agent that
+    /// produced this chunk. Populated on the relay path so the
+    /// operator can attribute rows. Empty in single-agent mode —
+    /// the operator infers attribution from the connection's
+    /// pinned fingerprint.
+    #[prost(bytes = "vec", tag = "4")]
+    pub agent_fp: Vec<u8>,
 }
 
 /// One row in a SQL response chunk.
@@ -711,6 +740,7 @@ mod tests {
             columns: vec!["a".into(), "b".into(), "c".into()],
             rows: vec![row1, row2],
             end: true,
+            agent_fp: vec![0x42; 32],
         };
         let result = OperatorResult {
             request_id: "req-1".into(),
@@ -737,6 +767,8 @@ mod tests {
             timeout_ms: 5_000,
             command: Some(OperatorCommandBody::Sql(SqlQuery {
                 sql: "SELECT pid FROM processes LIMIT 5".into(),
+                fanout: false,
+                peers: Vec::new(),
             })),
         };
         let bytes = WhisperPayload::operator_command(cmd.clone()).encode_to_vec();
