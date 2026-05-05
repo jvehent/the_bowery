@@ -34,7 +34,7 @@
 use std::time::Duration;
 
 use rusqlite::Connection;
-use rusqlite::types::Value;
+pub use rusqlite::types::Value;
 use thiserror::Error;
 use tracing::debug;
 

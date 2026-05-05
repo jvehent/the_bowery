@@ -299,7 +299,7 @@ pub struct OperatorCommand {
     #[prost(uint32, tag = "2")]
     pub timeout_ms: u32,
     /// One of the typed command bodies.
-    #[prost(oneof = "OperatorCommandBody", tags = "10")]
+    #[prost(oneof = "OperatorCommandBody", tags = "10, 11")]
     pub command: Option<OperatorCommandBody>,
 }
 
@@ -311,6 +311,15 @@ pub enum OperatorCommandBody {
     /// permissive, tighten later).
     #[prost(message, tag = "10")]
     Osquery(OsqueryQuery),
+    /// Run a SQL query against the agent's native Phase-9 SQL
+    /// surface (`bowery-sql`). The response is *streamed*: the
+    /// agent emits one or more `SqlChunk` envelopes (each in its
+    /// own unidirectional QUIC stream, all with the same
+    /// `request_id`) terminated by either a chunk with `end =
+    /// true` or an `Error` body. Operator-side decoder loops on
+    /// `recv_envelope` until it sees the terminal frame.
+    #[prost(message, tag = "11")]
+    Sql(SqlQuery),
 }
 
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
@@ -318,6 +327,18 @@ pub struct OsqueryQuery {
     /// SQL string. Subject to per-agent allow-list policy at handler
     /// time; the agent may refuse any query the local config doesn't
     /// permit.
+    #[prost(string, tag = "1")]
+    pub sql: String,
+}
+
+/// Phase-9 SQL command body. See [`OperatorCommandBody::Sql`].
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct SqlQuery {
+    /// SQL string evaluated against the agent's native table set
+    /// (see `bowery-tables`). No allow-list — every Phase-9 table
+    /// is read-only over `procfs`/`sysfs`/`/etc`, so an arbitrary
+    /// SELECT exposes only what the agent already publishes via
+    /// other channels.
     #[prost(string, tag = "1")]
     pub sql: String,
 }
@@ -331,7 +352,7 @@ pub struct OperatorResult {
     /// `error` field so a future "always populated alongside the
     /// concrete result" pattern (e.g. structured warnings) can
     /// extend cleanly.
-    #[prost(oneof = "OperatorResultBody", tags = "10, 11")]
+    #[prost(oneof = "OperatorResultBody", tags = "10, 11, 12")]
     pub result: Option<OperatorResultBody>,
 }
 
@@ -349,6 +370,12 @@ pub enum OperatorResultBody {
     /// transport-level error, not this.
     #[prost(message, tag = "11")]
     Error(OperatorError),
+    /// One chunk of a streaming SQL response. Multiple `SqlChunk`
+    /// envelopes share the same `request_id`. The first chunk
+    /// carries `columns`; subsequent chunks leave it empty. The
+    /// final chunk has `end = true` (and may also carry rows).
+    #[prost(message, tag = "12")]
+    SqlChunk(SqlChunk),
 }
 
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
@@ -363,6 +390,61 @@ pub struct OsqueryResult {
     /// fell back without a structured reason).
     #[prost(int32, tag = "2")]
     pub exit_code: i32,
+}
+
+/// One chunk of a streaming SQL response. See
+/// [`OperatorResultBody::SqlChunk`] for the framing protocol.
+///
+/// Empty rows + `end = true` is a valid terminator (used when the
+/// query produced no rows but still completed successfully). An
+/// error mid-stream is signalled by sending an `Error` body
+/// instead of a further `SqlChunk`; the operator-side decoder
+/// must accept either as a stream terminator.
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct SqlChunk {
+    /// Column names — populated only on the first chunk. Empty on
+    /// every subsequent chunk so we don't pay for the names on the
+    /// wire repeatedly.
+    #[prost(string, repeated, tag = "1")]
+    pub columns: Vec<String>,
+    /// Row batch. Each row's `values` length matches `columns`
+    /// length from the first chunk.
+    #[prost(message, repeated, tag = "2")]
+    pub rows: Vec<SqlRow>,
+    /// Terminator flag. The decoder stops reading further chunks
+    /// once it observes `end = true` (or an `Error` body).
+    #[prost(bool, tag = "3")]
+    pub end: bool,
+}
+
+/// One row in a SQL response chunk.
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct SqlRow {
+    #[prost(message, repeated, tag = "1")]
+    pub values: Vec<SqlValue>,
+}
+
+/// One typed cell in a `SqlRow`. Mirrors the five SQLite storage
+/// classes exactly (NULL, INTEGER, REAL, TEXT, BLOB). Empty
+/// `value` means SQL NULL — prost can't distinguish "field not
+/// set" from "null integer = 0", so we use the absence of the
+/// oneof to mean NULL.
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct SqlValue {
+    #[prost(oneof = "SqlValueKind", tags = "1, 2, 3, 4")]
+    pub value: Option<SqlValueKind>,
+}
+
+#[derive(Clone, PartialEq, Oneof)]
+pub enum SqlValueKind {
+    #[prost(int64, tag = "1")]
+    Integer(i64),
+    #[prost(double, tag = "2")]
+    Real(f64),
+    #[prost(string, tag = "3")]
+    Text(String),
+    #[prost(bytes, tag = "4")]
+    Blob(Vec<u8>),
 }
 
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
@@ -594,6 +676,73 @@ mod tests {
         let bytes = advert.encode_to_vec();
         let decoded = BloomAdvert::decode(bytes.as_slice()).unwrap();
         assert_eq!(advert, decoded);
+    }
+
+    #[test]
+    fn sql_chunk_roundtrip_streams_typed_values() {
+        // Build a chunk that exercises every SqlValueKind variant
+        // plus a NULL (None oneof) — the wire format must round-
+        // trip all five SQLite storage classes losslessly.
+        let row1 = SqlRow {
+            values: vec![
+                SqlValue {
+                    value: Some(SqlValueKind::Integer(42)),
+                },
+                SqlValue {
+                    value: Some(SqlValueKind::Text("hello".into())),
+                },
+                SqlValue { value: None }, // NULL
+            ],
+        };
+        let row2 = SqlRow {
+            values: vec![
+                SqlValue {
+                    value: Some(SqlValueKind::Real(2.5)),
+                },
+                SqlValue {
+                    value: Some(SqlValueKind::Blob(vec![0xde, 0xad, 0xbe, 0xef])),
+                },
+                SqlValue { value: None },
+            ],
+        };
+        let chunk = SqlChunk {
+            columns: vec!["a".into(), "b".into(), "c".into()],
+            rows: vec![row1, row2],
+            end: true,
+        };
+        let result = OperatorResult {
+            request_id: "req-1".into(),
+            result: Some(OperatorResultBody::SqlChunk(chunk.clone())),
+        };
+        let bytes = WhisperPayload::operator_result(result).encode_to_vec();
+        let decoded = WhisperPayload::decode(bytes.as_slice()).unwrap();
+        match decoded.body {
+            Some(Body::OperatorResult(r)) => {
+                assert_eq!(r.request_id, "req-1");
+                match r.result {
+                    Some(OperatorResultBody::SqlChunk(got)) => assert_eq!(got, chunk),
+                    other => panic!("unexpected result body: {other:?}"),
+                }
+            }
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sql_query_command_roundtrip() {
+        let cmd = OperatorCommand {
+            request_id: "q-7".into(),
+            timeout_ms: 5_000,
+            command: Some(OperatorCommandBody::Sql(SqlQuery {
+                sql: "SELECT pid FROM processes LIMIT 5".into(),
+            })),
+        };
+        let bytes = WhisperPayload::operator_command(cmd.clone()).encode_to_vec();
+        let decoded = WhisperPayload::decode(bytes.as_slice()).unwrap();
+        match decoded.body {
+            Some(Body::OperatorCommand(got)) => assert_eq!(got, cmd),
+            other => panic!("unexpected body: {other:?}"),
+        }
     }
 
     #[test]

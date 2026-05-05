@@ -395,6 +395,7 @@ impl Agent {
         };
         let op_router = Arc::new(OperatorCommandRouter {
             osquery: osquery_handle,
+            sql: Some(Arc::new(bowery_sql::Sql::new())),
             max_timeout: config.osquery.max_timeout,
         });
 
@@ -677,6 +678,13 @@ pub(crate) struct OperatorCommandRouter {
     /// Phase-6b osquery handler. Some when [`OsqueryConfig::enabled`]
     /// is true and `binary_path` resolves at startup.
     pub osquery: Option<Arc<bowery_osquery::Osquery>>,
+    /// Phase-9 native SQL engine. Always populated — `bowery-sql`
+    /// has no privileged surface and no external dependencies, so
+    /// there's nothing to gate. `Arc` makes the engine
+    /// cheap-to-clone across handler spawns even though `Sql`
+    /// itself is `Clone`; it preserves a single canonical
+    /// configuration owned by the agent.
+    pub sql: Option<Arc<bowery_sql::Sql>>,
     /// Hard ceiling on per-query timeout, applied to every
     /// command kind.
     pub max_timeout: Duration,
@@ -912,6 +920,7 @@ async fn respond_to_operator_command(
     let request_id = cmd.request_id.clone();
     let command_kind = match cmd.command.as_ref() {
         Some(OperatorCommandBody::Osquery(_)) => "osquery",
+        Some(OperatorCommandBody::Sql(_)) => "sql",
         None => "<empty>",
     };
     // Clamp the operator's requested timeout to our configured cap.
@@ -929,7 +938,31 @@ async fn respond_to_operator_command(
         "operator command received"
     );
 
+    // SQL is special-cased: it streams multiple chunked envelopes
+    // back over the same connection. Other variants build a single
+    // OperatorResultBody and fall through to the unified send below.
+    if let Some(OperatorCommandBody::Sql(q)) = &cmd.command {
+        let sql_engine = op_router.sql.clone();
+        let outcome = stream_sql_response(
+            conn,
+            sealer,
+            operator,
+            &request_id,
+            sql_engine.as_ref(),
+            &q.sql,
+            effective_timeout,
+        )
+        .await;
+        let _ = events_tx.send(AgentEvent::OperatorCommandHandled {
+            operator,
+            request_id,
+            kind: command_kind,
+        });
+        return outcome;
+    }
+
     let result = match cmd.command {
+        Some(OperatorCommandBody::Sql(_)) => unreachable!("handled above"),
         Some(OperatorCommandBody::Osquery(q)) => match &op_router.osquery {
             Some(osq) => match osq.run(&q.sql, effective_timeout).await {
                 Ok(out) => OperatorResultBody::Osquery(OsqueryResult {
@@ -972,6 +1005,134 @@ async fn respond_to_operator_command(
         kind: command_kind,
     });
     Ok(())
+}
+
+/// Soft cap on rows per `SqlChunk` envelope. Trades off
+/// per-envelope encoded size (proto + ed25519 sig + QUIC framing
+/// overhead) against the operator's "first row" latency. 256 rows
+/// of typical /proc-shaped columns sit well under the
+/// `MAX_FRAME_BYTES` envelope cap with headroom for wide rows.
+const SQL_CHUNK_ROW_LIMIT: usize = 256;
+
+/// Drive the streaming SQL response. On success, emits one or
+/// more `OperatorResult { SqlChunk }` envelopes (terminated by a
+/// chunk with `end = true`); on failure, emits a single
+/// `OperatorResult { Error }` and stops. Each envelope is sealed
+/// independently for the operator and rides its own QUIC stream.
+async fn stream_sql_response(
+    conn: &BoweryConnection,
+    sealer: &Sealer,
+    operator: Fingerprint,
+    request_id: &str,
+    sql_engine: Option<&Arc<bowery_sql::Sql>>,
+    sql: &str,
+    timeout: Duration,
+) -> Result<(), bowery_whisper::transport::Error> {
+    use bowery_proto::{OperatorError, OperatorResult, OperatorResultBody, SqlChunk};
+
+    let Some(engine) = sql_engine else {
+        // Unreachable in practice — the agent always wires `sql`
+        // alongside the router — but kept defensive so a future
+        // operator-config gate flowing in here surfaces a clean
+        // policy_denied instead of a panic.
+        let err = OperatorResultBody::Error(OperatorError {
+            kind: "policy_denied".into(),
+            message: "SQL engine not configured on this agent".into(),
+        });
+        let response = OperatorResult {
+            request_id: request_id.to_string(),
+            result: Some(err),
+        };
+        let outbound = sealer.seal_for(&operator, &WhisperPayload::operator_result(response));
+        return conn.send_envelope(&outbound).await;
+    };
+
+    let rows = match engine.query(sql, timeout).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            let kind = match &e {
+                bowery_sql::SqlError::Timeout(_) => "timeout",
+                bowery_sql::SqlError::RowCapExceeded { .. } => "row_cap_exceeded",
+                bowery_sql::SqlError::Sqlite(_) => "sql_error",
+                _ => "handler_error",
+            };
+            let err = OperatorResultBody::Error(OperatorError {
+                kind: kind.into(),
+                message: e.to_string(),
+            });
+            let response = OperatorResult {
+                request_id: request_id.to_string(),
+                result: Some(err),
+            };
+            let outbound = sealer.seal_for(&operator, &WhisperPayload::operator_result(response));
+            return conn.send_envelope(&outbound).await;
+        }
+    };
+
+    let columns: Vec<String> = rows
+        .first()
+        .map(|r| r.columns.iter().map(|(name, _)| name.clone()).collect())
+        .unwrap_or_default();
+
+    // No rows: still send exactly one terminal chunk so the
+    // operator-side loop has something to terminate on.
+    if rows.is_empty() {
+        let chunk = SqlChunk {
+            columns,
+            rows: Vec::new(),
+            end: true,
+        };
+        let response = OperatorResult {
+            request_id: request_id.to_string(),
+            result: Some(OperatorResultBody::SqlChunk(chunk)),
+        };
+        let outbound = sealer.seal_for(&operator, &WhisperPayload::operator_result(response));
+        return conn.send_envelope(&outbound).await;
+    }
+
+    let mut sent = 0usize;
+    while sent < rows.len() {
+        let take = SQL_CHUNK_ROW_LIMIT.min(rows.len() - sent);
+        let batch = &rows[sent..sent + take];
+        let proto_rows: Vec<bowery_proto::SqlRow> = batch.iter().map(encode_row).collect();
+        let chunk_columns = if sent == 0 {
+            columns.clone()
+        } else {
+            Vec::new()
+        };
+        let end = sent + take == rows.len();
+        let chunk = SqlChunk {
+            columns: chunk_columns,
+            rows: proto_rows,
+            end,
+        };
+        let response = OperatorResult {
+            request_id: request_id.to_string(),
+            result: Some(OperatorResultBody::SqlChunk(chunk)),
+        };
+        let outbound = sealer.seal_for(&operator, &WhisperPayload::operator_result(response));
+        conn.send_envelope(&outbound).await?;
+        sent += take;
+    }
+    Ok(())
+}
+
+fn encode_row(row: &bowery_sql::Row) -> bowery_proto::SqlRow {
+    let values = row
+        .columns
+        .iter()
+        .map(|(_, v)| {
+            let kind = match v {
+                bowery_sql::Value::Null => None,
+                bowery_sql::Value::Integer(i) => Some(bowery_proto::SqlValueKind::Integer(*i)),
+                bowery_sql::Value::Real(f) => Some(bowery_proto::SqlValueKind::Real(*f)),
+                bowery_sql::Value::Text(s) => Some(bowery_proto::SqlValueKind::Text(s.clone())),
+                bowery_sql::Value::Blob(b) => Some(bowery_proto::SqlValueKind::Blob(b.clone())),
+            };
+            bowery_proto::SqlValue { value: kind }
+        })
+        .collect();
+    bowery_proto::SqlRow { values }
 }
 
 fn spawn_heartbeat_task(

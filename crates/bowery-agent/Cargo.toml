@@ -35,6 +35,7 @@ bowery-mesh = { workspace = true }
 bowery-osquery = { workspace = true }
 bowery-proto = { workspace = true }
 bowery-response = { workspace = true }
+bowery-sql = { workspace = true }
 bowery-whisper = { workspace = true }
 
 anyhow = { workspace = true }

@@ -97,6 +97,36 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum ExecCommand {
+    /// Run a native Bowery SQL query (Phase-9 surface) against the
+    /// agent's `bowery-sql` engine. The agent streams the response
+    /// in chunks; the CLI prints rows as they arrive.
+    Sql {
+        /// Path to the operator's identity key file.
+        #[arg(long)]
+        operator_key: PathBuf,
+        /// Agent's whisper bind address (e.g. `127.0.0.1:9902`).
+        #[arg(long)]
+        agent_addr: SocketAddr,
+        /// Hex-encoded fingerprint of the agent's identity key.
+        #[arg(long)]
+        agent_fp: String,
+        /// Base64-encoded Ed25519 verifying key of the agent.
+        #[arg(long)]
+        agent_pubkey_b64: String,
+        /// SQL string evaluated by `bowery-sql` against the
+        /// agent's native Phase-9 tables (e.g. `processes`,
+        /// `listening_ports`, `users`).
+        #[arg(long)]
+        sql: String,
+        /// Wall-clock deadline for the agent-side query. Accepts
+        /// humantime expressions (`5s`, `30s`, `2m`).
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        timeout: Duration,
+        /// Emit one JSON object per row instead of a tab-separated
+        /// table. The first line is a JSON array of column names.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run an osquery query on the agent host and print the result.
     Osquery {
         /// Path to the operator's identity key file.
@@ -344,6 +374,38 @@ impl Cli {
                     .build()
                     .context("building tokio runtime")?;
                 runtime.block_on(exec::osquery(
+                    operator_key,
+                    agent_addr,
+                    agent_fp,
+                    agent_pubkey_b64,
+                    sql,
+                    timeout,
+                    json,
+                ))?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::Exec {
+                sub:
+                    ExecCommand::Sql {
+                        operator_key,
+                        agent_addr,
+                        agent_fp,
+                        agent_pubkey_b64,
+                        sql,
+                        timeout,
+                        json,
+                    },
+            } => {
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::WARN)
+                    .with_target(false)
+                    .with_writer(std::io::stderr)
+                    .init();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building tokio runtime")?;
+                runtime.block_on(exec::sql(
                     operator_key,
                     agent_addr,
                     agent_fp,

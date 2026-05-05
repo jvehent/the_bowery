@@ -281,6 +281,7 @@ dependencies = [
  "bowery-osquery",
  "bowery-proto",
  "bowery-response",
+ "bowery-sql",
  "bowery-whisper",
  "clap",
  "ed25519-dalek",

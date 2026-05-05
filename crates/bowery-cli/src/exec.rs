@@ -19,7 +19,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use bowery_crypto::{Fingerprint, Identity};
 use bowery_proto::{
-    Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, OsqueryQuery, WhisperPayload,
+    Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, OsqueryQuery, SqlChunk,
+    SqlQuery, SqlValueKind, WhisperPayload,
 };
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::BoweryEndpoint;
@@ -134,6 +135,188 @@ pub(crate) async fn osquery(
     print_result(&result, json)
 }
 
+/// Send a single Phase-9 SQL query and stream the rows back. Each
+/// chunk envelope arrives on its own QUIC stream; the loop
+/// terminates on the first chunk with `end = true` or on an
+/// `Error` body. The exchange-level deadline is the operator-
+/// supplied timeout plus a small slack — the agent enforces its
+/// own timeout server-side and is the authority on "how long
+/// before this query is killed".
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sql(
+    operator_key: PathBuf,
+    target_addr: SocketAddr,
+    target_fp_hex: String,
+    target_pubkey_b64: String,
+    sql: String,
+    timeout: Duration,
+    json: bool,
+) -> Result<()> {
+    let identity = Arc::new(
+        Identity::load(&operator_key)
+            .with_context(|| format!("loading operator key from {}", operator_key.display()))?,
+    );
+
+    let target_fp = parse_fingerprint(&target_fp_hex)?;
+    let target_vk = parse_verifying_key(&target_pubkey_b64)?;
+    let mut resolver = StaticResolver::new();
+    let inserted_fp = resolver.insert(target_vk);
+    if inserted_fp != target_fp {
+        bail!("target_pubkey_b64 fingerprint {inserted_fp} doesn't match --agent-fp {target_fp}");
+    }
+    let resolver = Arc::new(resolver);
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
+    let endpoint = BoweryEndpoint::bind(identity.clone(), accept_verifier, bind_addr)
+        .context("binding operator-side endpoint")?;
+
+    let operator_fp = identity.fingerprint();
+    let sealer = Sealer::new(identity);
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
+
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), target_fp));
+    let conn = endpoint
+        .dial(dial_verifier, target_addr)
+        .await
+        .with_context(|| format!("dialing agent at {target_addr}"))?;
+
+    let request_id = format!("op-{}", current_unix_ms());
+    let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+
+    let cmd = OperatorCommand {
+        request_id: request_id.clone(),
+        timeout_ms,
+        command: Some(OperatorCommandBody::Sql(SqlQuery { sql })),
+    };
+    let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
+
+    let exchange_timeout = timeout + Duration::from_secs(2);
+    let exchange = async {
+        conn.send_envelope(&outbound)
+            .await
+            .context("sending OperatorCommand")?;
+
+        let mut columns: Vec<String> = Vec::new();
+        let mut printed_header = false;
+        loop {
+            let bytes = conn
+                .recv_envelope()
+                .await
+                .context("awaiting SqlChunk envelope")?;
+            let opened = envelope_verifier
+                .open(&bytes)
+                .context("verifying SqlChunk envelope")?;
+            let result = match opened.payload.body {
+                Some(Body::OperatorResult(r)) => r,
+                other => bail!("agent replied with unexpected body: {other:?}"),
+            };
+            if result.request_id != request_id {
+                bail!(
+                    "agent echoed request_id={:?}, expected {:?}",
+                    result.request_id,
+                    request_id
+                );
+            }
+            match result.result {
+                Some(OperatorResultBody::SqlChunk(chunk)) => {
+                    let SqlChunk {
+                        columns: chunk_cols,
+                        rows,
+                        end,
+                    } = chunk;
+                    if !chunk_cols.is_empty() {
+                        columns = chunk_cols;
+                    }
+                    if !printed_header {
+                        print_sql_header(&columns, json);
+                        printed_header = true;
+                    }
+                    for row in rows {
+                        print_sql_row(&columns, &row, json);
+                    }
+                    if end {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                }
+                Some(OperatorResultBody::Error(e)) => {
+                    eprintln!("agent refused query: {} ({})", e.message, e.kind);
+                    bail!("sql query failed: {}", e.kind);
+                }
+                Some(other) => bail!("unexpected OperatorResult body: {other:?}"),
+                None => bail!("agent returned an OperatorResult with no body"),
+            }
+        }
+    };
+    let outcome = tokio::time::timeout(exchange_timeout, exchange).await;
+    drop(conn);
+    endpoint.close().await;
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => bail!("sql query timed out after {exchange_timeout:?}"),
+    }
+}
+
+fn print_sql_header(columns: &[String], json: bool) {
+    if json {
+        // First line is a JSON array of column names so consumers
+        // can demux the rest as `{col: val}` dicts.
+        let escaped: Vec<String> = columns
+            .iter()
+            .map(|c| format!("\"{}\"", escape_json_string(c)))
+            .collect();
+        println!("[{}]", escaped.join(","));
+    } else {
+        println!("{}", columns.join("\t"));
+    }
+}
+
+fn print_sql_row(columns: &[String], row: &bowery_proto::SqlRow, json: bool) {
+    if json {
+        let mut parts: Vec<String> = Vec::with_capacity(row.values.len());
+        for (i, v) in row.values.iter().enumerate() {
+            let key = columns.get(i).map_or("", String::as_str);
+            parts.push(format!(
+                "\"{}\":{}",
+                escape_json_string(key),
+                value_to_json(v)
+            ));
+        }
+        println!("{{{}}}", parts.join(","));
+    } else {
+        let cells: Vec<String> = row.values.iter().map(value_to_text).collect();
+        println!("{}", cells.join("\t"));
+    }
+}
+
+fn value_to_text(v: &bowery_proto::SqlValue) -> String {
+    match &v.value {
+        None => String::new(),
+        Some(SqlValueKind::Integer(i)) => i.to_string(),
+        Some(SqlValueKind::Real(f)) => f.to_string(),
+        Some(SqlValueKind::Text(s)) => s.clone(),
+        Some(SqlValueKind::Blob(b)) => format!("<{} bytes>", b.len()),
+    }
+}
+
+fn value_to_json(v: &bowery_proto::SqlValue) -> String {
+    match &v.value {
+        None => "null".to_string(),
+        Some(SqlValueKind::Integer(i)) => i.to_string(),
+        Some(SqlValueKind::Real(f)) => {
+            // JSON disallows NaN/Inf; emit null for those.
+            if f.is_finite() {
+                f.to_string()
+            } else {
+                "null".to_string()
+            }
+        }
+        Some(SqlValueKind::Text(s)) => format!("\"{}\"", escape_json_string(s)),
+        Some(SqlValueKind::Blob(b)) => format!("\"<{} bytes>\"", b.len()),
+    }
+}
+
 fn print_result(result: &bowery_proto::OperatorResult, json: bool) -> Result<()> {
     match (&result.result, json) {
         (Some(OperatorResultBody::Osquery(o)), true) => {
@@ -157,6 +340,11 @@ fn print_result(result: &bowery_proto::OperatorResult, json: bool) -> Result<()>
         (Some(OperatorResultBody::Error(e)), _) => {
             eprintln!("agent refused command: {} ({})", e.message, e.kind);
             bail!("operator command failed: {}", e.kind);
+        }
+        (Some(OperatorResultBody::SqlChunk(_)), _) => {
+            // The osquery exec path is single-shot; receiving a
+            // SqlChunk on it indicates a wire-protocol mismatch.
+            bail!("agent replied to osquery command with SqlChunk; protocol mismatch");
         }
         (None, _) => bail!("agent returned an OperatorResult with no body"),
     }

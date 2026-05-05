@@ -20,7 +20,8 @@ use bowery_agent::{Agent, AgentEvent};
 use bowery_crypto::Identity;
 use bowery_events::source::NoopEventSource;
 use bowery_proto::{
-    Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, OsqueryQuery, WhisperPayload,
+    Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, OsqueryQuery, SqlQuery,
+    SqlValueKind, WhisperPayload,
 };
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::BoweryEndpoint;
@@ -336,5 +337,203 @@ async fn non_operator_sender_is_rejected() {
 
     drop(conn);
     stranger_endpoint.close().await;
+    agent.shutdown().await.expect("shutdown");
+}
+
+/// Phase-9 slice 6: the operator dials a running agent, sends an
+/// `OperatorCommand::Sql` against the native `bowery-sql` engine,
+/// and the agent streams the response back as one or more
+/// `SqlChunk` envelopes terminated by `end = true`. This test
+/// exercises the full path: proto encode → seal → QUIC → handler
+/// dispatch → bowery-sql query → chunked sealed envelopes → operator
+/// decode + reassembly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_command_streams_chunked_response() {
+    let workdir = TempDir::new().unwrap();
+    let operator_id = Arc::new(Identity::generate());
+    let operator_pubkey_b64 = BASE64.encode(operator_id.verifying_key().as_bytes());
+
+    let cfg = build_agent_config(
+        workdir.path(),
+        reserve_udp_port(),
+        operator_pubkey_b64.clone(),
+        OsqueryConfig::default(),
+    );
+    let agent_id = Arc::new(Identity::generate());
+    let agent_fp = agent_id.fingerprint();
+    let agent_vk = agent_id.verifying_key();
+
+    let agent = Agent::start(cfg, agent_id, Box::new(NoopEventSource))
+        .await
+        .expect("start agent");
+    let agent_whisper_addr = agent.whisper_addr().expect("whisper addr");
+
+    let mut resolver = StaticResolver::new();
+    resolver.insert(agent_vk);
+    let resolver = Arc::new(resolver);
+    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
+    let operator_endpoint =
+        BoweryEndpoint::bind(operator_id.clone(), accept_verifier, loopback_ephemeral())
+            .expect("bind operator endpoint");
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), agent_fp));
+    let conn = operator_endpoint
+        .dial(dial_verifier, agent_whisper_addr)
+        .await
+        .expect("operator dial");
+
+    let operator_fp = operator_id.fingerprint();
+    let sealer = Sealer::new(operator_id.clone());
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
+
+    let cmd = OperatorCommand {
+        request_id: "sql-req-1".into(),
+        timeout_ms: 5_000,
+        command: Some(OperatorCommandBody::Sql(SqlQuery {
+            // Recursive CTE produces 600 rows — well above the
+            // SQL_CHUNK_ROW_LIMIT (256) so the response must arrive
+            // as multiple chunks, exercising the streaming path.
+            sql: "WITH RECURSIVE c(x) AS \
+                  (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 600) \
+                  SELECT x AS counter FROM c"
+                .into(),
+        })),
+    };
+    let outbound = sealer.seal_for(&agent_fp, &WhisperPayload::operator_command(cmd));
+    conn.send_envelope(&outbound).await.expect("send");
+
+    // Read chunks until end=true. Confirm columns arrived once,
+    // total rows match the CTE output, and the value of the first
+    // and last row are intact.
+    let mut chunks_seen = 0;
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows_seen: Vec<i64> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let bytes = tokio::time::timeout(timeout, conn.recv_envelope())
+            .await
+            .expect("recv chunk in time")
+            .expect("recv chunk");
+        let opened = envelope_verifier.open(&bytes).expect("verify chunk");
+        let result = match opened.payload.body {
+            Some(Body::OperatorResult(r)) => r,
+            other => panic!("unexpected body: {other:?}"),
+        };
+        assert_eq!(result.request_id, "sql-req-1");
+        let chunk = match result.result {
+            Some(OperatorResultBody::SqlChunk(c)) => c,
+            other => panic!("expected SqlChunk, got {other:?}"),
+        };
+        if chunks_seen == 0 {
+            assert_eq!(chunk.columns, vec!["counter".to_string()]);
+            columns = chunk.columns.clone();
+        } else {
+            assert!(
+                chunk.columns.is_empty(),
+                "subsequent chunks must not repeat column names"
+            );
+        }
+        for row in &chunk.rows {
+            assert_eq!(row.values.len(), columns.len());
+            match &row.values[0].value {
+                Some(SqlValueKind::Integer(i)) => rows_seen.push(*i),
+                other => panic!("unexpected value: {other:?}"),
+            }
+        }
+        chunks_seen += 1;
+        if chunk.end {
+            break;
+        }
+    }
+    assert!(
+        chunks_seen >= 2,
+        "600 rows must arrive in multiple chunks; got {chunks_seen}"
+    );
+    assert_eq!(rows_seen.len(), 600);
+    assert_eq!(rows_seen[0], 1);
+    assert_eq!(rows_seen[599], 600);
+
+    drop(conn);
+    operator_endpoint.close().await;
+    agent.shutdown().await.expect("shutdown");
+}
+
+/// Phase-9 slice 6: a SQL syntax error surfaces as a single
+/// `OperatorResult::Error` (terminating the stream with no chunks),
+/// not a `SqlChunk` with no rows. Operator-side decoder must accept
+/// either as a stream terminator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_syntax_error_returns_structured_error() {
+    let workdir = TempDir::new().unwrap();
+    let operator_id = Arc::new(Identity::generate());
+    let operator_pubkey_b64 = BASE64.encode(operator_id.verifying_key().as_bytes());
+
+    let cfg = build_agent_config(
+        workdir.path(),
+        reserve_udp_port(),
+        operator_pubkey_b64.clone(),
+        OsqueryConfig::default(),
+    );
+    let agent_id = Arc::new(Identity::generate());
+    let agent_fp = agent_id.fingerprint();
+    let agent_vk = agent_id.verifying_key();
+
+    let agent = Agent::start(cfg, agent_id, Box::new(NoopEventSource))
+        .await
+        .expect("start agent");
+    let agent_whisper_addr = agent.whisper_addr().expect("whisper addr");
+
+    let mut resolver = StaticResolver::new();
+    resolver.insert(agent_vk);
+    let resolver = Arc::new(resolver);
+    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
+    let operator_endpoint =
+        BoweryEndpoint::bind(operator_id.clone(), accept_verifier, loopback_ephemeral())
+            .expect("bind operator endpoint");
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), agent_fp));
+    let conn = operator_endpoint
+        .dial(dial_verifier, agent_whisper_addr)
+        .await
+        .expect("operator dial");
+
+    let operator_fp = operator_id.fingerprint();
+    let sealer = Sealer::new(operator_id.clone());
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
+
+    let cmd = OperatorCommand {
+        request_id: "sql-req-err".into(),
+        timeout_ms: 5_000,
+        command: Some(OperatorCommandBody::Sql(SqlQuery {
+            sql: "SELECT * FROM does_not_exist".into(),
+        })),
+    };
+    let outbound = sealer.seal_for(&agent_fp, &WhisperPayload::operator_command(cmd));
+    conn.send_envelope(&outbound).await.expect("send");
+
+    let bytes = tokio::time::timeout(Duration::from_secs(3), conn.recv_envelope())
+        .await
+        .expect("recv error envelope in time")
+        .expect("recv");
+    let opened = envelope_verifier.open(&bytes).expect("verify");
+    let result = match opened.payload.body {
+        Some(Body::OperatorResult(r)) => r,
+        other => panic!("unexpected body: {other:?}"),
+    };
+    assert_eq!(result.request_id, "sql-req-err");
+    match result.result {
+        Some(OperatorResultBody::Error(e)) => {
+            assert_eq!(e.kind, "sql_error", "expected sql_error, got {e:?}");
+            assert!(
+                e.message.to_lowercase().contains("does_not_exist")
+                    || e.message.to_lowercase().contains("no such table"),
+                "error message should mention the missing table; got: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Error body, got {other:?}"),
+    }
+
+    drop(conn);
+    operator_endpoint.close().await;
     agent.shutdown().await.expect("shutdown");
 }
