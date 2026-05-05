@@ -170,12 +170,28 @@ pub(crate) async fn sql(
     if inserted_fp != target_fp {
         bail!("target_pubkey_b64 fingerprint {inserted_fp} doesn't match --agent-fp {target_fp}");
     }
-    // Phase-9 final-1: with fanout=true, peers seal their chunks
-    // directly for us; we need each peer's pubkey to verify them.
-    // Pre-load the resolver with every operator-supplied peer
-    // pubkey. Peers whose pubkey isn't here will surface as
-    // `BadSignature` envelope-verify errors — visible failure
-    // mode rather than silent drop.
+    // Phase-9 final-1 + final-8: with fanout=true, peers seal
+    // their chunks directly for us. The resolver needs each peer's
+    // pubkey to verify them. Two sources, in priority order:
+    //
+    //   1. Operator-side peer manifest at ~/.bowery/peers.toml
+    //      (auto-loaded; bowery peers add/list/remove manages it).
+    //   2. Explicit --peer-pubkey-b64 flags on the command line
+    //      (operator can extend a one-off query without persisting).
+    //
+    // Peers absent from both surfaces will surface as
+    // `BadSignature` envelope-verify errors — visible failure mode
+    // rather than silent drop.
+    if fanout
+        && let Ok(manifest_path) = crate::peers::default_path()
+        && let Ok(manifest) = crate::peers::Manifest::load(&manifest_path)
+    {
+        for peer in &manifest.peers {
+            let vk = parse_verifying_key(&peer.pubkey_b64)
+                .with_context(|| format!("decoding peer manifest entry {} pubkey", peer.name))?;
+            resolver.insert(vk);
+        }
+    }
     for b64 in &peer_pubkeys_b64 {
         let vk = parse_verifying_key(b64)
             .with_context(|| format!("parsing --peer-pubkey-b64 {b64:?}"))?;

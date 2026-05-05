@@ -21,6 +21,7 @@ mod audit;
 mod doctor;
 mod exec;
 mod model;
+mod peers;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -92,6 +93,50 @@ enum Command {
     Exec {
         #[command(subcommand)]
         sub: ExecCommand,
+    },
+
+    /// Manage the operator-side peer manifest at
+    /// `~/.bowery/peers.toml`. Each entry is the fingerprint +
+    /// pubkey of an agent that may respond to a fan-out query;
+    /// `bowery exec sql --fanout` auto-loads them into the
+    /// operator's verifier resolver so peer-sealed `SqlChunk`
+    /// envelopes verify cleanly.
+    Peers {
+        #[command(subcommand)]
+        sub: PeersCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PeersCommand {
+    /// Add or replace an entry in the manifest. Replaces by `fp`
+    /// (fingerprint) if one already exists.
+    Add {
+        /// Operator-friendly label (e.g. `web-1`, `db-primary`).
+        #[arg(long)]
+        name: String,
+        /// Hex-encoded 32-byte agent fingerprint.
+        #[arg(long)]
+        fp: String,
+        /// Base64-encoded Ed25519 verifying key.
+        #[arg(long)]
+        pubkey_b64: String,
+        /// Manifest path. Default `$HOME/.bowery/peers.toml`.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Remove an entry by fingerprint. Idempotent.
+    Remove {
+        /// Hex-encoded fingerprint to remove.
+        #[arg(long)]
+        fp: String,
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Print every entry in the manifest.
+    List {
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -470,7 +515,32 @@ impl Cli {
                 ))?;
                 Ok(ExitCode::SUCCESS)
             }
+            Command::Peers { sub } => {
+                let path = match peers_path_for(&sub) {
+                    Some(p) => p,
+                    None => peers::default_path()?,
+                };
+                match sub {
+                    PeersCommand::Add {
+                        name,
+                        fp,
+                        pubkey_b64,
+                        ..
+                    } => peers::add(&path, &name, &fp, &pubkey_b64)?,
+                    PeersCommand::Remove { fp, .. } => peers::remove(&path, &fp)?,
+                    PeersCommand::List { .. } => peers::list(&path)?,
+                }
+                Ok(ExitCode::SUCCESS)
+            }
         }
+    }
+}
+
+fn peers_path_for(cmd: &PeersCommand) -> Option<PathBuf> {
+    match cmd {
+        PeersCommand::Add { path, .. }
+        | PeersCommand::Remove { path, .. }
+        | PeersCommand::List { path } => path.clone(),
     }
 }
 
