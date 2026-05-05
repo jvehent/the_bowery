@@ -50,6 +50,14 @@ pub const AUDIT_SIG_DOMAIN: &[u8] = b"bowery/audit/envelope/v1";
 /// Field order matters: `serde_json` emits fields in declaration
 /// order, and the verifier reconstructs the canonical bytes by
 /// re-serialising. Reordering fields here is a wire-format break.
+///
+/// **Chain fields** (`seq`, `prev_sig_hex`) form a hash-chain across
+/// every record a single host produces. The Phase-8 H9 fix makes
+/// audit logs deletion-resistant: a verifier walking the file can
+/// detect missing entries (gap in `seq`) and selectively-edited
+/// entries (broken `prev_sig_hex` link). Without these fields, an
+/// attacker with write access could `sed -i '/episode-evil/d'`
+/// inconvenient lines and the per-line signatures still verify.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecord {
     /// Schema version. Verifiers reject unknown versions.
@@ -57,6 +65,14 @@ pub struct AuditRecord {
     /// Hex-encoded fingerprint of the host that produced the entry.
     /// 64 lowercase hex chars (SHA-256 of the verifying key).
     pub host_fp_hex: String,
+    /// Per-host monotonic sequence number. First entry is `seq = 0`,
+    /// every subsequent entry strictly increments. Gap detection in
+    /// `bowery audit verify` exits non-zero on missing entries.
+    pub seq: u64,
+    /// Hex-encoded sig of the previous entry, or empty string for the
+    /// first entry. Forms a hash chain — re-ordering, deleting, or
+    /// substituting any prior entry breaks the chain.
+    pub prev_sig_hex: String,
     /// Stable engine identifier (`"noop"`, `"process-kill"`,
     /// `"bpf-lsm"`).
     pub engine: String,
@@ -77,10 +93,16 @@ pub struct AuditRecord {
 }
 
 impl AuditRecord {
-    pub const VERSION: u32 = 1;
+    /// Current schema version. Phase-8 H9 bumped this from 1 to 2 to
+    /// add the `seq` and `prev_sig_hex` chain fields. v1 envelopes
+    /// (pre-Phase-8) won't verify under this build — there are no
+    /// production deployments to migrate.
+    pub const VERSION: u32 = 2;
 
-    /// Build a record. Stamps `recorded_at_unix_ms` with the current
-    /// wall clock; tests that need determinism use [`Self::with_now`].
+    /// Build a record without chain fields populated. The sink fills
+    /// in `seq` and `prev_sig_hex` at write time. Stamps
+    /// `recorded_at_unix_ms` with the current wall clock; tests that
+    /// need determinism use [`Self::with_now`].
     pub fn new(
         host_fp: &Fingerprint,
         engine: &str,
@@ -110,6 +132,8 @@ impl AuditRecord {
         Self {
             version: Self::VERSION,
             host_fp_hex: host_fp.to_hex(),
+            seq: 0,
+            prev_sig_hex: String::new(),
             engine: engine.to_string(),
             episode_id: episode_id.to_string(),
             action_id,
@@ -211,12 +235,36 @@ pub enum AuditError {
 
 /// Anywhere an [`AuditEnvelope`] can be written.
 ///
-/// Implementations are responsible for durability: a `write` that
-/// returns `Ok(())` should mean the envelope survives a crash. The
-/// [`JsonlFileSink`] enforces this by fsyncing every line.
+/// Implementations own chain state (per-host monotonic seq + previous
+/// sig) and apply it inside `record_signed`. `write` is a lower-level
+/// API that takes a pre-signed envelope; production callers should
+/// prefer `record_signed`.
+///
+/// Durability contract: a method that returns `Ok(())` means the
+/// envelope survives a crash. The [`JsonlFileSink`] enforces this by
+/// fsyncing every line.
 #[async_trait]
 pub trait AuditSink: Send + Sync + std::fmt::Debug {
+    /// Write a pre-signed envelope as-is. Used by tests; production
+    /// callers go through `record_signed`.
     async fn write(&self, envelope: &AuditEnvelope) -> Result<(), AuditError>;
+
+    /// Build a record with the next chain fields (`seq` + `prev_sig_hex`)
+    /// supplied by the sink, sign it with `identity`, and persist.
+    /// This is the API the agent uses for every action attempt.
+    ///
+    /// Default implementation assigns `seq = 0` / `prev_sig_hex = ""`
+    /// and writes — fine for sinks that don't care about chain
+    /// integrity (e.g. `NoopSink`). Sinks that want deletion-resistance
+    /// override this to maintain real chain state.
+    async fn record_signed(
+        &self,
+        identity: &Identity,
+        record: AuditRecord,
+    ) -> Result<(), AuditError> {
+        let envelope = AuditEnvelope::sign(record, identity)?;
+        self.write(&envelope).await
+    }
 }
 
 /// `/dev/null`-equivalent sink. Drops envelopes silently. Useful for
@@ -231,19 +279,45 @@ impl AuditSink for NoopSink {
     }
 }
 
+/// Per-host hash-chain state. The first entry has `seq = 0` and an
+/// empty `prev_sig_hex`; every subsequent entry sets `seq` to one
+/// more than the previous and copies the previous entry's `sig_hex`
+/// into `prev_sig_hex`. The signature covers both fields.
+#[derive(Debug, Default, Clone)]
+struct ChainState {
+    next_seq: u64,
+    last_sig_hex: String,
+}
+
 /// Newline-delimited JSON file. Each line is a serialised
-/// [`AuditEnvelope`]. Writes are serialised through a `Mutex<File>`
-/// and fsynced before returning.
+/// [`AuditEnvelope`]. Writes are serialised through a single mutex
+/// (file + chain state) and fsynced before returning.
 pub struct JsonlFileSink {
     path: PathBuf,
-    file: Mutex<File>,
+    /// File + chain state guarded together so `seq`/`prev_sig` and the
+    /// on-disk write happen as a single critical section. Keeping the
+    /// Mutex wrap simple costs nothing — write lock hold time is one
+    /// fsync, dwarfed by disk latency anyway.
+    state: Mutex<JsonlState>,
+}
+
+struct JsonlState {
+    file: File,
+    chain: ChainState,
 }
 
 impl JsonlFileSink {
-    /// Open `path` in append mode, creating it if missing. The
-    /// containing directory must already exist.
+    /// Open `path` in append mode, creating it if missing. Recovers
+    /// chain state by reading the existing log (if any) and
+    /// extracting the `seq` + `sig_hex` of the last well-formed
+    /// envelope. A truncated final line is logged at warn! level
+    /// but doesn't fail open: the operator's `bowery audit verify`
+    /// surfaces the partial-line condition separately.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
         let path = path.as_ref().to_path_buf();
+
+        let chain = recover_chain_state(&path).await?;
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -255,7 +329,7 @@ impl JsonlFileSink {
             })?;
         Ok(Self {
             path,
-            file: Mutex::new(file),
+            state: Mutex::new(JsonlState { file, chain }),
         })
     }
 
@@ -272,22 +346,117 @@ impl std::fmt::Debug for JsonlFileSink {
     }
 }
 
+/// Recover the chain state from an existing audit log file. Reads
+/// every line, parses, takes the last well-formed envelope's
+/// `(seq, sig_hex)` as the resume point. Truncated/garbage lines
+/// after the last good one are tolerated — the next signed entry's
+/// `prev_sig_hex` will reference whatever the last clean entry was,
+/// which `bowery audit verify` will then flag as a chain break IF
+/// the operator believes the partial line is forged. (If they
+/// believe it's a crash artifact, they truncate the file to the
+/// last newline-terminated line and re-verify.)
+async fn recover_chain_state(path: &Path) -> Result<ChainState, AuditError> {
+    use tokio::io::AsyncReadExt;
+
+    let mut state = ChainState::default();
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return Ok(state);
+    };
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)
+        .await
+        .map_err(|source| AuditError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    for line in buf.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<AuditEnvelope>(line) {
+            Ok(env) => {
+                state.next_seq = env.record.seq.saturating_add(1);
+                state.last_sig_hex.clone_from(&env.sig_hex);
+            }
+            Err(_) => {
+                // Garbage line. Don't update chain state; the next
+                // recorded entry's prev_sig_hex still refers to the
+                // last good entry, so the chain remains coherent
+                // post-crash (modulo the unparseable line which the
+                // verifier will flag).
+                tracing::warn!(
+                    path = %path.display(),
+                    "audit log contains an unparseable line during chain-state recovery; \
+                     subsequent entries chain off the previous well-formed line"
+                );
+            }
+        }
+    }
+    Ok(state)
+}
+
 #[async_trait]
 impl AuditSink for JsonlFileSink {
     async fn write(&self, envelope: &AuditEnvelope) -> Result<(), AuditError> {
         let mut line = serde_json::to_vec(envelope).map_err(AuditError::Encode)?;
         line.push(b'\n');
-        let mut file = self.file.lock().await;
-        file.write_all(&line)
+        let mut state = self.state.lock().await;
+        state
+            .file
+            .write_all(&line)
             .await
             .map_err(|source| AuditError::Io {
                 path: self.path.clone(),
                 source,
             })?;
-        file.sync_data().await.map_err(|source| AuditError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
+        state
+            .file
+            .sync_data()
+            .await
+            .map_err(|source| AuditError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        // Update chain state from the envelope we just wrote so that
+        // subsequent record_signed calls chain off it.
+        state.chain.next_seq = envelope.record.seq.saturating_add(1);
+        state.chain.last_sig_hex.clone_from(&envelope.sig_hex);
+        Ok(())
+    }
+
+    async fn record_signed(
+        &self,
+        identity: &Identity,
+        mut record: AuditRecord,
+    ) -> Result<(), AuditError> {
+        // Take the lock once for the whole sign+write+state-update so
+        // the seq/prev_sig the envelope is signed over matches what
+        // ends up in the file, even under concurrent record_signed
+        // calls.
+        let mut state = self.state.lock().await;
+        record.seq = state.chain.next_seq;
+        record.prev_sig_hex.clone_from(&state.chain.last_sig_hex);
+        let envelope = AuditEnvelope::sign(record, identity)?;
+        let mut line = serde_json::to_vec(&envelope).map_err(AuditError::Encode)?;
+        line.push(b'\n');
+        state
+            .file
+            .write_all(&line)
+            .await
+            .map_err(|source| AuditError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        state
+            .file
+            .sync_data()
+            .await
+            .map_err(|source| AuditError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        state.chain.next_seq = envelope.record.seq.saturating_add(1);
+        state.chain.last_sig_hex.clone_from(&envelope.sig_hex);
         Ok(())
     }
 }
@@ -299,6 +468,9 @@ impl AuditSink for JsonlFileSink {
 /// Build, sign, and persist a single audit entry. Logs (but does not
 /// propagate) sink errors so a transient disk problem can't stall the
 /// LLM-outcomes loop.
+///
+/// Routes through `AuditSink::record_signed` so the sink can fill in
+/// the chain fields (`seq`, `prev_sig_hex`) before signing.
 pub async fn record(
     sink: &Arc<dyn AuditSink>,
     identity: &Identity,
@@ -309,14 +481,7 @@ pub async fn record(
 ) {
     let host_fp = identity.fingerprint();
     let record = AuditRecord::new(&host_fp, engine, episode_id, action, outcome);
-    let envelope = match AuditEnvelope::sign(record, identity) {
-        Ok(env) => env,
-        Err(e) => {
-            warn!(error = %e, "audit: failed to sign envelope; entry dropped");
-            return;
-        }
-    };
-    if let Err(e) = sink.write(&envelope).await {
+    if let Err(e) = sink.record_signed(identity, record).await {
         warn!(error = %e, "audit: sink write failed; entry dropped");
     }
 }
@@ -450,5 +615,123 @@ mod tests {
         let id = Identity::generate();
         let env = AuditEnvelope::sign(sample_record(&id.fingerprint()), &id).unwrap();
         sink.write(&env).await.unwrap();
+    }
+
+    /// Phase-8 H9: every entry past the first carries `seq` strictly
+    /// greater than the previous entry's, and `prev_sig_hex` matches
+    /// the previous entry's `sig_hex`. The first entry has `seq=0`
+    /// and empty `prev_sig`.
+    #[tokio::test]
+    async fn record_signed_builds_a_hash_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let sink: Arc<dyn AuditSink> = Arc::new(JsonlFileSink::open(&path).await.unwrap());
+        let id = Identity::generate();
+
+        for i in 0..3 {
+            let action = Action::KillProcess {
+                pid: 100 + i,
+                episode_id: format!("ep-{i}"),
+            };
+            record(
+                &sink,
+                &id,
+                "noop",
+                &format!("ep-{i}"),
+                action,
+                ActionOutcome::suppressed("test"),
+            )
+            .await;
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let envs: Vec<AuditEnvelope> = contents
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(envs.len(), 3);
+
+        // First entry: seq=0, empty prev_sig.
+        assert_eq!(envs[0].record.seq, 0);
+        assert!(envs[0].record.prev_sig_hex.is_empty());
+        envs[0].verify(&id.verifying_key()).unwrap();
+
+        // Subsequent entries: seq+1, prev_sig matches previous sig_hex.
+        for i in 1..3 {
+            assert_eq!(envs[i].record.seq, i as u64);
+            assert_eq!(envs[i].record.prev_sig_hex, envs[i - 1].sig_hex);
+            envs[i].verify(&id.verifying_key()).unwrap();
+        }
+    }
+
+    /// Phase-8 H9: chain state survives sink restart (re-open of the
+    /// same file). The recovered `next_seq` and `last_sig_hex` are
+    /// drawn from the last well-formed envelope in the existing log.
+    #[tokio::test]
+    async fn chain_state_recovers_across_sink_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let id = Identity::generate();
+
+        // First sink: write two entries, drop.
+        {
+            let sink: Arc<dyn AuditSink> = Arc::new(JsonlFileSink::open(&path).await.unwrap());
+            for i in 0..2 {
+                let action = Action::KillProcess {
+                    pid: 200 + i,
+                    episode_id: format!("ep-r-{i}"),
+                };
+                record(
+                    &sink,
+                    &id,
+                    "noop",
+                    &format!("ep-r-{i}"),
+                    action,
+                    ActionOutcome::suppressed("test"),
+                )
+                .await;
+            }
+        }
+
+        // Second sink: re-open, write one more entry. It should have
+        // seq=2 and prev_sig_hex = previous entry's sig_hex.
+        let prev_sig_after_first_run = {
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let envs: Vec<AuditEnvelope> = contents
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            envs[envs.len() - 1].sig_hex.clone()
+        };
+
+        {
+            let sink: Arc<dyn AuditSink> = Arc::new(JsonlFileSink::open(&path).await.unwrap());
+            let action = Action::KillProcess {
+                pid: 999,
+                episode_id: "ep-after-restart".into(),
+            };
+            record(
+                &sink,
+                &id,
+                "noop",
+                "ep-after-restart",
+                action,
+                ActionOutcome::suppressed("test"),
+            )
+            .await;
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let envs: Vec<AuditEnvelope> = contents
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(envs.len(), 3);
+        assert_eq!(envs[2].record.seq, 2);
+        assert_eq!(envs[2].record.prev_sig_hex, prev_sig_after_first_run);
+        envs[2].verify(&id.verifying_key()).unwrap();
     }
 }

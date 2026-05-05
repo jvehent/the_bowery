@@ -61,6 +61,8 @@ fn arb_record(host_fp_hex: String) -> impl Strategy<Value = AuditRecord> {
             AuditRecord {
                 version: AuditRecord::VERSION,
                 host_fp_hex: host_fp_hex.clone(),
+                seq: 0,
+                prev_sig_hex: String::new(),
                 engine,
                 episode_id: record_episode,
                 action_id: action.id().to_string(),
