@@ -194,6 +194,13 @@ impl Baseline {
     /// I/O, no async). Used by the Phase-5 whisper responder to
     /// aggregate sightings by tier-1 fingerprint without an extra
     /// schema column.
+    ///
+    /// **Caller must keep the visit callback cheap** — the mutex
+    /// is held for the entire walk. Callers that need to do
+    /// non-trivial per-row work (e.g. writing into a `SQLite`
+    /// connection elsewhere) should use [`Self::snapshot_binaries`]
+    /// instead, which collects into a Vec under the lock and
+    /// releases the mutex before the caller iterates.
     pub fn for_each_binary<F>(&self, mut visit: F) -> Result<()>
     where
         F: FnMut(&BinaryRecord),
@@ -219,6 +226,42 @@ impl Baseline {
             visit(&rec);
         }
         Ok(())
+    }
+
+    /// Snapshot every binary into a Vec, releasing the mutex
+    /// before returning so the caller can iterate without
+    /// blocking concurrent baseline writers (the analyzer's
+    /// `upsert_binary` path, the whisper-Q&A reader, etc.).
+    ///
+    /// SECURITY-AUDIT-PHASE9 F-9: `bowery-agent`'s SQL bonus
+    /// table `bowery_baseline_binaries` previously held this
+    /// mutex through every per-row INSERT into a per-query
+    /// in-memory `SQLite`, blocking analyzer upserts for as long
+    /// as the operator-supplied query took. Snapshotting first
+    /// trades a transient ~40 bytes/record allocation for
+    /// mutex-hold time bounded by the SELECT walk only.
+    pub fn snapshot_binaries(&self) -> Result<Vec<BinaryRecord>> {
+        let conn = self.inner.lock().expect("baseline mutex poisoned");
+        let mut stmt =
+            conn.prepare("SELECT sha256, first_seen, last_seen, seen_count FROM binaries")?;
+        let rows = stmt.query_map([], |row| {
+            let sha_blob: Vec<u8> = row.get(0)?;
+            let mut sha = [0u8; 32];
+            if sha_blob.len() == 32 {
+                sha.copy_from_slice(&sha_blob);
+            }
+            Ok(BinaryRecord {
+                sha256: sha,
+                first_seen: secs_to_system_time(row.get::<_, i64>(1)?),
+                last_seen: secs_to_system_time(row.get::<_, i64>(2)?),
+                seen_count: row.get::<_, u64>(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------

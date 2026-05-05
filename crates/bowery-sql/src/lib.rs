@@ -136,8 +136,21 @@ impl Sql {
 }
 
 /// Synchronous query runner — opens a connection, registers every
-/// table (default set + caller-supplied extras), prepares + steps
-/// the user's SQL, collects rows.
+/// table (default set + caller-supplied extras), installs a
+/// SELECT-only `set_authorizer` gate, then prepares + steps the
+/// user's SQL and collects rows.
+///
+/// The authorizer is **disabled during registration** so each
+/// `BoweryTable::register` impl is free to `CREATE TABLE` and
+/// `INSERT` its rows. After registration we install a hook that
+/// allows reads (`Read` / `Select` / `Recursive` / `Function`)
+/// and a small whitelist of harmless `Pragma`s, but denies every
+/// destructive or escape-prone op (`Attach`, `Detach`, `Pragma
+/// writable_schema`, `Insert`/`Update`/`Delete`, `Create*`,
+/// `Drop*`, `AlterTable`, `Transaction`, `Savepoint`, …). This
+/// closes the SECURITY-AUDIT-PHASE9 F-15 escape — operators can no
+/// longer `ATTACH DATABASE 'file:///etc/passwd' AS x` or use
+/// `PRAGMA writable_schema = ON` to force-write the in-memory db.
 fn run_blocking(
     sql: &str,
     row_cap: usize,
@@ -148,6 +161,7 @@ fn run_blocking(
     for extra in extras {
         extra.register(&conn)?;
     }
+    install_select_only_authorizer(&conn);
     debug!(
         sql_preview = sql.chars().take(80).collect::<String>(),
         "running SQL"
@@ -173,6 +187,58 @@ fn run_blocking(
         out.push(Row { columns: cells });
     }
     Ok(out)
+}
+
+/// Install a SELECT-only authorizer hook on `conn`. Allows row
+/// reads + a small whitelist of read-only pragmas; denies every
+/// other op so an operator-supplied `ATTACH`, `PRAGMA
+/// writable_schema = ON`, `DROP`, `INSERT`, etc. cannot escape
+/// the in-memory connection or modify Bowery state.
+fn install_select_only_authorizer(conn: &Connection) {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    /// Pragmas that are read-only / inspection-only and don't
+    /// expose a writable side effect. Anything else is denied.
+    const SAFE_PRAGMAS: &[&str] = &[
+        "table_info",
+        "index_list",
+        "index_info",
+        "database_list",
+        "foreign_key_list",
+        "compile_options",
+        "encoding",
+    ];
+
+    conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+        // Operator queries: SELECT, recursive CTE, and read-row
+        // operations against any registered table. Function calls
+        // are allowed too (e.g. `length(x)`, aggregates) — SQLite
+        // treats `length`/`coalesce`/`count` as Function actions.
+        AuthAction::Select
+        | AuthAction::Read { .. }
+        | AuthAction::Function { .. }
+        | AuthAction::Recursive => Authorization::Allow,
+
+        // Whitelisted read-only pragmas only.
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } => {
+            if pragma_value.is_some() {
+                // any `PRAGMA x = y` is a write — deny.
+                Authorization::Deny
+            } else if SAFE_PRAGMAS.contains(&pragma_name) {
+                Authorization::Allow
+            } else {
+                Authorization::Deny
+            }
+        }
+
+        // Everything else: ATTACH / DETACH / DROP / CREATE / ALTER /
+        // INSERT / UPDATE / DELETE / TRANSACTION / SAVEPOINT /
+        // TRIGGER / VIEW / INDEX / VTABLE / unknown — denied.
+        _ => Authorization::Deny,
+    }));
 }
 
 fn value_from_ref(v: rusqlite::types::ValueRef<'_>) -> Value {
@@ -350,6 +416,65 @@ mod tests {
             .await
             .expect_err("missing table");
         assert!(matches!(err, SqlError::Sqlite(_)));
+    }
+
+    #[tokio::test]
+    async fn authorizer_blocks_attach_database() {
+        // SECURITY-AUDIT-PHASE9 F-15: an operator-supplied
+        // `ATTACH DATABASE` statement is denied by the SELECT-only
+        // authorizer, even though SQLite would otherwise accept it.
+        let sql = Sql::new();
+        let err = sql
+            .query(
+                "ATTACH DATABASE 'file:///tmp/bowery-attack.db' AS x",
+                Duration::from_secs(2),
+            )
+            .await
+            .expect_err("attach must be denied");
+        assert!(
+            matches!(err, SqlError::Sqlite(_)),
+            "expected sqlite-level denial, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorizer_blocks_writable_schema_pragma() {
+        // SECURITY-AUDIT-PHASE9 F-15: `PRAGMA writable_schema = ON`
+        // is a write to a pragma, which the authorizer denies.
+        let sql = Sql::new();
+        let err = sql
+            .query("PRAGMA writable_schema = ON", Duration::from_secs(2))
+            .await
+            .expect_err("write-pragma must be denied");
+        assert!(matches!(err, SqlError::Sqlite(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn authorizer_blocks_drop_table() {
+        // Operator SQL trying to drop one of our registered tables
+        // is denied. (Even if it weren't, the in-memory connection
+        // is fresh per query — but rejecting up-front gives the
+        // operator a structured error instead of a half-executed
+        // statement.)
+        let sql = Sql::new();
+        let err = sql
+            .query("DROP TABLE processes", Duration::from_secs(2))
+            .await
+            .expect_err("drop must be denied");
+        assert!(matches!(err, SqlError::Sqlite(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn authorizer_allows_read_only_pragma() {
+        // PRAGMA database_list and friends are read-only and should
+        // pass — useful for operators introspecting the registered
+        // table set.
+        let sql = Sql::new();
+        let rows = sql
+            .query("PRAGMA database_list", Duration::from_secs(2))
+            .await
+            .expect("read-only pragma must pass");
+        assert!(!rows.is_empty(), "database_list should return ≥1 row");
     }
 
     #[tokio::test]

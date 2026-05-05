@@ -99,23 +99,23 @@ impl BoweryTable for BoweryBaselineBinariesTable {
                 seen_count      INTEGER
             );",
         )?;
+        // SECURITY-AUDIT-PHASE9 F-9: snapshot the binaries first so
+        // the baseline mutex isn't held during our per-row INSERTs.
+        // Snapshot errors fall back to "no rows" rather than failing
+        // the whole query — same best-effort policy as everywhere
+        // else in `bowery-tables`.
+        let snapshot = self.baseline.snapshot_binaries().unwrap_or_default();
         let mut stmt = conn.prepare(
             "INSERT INTO bowery_baseline_binaries (sha256_hex, first_seen_unix, last_seen_unix, seen_count)
              VALUES (?1, ?2, ?3, ?4)",
         )?;
-        // for_each_binary returns Result<()>; treat any internal error
-        // as "stop walking" rather than failing the whole query —
-        // baseline reads happen on a hot path and a corrupt row
-        // shouldn't break unrelated queries.
-        let _ = self.baseline.for_each_binary(|rec| {
+        for rec in &snapshot {
             let sha_hex = hex_lower(&rec.sha256);
             let first = unix_secs(rec.first_seen);
             let last = unix_secs(rec.last_seen);
             let count = i64::try_from(rec.seen_count).unwrap_or(i64::MAX);
-            // Best-effort: ignore per-row insert errors so one bad
-            // row doesn't kill the table.
             let _ = stmt.execute(params![sha_hex, first, last, count]);
-        });
+        }
         Ok(())
     }
 }
@@ -210,12 +210,25 @@ impl BoweryAuditTable {
     }
 }
 
+/// Hard cap on the audit log bytes any single query will read.
+/// SECURITY-AUDIT-PHASE9 F-12: prior implementation called
+/// `fs::read_to_string` with no cap, so an audit log grown to
+/// many MB-to-GB would OOM the agent on every query (and was
+/// reachable via fanout — one operator query × N peers).
+///
+/// 64 MiB is well above any realistic short-term operator-question
+/// volume; longer-horizon forensics should be done with `bowery
+/// audit verify` against the file directly, not via SQL.
+const MAX_AUDIT_BYTES: u64 = 64 * 1024 * 1024;
+
 impl BoweryTable for BoweryAuditTable {
     fn name(&self) -> &'static str {
         "bowery_audit"
     }
 
     fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        use std::io::{BufRead, BufReader, Read};
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS bowery_audit (
                 seq          INTEGER,
@@ -228,14 +241,26 @@ impl BoweryTable for BoweryAuditTable {
         let Some(path) = self.log_path.as_ref() else {
             return Ok(());
         };
-        let Ok(contents) = std::fs::read_to_string(path) else {
+        let Ok(file) = std::fs::File::open(path) else {
             return Ok(());
         };
+        // Cap the reader at MAX_AUDIT_BYTES so an operator query
+        // can't read a multi-GB audit log into memory. The line
+        // straddling the cap will hit EOF mid-record and json-parse
+        // fail — silently skipped, same as any malformed line.
+        let reader = BufReader::new(file.take(MAX_AUDIT_BYTES));
         let mut stmt = conn.prepare(
             "INSERT INTO bowery_audit (seq, ts_unix_ms, episode_id, action_id, outcome_kind)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
-        for line in contents.lines() {
+        for line in reader.lines() {
+            // I/O errors during a streaming read mean the file is
+            // changing under us or we hit our byte cap mid-line —
+            // either way, stop cleanly. The rows we already
+            // inserted are still queryable.
+            let Ok(line) = line else {
+                break;
+            };
             let line = line.trim();
             if line.is_empty() {
                 continue;

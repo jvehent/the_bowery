@@ -1301,14 +1301,18 @@ async fn relay_to_peers(
         return Ok(());
     }
 
-    // Spawn one task per peer. Each task dials, sends a non-fanout
-    // SqlQuery, reads chunks back, and forwards them through an
-    // mpsc channel to the multiplexer. The buffer is small — the
-    // multiplexer should keep up with the operator-side QUIC
-    // stream rate.
+    // Spawn one task per peer onto a JoinSet so we can abort the
+    // whole batch if the operator disconnects. SECURITY-AUDIT-PHASE9
+    // F-16: previously bare `tokio::spawn` left peer tasks running
+    // long after the operator dropped the connection — each kept
+    // dialing its peer + reading the full response stream. With a
+    // JoinSet, the `abort_all()` on drop (or on the first
+    // operator-side send failure) terminates them at the next .await
+    // point.
     let (chunk_tx, mut chunk_rx) =
         mpsc::channel::<(Fingerprint, Result<SqlChunk, OperatorError>)>(64);
     let per_peer_timeout = timeout;
+    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     for peer in peers {
         let chunk_tx = chunk_tx.clone();
@@ -1318,7 +1322,7 @@ async fn relay_to_peers(
         let sealer_clone = sealer.clone();
         let sql = sql.to_string();
         let request_id = request_id.to_string();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             run_peer_query(
                 endpoint,
                 kn,
@@ -1337,23 +1341,40 @@ async fn relay_to_peers(
 
     // Drain peer chunks; rewrite agent_fp; forward to operator.
     // On per-peer error, synthesise a terminal chunk so the operator
-    // still sees the EOF.
-    while let Some((peer_fp, outcome)) = chunk_rx.recv().await {
-        let chunk = match outcome {
-            Ok(mut c) => {
-                c.agent_fp = peer_fp.as_bytes().to_vec();
-                c
-            }
-            Err(_) => SqlChunk {
-                columns: Vec::new(),
-                rows: Vec::new(),
-                end: true,
-                agent_fp: peer_fp.as_bytes().to_vec(),
-            },
-        };
-        send_chunk(conn, sealer, &operator, request_id, chunk).await?;
+    // still sees the EOF. If the operator-side send fails (the
+    // operator dropped the connection), abort every peer task —
+    // they'd otherwise keep dialing peers and reading their
+    // responses with nowhere to send them.
+    let drain_outcome: Result<(), bowery_whisper::transport::Error> = async {
+        while let Some((peer_fp, outcome)) = chunk_rx.recv().await {
+            let chunk = match outcome {
+                Ok(mut c) => {
+                    c.agent_fp = peer_fp.as_bytes().to_vec();
+                    c
+                }
+                Err(_) => SqlChunk {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    end: true,
+                    agent_fp: peer_fp.as_bytes().to_vec(),
+                },
+            };
+            send_chunk(conn, sealer, &operator, request_id, chunk).await?;
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+
+    // Always tear down spawned peer tasks. Three regimes:
+    //   - drain finished cleanly → abort_all is a no-op (tasks are
+    //     done since chunk_rx ended).
+    //   - send_chunk failed mid-drain → abort the in-flight peer
+    //     tasks so they don't keep working on a dead connection.
+    //   - this future itself is dropped (e.g. parent task cancelled)
+    //     → JoinSet's Drop impl calls abort_all automatically.
+    join_set.abort_all();
+    while join_set.join_next().await.is_some() {}
+    drain_outcome
 }
 
 /// One peer's leg of the fan-out. Dials the peer, sends a

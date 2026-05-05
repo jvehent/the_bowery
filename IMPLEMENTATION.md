@@ -2125,13 +2125,40 @@ without requiring a live agent.
   pressure forces slow peers to wait for the relay→operator
   link.
 
-### 22.8 What's deferred
+### 22.8 Security audit findings — what's hardened
 
-- **Per-row peer→operator end-to-end signing** — currently the
-  relay signs its forwarded chunks with its own key, so a
-  malicious relay could fabricate rows. Rotating to
-  end-to-end (peer signs each row, relay multiplexes verbatim)
-  is queued.
+A two-pass security audit
+([`SECURITY-AUDIT-PHASE9.md`](SECURITY-AUDIT-PHASE9.md)) surfaced
+15 findings. The CRIT/HIGH items addressed in this pass:
+
+- **F-9** Baseline mutex now snapshot-then-iterate via the new
+  `Baseline::snapshot_binaries` helper. The mutex is released
+  before the per-row SQLite INSERTs run, unblocking the
+  analyzer's `upsert_binary` path during operator queries.
+- **F-12** `bowery_audit` reads through a `BufReader` capped at
+  64 MiB instead of `fs::read_to_string`. Operator queries can
+  no longer OOM the agent against a multi-GB audit log (or
+  amplify the cost via fanout).
+- **F-15** Each per-query SQLite connection now has a
+  `set_authorizer` callback installed (after registration). The
+  authorizer allows `Select` / `Read` / `Recursive` / `Function`
+  and a small whitelist of read-only pragmas; everything else
+  (`Attach`, `Detach`, `Pragma writable_schema`, `Drop`,
+  `Insert`/`Update`/`Delete`, `Create*`, `Alter*`, …) is denied.
+  Closes the `ATTACH DATABASE 'file:///etc/secret.db'` escape.
+- **F-16** `relay_to_peers` spawns peer tasks onto a `JoinSet`
+  and calls `abort_all()` on drop or on the first
+  `send_chunk` failure. Operator-disconnect no longer leaks
+  per-peer mesh-amplified work.
+
+### 22.9 What's deferred
+
+- **Per-row peer→operator end-to-end signing** (audit F-1/F-2/F-3)
+  — currently the relay signs its forwarded chunks with its own
+  key, so a malicious relay could fabricate rows. Rotating to
+  end-to-end (peer signs each chunk for the operator, relay
+  multiplexes verbatim via a new `forwarded_from_operator` proto
+  field) is the architectural follow-up.
 - **vtab pushdown for `file` / `hash` tables** — both need
   `WHERE path = '...'` to be safe; otherwise an unscoped query
   walks the entire filesystem. Slice 2b deferred until the
