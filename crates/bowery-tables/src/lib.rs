@@ -16,6 +16,7 @@
 #![warn(unreachable_pub)]
 
 pub mod crontab;
+pub mod file_funcs;
 pub mod interfaces;
 pub mod kernel_modules;
 pub mod last;
@@ -64,10 +65,11 @@ pub trait BoweryTable: Send + Sync {
     fn register(&self, conn: &Connection) -> Result<(), TableError>;
 }
 
-/// Register every Phase-9 table on `conn`. The set of tables grows
-/// across slices; callers can also build their own mix via the
-/// per-table `register` functions if they need a subset.
+/// Register every Phase-9 table + scalar function on `conn`. The
+/// set grows across slices; callers can also build their own mix
+/// via the per-table `register` functions if they need a subset.
 pub fn register_all(conn: &Connection) -> Result<(), TableError> {
+    file_funcs::register_file_functions(conn)?;
     for table in default_tables() {
         table.register(conn)?;
     }

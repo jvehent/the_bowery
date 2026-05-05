@@ -233,6 +233,9 @@ fn run_blocking(
     cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<Row>, SqlError> {
     let conn = Connection::open_in_memory()?;
+    // Phase-9 final-7: scalar file functions, registered before
+    // the authorizer goes up so callers can use them via SELECT.
+    bowery_tables::file_funcs::register_file_functions(&conn)?;
     // Skip default tables whose names appear in `overrides` —
     // the caller will register a replacement via `extras`.
     for table in bowery_tables::default_tables() {
@@ -472,6 +475,23 @@ mod tests {
             .await
             .unwrap();
         assert!(!rows.is_empty(), "root must appear in users");
+    }
+
+    #[tokio::test]
+    async fn file_funcs_are_callable() {
+        // Phase-9 final-7: scalar file functions are reachable
+        // through the same SELECT-only authorizer.
+        let sql = Sql::new();
+        let rows = sql
+            .query(
+                "SELECT bowery_file_exists('/etc/passwd'), bowery_file_size('/etc/passwd')",
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].columns[0].1, Value::Integer(1)));
+        assert!(matches!(rows[0].columns[1].1, Value::Integer(n) if n > 0));
     }
 
     #[tokio::test]

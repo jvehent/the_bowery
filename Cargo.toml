@@ -99,7 +99,7 @@ tokio-stream = "0.1"
 futures = "0.3"
 
 # Baseline storage
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks", "functions"] }
 
 # Phase-9 host-state tables source
 procfs = { version = "0.17", default-features = false }
