@@ -403,7 +403,17 @@ impl Agent {
         // Bonus tables (Phase-9 slice 8) — Bowery-internal state
         // exposed as SQL views. Each table holds an Arc to its
         // data source and re-reads on every query.
+        //
+        // Phase-9 final-4 + final-5: substitute the agent's
+        // configured ProcessesTable (with optional cmdline) for
+        // the default-default-cmdline-off instance, and apply the
+        // configured concurrency cap.
         let sql_engine = bowery_sql::Sql::new()
+            .with_concurrency_cap(config.sql.max_concurrent_queries)
+            .override_default_table("processes")
+            .with_extra_table(Arc::new(bowery_tables::processes::ProcessesTable::new(
+                config.sql.expose_cmdline,
+            )))
             .with_extra_table(Arc::new(crate::sql_tables::BoweryPeersTable::new(
                 known_neighbors.clone(),
             )))
@@ -420,6 +430,7 @@ impl Agent {
             sysquery: sysquery_handle,
             sql: Some(Arc::new(sql_engine)),
             relay: Some(relay_ctx),
+            fanout_rate_limit: Arc::new(FanoutRateLimit::new()),
             max_timeout: config.sysquery.max_timeout,
         });
 
@@ -717,9 +728,63 @@ pub(crate) struct OperatorCommandRouter {
     /// is silently ignored — the result still streams correctly,
     /// just without per-peer rows).
     pub relay: Option<Arc<RelayContext>>,
+    /// Phase-9 final-2: per-operator-fingerprint rate limiter for
+    /// fan-out queries. Enforces F-4 from the security audit.
+    /// Operator-direct queries aren't throttled — the blast radius
+    /// is one host and `max_timeout` already caps per-query work.
+    pub fanout_rate_limit: Arc<FanoutRateLimit>,
     /// Hard ceiling on per-query timeout, applied to every
     /// command kind.
     pub max_timeout: Duration,
+}
+
+/// Token-bucket rate limiter keyed on operator fingerprint. Each
+/// fan-out query consumes one token; tokens refill at
+/// `REFILL_PER_SEC`. A first-time operator gets `BURST` tokens
+/// immediately. Defends against a compromised operator key
+/// driving the relay into sustained mesh-amplified work.
+///
+/// Sized for the realistic operator workflow: one fan-out every
+/// 5 seconds for interactive triage, bursts up to 6 queries.
+#[derive(Debug, Default)]
+pub(crate) struct FanoutRateLimit {
+    inner: std::sync::Mutex<std::collections::HashMap<Fingerprint, FanoutBucket>>,
+}
+
+#[derive(Debug)]
+struct FanoutBucket {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl FanoutRateLimit {
+    const REFILL_PER_SEC: f64 = 0.2; // 1 token / 5 s
+    const BURST: f64 = 6.0;
+
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Try to consume one token for `operator`. Returns `true` if
+    /// a token was available; `false` if the operator should be
+    /// deferred.
+    pub(crate) fn try_acquire(&self, operator: &Fingerprint) -> bool {
+        let now = std::time::Instant::now();
+        let mut map = self.inner.lock().expect("fanout rate-limit mutex poisoned");
+        let bucket = map.entry(*operator).or_insert(FanoutBucket {
+            tokens: Self::BURST,
+            last_refill: now,
+        });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * Self::REFILL_PER_SEC).min(Self::BURST);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Phase-9 slice 7: handles needed to dial pinned peers from
@@ -1075,6 +1140,27 @@ async fn respond_to_operator_command(
     // OperatorResultBody and fall through to the unified send below.
     if let Some(OperatorCommandBody::Sql(q)) = &cmd.command {
         let sql_engine = op_router.sql.clone();
+        // SECURITY-AUDIT-PHASE9 F-4: per-operator-fp rate limit
+        // on fan-out queries. Only applied to the entry-point
+        // relay (is_direct_operator), not to forwarded peers
+        // (their fanout=true is rejected upstream by cycle
+        // prevention; their fanout=false bypasses the limiter).
+        if q.fanout && is_direct_operator && !op_router.fanout_rate_limit.try_acquire(&operator) {
+            warn!(
+                operator = %operator,
+                request_id = %request_id,
+                "rate-limiting fan-out: operator bucket empty"
+            );
+            return send_sql_error(
+                conn,
+                &sealer,
+                &operator,
+                &request_id,
+                "rate_limited",
+                "fan-out bucket empty for this operator; back off and retry",
+            )
+            .await;
+        }
         let relay = if q.fanout {
             op_router.relay.clone()
         } else {
@@ -1668,6 +1754,22 @@ fn command_body_digest(body: &bowery_proto::OperatorCommandBody) -> [u8; 32] {
     bowery_whisper::forwarding::command_body_digest(body)
 }
 
+/// Phase-9 final-3: hard cap on the bytes any single cell may
+/// occupy on the wire. SECURITY-AUDIT-PHASE9 F-6: previously a
+/// query like `SELECT randomblob(80000)` would build a row
+/// larger than `MAX_FRAME_BYTES` (64 KiB), and the unstructured
+/// `FrameTooLarge` would tear down the QUIC stream with no
+/// signal to the operator. We now truncate large cells at the
+/// agent and substitute a `Text` placeholder so the operator
+/// gets an unambiguous "<truncated N bytes>" marker on each
+/// affected cell.
+///
+/// 16 KiB is well above any sensible row width (typical procfs
+/// columns are <1 KiB) but well below the per-frame cap, leaving
+/// room for the rest of the chunk's structure + a healthy batch
+/// of rows.
+const MAX_CELL_BYTES: usize = 16 * 1024;
+
 fn encode_row(row: &bowery_sql::Row) -> bowery_proto::SqlRow {
     let values = row
         .columns
@@ -1677,8 +1779,26 @@ fn encode_row(row: &bowery_sql::Row) -> bowery_proto::SqlRow {
                 bowery_sql::Value::Null => None,
                 bowery_sql::Value::Integer(i) => Some(bowery_proto::SqlValueKind::Integer(*i)),
                 bowery_sql::Value::Real(f) => Some(bowery_proto::SqlValueKind::Real(*f)),
-                bowery_sql::Value::Text(s) => Some(bowery_proto::SqlValueKind::Text(s.clone())),
-                bowery_sql::Value::Blob(b) => Some(bowery_proto::SqlValueKind::Blob(b.clone())),
+                bowery_sql::Value::Text(s) => {
+                    if s.len() > MAX_CELL_BYTES {
+                        Some(bowery_proto::SqlValueKind::Text(format!(
+                            "<truncated {} bytes>",
+                            s.len()
+                        )))
+                    } else {
+                        Some(bowery_proto::SqlValueKind::Text(s.clone()))
+                    }
+                }
+                bowery_sql::Value::Blob(b) => {
+                    if b.len() > MAX_CELL_BYTES {
+                        Some(bowery_proto::SqlValueKind::Text(format!(
+                            "<truncated {} bytes>",
+                            b.len()
+                        )))
+                    } else {
+                        Some(bowery_proto::SqlValueKind::Blob(b.clone()))
+                    }
+                }
             };
             bowery_proto::SqlValue { value: kind }
         })

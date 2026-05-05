@@ -80,7 +80,7 @@ pub fn default_tables() -> Vec<Box<dyn BoweryTable>> {
     vec![
         Box::new(os_version::OsVersionTable),
         Box::new(system_info::SystemInfoTable),
-        Box::new(processes::ProcessesTable),
+        Box::new(processes::ProcessesTable::default()),
         Box::new(mounts::MountsTable),
         Box::new(kernel_modules::KernelModulesTable),
         Box::new(interfaces::InterfacesTable),

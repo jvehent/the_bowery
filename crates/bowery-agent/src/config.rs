@@ -58,6 +58,8 @@ pub struct Config {
     pub response: ResponseConfig,
     #[serde(default)]
     pub sysquery: SysqueryConfig,
+    #[serde(default)]
+    pub sql: SqlConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,6 +549,35 @@ fn default_sysquery_binary_path() -> PathBuf {
 
 fn default_sysquery_max_timeout() -> Duration {
     Duration::from_secs(30)
+}
+
+/// Phase-9 final-4 + final-5: native SQL surface tunables. All
+/// fields default-friendly so an existing agent.toml without a
+/// `[sql]` block keeps working.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqlConfig {
+    /// SECURITY-AUDIT-PHASE9 F-8: when `true`, the `processes`
+    /// table populates the `cmdline` column with the full argv.
+    /// argv routinely contains DB connection strings, API
+    /// tokens passed via `--token=…`, secrets, and `$HOME`
+    /// paths — exposing it across a fan-out leaks credentials
+    /// to operators authorised on the relay but not the peer.
+    /// Default `false`.
+    #[serde(default)]
+    pub expose_cmdline: bool,
+    /// SECURITY-AUDIT-PHASE9 F-13: maximum number of operator
+    /// queries that may run concurrently per agent. Each query
+    /// builds a fresh in-memory `SQLite` + registers all 13+ tables;
+    /// concurrent operators scale that linearly. The semaphore
+    /// holds back queries past the cap until earlier ones drain.
+    /// Default `4`.
+    #[serde(default = "default_max_concurrent_queries")]
+    pub max_concurrent_queries: usize,
+}
+
+fn default_max_concurrent_queries() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

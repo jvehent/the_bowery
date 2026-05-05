@@ -83,6 +83,19 @@ pub struct Row {
 pub struct Sql {
     row_cap: usize,
     extra_tables: Vec<Arc<dyn BoweryTable>>,
+    /// Phase-9 final-4 + final-5: when non-empty, default tables
+    /// matching one of these names are skipped during
+    /// registration. Lets the agent substitute a privileged
+    /// instance (e.g. `ProcessesTable::new(expose_cmdline=true)`)
+    /// for the default instance without the second registration
+    /// inserting duplicate rows.
+    overridden_defaults: Vec<&'static str>,
+    /// SECURITY-AUDIT-PHASE9 F-13: maximum concurrent queries.
+    /// Each query opens a fresh in-memory `SQLite` + walks all
+    /// tables; concurrent operators scale that linearly. The
+    /// semaphore holds back queries past the cap until earlier
+    /// ones drain. `None` = unbounded (today's behaviour).
+    concurrency_cap: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl std::fmt::Debug for Sql {
@@ -90,6 +103,8 @@ impl std::fmt::Debug for Sql {
         f.debug_struct("Sql")
             .field("row_cap", &self.row_cap)
             .field("extra_table_count", &self.extra_tables.len())
+            .field("overridden_defaults", &self.overridden_defaults)
+            .field("concurrency_cap", &self.concurrency_cap.is_some())
             .finish()
     }
 }
@@ -99,6 +114,8 @@ impl Sql {
         Self {
             row_cap: DEFAULT_ROW_CAP,
             extra_tables: Vec::new(),
+            overridden_defaults: Vec::new(),
+            concurrency_cap: None,
         }
     }
 
@@ -120,14 +137,71 @@ impl Sql {
         self
     }
 
+    /// Skip a default `bowery-tables` entry by name. Use together
+    /// with `with_extra_table(custom_instance)` to substitute a
+    /// configured table (e.g. the agent's `ProcessesTable` with
+    /// `expose_cmdline = true`) for the default-default-config
+    /// version.
+    #[must_use]
+    pub fn override_default_table(mut self, name: &'static str) -> Self {
+        self.overridden_defaults.push(name);
+        self
+    }
+
+    /// Cap the number of concurrent `query()` invocations.
+    /// SECURITY-AUDIT-PHASE9 F-13: each query opens a fresh
+    /// in-memory `SQLite` and registers every table; without a cap
+    /// concurrent operators scale memory + CPU linearly. Default
+    /// `None` (unbounded); pass `Some(N)` to enforce.
+    #[must_use]
+    pub fn with_concurrency_cap(mut self, cap: usize) -> Self {
+        if cap > 0 {
+            self.concurrency_cap = Some(Arc::new(tokio::sync::Semaphore::new(cap)));
+        }
+        self
+    }
+
     /// Run `sql` against the registered table set, capped at
     /// `timeout` wall-clock and `self.row_cap` rows.
     pub async fn query(&self, sql: &str, timeout: Duration) -> Result<Vec<Row>, SqlError> {
         let row_cap = self.row_cap;
         let sql = sql.to_string();
         let extras = self.extra_tables.clone();
-        let join = tokio::task::spawn_blocking(move || run_blocking(&sql, row_cap, &extras));
-        match tokio::time::timeout(timeout, join).await {
+        let overrides = self.overridden_defaults.clone();
+        // Phase-9 final-5 / F-13: hold a semaphore permit across
+        // the whole query (including the spawn_blocking +
+        // timeout). Cap doesn't apply when concurrency_cap is
+        // None — preserves today's unbounded default for
+        // standalone Sql users.
+        let _permit = if let Some(sem) = self.concurrency_cap.as_ref() {
+            Some(
+                Arc::clone(sem)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| SqlError::Cancelled)?,
+            )
+        } else {
+            None
+        };
+        // Phase-9 final-6 / F-14: cooperative cancellation. When
+        // the wall-clock timeout fires, we set
+        // `cancel_flag.store(true)`; the `progress_handler`
+        // installed inside `run_blocking` polls it every 1024
+        // VDBE ops and returns `true` (interrupt) on cancel.
+        // Without this, SQLite would happily walk a recursive CTE
+        // for hours after our future was dropped, holding a
+        // blocking-pool slot until completion.
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_for_blocking = cancel_flag.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            run_blocking(&sql, row_cap, &extras, &overrides, &cancel_for_blocking)
+        });
+        let outcome = tokio::time::timeout(timeout, join).await;
+        // Always raise the flag — even on success, where it's a
+        // no-op. On timeout, this is what kicks the running
+        // query out of its inner loop.
+        cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        match outcome {
             Ok(Ok(result)) => result,
             Ok(Err(_join_err)) => Err(SqlError::Cancelled),
             Err(_) => Err(SqlError::Timeout(timeout)),
@@ -155,13 +229,31 @@ fn run_blocking(
     sql: &str,
     row_cap: usize,
     extras: &[Arc<dyn BoweryTable>],
+    overrides: &[&'static str],
+    cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<Row>, SqlError> {
     let conn = Connection::open_in_memory()?;
-    bowery_tables::register_all(&conn)?;
+    // Skip default tables whose names appear in `overrides` —
+    // the caller will register a replacement via `extras`.
+    for table in bowery_tables::default_tables() {
+        if overrides.contains(&table.name()) {
+            continue;
+        }
+        table.register(&conn)?;
+    }
     for extra in extras {
         extra.register(&conn)?;
     }
     install_select_only_authorizer(&conn);
+    // Phase-9 final-6 / F-14: cooperative cancellation. The
+    // closure returns `true` to interrupt; SQLite calls it every
+    // ~1024 VDBE ops, so even a pathological CTE notices the
+    // cancel within a few ms.
+    let cancel_for_handler = cancel_flag.clone();
+    conn.progress_handler(
+        1024,
+        Some(move || cancel_for_handler.load(std::sync::atomic::Ordering::Relaxed)),
+    );
     debug!(
         sql_preview = sql.chars().take(80).collect::<String>(),
         "running SQL"

@@ -43,8 +43,23 @@ const SCHEMA: &str = r"
     );
 ";
 
-#[derive(Debug)]
-pub struct ProcessesTable;
+#[derive(Debug, Default)]
+pub struct ProcessesTable {
+    /// SECURITY-AUDIT-PHASE9 F-8 — Phase-9 final-4: `expose_cmdline`
+    /// is OFF by default. argv routinely contains DB connection
+    /// strings, API tokens, secrets passed via `--token=…` flags,
+    /// and full paths under `$HOME`. With fanout, that data
+    /// crosses to operators authorised on the relay but not
+    /// necessarily on the peer. Operators who need cmdline must
+    /// opt in per agent via `[sql] expose_cmdline = true`.
+    expose_cmdline: bool,
+}
+
+impl ProcessesTable {
+    pub fn new(expose_cmdline: bool) -> Self {
+        Self { expose_cmdline }
+    }
+}
 
 impl BoweryTable for ProcessesTable {
     fn name(&self) -> &'static str {
@@ -53,7 +68,7 @@ impl BoweryTable for ProcessesTable {
 
     fn register(&self, conn: &Connection) -> Result<(), TableError> {
         conn.execute_batch(SCHEMA)?;
-        let rows = collect();
+        let rows = collect(self.expose_cmdline);
         let mut stmt = conn.prepare(
             "INSERT INTO processes (pid, ppid, uid, gid, name, cmdline, exe_path,
                                     start_time_unix, state, threads, rss_bytes, vsize_bytes)
@@ -95,7 +110,7 @@ struct ProcRow {
     vsize_bytes: Option<i64>,
 }
 
-fn collect() -> Vec<ProcRow> {
+fn collect(expose_cmdline: bool) -> Vec<ProcRow> {
     let Ok(iter) = procfs::process::all_processes() else {
         return Vec::new();
     };
@@ -104,7 +119,13 @@ fn collect() -> Vec<ProcRow> {
     let page_size = procfs::page_size();
     let mut out = Vec::new();
     for proc in iter.flatten() {
-        out.push(build_row(&proc, boot_time, ticks, page_size));
+        out.push(build_row(
+            &proc,
+            boot_time,
+            ticks,
+            page_size,
+            expose_cmdline,
+        ));
     }
     out
 }
@@ -114,6 +135,7 @@ fn build_row(
     boot_time: Option<u64>,
     ticks_per_second: u64,
     page_size: u64,
+    expose_cmdline: bool,
 ) -> ProcRow {
     let pid = i64::from(proc.pid());
     let mut row = ProcRow {
@@ -135,7 +157,7 @@ fn build_row(
         row.uid = Some(i64::from(status.ruid));
         row.gid = Some(i64::from(status.rgid));
     }
-    if let Ok(cmdline) = proc.cmdline() {
+    if expose_cmdline && let Ok(cmdline) = proc.cmdline() {
         // /proc/<pid>/cmdline is NUL-separated argv; join with space
         // for human-readable display. Empty cmdline (kernel threads)
         // surfaces as NULL so operators can `WHERE cmdline IS NULL`.
@@ -171,7 +193,7 @@ mod tests {
     #[test]
     fn registers_at_least_self() {
         let conn = Connection::open_in_memory().unwrap();
-        ProcessesTable.register(&conn).unwrap();
+        ProcessesTable::new(true).register(&conn).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM processes", [], |row| row.get(0))
             .unwrap();
@@ -191,7 +213,7 @@ mod tests {
     #[test]
     fn self_row_has_expected_shape() {
         let conn = Connection::open_in_memory().unwrap();
-        ProcessesTable.register(&conn).unwrap();
+        ProcessesTable::new(true).register(&conn).unwrap();
         let my_pid = i64::from(std::process::id());
         let (ppid, name, threads): (Option<i64>, Option<String>, Option<i64>) = conn
             .query_row(

@@ -68,6 +68,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, publish_interval: Duration) -
         },
         response: ResponseConfig::default(),
         sysquery: bowery_agent::config::SysqueryConfig::default(),
+        sql: bowery_agent::config::SqlConfig::default(),
     }
 }
 
