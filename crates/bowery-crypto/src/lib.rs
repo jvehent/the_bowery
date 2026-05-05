@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use ed25519_dalek::{SECRET_KEY_LENGTH, Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{SECRET_KEY_LENGTH, Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -157,8 +157,15 @@ impl Identity {
     }
 
     /// Verify a detached Ed25519 signature against a verifying key.
+    ///
+    /// Uses `verify_strict` to reject malleable `s` components and small-
+    /// order/torsion `R` components (RFC 8032 §5.1.7). The lenient `verify`
+    /// path would let an attacker who captured one valid signature produce
+    /// a second, distinct-bytes signature for the same message — which is
+    /// safe today because nothing keys on signature bytes, but a footgun
+    /// for any future use case that does.
     pub fn verify(vk: &VerifyingKey, msg: &[u8], sig: &Signature) -> Result<()> {
-        vk.verify(msg, sig).map_err(|_| Error::BadSignature)
+        vk.verify_strict(msg, sig).map_err(|_| Error::BadSignature)
     }
 
     /// Persist to disk as a TOML envelope with mode 0600. Refuses to overwrite

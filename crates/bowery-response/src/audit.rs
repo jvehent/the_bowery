@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bowery_crypto::{Fingerprint, Identity};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
@@ -169,7 +169,10 @@ impl AuditEnvelope {
         })?;
         let sig = Signature::from_bytes(&sig_arr);
         let input = self.record.signing_input()?;
-        vk.verify(&input, &sig)
+        // Strict mode (RFC 8032 §5.1.7) — reject malleable / small-order
+        // signatures. Cheap defense against any future tooling that
+        // indexes audit entries by sig bytes.
+        vk.verify_strict(&input, &sig)
             .map_err(|_| AuditError::BadSignature)
     }
 }

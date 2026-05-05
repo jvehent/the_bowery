@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bowery_crypto::{Fingerprint, Identity};
 use bowery_proto::{CANONICAL_SIG_DOMAIN, WhisperEnvelope, WhisperPayload};
-use ed25519_dalek::{Signature, Verifier as DalekVerifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use prost::Message as _;
 use thiserror::Error;
 
@@ -232,7 +232,10 @@ impl<R: FingerprintResolver> Verifier<R> {
         let sig = Signature::from_bytes(&sig_arr);
 
         let canonical = signing_input(sender.as_bytes(), env.nonce, env.ts_unix_ms, &env.payload);
-        vk.verify(&canonical, &sig)
+        // Strict mode rejects malleable s and small-order/torsion R components
+        // (per RFC 8032 §5.1.7) so a captured envelope can't be turned into a
+        // second, distinct-bytes envelope that verifies under the same key.
+        vk.verify_strict(&canonical, &sig)
             .map_err(|_| Error::BadSignature)?;
 
         let local_ms = current_ms().ok_or(Error::LocalClockBeforeEpoch)?;
@@ -417,5 +420,35 @@ mod tests {
             WhisperEnvelope::decode(sealer.seal(&WhisperPayload::heartbeat("0.0.1")).as_slice())
                 .unwrap();
         assert!(b.nonce > a.nonce);
+    }
+
+    /// Phase-8 hardening: confirm `verify_strict` rejects a malleable
+    /// signature — one with `s' = s + L` (curve order). The lenient
+    /// `Verifier::verify` path used to accept this, letting an attacker
+    /// turn a captured envelope into a second, distinct-bytes envelope.
+    #[test]
+    fn rejects_malleable_signature() {
+        // Add the curve order L (little-endian) to the lower-half `s` of
+        // the signature. The result is still a structurally valid Ed25519
+        // signature that verifies under lenient mode, but `verify_strict`
+        // rejects it because `s >= L`.
+        const ED25519_ORDER_LE: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x10,
+        ];
+
+        let (_id, sealer, verifier) = paired();
+        let bytes = sealer.seal(&WhisperPayload::heartbeat("0.0.1"));
+        let mut env = WhisperEnvelope::decode(bytes.as_slice()).unwrap();
+
+        let mut carry: u16 = 0;
+        for (s_dst, l_src) in env.signature[32..].iter_mut().zip(ED25519_ORDER_LE.iter()) {
+            let sum = u16::from(*s_dst) + u16::from(*l_src) + carry;
+            *s_dst = (sum & 0xff) as u8;
+            carry = sum >> 8;
+        }
+        let mangled = env.encode_to_vec();
+        assert!(matches!(verifier.open(&mangled), Err(Error::BadSignature)));
     }
 }
