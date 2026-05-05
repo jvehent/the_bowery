@@ -234,6 +234,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slice_3_network_tables_are_queryable() {
+        // Smoke test: every slice-3 network table accepts a basic
+        // projection. Sandbox/CI hosts may have empty /proc/net so
+        // we don't assert on row counts.
+        let sql = Sql::new();
+        for table in ["listening_ports", "process_open_sockets"] {
+            let q = format!("SELECT COUNT(*) AS n FROM {table}");
+            let rows = sql.query(&q, Duration::from_secs(2)).await.unwrap();
+            assert_eq!(rows.len(), 1, "{table}: COUNT(*) must return one row");
+        }
+        // Inode-based JOIN matches the documented usage pattern.
+        let rows = sql
+            .query(
+                "SELECT process_open_sockets.pid, listening_ports.port
+                 FROM process_open_sockets
+                 JOIN listening_ports USING (inode)
+                 LIMIT 5",
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        // The query must execute even if 0 rows match.
+        assert!(rows.len() <= 5);
+    }
+
+    #[tokio::test]
     async fn join_across_tables_works() {
         // Cross-product across two single-row tables — sanity that
         // we have a working SQL engine, not just two separate

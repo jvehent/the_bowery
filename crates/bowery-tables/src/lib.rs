@@ -17,8 +17,10 @@
 
 pub mod interfaces;
 pub mod kernel_modules;
+pub mod listening_ports;
 pub mod mounts;
 pub mod os_version;
+pub mod process_open_sockets;
 pub mod processes;
 pub mod system_info;
 
@@ -76,5 +78,7 @@ pub fn default_tables() -> Vec<Box<dyn BoweryTable>> {
         Box::new(mounts::MountsTable),
         Box::new(kernel_modules::KernelModulesTable),
         Box::new(interfaces::InterfacesTable),
+        Box::new(listening_ports::ListeningPortsTable),
+        Box::new(process_open_sockets::ProcessOpenSocketsTable),
     ]
 }
