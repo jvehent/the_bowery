@@ -35,6 +35,7 @@ envelope follow-up sections will be added when those land.
 19. [What we explicitly don't do](#19-what-we-explicitly-dont-do)
 20. [Phase 8 hardening](#20-phase-8-hardening)
 21. [Phase 6b operator commands](#21-phase-6b-operator-commands)
+22. [Phase 9 native SQL surface](#22-phase-9-native-sql-surface)
 
 ---
 
@@ -1996,6 +1997,149 @@ wrapped binary's JSON verbatim.
   for the full slice plan. Sysquery is kept alongside as the
   fallback for operators who want the wider third-party-binary
   table set without writing a new `bowery-tables` module.
+
+## 22. Phase 9 native SQL surface
+
+Phase 9 builds a pure-Rust SQL surface over Bowery's host-state
+view as the going-forward replacement for the sysquery
+(subprocess) path. The full slice plan lives in
+[`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md); this section is
+the in-tree reference for what shipped.
+
+### 22.1 Crates
+
+- [`crates/bowery-sql/`](crates/bowery-sql/) — async SQL engine
+  on top of `rusqlite`. Each `query()` opens a fresh in-memory
+  Connection, registers every table, runs the operator's SQL
+  inside `tokio::task::spawn_blocking` wrapped in
+  `tokio::time::timeout`, and returns
+  `Vec<Row>`. Bounded by `DEFAULT_ROW_CAP` (1M) and a wall-clock
+  deadline.
+- [`crates/bowery-tables/`](crates/bowery-tables/) — every
+  Phase-9 table impl. Each implements
+  `BoweryTable { name(), register(&Connection) }`. Slice-1
+  through slice-5 ship 13 tables backed by procfs / sysfs /
+  /etc / utmp.
+
+### 22.2 Default table set
+
+| Table | Slice | Source |
+|---|---|---|
+| `os_version` | 1 | `/etc/os-release` (+ `/usr/lib/os-release` fallback) |
+| `system_info` | 1 | `/proc/sys/kernel/{hostname,osrelease}`, `/proc/cpuinfo`, `/proc/meminfo`, `/sys/class/dmi/id/*` |
+| `processes` | 2a | `procfs::process::all_processes()` |
+| `mounts` | 2a | `/proc/self/mountinfo` |
+| `kernel_modules` | 2a | `/proc/modules` |
+| `interfaces` | 2a | `/sys/class/net/*` |
+| `listening_ports` | 3 | `/proc/net/{tcp,tcp6,udp,udp6}` |
+| `process_open_sockets` | 3 | per-pid fd-walk + inode lookup against the four protocol tables |
+| `users` | 4 | `/etc/passwd` |
+| `logged_in_users` | 4 | `/var/run/utmp` |
+| `last` | 4 | `/var/log/wtmp` |
+| `systemd_units` | 5 | unit-file walk under standard search paths |
+| `crontab` | 5 | `/etc/crontab` + `/etc/cron.d/*` |
+
+### 22.3 Streaming wire format (slice 6)
+
+Operator-facing entry: `OperatorCommandBody::Sql(SqlQuery)`. The
+agent streams the response as one or more
+`OperatorResultBody::SqlChunk` envelopes, each on its own QUIC
+unidirectional stream:
+
+- First chunk per agent carries the column names; subsequent
+  chunks leave them empty.
+- `end = true` terminates that agent's stream.
+- `agent_fp` (slice-7 onwards) tags rows with the producing
+  agent.
+- 256 rows per chunk by default
+  ([`SQL_CHUNK_ROW_LIMIT`](crates/bowery-agent/src/agent.rs)).
+- Errors collapse to a single `OperatorResultBody::Error` —
+  decoder treats either form as a stream terminator.
+
+### 22.4 Multi-agent fan-out via relay (slice 7)
+
+`SqlQuery { fanout: true, peers: [...] }` turns the dialled
+agent into a relay: it runs the query locally and dispatches
+`fanout: false` copies in parallel to its pinned peers
+(filtered by the `peers` array, or all of them if empty),
+multiplexing per-peer chunks back to the operator with
+`agent_fp` rewritten to identify each producer. Cycle prevention
+is implicit — peers always receive `fanout: false`.
+
+Per-peer dial / send / receive failures collapse to a synthetic
+terminal chunk for that peer, so the operator-side decoder
+always observes EOF for every peer it expected.
+
+**Fleet-config requirement:** the relay's identity must be in
+every peer's `[operators] pubkeys_b64` list. The relay signs
+its outbound `OperatorCommand` envelopes with its own key, and
+peers apply the same operator-only gate as a direct operator
+dial. This is documented as a slice-7 precondition; per-row
+peer→operator end-to-end signing is a slice-8+ hardening item
+if relay-tampering becomes a real concern.
+
+### 22.5 Bonus tables (slice 8)
+
+Four agent-state-aware tables plumbed in via
+`Sql::with_extra_table(Arc<dyn BoweryTable>)`. They live under
+[`crates/bowery-agent/src/sql_tables.rs`](crates/bowery-agent/src/sql_tables.rs)
+because they hold `Arc`s to agent state (`KnownNeighbors`,
+`Baseline`, `AlertInbox`, audit-log path) that `bowery-tables`
+intentionally doesn't depend on:
+
+- `bowery_peers` — fingerprints in the agent's KnownNeighbors.
+- `bowery_baseline_binaries` — every SHA the baseline has seen.
+- `bowery_alerts` — alerts in the in-memory inbox.
+- `bowery_audit` — Phase-7 audit log entries (parsed JSONL).
+
+These expose Bowery's own awareness of the mesh — questions a
+third-party SQL surface like sysquery can never answer.
+
+### 22.6 Operator CLI (slice 6 + 8)
+
+```sh
+# Single agent
+bowery exec sql --operator-key ... --agent-addr ... --agent-fp ... --agent-pubkey-b64 ... \
+    --sql 'SELECT pid, name FROM processes LIMIT 5'
+
+# Multi-agent fan-out via relay
+bowery exec sql ... --fanout --sql 'SELECT * FROM bowery_alerts WHERE suspicion >= 0.95'
+
+# Output formats: tsv (default, streams), json (streams), table (buffers)
+bowery exec sql ... --format=table --sql 'SELECT * FROM listening_ports'
+```
+
+`bowery doctor` (slice 8c) runs `SELECT 1` against an in-process
+`bowery-sql` engine, catching build-time SQL surface breakage
+without requiring a live agent.
+
+### 22.7 Resource caps
+
+- Per-query row cap (`DEFAULT_ROW_CAP = 1M`) — defends against
+  a query joining every table to itself.
+- Per-query wall-clock timeout, clamped to
+  `[sysquery] max_timeout` agent-side so a stolen operator key
+  can't pin the host indefinitely.
+- Per-chunk size: 256 rows, well under `MAX_FRAME_BYTES`.
+- Per-peer fan-out tasks share a 64-slot mpsc channel; back-
+  pressure forces slow peers to wait for the relay→operator
+  link.
+
+### 22.8 What's deferred
+
+- **Per-row peer→operator end-to-end signing** — currently the
+  relay signs its forwarded chunks with its own key, so a
+  malicious relay could fabricate rows. Rotating to
+  end-to-end (peer signs each row, relay multiplexes verbatim)
+  is queued.
+- **vtab pushdown for `file` / `hash` tables** — both need
+  `WHERE path = '...'` to be safe; otherwise an unscoped query
+  walks the entire filesystem. Slice 2b deferred until the
+  rusqlite `vtab` module API can express the constraint.
+- **Operator-side peer manifest** (`bowery peers add/list/remove`) —
+  useful for "did all my expected peers reply?" checks across a
+  fan-out query. Currently the operator inspects the `_agent_fp`
+  column.
 
 ---
 

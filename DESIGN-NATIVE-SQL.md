@@ -1,10 +1,12 @@
 # The Bowery — Native SQL surface (Phase 9)
 
-**Status:** in flight. Slices 1–5 of the table set + slice 6 of the
-streaming wire path have shipped (commits `6856fa4`, `b39441d`,
-`50f227b`, `618f655`, `9a929d1`, `bf29998`). This document is the
-remaining-work guide and supersedes the "bundle osqueryi" path
-proposed in Phase 6b.
+**Status:** shipped. Phase 9 slices 1–8 are in tree. The native
+engine (`bowery-sql`) lives alongside `bowery-sysquery` (the
+renamed subprocess wrapper); operators choose between them via
+`bowery exec sql` (native, default) and `bowery exec sysquery`
+(subprocess fallback). This document is the design rationale +
+operator guide; for the in-tree implementation reference see
+[`IMPLEMENTATION.md` § 22](IMPLEMENTATION.md#22-phase-9-native-sql-surface).
 
 This document scopes a pure-Rust replacement for osquery: a SQL
 surface over a curated set of host-state tables, queryable by an
