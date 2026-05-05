@@ -30,15 +30,39 @@ use crate::action::{Action, ActionError, ActionOutcome};
 use crate::engine::ResponseEngine;
 use crate::policy::ResponsePolicy;
 
+/// Pids we will never signal regardless of LLM verdict / operator policy.
+/// `0` is "process group / current session" sentinel for `kill(2)`,
+/// `1` is `init` (typically systemd), `2` is `kthreadd` (kernel thread
+/// supervisor). Killing any of these is at best a self-inflicted host
+/// reboot and at worst a kernel panic.
+const FORBIDDEN_PIDS: &[u32] = &[0, 1, 2];
+
+/// Read the comm of `pid` from `/proc/<pid>/comm`. Returns `None` on
+/// any I/O error (process gone, permissions, /proc unavailable). The
+/// caller treats `None` as "we don't know what this pid is right now",
+/// which composes naturally with the `AlreadyGone` short-circuit.
+fn pid_comm(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim_end_matches('\n').to_string())
+}
+
 /// `SIGKILL`-on-permitted-action engine.
 #[derive(Debug)]
 pub struct ProcessKillEngine {
     policy: ResponsePolicy,
+    /// pid of the agent process. We refuse to SIGKILL ourselves
+    /// regardless of LLM verdict. Captured at construction time
+    /// (`std::process::id()`).
+    self_pid: u32,
 }
 
 impl ProcessKillEngine {
     pub fn new(policy: ResponsePolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            self_pid: std::process::id(),
+        }
     }
 }
 
@@ -50,6 +74,43 @@ impl ResponseEngine for ProcessKillEngine {
         }
         match action {
             Action::KillProcess { pid, episode_id } => {
+                // Forbidden-pid skip-list: 0 (kill(2)'s "current group"
+                // sentinel), 1 (init), 2 (kthreadd), and the agent's own
+                // pid. None of these ever should be signalled, regardless
+                // of LLM verdict.
+                if FORBIDDEN_PIDS.contains(pid) || *pid == self.self_pid {
+                    warn!(
+                        episode = %episode_id,
+                        pid = pid,
+                        "process_kill: refusing to SIGKILL forbidden pid"
+                    );
+                    return Ok(ActionOutcome::suppressed(
+                        "pid is on the kill_process forbidden list (init / kthreadd / agent self)",
+                    ));
+                }
+                // Defense-in-depth against pid recycling: between exec
+                // event capture and SIGKILL the pid may have been reused
+                // by an unrelated process. Read /proc/<pid>/comm and
+                // refuse if the comm landed on the BlockExec deny-list
+                // (sshd, systemd, etc.) — same critical-service set we
+                // protect against the BPF-LSM-engine spoof attack. This
+                // doesn't fully close the race (process could re-exec
+                // again between this read and kill), but it catches the
+                // common case where pid landed in a long-lived service.
+                if let Some(current_comm) = pid_comm(*pid)
+                    && !self.policy.permits_block_exec_comm(&current_comm)
+                {
+                    warn!(
+                        episode = %episode_id,
+                        pid = pid,
+                        comm = %current_comm,
+                        "process_kill: refusing SIGKILL on critical-service comm \
+                         (likely pid-reuse race or comm spoof)"
+                    );
+                    return Ok(ActionOutcome::suppressed(
+                        "pid currently maps to a comm on the critical-service deny-list",
+                    ));
+                }
                 let pid_i32 = i32::try_from(*pid)
                     .map_err(|_| ActionError::Invalid(format!("pid {pid} doesn't fit in i32")))?;
                 let target = Pid::from_raw(pid_i32);
@@ -193,5 +254,52 @@ mod tests {
     fn name_is_process_kill() {
         let engine = ProcessKillEngine::new(ResponsePolicy::default());
         assert_eq!(engine.name(), "process-kill");
+    }
+
+    /// Phase-8 hardening (H10): refuse to SIGKILL pid 1 (init) even
+    /// under permissive policy. The pid is forbidden on the engine
+    /// side regardless of what the LLM verdict said.
+    #[tokio::test]
+    async fn refuses_to_kill_pid_one() {
+        let engine = ProcessKillEngine::new(permissive_policy());
+        let outcome = engine.execute(&kill_action(1)).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                ActionOutcome::Suppressed { ref reason } if reason.contains("forbidden")
+            ),
+            "expected forbidden-pid suppression, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_kill_kthreadd() {
+        let engine = ProcessKillEngine::new(permissive_policy());
+        let outcome = engine.execute(&kill_action(2)).await.unwrap();
+        assert!(matches!(
+            outcome,
+            ActionOutcome::Suppressed { ref reason } if reason.contains("forbidden")
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_to_kill_zero_pid_sentinel() {
+        let engine = ProcessKillEngine::new(permissive_policy());
+        let outcome = engine.execute(&kill_action(0)).await.unwrap();
+        assert!(matches!(
+            outcome,
+            ActionOutcome::Suppressed { ref reason } if reason.contains("forbidden")
+        ));
+    }
+
+    #[tokio::test]
+    async fn refuses_to_kill_agent_self() {
+        let engine = ProcessKillEngine::new(permissive_policy());
+        let self_pid = std::process::id();
+        let outcome = engine.execute(&kill_action(self_pid)).await.unwrap();
+        assert!(matches!(
+            outcome,
+            ActionOutcome::Suppressed { ref reason } if reason.contains("forbidden")
+        ));
     }
 }
