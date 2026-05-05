@@ -67,6 +67,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, publish_interval: Duration) -
             ..BloomConfig::default()
         },
         response: ResponseConfig::default(),
+        osquery: bowery_agent::config::OsqueryConfig::default(),
     }
 }
 

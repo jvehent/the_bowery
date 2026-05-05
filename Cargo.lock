@@ -278,6 +278,7 @@ dependencies = [
  "bowery-events",
  "bowery-llm",
  "bowery-mesh",
+ "bowery-osquery",
  "bowery-proto",
  "bowery-response",
  "bowery-whisper",
@@ -412,6 +413,16 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "bowery-osquery"
+version = "0.0.1"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

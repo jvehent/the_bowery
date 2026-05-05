@@ -366,6 +366,38 @@ impl Agent {
             shutdown_rx.clone(),
         );
 
+        // Phase-6b operator-command router. Build the osquery handle
+        // only when the operator has explicitly opted in *and* the
+        // binary resolves; otherwise commands fail-shut with
+        // policy_denied at dispatch time.
+        let osquery_handle = if config.osquery.enabled {
+            match bowery_osquery::Osquery::new(&config.osquery.binary_path) {
+                Ok(o) => {
+                    info!(
+                        binary = %config.osquery.binary_path.display(),
+                        max_timeout = ?config.osquery.max_timeout,
+                        "osquery handler enabled"
+                    );
+                    Some(Arc::new(o))
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        binary = %config.osquery.binary_path.display(),
+                        "osquery enabled in config but binary not found; \
+                         dispatch will return policy_denied"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let op_router = Arc::new(OperatorCommandRouter {
+            osquery: osquery_handle,
+            max_timeout: config.osquery.max_timeout,
+        });
+
         let accept_task = spawn_accept_task(
             endpoint.clone(),
             resolver.clone(),
@@ -373,6 +405,7 @@ impl Agent {
             sealer.clone(),
             baseline.clone(),
             inbox.clone(),
+            op_router,
             events_tx.clone(),
             shutdown_rx.clone(),
         );
@@ -636,6 +669,19 @@ fn spawn_pin_task(
 
 type ResolverArc = Arc<CompositeResolver<Arc<KnownNeighbors>, Arc<StaticResolver>>>;
 
+/// Bundle of operator-command handler dependencies. `None` for any
+/// field means the corresponding command is rejected with
+/// `policy_denied` instead of being dispatched.
+#[derive(Clone, Default)]
+pub(crate) struct OperatorCommandRouter {
+    /// Phase-6b osquery handler. Some when [`OsqueryConfig::enabled`]
+    /// is true and `binary_path` resolves at startup.
+    pub osquery: Option<Arc<bowery_osquery::Osquery>>,
+    /// Hard ceiling on per-query timeout, applied to every
+    /// command kind.
+    pub max_timeout: Duration,
+}
+
 #[allow(clippy::too_many_arguments)] // wiring kept explicit at the call site
 fn spawn_accept_task(
     endpoint: BoweryEndpoint,
@@ -644,6 +690,7 @@ fn spawn_accept_task(
     sealer: Arc<Sealer>,
     baseline: Arc<Baseline>,
     inbox: Arc<AlertInbox>,
+    op_router: Arc<OperatorCommandRouter>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -661,9 +708,10 @@ fn spawn_accept_task(
                             let sealer = sealer.clone();
                             let baseline = baseline.clone();
                             let inbox = inbox.clone();
+                            let op_router = op_router.clone();
                             let events = events_tx.clone();
                             tokio::spawn(handle_connection(
-                                conn, verifier, operators, sealer, baseline, inbox, events,
+                                conn, verifier, operators, sealer, baseline, inbox, op_router, events,
                             ));
                         }
                         Err(e) => warn!(error = %e, "accept failed"),
@@ -683,6 +731,7 @@ async fn handle_connection(
     sealer: Arc<Sealer>,
     baseline: Arc<Baseline>,
     inbox: Arc<AlertInbox>,
+    op_router: Arc<OperatorCommandRouter>,
     events_tx: broadcast::Sender<AgentEvent>,
 ) {
     while let Ok(bytes) = conn.recv_envelope().await {
@@ -732,9 +781,10 @@ async fn handle_connection(
                             );
                             continue;
                         }
-                        if let Err(e) =
-                            respond_to_operator_command(&conn, &sealer, env.sender, c, &events_tx)
-                                .await
+                        if let Err(e) = respond_to_operator_command(
+                            &conn, &sealer, env.sender, c, &op_router, &events_tx,
+                        )
+                        .await
                         {
                             warn!(sender = %env.sender, error = %e, "OperatorCommand response failed");
                         }
@@ -852,35 +902,57 @@ async fn respond_to_operator_command(
     sealer: &Sealer,
     operator: Fingerprint,
     cmd: bowery_proto::OperatorCommand,
+    op_router: &OperatorCommandRouter,
     events_tx: &broadcast::Sender<AgentEvent>,
 ) -> Result<(), bowery_whisper::transport::Error> {
-    use bowery_proto::{OperatorCommandBody, OperatorError, OperatorResult, OperatorResultBody};
+    use bowery_proto::{
+        OperatorCommandBody, OperatorError, OperatorResult, OperatorResultBody, OsqueryResult,
+    };
 
     let request_id = cmd.request_id.clone();
     let command_kind = match cmd.command.as_ref() {
         Some(OperatorCommandBody::Osquery(_)) => "osquery",
         None => "<empty>",
     };
+    // Clamp the operator's requested timeout to our configured cap.
+    // The operator can ask for less; they can't ask for more.
+    let requested = Duration::from_millis(u64::from(cmd.timeout_ms));
+    let effective_timeout = requested
+        .min(op_router.max_timeout)
+        .max(Duration::from_millis(100));
     info!(
         operator = %operator,
         request_id = %request_id,
         kind = command_kind,
-        timeout_ms = cmd.timeout_ms,
+        requested_ms = cmd.timeout_ms,
+        effective_ms = u64::try_from(effective_timeout.as_millis()).unwrap_or(u64::MAX),
         "operator command received"
     );
 
     let result = match cmd.command {
-        Some(OperatorCommandBody::Osquery(_q)) => {
-            // Phase-6b slice 1: dispatch is wired but the real
-            // osquery integration lives in slice 2. Returning a
-            // structured error here lets the CLI exercise the full
-            // round-trip today; slice 2 swaps the body for an
-            // OsqueryResult.
-            OperatorResultBody::Error(OperatorError {
-                kind: "unimplemented".into(),
-                message: "osquery handler arrives in Phase-6b slice 2".into(),
-            })
-        }
+        Some(OperatorCommandBody::Osquery(q)) => match &op_router.osquery {
+            Some(osq) => match osq.run(&q.sql, effective_timeout).await {
+                Ok(out) => OperatorResultBody::Osquery(OsqueryResult {
+                    json: out.stdout,
+                    exit_code: out.exit_code,
+                }),
+                Err(e) => {
+                    let kind = match &e {
+                        bowery_osquery::OsqueryError::Timeout(_) => "timeout",
+                        bowery_osquery::OsqueryError::OutputTooLarge { .. } => "output_too_large",
+                        _ => "handler_error",
+                    };
+                    OperatorResultBody::Error(OperatorError {
+                        kind: kind.into(),
+                        message: e.to_string(),
+                    })
+                }
+            },
+            None => OperatorResultBody::Error(OperatorError {
+                kind: "policy_denied".into(),
+                message: "osquery not enabled on this agent (set [osquery] enabled = true)".into(),
+            }),
+        },
         None => OperatorResultBody::Error(OperatorError {
             kind: "unsupported_command".into(),
             message: "OperatorCommand.command is empty".into(),

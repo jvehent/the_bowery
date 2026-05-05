@@ -56,6 +56,8 @@ pub struct Config {
     pub bloom: BloomConfig,
     #[serde(default)]
     pub response: ResponseConfig,
+    #[serde(default)]
+    pub osquery: OsqueryConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -492,6 +494,51 @@ pub struct ResponseConfig {
     /// audit log.
     #[serde(default)]
     pub audit_log_path: Option<PathBuf>,
+}
+
+/// Phase-6b: osquery operator-command settings.
+///
+/// Off by default. When `enabled = false`, any `OperatorCommand::Osquery`
+/// the agent receives is rejected with `kind = "policy_denied"` so the
+/// CLI gets a structured failure (not a silent timeout). When enabled,
+/// the agent runs `osqueryi` at `binary_path` with conservative
+/// hardening flags and a per-call wall-clock cap (operator-supplied
+/// timeouts are clamped down to `max_timeout`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OsqueryConfig {
+    /// Master switch. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the `osqueryi` binary. Default: `/usr/bin/osqueryi`.
+    /// Distros sometimes install at `/usr/local/bin/osqueryi`; check
+    /// with `bowery doctor` (Phase-9 will add an osquery probe).
+    #[serde(default = "default_osquery_binary_path")]
+    pub binary_path: PathBuf,
+    /// Hard ceiling on per-query timeout. The operator's request
+    /// timeout is clamped to `min(operator_request, max_timeout)`.
+    /// Defends against a compromised operator key hanging the host
+    /// with a deliberately long-running query.
+    #[serde(with = "humantime_serde", default = "default_osquery_max_timeout")]
+    pub max_timeout: Duration,
+}
+
+impl Default for OsqueryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            binary_path: default_osquery_binary_path(),
+            max_timeout: default_osquery_max_timeout(),
+        }
+    }
+}
+
+fn default_osquery_binary_path() -> PathBuf {
+    PathBuf::from("/usr/bin/osqueryi")
+}
+
+fn default_osquery_max_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
