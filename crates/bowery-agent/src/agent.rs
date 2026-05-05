@@ -634,7 +634,8 @@ fn spawn_accept_task(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let envelope_verifier = Arc::new(Verifier::new(resolver));
+        let self_fp = sealer.fingerprint();
+        let envelope_verifier = Arc::new(Verifier::new(resolver, self_fp));
         loop {
             tokio::select! {
                 accept = endpoint.accept() => {
@@ -680,7 +681,9 @@ async fn handle_connection(
                 });
                 match env.payload.body {
                     Some(Body::Question(q)) => {
-                        if let Err(e) = respond_to_question(&conn, &sealer, &baseline, q).await {
+                        if let Err(e) =
+                            respond_to_question(&conn, &sealer, &baseline, env.sender, q).await
+                        {
                             warn!(sender = %env.sender, error = %e, "whisper Q&A response failed");
                         }
                     }
@@ -723,6 +726,7 @@ async fn respond_to_question(
     conn: &BoweryConnection,
     sealer: &Sealer,
     baseline: &Arc<Baseline>,
+    asker: Fingerprint,
     question: bowery_proto::Question,
 ) -> Result<(), bowery_whisper::transport::Error> {
     if question.tier1_fp.len() != TIER1_LEN {
@@ -757,7 +761,7 @@ async fn respond_to_question(
         last_seen_unix_ms: sighting.last_seen_unix_ms,
         note: String::new(),
     };
-    let outbound = sealer.seal(&WhisperPayload::answer(answer));
+    let outbound = sealer.seal_for(&asker, &WhisperPayload::answer(answer));
     conn.send_envelope(&outbound).await
 }
 
@@ -784,7 +788,7 @@ async fn respond_to_subscribe(
         items,
         cursor_unix_ms: cursor,
     };
-    let outbound = sealer.seal(&WhisperPayload::alerts(response));
+    let outbound = sealer.seal_for(&operator, &WhisperPayload::alerts(response));
     conn.send_envelope(&outbound).await?;
 
     let _ = events_tx.send(AgentEvent::AlertsDelivered {
@@ -837,7 +841,7 @@ async fn send_heartbeat(
     peer: PeerInfo,
     events_tx: broadcast::Sender<AgentEvent>,
 ) {
-    let bytes = sealer.seal(&WhisperPayload::heartbeat(AGENT_VERSION));
+    let bytes = sealer.seal_for(&peer.fingerprint, &WhisperPayload::heartbeat(AGENT_VERSION));
     let verifier = Arc::new(PinnedCertVerifier::expecting(kn, peer.fingerprint));
     match endpoint.dial(verifier, peer.whisper_addr).await {
         Ok(conn) => match conn.send_envelope(&bytes).await {

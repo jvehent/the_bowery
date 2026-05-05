@@ -43,11 +43,26 @@ pub struct WhisperEnvelope {
 
 /// Domain-separation prefix for envelope signatures.
 ///
-/// Every signed message is `domain || sender_fingerprint || nonce_be ||
-/// ts_be || payload`, where `domain` is this constant. The prefix prevents
-/// cross-protocol signature reuse if Bowery keys are ever loaded into other
-/// protocols by mistake.
-pub const CANONICAL_SIG_DOMAIN: &[u8] = b"bowery/whisper/envelope/v1";
+/// Every signed message is
+///   `domain || recipient_fp || sender_fp || nonce_be || ts_be || payload`
+/// where `domain` is this constant and both fingerprints are 32 bytes.
+/// The prefix prevents cross-protocol signature reuse if Bowery keys
+/// are ever loaded into other protocols by mistake.
+///
+/// **Recipient binding (Phase-8 H1):** including the *recipient*'s
+/// fingerprint in the signing input means an envelope signed for
+/// host A cannot be replayed against host B — even if both pin the
+/// same sender — because B's signing input would be different. The
+/// recipient_fp is *not* on the wire (the envelope shape is the
+/// same as v1); each receiver supplies its own self-fp when
+/// building the signing input. This means a mismatch between what
+/// the sender targeted and what the receiver expects surfaces as
+/// `BadSignature`, which is the right outcome.
+///
+/// Bumped from `v1` → `v2` for the recipient-binding change. Any v1
+/// peers still running will see `BadSignature` from a v2 receiver
+/// (and vice-versa); there's no production fleet to migrate.
+pub const CANONICAL_SIG_DOMAIN: &[u8] = b"bowery/whisper/envelope/v2";
 
 // ---------------------------------------------------------------------------
 // Payload

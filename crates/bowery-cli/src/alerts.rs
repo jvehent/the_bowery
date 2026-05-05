@@ -48,13 +48,20 @@ pub(crate) async fn run(
 
     // Bind a transient endpoint on a loopback ephemeral port; we never
     // accept incoming on the operator side.
-    let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    // Bind on loopback only — the operator endpoint never accepts
+    // inbound (it just dials), so exposing on all interfaces would
+    // be unnecessary attack surface.
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
     let endpoint = BoweryEndpoint::bind(identity.clone(), accept_verifier, bind_addr)
         .context("binding operator-side endpoint")?;
 
+    let operator_fp = identity.fingerprint();
     let sealer = Sealer::new(identity);
-    let envelope_verifier = Verifier::new(resolver.clone());
+    // Operator's own fp is required for the recipient-binding signing
+    // input on inbound envelopes. The agent signs its Alerts response
+    // for this operator specifically (Phase-8 H1).
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
 
     let mut cursor = since_unix_ms;
     loop {
@@ -64,10 +71,13 @@ pub(crate) async fn run(
             .await
             .with_context(|| format!("dialing agent at {target_addr}"))?;
 
-        let outbound = sealer.seal(&WhisperPayload::subscribe(Subscribe {
-            since_unix_ms: cursor,
-            max_items: 0,
-        }));
+        let outbound = sealer.seal_for(
+            &target_fp,
+            &WhisperPayload::subscribe(Subscribe {
+                since_unix_ms: cursor,
+                max_items: 0,
+            }),
+        );
         conn.send_envelope(&outbound)
             .await
             .context("sending Subscribe")?;

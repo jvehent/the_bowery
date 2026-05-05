@@ -26,6 +26,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bowery_crypto::Fingerprint;
 use bowery_proto::{Answer, Body, Question, WhisperPayload};
 use rand::RngCore;
 use thiserror::Error;
@@ -123,23 +124,27 @@ fn ttl_deadline_ms(rel_ms: u64) -> u64 {
 // Asker
 // ---------------------------------------------------------------------------
 
-/// Send a question on `conn`, await the answer, return it verified.
+/// Send a question on `conn` to `responder`, await the answer, return
+/// it verified.
 ///
 /// The caller is responsible for having already dialed the peer and
 /// having a [`Sealer`] (their own identity) plus a [`Verifier`] that
 /// can resolve the *responder's* verifying key — typically the same
 /// `KnownNeighbors` used to pin the connection's TLS verifier.
+/// `responder` is the responder's fingerprint, used to bind the
+/// envelope signature to that recipient (Phase-8 H1 anti-replay).
 pub async fn ask<R: FingerprintResolver>(
     conn: &BoweryConnection,
     sealer: &Sealer,
     verifier: &Verifier<R>,
+    responder: Fingerprint,
     question: Question,
     timeout: Duration,
 ) -> Result<Answer, AskError> {
     let expected_episode = question.episode_id.clone();
     let expected_fp = question.tier1_fp.clone();
 
-    let outbound = sealer.seal(&WhisperPayload::question(question));
+    let outbound = sealer.seal_for(&responder, &WhisperPayload::question(question));
 
     let exchange = async {
         conn.send_envelope(&outbound).await?;
@@ -202,6 +207,10 @@ where
 {
     let bytes = conn.recv_envelope().await?;
     let opened = verifier.open(&bytes)?;
+    // Asker's fingerprint, recovered from the verified envelope. Used
+    // as the recipient when sealing the Answer back to them
+    // (Phase-8 H1).
+    let asker = opened.sender;
     let question = match opened.payload.body {
         Some(Body::Question(q)) => q,
         Some(other) => return Err(AnswerError::UnexpectedBody(body_kind(&other))),
@@ -252,7 +261,7 @@ where
         last_seen_unix_ms: sighting.last_seen_unix_ms,
         note: note.to_string(),
     };
-    let outbound = sealer.seal(&WhisperPayload::answer(answer));
+    let outbound = sealer.seal_for(&asker, &WhisperPayload::answer(answer));
     conn.send_envelope(&outbound).await?;
     Ok(question)
 }
@@ -303,6 +312,7 @@ mod tests {
         Sealer,
         Verifier<StaticResolver>,
         Verifier<StaticResolver>,
+        Fingerprint, // beta's fingerprint — recipient for ask() in tests
     ) {
         let id_alpha = Arc::new(Identity::generate());
         let id_beta = Arc::new(Identity::generate());
@@ -341,10 +351,12 @@ mod tests {
             .expect("dial");
         let beta_conn = beta_accept.await.unwrap();
 
+        let alpha_fp = id_alpha.fingerprint();
+        let beta_fp = id_beta.fingerprint();
         let alpha_sealer = Sealer::new(id_alpha.clone());
         let beta_sealer = Sealer::new(id_beta.clone());
-        let alpha_verifier = Verifier::new(resolver_alpha);
-        let beta_verifier = Verifier::new(resolver_beta);
+        let alpha_verifier = Verifier::new(resolver_alpha, alpha_fp);
+        let beta_verifier = Verifier::new(resolver_beta, beta_fp);
 
         (
             endpoint_alpha,
@@ -355,6 +367,7 @@ mod tests {
             beta_sealer,
             alpha_verifier,
             beta_verifier,
+            beta_fp,
         )
     }
 
@@ -369,6 +382,7 @@ mod tests {
             beta_sealer,
             alpha_verifier,
             beta_verifier,
+            beta_fp,
         ) = paired().await;
 
         let fp = Tier1Fingerprint::derive(b"sneaky");
@@ -397,6 +411,7 @@ mod tests {
             &alpha_conn,
             &alpha_sealer,
             &alpha_verifier,
+            beta_fp,
             question,
             Duration::from_secs(5),
         )
@@ -424,6 +439,7 @@ mod tests {
             beta_sealer,
             alpha_verifier,
             beta_verifier,
+            beta_fp,
         ) = paired().await;
 
         let fp = Tier1Fingerprint::derive(b"nothing-here");
@@ -444,6 +460,7 @@ mod tests {
             &alpha_conn,
             &alpha_sealer,
             &alpha_verifier,
+            beta_fp,
             build_question(fp, Duration::from_mins(1), ""),
             Duration::from_secs(5),
         )
@@ -469,6 +486,7 @@ mod tests {
             _beta_sealer,
             alpha_verifier,
             _beta_verifier,
+            beta_fp,
         ) = paired().await;
 
         let fp = Tier1Fingerprint::derive(b"silent");
@@ -476,6 +494,7 @@ mod tests {
             &alpha_conn,
             &alpha_sealer,
             &alpha_verifier,
+            beta_fp,
             build_question(fp, Duration::from_mins(1), ""),
             Duration::from_millis(200),
         )
@@ -497,6 +516,7 @@ mod tests {
             beta_sealer,
             alpha_verifier,
             beta_verifier,
+            beta_fp,
         ) = paired().await;
 
         let fp = Tier1Fingerprint::derive(b"expired");
@@ -521,6 +541,7 @@ mod tests {
             &alpha_conn,
             &alpha_sealer,
             &alpha_verifier,
+            beta_fp,
             question,
             Duration::from_millis(300),
         )

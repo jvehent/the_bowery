@@ -22,7 +22,8 @@ fn verifier() -> &'static Verifier<StaticResolver> {
         let identity = Identity::generate();
         let mut resolver = StaticResolver::new();
         resolver.insert(identity.verifying_key());
-        Verifier::new(resolver)
+        let self_fp = identity.fingerprint();
+        Verifier::new(resolver, self_fp)
     })
 }
 

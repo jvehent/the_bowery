@@ -91,6 +91,7 @@ fn make_exec(pid: u32, exe_path: std::path::PathBuf) -> Event {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // end-to-end test, kept linear for readability
 async fn high_suspicion_exec_appears_in_operator_inbox_via_subscribe() {
     let workdir = TempDir::new().unwrap();
     let payload_path = workdir.path().join("payload");
@@ -156,13 +157,17 @@ async fn high_suspicion_exec_appears_in_operator_inbox_via_subscribe() {
         .await
         .expect("operator dial");
 
+    let operator_fp = operator_id.fingerprint();
     let sealer = Sealer::new(operator_id.clone());
-    let envelope_verifier = Verifier::new(resolver.clone());
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
 
-    let outbound = sealer.seal(&WhisperPayload::subscribe(Subscribe {
-        since_unix_ms: 0,
-        max_items: 0,
-    }));
+    let outbound = sealer.seal_for(
+        &agent_fp,
+        &WhisperPayload::subscribe(Subscribe {
+            since_unix_ms: 0,
+            max_items: 0,
+        }),
+    );
     conn.send_envelope(&outbound).await.expect("send subscribe");
     let bytes = conn.recv_envelope().await.expect("recv alerts");
     let opened = envelope_verifier.open(&bytes).expect("verify alerts");
@@ -194,10 +199,13 @@ async fn high_suspicion_exec_appears_in_operator_inbox_via_subscribe() {
         .dial(dial_verifier_2, agent_whisper_addr)
         .await
         .expect("re-dial");
-    let outbound2 = sealer.seal(&WhisperPayload::subscribe(Subscribe {
-        since_unix_ms: alerts.cursor_unix_ms,
-        max_items: 0,
-    }));
+    let outbound2 = sealer.seal_for(
+        &agent_fp,
+        &WhisperPayload::subscribe(Subscribe {
+            since_unix_ms: alerts.cursor_unix_ms,
+            max_items: 0,
+        }),
+    );
     conn2
         .send_envelope(&outbound2)
         .await
@@ -264,10 +272,13 @@ async fn unauthorized_operator_subscribe_is_rejected() {
         .await;
     if let Ok(conn) = dial_result {
         let sealer = Sealer::new(stranger_id.clone());
-        let outbound = sealer.seal(&WhisperPayload::subscribe(Subscribe {
-            since_unix_ms: 0,
-            max_items: 0,
-        }));
+        let outbound = sealer.seal_for(
+            &agent_fp,
+            &WhisperPayload::subscribe(Subscribe {
+                since_unix_ms: 0,
+                max_items: 0,
+            }),
+        );
         // Send may succeed (one-way uni stream); recv must error.
         let _ = conn.send_envelope(&outbound).await;
         let recv_result =
@@ -383,12 +394,16 @@ async fn llm_verdict_re_emits_refined_alert_into_inbox() {
         .dial(dial_verifier, agent.whisper_addr().expect("whisper_addr"))
         .await
         .expect("dial");
+    let operator_fp = operator_id.fingerprint();
     let sealer = Sealer::new(operator_id);
-    let envelope_verifier = Verifier::new(resolver.clone());
-    let outbound = sealer.seal(&WhisperPayload::subscribe(Subscribe {
-        since_unix_ms: 0,
-        max_items: 0,
-    }));
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
+    let outbound = sealer.seal_for(
+        &agent_fp,
+        &WhisperPayload::subscribe(Subscribe {
+            since_unix_ms: 0,
+            max_items: 0,
+        }),
+    );
     conn.send_envelope(&outbound).await.expect("send subscribe");
     let bytes = conn.recv_envelope().await.expect("recv alerts");
     let opened = envelope_verifier.open(&bytes).expect("verify alerts");

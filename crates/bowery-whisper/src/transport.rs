@@ -373,7 +373,7 @@ mod tests {
         let endpoint_beta_clone = endpoint_beta.clone();
         let mut resolver_for_verify = StaticResolver::new();
         resolver_for_verify.insert(id_alpha.verifying_key());
-        let envelope_verifier = Verifier::new(resolver_for_verify);
+        let envelope_verifier = Verifier::new(resolver_for_verify, id_beta.fingerprint());
         let alpha_fp = id_alpha.fingerprint();
 
         let beta_task = tokio::spawn(async move {
@@ -395,7 +395,7 @@ mod tests {
             .expect("dial");
 
         let sealer = Sealer::new(id_alpha.clone());
-        let bytes = sealer.seal(&WhisperPayload::heartbeat("0.0.1"));
+        let bytes = sealer.seal_for(&id_beta.fingerprint(), &WhisperPayload::heartbeat("0.0.1"));
         conn.send_envelope(&bytes).await.expect("send");
 
         let opened = tokio::time::timeout(Duration::from_secs(5), beta_task)

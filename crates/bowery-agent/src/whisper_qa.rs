@@ -300,7 +300,7 @@ async fn run_round(
         })
         .collect();
 
-    let envelope_verifier = Arc::new(Verifier::new(kn.clone()));
+    let envelope_verifier = Arc::new(Verifier::new(kn.clone(), local_fp));
 
     let asks = ranked
         .into_iter()
@@ -477,7 +477,15 @@ async fn ask_one(
         .await
         .map_err(AskError::Transport)?;
     let question = qa::build_question(tier1, timeout, "");
-    let answer = qa::ask(&conn, sealer, envelope_verifier, question, timeout).await?;
+    let answer = qa::ask(
+        &conn,
+        sealer,
+        envelope_verifier,
+        peer.fingerprint,
+        question,
+        timeout,
+    )
+    .await?;
     Ok(answer)
 }
 
