@@ -60,6 +60,21 @@ impl ResponseEngine for BpfLsmEngine {
         }
         match action {
             Action::BlockExec { comm, episode_id } => {
+                // Critical-comm protection. An attacker can call
+                // prctl(PR_SET_NAME, "sshd") to spoof their comm; if we
+                // add "sshd" to BLOCKED_COMMS the kernel hook then EPERM's
+                // every legitimate sshd exec. Default-deny on a list of
+                // process names whose loss would brick the host.
+                if !self.policy.permits_block_exec_comm(comm) {
+                    warn!(
+                        episode = %episode_id,
+                        comm = %comm,
+                        "bpf-lsm: refusing to block protected comm"
+                    );
+                    return Ok(ActionOutcome::suppressed(
+                        "comm is on the BlockExec deny-list (critical-service protection)",
+                    ));
+                }
                 let mut blocker = self.blocker.lock().await;
                 match blocker.block_comm(comm) {
                     Ok(()) => {

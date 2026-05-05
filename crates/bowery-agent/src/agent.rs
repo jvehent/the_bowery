@@ -296,6 +296,10 @@ impl Agent {
             engine = response_engine.name(),
             "response engine initialised"
         );
+        info!(
+            deny_list = ?response_engine.policy().effective_block_exec_deny_list(),
+            "block_exec deny-list (defaults + operator additions)"
+        );
 
         // Phase-7 slice 4: signed audit log. Off by default — operators
         // who turn it on get one fsynced JSON line per action attempt,

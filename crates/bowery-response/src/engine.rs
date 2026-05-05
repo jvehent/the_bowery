@@ -114,6 +114,7 @@ mod tests {
         let policy = ResponsePolicy {
             allowed_actions: vec!["kill_process".into()],
             disabled: false,
+            block_exec_deny_list: vec![],
         };
         let eng = NoopEngine::new(policy);
         let outcome = eng.execute(&kill_action()).await.unwrap();
@@ -128,6 +129,7 @@ mod tests {
         let policy = ResponsePolicy {
             allowed_actions: vec!["kill_process".into()],
             disabled: true,
+            block_exec_deny_list: vec![],
         };
         let eng = NoopEngine::new(policy);
         let outcome = eng.execute(&kill_action()).await.unwrap();

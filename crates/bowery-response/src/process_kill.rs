@@ -108,6 +108,7 @@ mod tests {
         ResponsePolicy {
             allowed_actions: vec!["kill_process".into()],
             disabled: false,
+            block_exec_deny_list: vec![],
         }
     }
 

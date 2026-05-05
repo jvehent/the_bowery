@@ -27,6 +27,37 @@ use tracing::warn;
 
 use crate::action::Action;
 
+/// Default deny-list of `comm` strings that must never be added to a
+/// kernel-side block list, regardless of LLM suggestion or operator
+/// `allowed_actions`. An attacker who can call `prctl(PR_SET_NAME)`
+/// can spoof their `comm` to match any of these — so blocking by comm
+/// is otherwise a remote-DoS-by-name-confusion primitive (block
+/// "sshd" → every legitimate sshd exec gets EPERM).
+///
+/// Operators can extend this list via `block_exec_deny_list` in the
+/// policy file. The defaults cover the most catastrophic cases.
+const DEFAULT_BLOCK_EXEC_DENY_LIST: &[&str] = &[
+    // Login / remote access — losing these means no recovery path.
+    "sshd",
+    "login",
+    "su",
+    "sudo",
+    // PID-1 / supervisor.
+    "init",
+    "systemd",
+    "systemd-journald",
+    "systemd-logind",
+    "systemd-udevd",
+    "systemd-networkd",
+    "systemd-resolved",
+    "openrc-init",
+    // Kernel threads (defense-in-depth; LSM hook normally won't fire).
+    "kthreadd",
+    "kworker",
+    // The agent itself — never block its own restarts.
+    "bowery-agent",
+];
+
 /// Operator-controlled gate for autonomous actions.
 ///
 /// `default()` is the safe choice — empty `allowed_actions`,
@@ -48,6 +79,15 @@ pub struct ResponsePolicy {
     /// the "panic, halt all autonomy" lever during incidents.
     #[serde(default)]
     pub disabled: bool,
+
+    /// Additional `comm` strings to add to the `BlockExec` deny-list.
+    /// Operator entries are unioned with [`DEFAULT_BLOCK_EXEC_DENY_LIST`];
+    /// neither list is overridable. Defense against
+    /// `prctl(PR_SET_NAME, "sshd")`-style spoofing where an attacker
+    /// renames their process to coerce the agent into blocking a
+    /// critical service.
+    #[serde(default)]
+    pub block_exec_deny_list: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -98,6 +138,39 @@ impl ResponsePolicy {
         self.allowed_actions.iter().any(|s| s == id)
     }
 
+    /// True iff `comm` may be added to a `BlockExec` block-list. Returns
+    /// `false` when `comm` is in the built-in critical-comm deny-list
+    /// or in the operator's `block_exec_deny_list`.
+    ///
+    /// Comparison is byte-exact (no normalisation) so an attacker can't
+    /// trivially escape via case variation — but the kernel's `comm`
+    /// is byte-bounded to 16 chars and the LSM hook normalises trailing
+    /// whitespace, so the only realistic spoof is the one this list
+    /// defends against. Engines should call this in addition to
+    /// `permits("block_exec")`.
+    pub fn permits_block_exec_comm(&self, comm: &str) -> bool {
+        if DEFAULT_BLOCK_EXEC_DENY_LIST.contains(&comm) {
+            return false;
+        }
+        if self.block_exec_deny_list.iter().any(|c| c == comm) {
+            return false;
+        }
+        true
+    }
+
+    /// The full effective deny-list (defaults plus operator additions).
+    /// Used by startup logs so operators can see what's protected.
+    pub fn effective_block_exec_deny_list(&self) -> Vec<String> {
+        let mut out: Vec<String> = DEFAULT_BLOCK_EXEC_DENY_LIST
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        out.extend(self.block_exec_deny_list.iter().cloned());
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Strings in `allowed_actions` that don't match any known
     /// action id. Operators see these in startup logs so a typo
     /// doesn't quietly leave a host with no coverage.
@@ -128,6 +201,7 @@ mod tests {
         let p = ResponsePolicy {
             allowed_actions: vec!["kill_process".into()],
             disabled: false,
+            block_exec_deny_list: vec![],
         };
         assert!(p.permits("kill_process"));
         assert!(!p.permits("block_exec"));
@@ -138,6 +212,7 @@ mod tests {
         let p = ResponsePolicy {
             allowed_actions: vec!["kill_process".into()],
             disabled: true,
+            block_exec_deny_list: vec![],
         };
         assert!(!p.permits("kill_process"));
     }
@@ -151,10 +226,44 @@ mod tests {
                 "page_oncall".into(),  // never supported
             ],
             disabled: false,
+            block_exec_deny_list: vec![],
         };
         let mut w = p.warnings();
         w.sort();
         assert_eq!(w, vec!["isolate_host", "page_oncall"]);
+    }
+
+    /// Phase-8 hardening (H11): default deny-list protects critical
+    /// comms even when policy permits `block_exec` broadly.
+    #[test]
+    fn default_deny_list_protects_sshd() {
+        let p = ResponsePolicy {
+            allowed_actions: vec!["block_exec".into()],
+            disabled: false,
+            block_exec_deny_list: vec![],
+        };
+        assert!(p.permits("block_exec"));
+        assert!(!p.permits_block_exec_comm("sshd"));
+        assert!(!p.permits_block_exec_comm("systemd"));
+        assert!(!p.permits_block_exec_comm("bowery-agent"));
+        // A non-critical comm is permitted.
+        assert!(p.permits_block_exec_comm("evil"));
+    }
+
+    #[test]
+    fn operator_can_extend_deny_list_but_not_shrink_defaults() {
+        let p = ResponsePolicy {
+            allowed_actions: vec!["block_exec".into()],
+            disabled: false,
+            block_exec_deny_list: vec!["my-critical-app".into()],
+        };
+        assert!(!p.permits_block_exec_comm("my-critical-app"));
+        // Defaults still hold.
+        assert!(!p.permits_block_exec_comm("sshd"));
+        // The effective list contains both.
+        let effective = p.effective_block_exec_deny_list();
+        assert!(effective.contains(&"my-critical-app".to_string()));
+        assert!(effective.contains(&"sshd".to_string()));
     }
 
     #[test]
