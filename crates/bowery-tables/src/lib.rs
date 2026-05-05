@@ -15,7 +15,11 @@
 
 #![warn(unreachable_pub)]
 
+pub mod interfaces;
+pub mod kernel_modules;
+pub mod mounts;
 pub mod os_version;
+pub mod processes;
 pub mod system_info;
 
 use rusqlite::Connection;
@@ -68,5 +72,9 @@ pub fn default_tables() -> Vec<Box<dyn BoweryTable>> {
     vec![
         Box::new(os_version::OsVersionTable),
         Box::new(system_info::SystemInfoTable),
+        Box::new(processes::ProcessesTable),
+        Box::new(mounts::MountsTable),
+        Box::new(kernel_modules::KernelModulesTable),
+        Box::new(interfaces::InterfacesTable),
     ]
 }

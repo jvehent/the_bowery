@@ -101,6 +101,9 @@ futures = "0.3"
 # Baseline storage
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# Phase-9 host-state tables source
+procfs = { version = "0.17", default-features = false }
+
 # Async traits
 async-trait = "0.1"
 

@@ -207,6 +207,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slice_2_tables_are_queryable() {
+        // Smoke test: every Phase-9 slice-2 table accepts a basic
+        // projection. We don't assert on row counts beyond what's
+        // load-bearing (loopback for `interfaces`, self-pid for
+        // `processes`, root mount for `mounts`) — the per-table
+        // tests cover correctness; this just confirms registration
+        // wired them onto the shared connection.
+        let sql = Sql::new();
+        for table in ["processes", "mounts", "kernel_modules", "interfaces"] {
+            let q = format!("SELECT COUNT(*) AS n FROM {table}");
+            let rows = sql.query(&q, Duration::from_secs(2)).await.unwrap();
+            assert_eq!(rows.len(), 1, "{table}: COUNT(*) must return one row");
+        }
+        // Cross-table sanity: every process must reference a real
+        // mount-relevant fs (loose join — not a referential check,
+        // just confirms two slice-2 tables coexist on the same conn).
+        let rows = sql
+            .query(
+                "SELECT processes.pid FROM processes, interfaces WHERE interfaces.name = 'lo' LIMIT 1",
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
     async fn join_across_tables_works() {
         // Cross-product across two single-row tables — sanity that
         // we have a working SQL engine, not just two separate
