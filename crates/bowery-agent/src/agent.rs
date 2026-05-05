@@ -1110,19 +1110,18 @@ async fn stream_sql_response(
     relay: Option<&Arc<RelayContext>>,
     timeout: Duration,
 ) -> Result<(), bowery_whisper::transport::Error> {
-    use bowery_proto::{OperatorError, OperatorResult, OperatorResultBody, SqlChunk};
+    use bowery_proto::SqlChunk;
 
     let Some(engine) = sql_engine else {
-        let err = OperatorResultBody::Error(OperatorError {
-            kind: "policy_denied".into(),
-            message: "SQL engine not configured on this agent".into(),
-        });
-        let response = OperatorResult {
-            request_id: request_id.to_string(),
-            result: Some(err),
-        };
-        let outbound = sealer.seal_for(&operator, &WhisperPayload::operator_result(response));
-        return conn.send_envelope(&outbound).await;
+        return send_sql_error(
+            conn,
+            sealer,
+            &operator,
+            request_id,
+            "policy_denied",
+            "SQL engine not configured on this agent",
+        )
+        .await;
     };
 
     let self_fp = sealer.fingerprint();
@@ -1137,16 +1136,7 @@ async fn stream_sql_response(
                 bowery_sql::SqlError::Sqlite(_) => "sql_error",
                 _ => "handler_error",
             };
-            let err = OperatorResultBody::Error(OperatorError {
-                kind: kind.into(),
-                message: e.to_string(),
-            });
-            let response = OperatorResult {
-                request_id: request_id.to_string(),
-                result: Some(err),
-            };
-            let outbound = sealer.seal_for(&operator, &WhisperPayload::operator_result(response));
-            return conn.send_envelope(&outbound).await;
+            return send_sql_error(conn, sealer, &operator, request_id, kind, &e.to_string()).await;
         }
     };
 
@@ -1229,6 +1219,29 @@ async fn send_chunk(
     let response = OperatorResult {
         request_id: request_id.to_string(),
         result: Some(OperatorResultBody::SqlChunk(chunk)),
+    };
+    let outbound = sealer.seal_for(operator, &WhisperPayload::operator_result(response));
+    conn.send_envelope(&outbound).await
+}
+
+/// Helper to seal + send a stream-terminating `OperatorError`
+/// envelope. The decoder treats any `Error` body as the end of
+/// the stream regardless of how many `SqlChunk`s preceded it.
+async fn send_sql_error(
+    conn: &BoweryConnection,
+    sealer: &Sealer,
+    operator: &Fingerprint,
+    request_id: &str,
+    kind: &str,
+    message: &str,
+) -> Result<(), bowery_whisper::transport::Error> {
+    use bowery_proto::{OperatorError, OperatorResult, OperatorResultBody};
+    let response = OperatorResult {
+        request_id: request_id.to_string(),
+        result: Some(OperatorResultBody::Error(OperatorError {
+            kind: kind.to_string(),
+            message: message.to_string(),
+        })),
     };
     let outbound = sealer.seal_for(operator, &WhisperPayload::operator_result(response));
     conn.send_envelope(&outbound).await
