@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 mod alerts;
 mod audit;
 mod doctor;
+mod exec;
 mod model;
 
 #[derive(Parser, Debug)]
@@ -79,6 +80,49 @@ enum Command {
     Audit {
         #[command(subcommand)]
         sub: AuditCommand,
+    },
+
+    /// Send a typed operator command to an agent and print the result.
+    ///
+    /// Phase 6b. Each subcommand maps to one
+    /// [`bowery_proto::OperatorCommandBody`] variant. The CLI
+    /// authenticates with the operator key (must be in the agent's
+    /// `[operators] pubkeys_b64` list) and TLS-pins the agent the
+    /// same way `alerts tail` does.
+    Exec {
+        #[command(subcommand)]
+        sub: ExecCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ExecCommand {
+    /// Run an osquery query on the agent host and print the result.
+    Osquery {
+        /// Path to the operator's identity key file.
+        #[arg(long)]
+        operator_key: PathBuf,
+        /// Agent's whisper bind address (e.g. `127.0.0.1:9902`).
+        #[arg(long)]
+        agent_addr: SocketAddr,
+        /// Hex-encoded fingerprint of the agent's identity key.
+        #[arg(long)]
+        agent_fp: String,
+        /// Base64-encoded Ed25519 verifying key of the agent.
+        #[arg(long)]
+        agent_pubkey_b64: String,
+        /// SQL string. Read-only by osquery convention; the agent
+        /// may additionally refuse the query at policy-check time.
+        #[arg(long)]
+        sql: String,
+        /// Wall-clock deadline for the agent-side handler. Accepts
+        /// humantime expressions (e.g. `5s`, `30s`, `2m`).
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        timeout: Duration,
+        /// Emit the result as a single JSON object (full envelope
+        /// shape) instead of just the osquery JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -203,6 +247,7 @@ fn main() -> ExitCode {
 }
 
 impl Cli {
+    #[allow(clippy::too_many_lines)] // top-level CLI dispatch; one arm per subcommand
     fn run(self) -> Result<ExitCode> {
         match self.command {
             Command::Key(KeyCommand::Generate { out }) => {
@@ -277,6 +322,38 @@ impl Cli {
                         json,
                     },
             } => audit::verify(&path, pubkey_b64, pubkey_from, json),
+            Command::Exec {
+                sub:
+                    ExecCommand::Osquery {
+                        operator_key,
+                        agent_addr,
+                        agent_fp,
+                        agent_pubkey_b64,
+                        sql,
+                        timeout,
+                        json,
+                    },
+            } => {
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::WARN)
+                    .with_target(false)
+                    .with_writer(std::io::stderr)
+                    .init();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building tokio runtime")?;
+                runtime.block_on(exec::osquery(
+                    operator_key,
+                    agent_addr,
+                    agent_fp,
+                    agent_pubkey_b64,
+                    sql,
+                    timeout,
+                    json,
+                ))?;
+                Ok(ExitCode::SUCCESS)
+            }
         }
     }
 }

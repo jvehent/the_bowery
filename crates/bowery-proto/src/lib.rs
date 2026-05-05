@@ -274,13 +274,109 @@ pub struct Alerts {
     pub cursor_unix_ms: u64,
 }
 
-// Placeholders — populated in later phases.
+// ---------------------------------------------------------------------------
+// Operator commands — Phase 6b.
+//
+// `OperatorCommand` carries a typed `command` oneof so each variant has
+// its own schema. New commands are added by extending the oneof, never
+// by smuggling free-form strings — this keeps every command's input
+// surface visible at code-review time. `request_id` is the asker's
+// correlation token; the responder echoes it in `OperatorResult`.
+// ---------------------------------------------------------------------------
+
+// Drop the `Eq` derive on messages whose oneof contains nested oneofs —
+// prost's Oneof types are `PartialEq` only (some payloads may carry
+// floats in future variants). Matches the shape of `WhisperPayload`.
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct OperatorCommand {
+    /// Caller-chosen correlation id. Echoed in [`OperatorResult`] so the
+    /// CLI can match concurrent requests.
+    #[prost(string, tag = "1")]
+    pub request_id: String,
+    /// Per-command deadline in milliseconds. The agent enforces this on
+    /// the handler side (e.g. as a wall-clock timeout on the osquery
+    /// subprocess) and the CLI uses it to size its receive timeout.
+    #[prost(uint32, tag = "2")]
+    pub timeout_ms: u32,
+    /// One of the typed command bodies.
+    #[prost(oneof = "OperatorCommandBody", tags = "10")]
+    pub command: Option<OperatorCommandBody>,
+}
+
+#[derive(Clone, PartialEq, Oneof)]
+pub enum OperatorCommandBody {
+    /// Run an osquery query on the agent host. Read-only by the
+    /// nature of osquery's tables; the agent additionally rejects any
+    /// query containing forbidden keywords (Phase 6b polish — start
+    /// permissive, tighten later).
+    #[prost(message, tag = "10")]
+    Osquery(OsqueryQuery),
+}
 
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
-pub struct OperatorCommand {}
+pub struct OsqueryQuery {
+    /// SQL string. Subject to per-agent allow-list policy at handler
+    /// time; the agent may refuse any query the local config doesn't
+    /// permit.
+    #[prost(string, tag = "1")]
+    pub sql: String,
+}
+
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct OperatorResult {
+    /// Echo of [`OperatorCommand::request_id`].
+    #[prost(string, tag = "1")]
+    pub request_id: String,
+    /// One of the typed result bodies. Distinct from a top-level
+    /// `error` field so a future "always populated alongside the
+    /// concrete result" pattern (e.g. structured warnings) can
+    /// extend cleanly.
+    #[prost(oneof = "OperatorResultBody", tags = "10, 11")]
+    pub result: Option<OperatorResultBody>,
+}
+
+#[derive(Clone, PartialEq, Oneof)]
+pub enum OperatorResultBody {
+    /// Successful execution. Schema is per-command — for now, just
+    /// osquery's JSON output as a string. Future commands add their
+    /// own variants here.
+    #[prost(message, tag = "10")]
+    Osquery(OsqueryResult),
+    /// The handler refused or failed the command. Always populated
+    /// when the agent could parse the request but declined to run
+    /// it (policy denial, subprocess failure, timeout, etc.). For
+    /// "I couldn't even decode the envelope" the asker sees a
+    /// transport-level error, not this.
+    #[prost(message, tag = "11")]
+    Error(OperatorError),
+}
 
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
-pub struct OperatorResult {}
+pub struct OsqueryResult {
+    /// JSON array — the raw output of `osqueryi --json <sql>`.
+    /// Operator-side tooling parses this with `serde_json::Value`;
+    /// keeping it as a string here means we don't have to model
+    /// every column type in protobuf.
+    #[prost(string, tag = "1")]
+    pub json: String,
+    /// `osqueryi`'s exit status (0 = success, non-zero = handler
+    /// fell back without a structured reason).
+    #[prost(int32, tag = "2")]
+    pub exit_code: i32,
+}
+
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct OperatorError {
+    /// Stable, programmatic error tag — `"policy_denied"`,
+    /// `"timeout"`, `"unsupported_command"`, `"handler_error"`.
+    #[prost(string, tag = "1")]
+    pub kind: String,
+    /// Human-readable detail. Operators see this verbatim; never
+    /// embed paths or other host-specific data the operator
+    /// shouldn't know.
+    #[prost(string, tag = "2")]
+    pub message: String,
+}
 
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
 pub struct NeighborOp {}
@@ -364,6 +460,18 @@ impl WhisperPayload {
     pub fn alerts(a: Alerts) -> Self {
         Self {
             body: Some(Body::Alerts(a)),
+        }
+    }
+
+    pub fn operator_command(c: OperatorCommand) -> Self {
+        Self {
+            body: Some(Body::OperatorCommand(c)),
+        }
+    }
+
+    pub fn operator_result(r: OperatorResult) -> Self {
+        Self {
+            body: Some(Body::OperatorResult(r)),
         }
     }
 }

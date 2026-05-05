@@ -121,6 +121,14 @@ pub enum AgentEvent {
         action_id: &'static str,
         outcome: ActionOutcome,
     },
+    /// Phase 6b: an operator command was received, dispatched, and a
+    /// result was sealed back. `kind` is the command-body
+    /// discriminator (`"osquery"`, etc.) for ops dashboards.
+    OperatorCommandHandled {
+        operator: Fingerprint,
+        request_id: String,
+        kind: &'static str,
+    },
 }
 
 /// Why an LLM request didn't produce a verdict.
@@ -517,6 +525,12 @@ impl Agent {
         &self.inbox
     }
 
+    /// Pin store accessor — used by integration tests to seed peers
+    /// without going through the chitchat-bootstrap path.
+    pub fn known_neighbors(&self) -> &Arc<KnownNeighbors> {
+        &self.known_neighbors
+    }
+
     pub async fn shutdown(mut self) -> Result<(), AgentError> {
         let _ = self.shutdown_tx.send(true);
         self.endpoint.close().await;
@@ -708,6 +722,23 @@ async fn handle_connection(
                             warn!(sender = %env.sender, error = %e, "Subscribe response failed");
                         }
                     }
+                    Some(Body::OperatorCommand(c)) => {
+                        // Same operator-only gate as Subscribe — peers
+                        // mustn't be able to issue operator commands.
+                        if operators.resolve(&env.sender).is_none() {
+                            warn!(
+                                sender = %env.sender,
+                                "rejecting OperatorCommand from non-operator sender"
+                            );
+                            continue;
+                        }
+                        if let Err(e) =
+                            respond_to_operator_command(&conn, &sealer, env.sender, c, &events_tx)
+                                .await
+                        {
+                            warn!(sender = %env.sender, error = %e, "OperatorCommand response failed");
+                        }
+                    }
                     _ => {
                         // Heartbeat / other bodies: nothing to do beyond
                         // emitting EnvelopeReceived above.
@@ -795,6 +826,78 @@ async fn respond_to_subscribe(
         operator,
         delivered,
         cursor_unix_ms: cursor,
+    });
+    Ok(())
+}
+
+/// Phase-6b operator-command dispatch.
+///
+/// The envelope-level operator gate has already passed by the time
+/// we get here (`handle_connection` rejects non-operators upstream).
+/// This function:
+///
+/// 1. Decodes the typed command body. An empty `command` field
+///    surfaces as `unsupported_command` so the operator's CLI sees
+///    the wire-level mismatch rather than a silent timeout.
+/// 2. Dispatches to the per-command handler (osquery for now;
+///    future commands add new arms).
+/// 3. Builds an [`OperatorResult`] echoing the `request_id`, seals
+///    it back to the operator, and emits an event.
+///
+/// New commands are added by extending the match — never by
+/// smuggling free-form strings, so each command's surface stays
+/// visible at code-review time.
+async fn respond_to_operator_command(
+    conn: &BoweryConnection,
+    sealer: &Sealer,
+    operator: Fingerprint,
+    cmd: bowery_proto::OperatorCommand,
+    events_tx: &broadcast::Sender<AgentEvent>,
+) -> Result<(), bowery_whisper::transport::Error> {
+    use bowery_proto::{OperatorCommandBody, OperatorError, OperatorResult, OperatorResultBody};
+
+    let request_id = cmd.request_id.clone();
+    let command_kind = match cmd.command.as_ref() {
+        Some(OperatorCommandBody::Osquery(_)) => "osquery",
+        None => "<empty>",
+    };
+    info!(
+        operator = %operator,
+        request_id = %request_id,
+        kind = command_kind,
+        timeout_ms = cmd.timeout_ms,
+        "operator command received"
+    );
+
+    let result = match cmd.command {
+        Some(OperatorCommandBody::Osquery(_q)) => {
+            // Phase-6b slice 1: dispatch is wired but the real
+            // osquery integration lives in slice 2. Returning a
+            // structured error here lets the CLI exercise the full
+            // round-trip today; slice 2 swaps the body for an
+            // OsqueryResult.
+            OperatorResultBody::Error(OperatorError {
+                kind: "unimplemented".into(),
+                message: "osquery handler arrives in Phase-6b slice 2".into(),
+            })
+        }
+        None => OperatorResultBody::Error(OperatorError {
+            kind: "unsupported_command".into(),
+            message: "OperatorCommand.command is empty".into(),
+        }),
+    };
+
+    let response = OperatorResult {
+        request_id: request_id.clone(),
+        result: Some(result),
+    };
+    let outbound = sealer.seal_for(&operator, &WhisperPayload::operator_result(response));
+    conn.send_envelope(&outbound).await?;
+
+    let _ = events_tx.send(AgentEvent::OperatorCommandHandled {
+        operator,
+        request_id,
+        kind: command_kind,
     });
     Ok(())
 }
