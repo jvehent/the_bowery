@@ -112,7 +112,11 @@ proptest! {
     /// must be rejected as TooOld.
     #[test]
     fn nonces_below_window_are_too_old(
-        highest in (WINDOW_BITS + 1)..1_000_000u64,
+        // Ensure `highest >= below_offset` so the subtraction can't
+        // underflow at any sampled point in the range. Picking the
+        // lower bound of `highest` to be `below_offset_max + 1` keeps
+        // every sampled (highest, below_offset) pair valid.
+        highest in (WINDOW_BITS + 1000)..1_000_000u64,
         below_offset in WINDOW_BITS..(WINDOW_BITS + 1000),
     ) {
         let mut guard = ReplayGuard::new();
