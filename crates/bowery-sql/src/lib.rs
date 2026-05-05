@@ -279,6 +279,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slice_5_service_tables_are_queryable() {
+        let sql = Sql::new();
+        for table in ["systemd_units", "crontab"] {
+            let q = format!("SELECT COUNT(*) AS n FROM {table}");
+            let rows = sql.query(&q, Duration::from_secs(2)).await.unwrap();
+            assert_eq!(rows.len(), 1, "{table}: COUNT(*) must return one row");
+        }
+    }
+
+    #[tokio::test]
     async fn join_across_tables_works() {
         // Cross-product across two single-row tables — sanity that
         // we have a working SQL engine, not just two separate

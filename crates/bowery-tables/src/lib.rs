@@ -15,6 +15,7 @@
 
 #![warn(unreachable_pub)]
 
+pub mod crontab;
 pub mod interfaces;
 pub mod kernel_modules;
 pub mod last;
@@ -25,6 +26,7 @@ pub mod os_version;
 pub mod process_open_sockets;
 pub mod processes;
 pub mod system_info;
+pub mod systemd_units;
 pub mod users;
 mod utmp;
 
@@ -87,5 +89,7 @@ pub fn default_tables() -> Vec<Box<dyn BoweryTable>> {
         Box::new(users::UsersTable),
         Box::new(logged_in_users::LoggedInUsersTable),
         Box::new(last::LastTable),
+        Box::new(systemd_units::SystemdUnitsTable),
+        Box::new(crontab::CrontabTable),
     ]
 }
