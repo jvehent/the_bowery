@@ -36,7 +36,7 @@
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid},
     macros::{lsm, map, tracepoint},
-    maps::{HashMap, RingBuf},
+    maps::{LruHashMap, RingBuf},
     programs::{LsmContext, TracePointContext},
 };
 
@@ -100,11 +100,14 @@ static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 /// process from execing anything new — `block_exec` returns `-EPERM`
 /// from the `bprm_check_security` LSM hook.
 ///
-/// Capacity 256 is comfortable for "block this compromised shell"
-/// style use; later phases will pair this with an inode-keyed map for
-/// "block this binary across the host" semantics.
+/// `LruHashMap` (BPF_MAP_TYPE_LRU_HASH) automatically evicts the
+/// least-recently-used entry once full, so a steady drip of new
+/// `BlockExec` actions can never wedge the map. Capacity 4096 is
+/// well above realistic concurrent-block-list-size on a single host
+/// (Phase-8 audit recommended this; the previous 256 was a hard cap
+/// with no eviction).
 #[map]
-static BLOCKED_COMMS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(256, 0);
+static BLOCKED_COMMS: LruHashMap<[u8; 16], u8> = LruHashMap::with_max_entries(4096, 0);
 
 // ---------------------------------------------------------------------------
 // Programs.

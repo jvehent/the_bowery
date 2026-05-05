@@ -21,11 +21,16 @@
 //! per ring, all feeding the same [`bowery_events::Event`] mpsc channel.
 //!
 //! Locating the BPF object:
-//! 1. `BOWERY_BPF_OBJ_PATH` env var, if set
-//! 2. `/usr/local/lib/bowery/bowery-ebpf`
-//! 3. `/usr/lib/bowery/bowery-ebpf`
-//! 4. `target/bpfel-unknown-none/release/bowery-ebpf` relative to the
-//!    workspace root (handy for in-tree development)
+//! 1. `/usr/local/lib/bowery/bowery-ebpf`
+//! 2. `/usr/lib/bowery/bowery-ebpf`
+//! 3. `BOWERY_BPF_OBJ_PATH` env var, **only** when `BOWERY_BPF_DEV_MODE`
+//!    is also set (dev-mode escape hatch for `xtest run-agent`).
+//!
+//! Each candidate is integrity-checked: must exist as a regular file,
+//! be root-owned, and not be group/world-writable. Symlinks are
+//! refused outright — a symlink's target can be swapped at any
+//! moment, so a root-owned target through a user-writable symlink
+//! is the same as a user-controlled file.
 //!
 //! If none are found, [`BpfEventSource::from_default_locations`] returns
 //! a `NotFound` error and the agent falls back to
@@ -93,6 +98,13 @@ pub enum LoaderError {
     NotFound,
     #[error("BPF object path does not exist: {0}")]
     BadPath(PathBuf),
+    #[error(
+        "BPF object at {path} fails integrity checks: {reason}. \
+         The agent runs as root with CAP_BPF + CAP_SYS_ADMIN; loading \
+         a BPF object the kernel's lower-privileged users could have \
+         tampered with is full kernel-memory access."
+    )]
+    InsecureObject { path: PathBuf, reason: String },
     #[error("aya: {0}")]
     Aya(String),
     #[error("io: {0}")]
@@ -108,19 +120,40 @@ pub struct BpfEventSource {
 }
 
 impl BpfEventSource {
-    /// Use the BPF object at `path`. Returns `BadPath` if it doesn't exist.
+    /// Use the BPF object at `path`. Validates integrity (Phase-8 H8):
+    ///
+    /// - Path must exist and resolve to a regular file (no symlinks).
+    /// - Owned by root (uid 0) — anything else means a non-root user
+    ///   could substitute the object and gain kernel-memory access via
+    ///   the agent's `CAP_BPF`.
+    /// - Mode must not be group/world-writable (`& 0o022 == 0`).
+    ///
+    /// Returns `InsecureObject` if any check fails — fail-closed by
+    /// design. An honest packaging mistake produces a clear error;
+    /// silently falling back to a tampered file would be worse.
     pub fn from_path(path: impl Into<PathBuf>) -> Result<Self, LoaderError> {
         let path = path.into();
-        if !path.exists() {
-            return Err(LoaderError::BadPath(path));
-        }
+        validate_bpf_object(&path)?;
         Ok(Self { obj_path: path })
     }
 
-    /// Try the env var, then standard install paths, then the in-tree
-    /// development build directory.
+    /// Try the env var (only when the agent's `BOWERY_BPF_DEV_MODE`
+    /// also says yes — env-var override is dev-only), then standard
+    /// install paths.
+    ///
+    /// The previous behavior (cwd-relative dev fallback) is gone: any
+    /// path that survived the integrity check (root-owned, not
+    /// world-writable, not a symlink) is fine, but searching cwd is
+    /// a privilege-escalation footgun if the agent is ever cd'd into
+    /// a non-root-owned directory.
     pub fn from_default_locations() -> Result<Self, LoaderError> {
-        if let Ok(p) = std::env::var("BOWERY_BPF_OBJ_PATH") {
+        if std::env::var_os("BOWERY_BPF_DEV_MODE").is_some()
+            && let Ok(p) = std::env::var("BOWERY_BPF_OBJ_PATH")
+        {
+            tracing::warn!(
+                path = %p,
+                "BOWERY_BPF_DEV_MODE is set; trusting BOWERY_BPF_OBJ_PATH override"
+            );
             return Self::from_path(p);
         }
         for candidate in [
@@ -131,18 +164,56 @@ impl BpfEventSource {
                 return Self::from_path(candidate);
             }
         }
-        // In-tree dev build (when running from the workspace root):
-        let here = std::env::current_dir().unwrap_or_default();
-        let dev = here.join("crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf");
-        if dev.exists() {
-            return Self::from_path(dev);
-        }
         Err(LoaderError::NotFound)
     }
 
     pub fn obj_path(&self) -> &Path {
         &self.obj_path
     }
+}
+
+/// Phase-8 H8: validate that the BPF object's filesystem metadata is
+/// consistent with "only root-equivalent users could have written this."
+fn validate_bpf_object(path: &Path) -> Result<(), LoaderError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !path.exists() {
+        return Err(LoaderError::BadPath(path.to_path_buf()));
+    }
+    // `symlink_metadata` (NOT `metadata`) — we want to detect symlinks
+    // rather than follow them. A symlink whose target is root-owned
+    // doesn't help: the *symlink* itself is the entity an attacker
+    // controls, and they can swap its target at any moment.
+    let md = std::fs::symlink_metadata(path).map_err(|e| LoaderError::InsecureObject {
+        path: path.to_path_buf(),
+        reason: format!("stat: {e}"),
+    })?;
+    if md.file_type().is_symlink() {
+        return Err(LoaderError::InsecureObject {
+            path: path.to_path_buf(),
+            reason: "BPF object path is a symlink; refuse to load".into(),
+        });
+    }
+    if !md.is_file() {
+        return Err(LoaderError::InsecureObject {
+            path: path.to_path_buf(),
+            reason: format!("not a regular file (mode {:o})", md.mode()),
+        });
+    }
+    if md.uid() != 0 {
+        return Err(LoaderError::InsecureObject {
+            path: path.to_path_buf(),
+            reason: format!("owner uid is {}, expected 0 (root)", md.uid()),
+        });
+    }
+    let mode = md.mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(LoaderError::InsecureObject {
+            path: path.to_path_buf(),
+            reason: format!("mode {mode:o} is group/world-writable; require 0o644 or stricter"),
+        });
+    }
+    Ok(())
 }
 
 impl EventSource for BpfEventSource {
@@ -162,7 +233,22 @@ impl EventSource for BpfEventSource {
 
 async fn run(obj_path: &Path, tx: mpsc::Sender<Event>) -> Result<(), LoaderError> {
     info!(path = %obj_path.display(), "loading BPF object");
-    let mut ebpf = Ebpf::load_file(obj_path).map_err(|e| LoaderError::Aya(e.to_string()))?;
+    // aya can panic on malformed BTF in some 0.13 paths. catch_unwind
+    // turns that into a clean error rather than tearing down the
+    // whole agent — important because the integrity check above is
+    // a static metadata check and can't catch every malformed-bytes
+    // case.
+    let load = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Ebpf::load_file(obj_path)));
+    let mut ebpf = match load {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => return Err(LoaderError::Aya(e.to_string())),
+        Err(payload) => {
+            let msg = panic_payload_to_string(&payload);
+            return Err(LoaderError::Aya(format!(
+                "panic while loading BPF object: {msg}"
+            )));
+        }
+    };
 
     // Best-effort: hook up aya-log if the BPF program emits log records.
     // No log map => silently skip.
@@ -348,6 +434,19 @@ fn parse_connect(bytes: &[u8]) -> Option<Event> {
         dport: u16::from_be(raw.dport),
         ts: std::time::SystemTime::now(),
     }))
+}
+
+/// Render a panic payload (whatever was passed to `panic!()`) as a
+/// best-effort string. Handles the two common payload types
+/// (`&str`, `String`); falls back to a generic marker for anything else.
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 fn comm_to_string(comm: &[u8; 16]) -> String {
