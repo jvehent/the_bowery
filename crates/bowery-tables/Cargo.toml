@@ -1,0 +1,21 @@
+[package]
+name = "bowery-tables"
+description = "Phase-9 host-state tables for Bowery's SQL surface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

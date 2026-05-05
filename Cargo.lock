@@ -454,6 +454,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bowery-sql"
+version = "0.0.1"
+dependencies = [
+ "bowery-tables",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bowery-tables"
+version = "0.0.1"
+dependencies = [
+ "rusqlite",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "bowery-whisper"
 version = "0.0.1"
 dependencies = [

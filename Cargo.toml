@@ -13,6 +13,8 @@ members = [
     "crates/bowery-osquery",
     "crates/bowery-proto",
     "crates/bowery-response",
+    "crates/bowery-sql",
+    "crates/bowery-tables",
     "crates/bowery-whisper",
 ]
 # bowery-ebpf is its own workspace (compiles for bpfel-unknown-none).
@@ -42,6 +44,8 @@ bowery-mesh = { path = "crates/bowery-mesh", version = "0.0.1" }
 bowery-osquery = { path = "crates/bowery-osquery", version = "0.0.1" }
 bowery-proto = { path = "crates/bowery-proto", version = "0.0.1" }
 bowery-response = { path = "crates/bowery-response", version = "0.0.1" }
+bowery-sql = { path = "crates/bowery-sql", version = "0.0.1" }
+bowery-tables = { path = "crates/bowery-tables", version = "0.0.1" }
 bowery-whisper = { path = "crates/bowery-whisper", version = "0.0.1" }
 
 # Crypto
