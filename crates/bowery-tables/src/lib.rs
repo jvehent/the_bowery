@@ -17,12 +17,16 @@
 
 pub mod interfaces;
 pub mod kernel_modules;
+pub mod last;
 pub mod listening_ports;
+pub mod logged_in_users;
 pub mod mounts;
 pub mod os_version;
 pub mod process_open_sockets;
 pub mod processes;
 pub mod system_info;
+pub mod users;
+mod utmp;
 
 use rusqlite::Connection;
 use thiserror::Error;
@@ -80,5 +84,8 @@ pub fn default_tables() -> Vec<Box<dyn BoweryTable>> {
         Box::new(interfaces::InterfacesTable),
         Box::new(listening_ports::ListeningPortsTable),
         Box::new(process_open_sockets::ProcessOpenSocketsTable),
+        Box::new(users::UsersTable),
+        Box::new(logged_in_users::LoggedInUsersTable),
+        Box::new(last::LastTable),
     ]
 }

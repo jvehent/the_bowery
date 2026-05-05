@@ -260,6 +260,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slice_4_identity_tables_are_queryable() {
+        let sql = Sql::new();
+        for table in ["users", "logged_in_users", "last"] {
+            let q = format!("SELECT COUNT(*) AS n FROM {table}");
+            let rows = sql.query(&q, Duration::from_secs(2)).await.unwrap();
+            assert_eq!(rows.len(), 1, "{table}: COUNT(*) must return one row");
+        }
+        // root must be queryable on any Linux host.
+        let rows = sql
+            .query(
+                "SELECT username, uid FROM users WHERE uid = 0",
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(!rows.is_empty(), "root must appear in users");
+    }
+
+    #[tokio::test]
     async fn join_across_tables_works() {
         // Cross-product across two single-row tables — sanity that
         // we have a working SQL engine, not just two separate
