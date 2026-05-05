@@ -6,10 +6,11 @@ how those decisions land in code, the patterns we reach for, and the
 specific tradeoffs taken at each layer. If you're new to the project,
 read [README.md](README.md) first for orientation, then this for depth.
 
-This document tracks Phase 0 → 8, which is everything currently
-implemented. Phase 6b (operator command issuance) and Phase 9
-(deferred Tier-2 follow-ups: race-free pidfd kill + LSM
-inode-keyed blocking) sections will be added when those land.
+This document tracks Phase 0 → 8, plus the now-shipped Phase 6b
+(operator command issuance), which is everything currently
+implemented. Phase 9 (deferred Tier-2 follow-ups: race-free pidfd
+kill + LSM inode-keyed blocking) and the operator-command audit-
+envelope follow-up sections will be added when those land.
 
 ## Contents
 
@@ -33,6 +34,7 @@ inode-keyed blocking) sections will be added when those land.
 18. [Patterns we keep using](#18-patterns-we-keep-using)
 19. [What we explicitly don't do](#19-what-we-explicitly-dont-do)
 20. [Phase 8 hardening](#20-phase-8-hardening)
+21. [Phase 6b operator commands](#21-phase-6b-operator-commands)
 
 ---
 
@@ -1309,6 +1311,7 @@ Single binary, `bowery`. Subcommands:
 | `alerts tail` | [`alerts.rs`](crates/bowery-cli/src/alerts.rs) |
 | `model {list, fetch}` | [`model.rs`](crates/bowery-cli/src/model.rs) |
 | `audit verify` | [`audit.rs`](crates/bowery-cli/src/audit.rs) |
+| `exec osquery` | [`exec.rs`](crates/bowery-cli/src/exec.rs) |
 
 ### 15.1 doctor
 
@@ -1862,6 +1865,128 @@ fixes:
   and a wire-format change for the action.
 
 Tracking: `memory/project_phase9_remaining.md`.
+
+## 21. Phase 6b operator commands
+
+Phase 6 originally shipped only the alert *inbox* (6a) — `bowery
+alerts tail` lets operators drain alerts but they couldn't *do*
+anything to an agent. The proto stubs `OperatorCommand` /
+`OperatorResult` were empty bodies. Phase 6b closes that gap.
+
+### 21.1 Wire shape
+
+[`crates/bowery-proto/src/lib.rs`](crates/bowery-proto/src/lib.rs).
+
+```text
+OperatorCommand
+  request_id  : String          (caller-chosen correlation)
+  timeout_ms  : u32             (per-handler deadline)
+  command     : oneof
+    Osquery   { sql: String }   (10)
+
+OperatorResult
+  request_id  : String          (echo)
+  result      : oneof
+    Osquery   { json, exit_code }     (10)
+    Error     { kind, message }       (11)
+```
+
+New commands extend the oneof — never via free-form strings, so
+every command's input surface stays visible at code review. The
+`request_id` lets the CLI match concurrent in-flight requests
+against the same agent.
+
+### 21.2 Agent dispatch
+
+[`crates/bowery-agent/src/agent.rs::respond_to_operator_command`](crates/bowery-agent/src/agent.rs).
+
+Mirrors `respond_to_subscribe`'s structure:
+
+1. Operator-only gate — envelope-verified-as-pinned-peer is **not**
+   enough; the sender must be in the configured `[operators]` set.
+2. Clamp the operator's requested timeout to
+   `min(request, [osquery] max_timeout)` so a stolen operator key
+   can't hang the host with an unbounded query.
+3. Dispatch to a per-command handler. The handler returns either
+   `OperatorResultBody::Osquery` on success or
+   `OperatorResultBody::Error { kind, message }` with stable
+   programmatic kinds (`policy_denied`, `timeout`,
+   `output_too_large`, `handler_error`, `unsupported_command`).
+4. Seal the result back to the operator and emit
+   `AgentEvent::OperatorCommandHandled { operator, request_id, kind }`
+   for ops dashboards.
+
+A new `OperatorCommandRouter` bundle holds the per-command handler
+references; `None` for any handler means the corresponding command
+returns `policy_denied` at dispatch time. This is the Phase-7
+"engines as Arc<dyn>" pattern adapted to operator commands.
+
+### 21.3 osquery handler
+
+[`crates/bowery-osquery/src/lib.rs`](crates/bowery-osquery/src/lib.rs).
+
+Standalone crate so the agent's dependency footprint stays
+predictable (just `tokio[process]` + `thiserror`). Public surface:
+
+- `Osquery::new(binary_path) -> Result<Self, OsqueryError>` —
+  stat-checks the binary at startup. The agent only constructs an
+  `Osquery` when both `[osquery] enabled = true` and the binary
+  resolves.
+- `Osquery::run(sql, timeout) -> Result<OsqueryOutput, OsqueryError>` —
+  spawns `osqueryi` with conservative hardening flags and a wall-
+  clock cap.
+
+Hardening flags (passed verbatim to every invocation):
+
+| Flag | Why |
+|---|---|
+| `--json` | Structured output, parsed operator-side. |
+| `--disable_extensions=true` | Operator SQL can't auto-load a `.so` extension. |
+| `--disable_audit=true` | No persistent audit subscribers. |
+| `--disable_events=true` | No kernel-event tables (require persistent state). |
+| `--ephemeral=true` + `--database_path=/tmp` | No on-disk state per query. |
+| `--config_path=/dev/null` | Don't read host osquery config. |
+
+Output capped at 16 MiB stdout + 16 MiB stderr — exceeding either
+surfaces as `OutputTooLarge` rather than unbounded RAM growth.
+Subprocess SIGKILL'd on timeout (`tokio::time::timeout`) and on
+caller cancellation (`Command::kill_on_drop(true)`).
+
+### 21.4 Operator CLI
+
+[`crates/bowery-cli/src/exec.rs`](crates/bowery-cli/src/exec.rs).
+
+```sh
+bowery exec osquery \
+    --operator-key /path/to/op.key \
+    --agent-addr 10.0.0.5:9902 \
+    --agent-fp <64-hex> --agent-pubkey-b64 <base64> \
+    --sql 'select pid, name from processes limit 5' \
+    --timeout 5s
+```
+
+One round-trip per invocation; no follow mode. The CLI wraps the
+exchange in `(operator_request_timeout + 2s)` so a stalled agent
+doesn't hang the operator. `--json` emits the full envelope shape
+(request_id + exit_code + json) for ops piping; default emits the
+osquery JSON verbatim.
+
+### 21.5 What's deferred
+
+- **Audit-envelope on operator commands.** The Phase-7 audit chain
+  (§16.5) is per-action by design; operator commands are a
+  different concept and warrant their own envelope type. A future
+  follow-up will add `OperatorCommandRecord` to the audit log so
+  operators can verify "what did this agent run, when, on whose
+  request." For now, dispatch fires `AgentEvent::OperatorCommandHandled`
+  but doesn't sign it — the signed envelope already came in
+  (`OperatorCommand`) and went out (`OperatorResult`); the audit
+  story is "verify those bytes against the operator's pubkey + the
+  agent's pubkey."
+- **More commands.** `inspect-baseline`, `list-pinned-peers`,
+  `trigger-baseline-rescan`, and operator-signed grants for the
+  Phase-7 response engine all extend the same pattern: add a oneof
+  variant to `OperatorCommandBody`, wire a handler in the router.
 
 ---
 
