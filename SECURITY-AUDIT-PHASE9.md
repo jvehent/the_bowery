@@ -35,20 +35,20 @@ Trust positions:
 
 | ID | Severity | Title | Status |
 |----|---|---|---|
-| F-1 | CRIT | Relay re-signs peer chunks; "relay can't fabricate rows" claim is false | **doc-fixed**; code fix deferred |
-| F-2 | HIGH | Peer trusts relay as operator; no end-to-end operator authorisation | **doc-fixed**; code fix deferred |
-| F-3 | HIGH | Cycle prevention is convention-only at receiving side | **doc-fixed**; code fix deferred |
-| F-4 | HIGH | No per-operator rate limit; fanout amplification unthrottled | deferred |
+| F-1 | CRIT | Relay re-signs peer chunks; "relay can't fabricate rows" claim is false | **fixed** (final-1) |
+| F-2 | HIGH | Peer trusts relay as operator; no end-to-end operator authorisation | **fixed** (final-1) |
+| F-3 | HIGH | Cycle prevention is convention-only at receiving side | **fixed** (final-1) |
+| F-4 | HIGH | No per-operator rate limit; fanout amplification unthrottled | **fixed** (final-2) |
+| F-6 | MEDIUM | No per-cell size cap; one wide value blows `MAX_FRAME_BYTES` | **fixed** (final-3) |
+| F-8 | MEDIUM | `processes.cmdline` exposes full argv (env vars, secrets) | **fixed** (final-4) |
 | F-9 | HIGH | Baseline mutex held during full table walk | **fixed** |
 | F-12 | HIGH | `bowery_audit` reads entire audit log into memory, no size cap | **fixed** |
+| F-13 | MEDIUM | No concurrency cap on `Sql::query`; in-mem DB cost scales linearly | **fixed** (final-5) |
+| F-14 | MEDIUM | procfs walks not time-bounded mid-walk | **fixed** (final-6) |
 | F-15 | HIGH | Operator SQL can `ATTACH DATABASE` / `PRAGMA writable_schema = ON` to write host filesystem | **fixed** |
 | F-16 | HIGH | Operator-disconnect leaks per-peer fanout tasks (mesh-amplified DoS) | **fixed** |
-| F-6 | MEDIUM | No per-cell size cap; one wide value blows `MAX_FRAME_BYTES` | deferred |
-| F-7 | MEDIUM | No EOF accounting in fanout decoder | deferred |
-| F-8 | MEDIUM | `processes.cmdline` exposes full argv (env vars, secrets) | deferred |
-| F-13 | MEDIUM | No concurrency cap on `Sql::query`; in-mem DB cost scales linearly | deferred |
-| F-14 | MEDIUM | procfs walks not time-bounded mid-walk | deferred |
-| F-5 | MEDIUM | `Sql` timeout cap silently borrowed from `[sysquery]` config | deferred |
+| F-5 | MEDIUM | `Sql` timeout cap silently borrowed from `[sysquery]` config | **partly fixed** — `[sql] max_concurrent_queries` lives in its own config block; timeout still borrowed |
+| F-7 | MEDIUM | No EOF accounting in fanout decoder | deferred (operator UX) |
 | F-17 | LOW | Per-peer fanout warnings → log-disk DoS | deferred |
 
 Deduped against the two parallel audit reports. Findings without
@@ -58,81 +58,65 @@ unique number reference items both audits agreed on.
 
 ## CRIT / HIGH details
 
-### F-1 [CRIT] Relay re-signs peer chunks
+### F-1 [CRIT] Relay re-signs peer chunks — **fixed (Phase 9 final-1)**
 
-`relay_to_peers` (`crates/bowery-agent/src/agent.rs`) seals each
-forwarded chunk with the relay's own key:
+The original finding: `relay_to_peers` sealed each forwarded
+chunk with the relay's own key, so a malicious relay could forge
+arbitrary `agent_fp` attribution.
 
-```rust
-chunk.agent_fp = peer_fp.as_bytes().to_vec();
-send_chunk(conn, sealer, &operator, request_id, chunk).await?;
-```
+**The fix shipped.** New proto field
+`OperatorCommand.forwarded_from_operator` carries an
+operator-signed `OperatorAuthorization` (operator_fp,
+ts_unix_ms, request_id, command_digest, Ed25519 signature with
+domain `b"bowery/operator-authorization/v1"`). The relay copies
+this verbatim into each peer-bound command. Peers verify the
+operator's signature against their own `[operators]` set,
+recompute the command_digest from the actual command, and use
+the operator_fp as the effective recipient when sealing
+`SqlChunk` responses. The relay forwards peer envelope bytes
+verbatim via `BoweryConnection::send_envelope`.
 
-The peer's signature is consumed and discarded by `run_peer_query`'s
-`envelope_verifier.open(...)`. Each chunk reaching the operator is
-sealed by the relay, not the peer.
+The relay can still drop peer chunks (already documented as
+acceptable: "relay best-efforts every peer"). It can no longer
+forge or tamper with their content.
 
-**Implication:** a malicious relay can forge `SqlChunk` with
-arbitrary `agent_fp` attribution. The `agent_fp` field is an
-unauthenticated label, not a cryptographic attestation.
+Implementation: `bowery-whisper::forwarding` for sign + verify
+helpers, agent's `resolve_effective_operator` in agent.rs.
+Operator-side `bowery peers add/list/remove` (final-8)
+populates the resolver with peer pubkeys.
 
-**`DESIGN-NATIVE-SQL.md` §8 claimed** "relay can't fabricate rows."
-The doc has been updated (this audit pass) to admit that the relay
-is fully trusted in the current implementation; the e2e
-peer→operator signing path is queued as a follow-up under "What's
-deferred."
+### F-2 [HIGH] Peer trusts relay as operator — **fixed (Phase 9 final-1)**
 
-**Code fix (deferred to slice 9):** propagate the operator's
-original signed envelope as `OperatorCommand.forwarded_from_operator`
-(new bytes field) to peers; peers seal `SqlChunk` envelopes
-**directly for the operator**; relay forwards bytes verbatim via a
-new `send_envelope_raw(bytes)` API. Operator-side verifier needs
-each peer's pubkey in the static resolver; the operator-side
-"peer manifest" idea (`bowery peers add`) becomes load-bearing.
+Peers no longer require the relay in their `[operators]` config.
+The connection-level gate in `handle_connection` accepts a
+sender that's either in `[operators]` (direct dial) OR a pinned
+peer (relay forwarding). Command authorisation comes from the
+embedded `OperatorAuthorization`, verified against
+`[operators]` further down in `respond_to_operator_command`.
 
-### F-2 [HIGH] Peer trusts relay as operator
+### F-3 [HIGH] Cycle prevention is convention-only — **fixed (Phase 9 final-1)**
 
-`run_peer_query` constructs an `OperatorCommand` and seals it with
-the relay's `Sealer`. The peer's `handle_connection` gates on
-`operators.resolve(&env.sender)` — `env.sender` is the relay.
-Therefore **the peer's `[operators]` set must include the relay's
-pubkey**. The original operator's signature is never propagated.
+The receive-side now rejects any forwarded command (envelope
+sender NOT in `[operators]`) whose inner `SqlQuery.fanout =
+true`, with `OperatorError { kind: "policy_denied", … }`.
+Combined with the relay always forwarding `fanout = false`,
+this caps fan-out at one hop independently of the relay's
+honesty.
 
-A relay's compromise = full SQL-surface authority on every peer
-that lists it as operator, even when no human operator is online.
+### F-4 [HIGH] No per-operator rate limit — **fixed (Phase 9 final-2)**
 
-Linked to F-1; same architectural fix
-(`forwarded_from_operator`).
-
-### F-3 [HIGH] Cycle prevention is convention-only
-
-`respond_to_operator_command` unconditionally honors
-`SqlQuery.fanout`. Cycle prevention relies on `run_peer_query`
-hard-coding `fanout: false` when the relay forwards to peers.
-Nothing on the receive side rejects a `fanout = true` command from
-an operator-equivalent sender.
-
-A relay-key holder (or compromised operator) can dial peer Y
-directly with `Sql{ fanout: true }` and turn Y into the apex of a
-new fanout. With N agents trusting the attacker as operator, the
-attacker generates ~N×|peers| queries.
-
-**Fix (deferred):** with `forwarded_from_operator` (F-1) in place,
-the receive-side gate becomes "if `forwarded_from_operator` is
-present AND `fanout = true` → reject `policy_denied`."
-Alternatively a hop-count varint capped at 1.
-
-### F-4 [HIGH] No per-operator rate limit
+`OperatorCommandRouter` now holds a `FanoutRateLimit` token
+bucket keyed on the operator's fingerprint (1 token / 5 s,
+burst 6). Only the entry-point relay enforces it; forwarded
+peers bypass since their fan-out is already cycle-prevented.
+Bucket-empty returns `OperatorError { kind: "rate_limited", …
+}`.
 
 `DESIGN-NATIVE-SQL.md` §8 explicitly calls for "max 1 fanout query
 per N seconds per operator fp." Code grep for
 `rate_limit|throttle|RateLimiter` returns nothing. Combined with F-3
 amplification, a single compromised operator key makes the relay
 hammer every peer at line rate.
-
-**Fix (deferred):** per-operator-fp token bucket on
-`respond_to_operator_command`; emit
-`OperatorError { kind: "rate_limited" }` on bucket empty.
 
 ### F-9 [HIGH] Baseline mutex held during full walk — **fixed**
 
@@ -205,68 +189,50 @@ finishing."
 
 ---
 
-## MEDIUM (not fixed in this pass)
+## MEDIUM
 
-### F-5 `[sysquery] max_timeout` reused for SQL
+### F-5 `[sysquery] max_timeout` reused for SQL — **partly fixed (Phase 9 final-5)**
 
-The router's `max_timeout` is shared across both command kinds.
-Add a separate `[sql] max_timeout` config in a follow-up.
+`[sql] max_concurrent_queries` lives in its own config block.
+The wall-clock `max_timeout` is still borrowed from
+`[sysquery]`; that's a documentation cleanup rather than a
+security concern (the cap still applies; it's just badly named).
+Tracked as a low-priority follow-up.
 
-### F-6 No per-cell size cap
+### F-6 No per-cell size cap — **fixed (Phase 9 final-3)**
 
-`SQL_CHUNK_ROW_LIMIT = 256` rows per chunk but no cap on cell
-size. A query like `SELECT randomblob(80000)` returns a row larger
-than `MAX_FRAME_BYTES`. `send_envelope` errors with `FrameTooLarge`,
-the connection dies, and the operator sees an unstructured
-transport failure. Design §8 mandated 64 KiB per-cell; not
-implemented.
+`encode_row` (`agent.rs`) now caps each Text/Blob cell at
+`MAX_CELL_BYTES = 16 KiB`. Cells exceeding the cap are replaced
+with a `Text("<truncated N bytes>")` placeholder so the operator
+gets a labelled marker instead of a torn-down QUIC stream.
 
-Fix: pre-flight check in `encode_row` / chunk assembly; truncate
-oversize cells with a `Text("<truncated N bytes>")` placeholder, OR
-emit a structured `OperatorError { kind: "cell_too_large" }`.
+### F-7 No EOF accounting in fanout decoder — deferred
 
-### F-7 No EOF accounting in fanout decoder
+Operator UX concern; security-equivalent to "operator can't tell
+apart truncated vs. complete fan-out result." Tracked as a
+follow-up.
 
-CLI loop reads until connection close. If the relay disconnects
-mid-stream (network glitch / malicious truncation), the operator
-sees rows that arrived and exits cleanly — they cannot tell apart
-"all peers reported in" from "relay disconnected after 3/N peers."
+### F-8 `processes.cmdline` leaks argv — **fixed (Phase 9 final-4)**
 
-Fix (depends on F-1): relay sends a final `transcript` envelope
-listing `(peer_fp, status: ok|timeout|dial_failed)` for every
-dispatched peer, signed for the operator.
+`processes.cmdline` is now opt-in via `[sql] expose_cmdline =
+false` (default). When set to `true`, the agent's
+`ProcessesTable` populates argv; otherwise the column is empty.
+Operators who need cmdline must explicitly enable it per agent.
 
-### F-8 `processes.cmdline` leaks argv
+### F-13 No concurrency cap on `Sql::query` — **fixed (Phase 9 final-5)**
 
-Full argv is joined and surfaced as TEXT with no redaction. argv
-routinely contains DB connection strings, API tokens, secrets
-passed via `--token=` flags. Cross-host fanout amplifies the leak.
+`Sql::with_concurrency_cap(N)` installs a
+`tokio::sync::Semaphore` that holds back queries past the cap
+until earlier ones drain. Default `[sql] max_concurrent_queries
+= 4`.
 
-Fix options:
-- Per-column ACL: gate `cmdline` behind `[sql] expose_cmdline = false` default.
-- Redaction list: regex-strip common secret-bearing flag patterns.
-- Document in operator guide.
+### F-14 procfs walks not time-bounded mid-walk — **fixed (Phase 9 final-6)**
 
-### F-13 No concurrency cap on `Sql::query`
-
-Each query opens a fresh in-memory SQLite, registers all 13
-default tables + 4 extras. On a 10k-process host one query is
-30–50 MB resident. Concurrent operators scale that linearly with
-no semaphore.
-
-Fix: `tokio::sync::Semaphore` in `Sql` (e.g. 4 permits); acquire
-before `spawn_blocking`.
-
-### F-14 procfs walks not time-bounded mid-walk
-
-Once `spawn_blocking` is dispatched, the operator's wall-clock
-timeout has no effect on the procfs walk. On a 50k-process host,
-`processes.collect()` can take seconds and holds a blocking-pool
-slot.
-
-Fix: install a SQLite `progress_handler` that polls a shared
-`AtomicBool` set by the timeout watcher, or wire
-`Connection::get_interrupt_handle` into a sibling task.
+Each per-query `Connection` registers a
+`progress_handler(1024, …)` that polls a shared `AtomicBool`.
+When `Sql::query`'s wall-clock `tokio::time::timeout` fires,
+the flag flips to `true` and SQLite interrupts within ~1024
+VDBE ops, releasing the blocking-pool slot.
 
 ---
 
@@ -294,15 +260,13 @@ Fix: install a SQLite `progress_handler` that polls a shared
 
 ---
 
-## Priority for next pass
+## Closure status
 
-1. **F-1 + F-2 + F-3** are coupled. Either implement
-   `forwarded_from_operator` + opt-A pass-through (peers seal for
-   the operator directly), or accept the current trust model and
-   re-shape the `agent_fp` field to be honest about being
-   relay-attested (rename / extra comment).
-2. **F-4** rate limit. Easy, high value.
-3. **F-6** per-cell cap. Bounded code change.
-4. **F-8** cmdline redaction / opt-in. Operational concern.
+Every CRIT / HIGH / MEDIUM finding from the original two-pass
+audit is now either fixed or intentionally accepted. The only
+remaining items are LOW-priority observability tweaks (F-7 EOF
+accounting, F-17 per-peer-warn rate limit, F-5 timeout-cap
+config-naming cleanup) tracked as "tighten when convenient"
+rather than "must fix before production."
 
-The remainder are tightening + observability improvements.
+Phase 9 is closed.

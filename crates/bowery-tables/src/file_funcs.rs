@@ -154,11 +154,9 @@ mod tests {
     fn exists_resolves_for_a_known_file() {
         let conn = fresh_conn();
         let exists: i64 = conn
-            .query_row(
-                "SELECT bowery_file_exists('/etc/passwd')",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT bowery_file_exists('/etc/passwd')", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(exists, 1);
         let missing: i64 = conn
@@ -220,11 +218,9 @@ mod tests {
     fn missing_file_size_returns_null() {
         let conn = fresh_conn();
         let size: Option<i64> = conn
-            .query_row(
-                "SELECT bowery_file_size('/no/such/file')",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT bowery_file_size('/no/such/file')", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert!(size.is_none());
     }

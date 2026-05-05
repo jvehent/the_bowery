@@ -2056,27 +2056,38 @@ unidirectional stream:
 - Errors collapse to a single `OperatorResultBody::Error` —
   decoder treats either form as a stream terminator.
 
-### 22.4 Multi-agent fan-out via relay (slice 7)
+### 22.4 Multi-agent fan-out via relay (slice 7 + final-1)
 
 `SqlQuery { fanout: true, peers: [...] }` turns the dialled
 agent into a relay: it runs the query locally and dispatches
 `fanout: false` copies in parallel to its pinned peers
 (filtered by the `peers` array, or all of them if empty),
-multiplexing per-peer chunks back to the operator with
-`agent_fp` rewritten to identify each producer. Cycle prevention
-is implicit — peers always receive `fanout: false`.
+multiplexing per-peer chunks back to the operator. Cycle
+prevention is enforced both at the relay (always sets
+`fanout: false` on outbound) AND at peer-side receive (rejects
+forwarded commands with `fanout: true` as `policy_denied`).
 
 Per-peer dial / send / receive failures collapse to a synthetic
-terminal chunk for that peer, so the operator-side decoder
-always observes EOF for every peer it expected.
+relay-signed terminal chunk for that peer, so the operator-side
+decoder always observes EOF for every peer it expected.
 
-**Fleet-config requirement:** the relay's identity must be in
-every peer's `[operators] pubkeys_b64` list. The relay signs
-its outbound `OperatorCommand` envelopes with its own key, and
-peers apply the same operator-only gate as a direct operator
-dial. This is documented as a slice-7 precondition; per-row
-peer→operator end-to-end signing is a slice-8+ hardening item
-if relay-tampering becomes a real concern.
+**End-to-end signing (Phase-9 final-1):** the operator signs an
+`OperatorAuthorization` (operator_fp + ts + request_id +
+command_digest) and embeds it in the outbound command's
+`forwarded_from_operator` field. The relay copies the
+authorisation verbatim into each peer-bound command. Peers
+verify the operator's signature against their own `[operators]`
+set and seal `SqlChunk` envelopes **directly for the operator's
+fingerprint**. The relay forwards peer envelope bytes verbatim
+via `BoweryConnection::send_envelope`. Relay can drop peer
+chunks but cannot forge or tamper with their content.
+
+**Fleet-config requirement:** Each peer must list the original
+operator in its `[operators]` config. The relay does **not**
+need to be in any peer's `[operators]` — it's authenticated as
+a pinned-peer (KnownNeighbors) sender, and its forwarding right
+comes from carrying the operator's signed delegation. A
+compromised relay key cannot grant SQL authority over peers.
 
 ### 22.5 Bonus tables (slice 8)
 
@@ -2095,18 +2106,26 @@ intentionally doesn't depend on:
 These expose Bowery's own awareness of the mesh — questions a
 third-party SQL surface like sysquery can never answer.
 
-### 22.6 Operator CLI (slice 6 + 8)
+### 22.6 Operator CLI (slice 6 + 8 + final-8)
 
 ```sh
 # Single agent
 bowery exec sql --operator-key ... --agent-addr ... --agent-fp ... --agent-pubkey-b64 ... \
     --sql 'SELECT pid, name FROM processes LIMIT 5'
 
-# Multi-agent fan-out via relay
+# Multi-agent fan-out via relay (auto-loads ~/.bowery/peers.toml)
 bowery exec sql ... --fanout --sql 'SELECT * FROM bowery_alerts WHERE suspicion >= 0.95'
 
 # Output formats: tsv (default, streams), json (streams), table (buffers)
 bowery exec sql ... --format=table --sql 'SELECT * FROM listening_ports'
+
+# File / hash via scalar functions (final-7) — operator supplies path
+bowery exec sql ... --sql "SELECT bowery_file_sha256_hex('/usr/bin/sshd')"
+
+# Operator peer manifest (final-8) — pre-loaded for fan-out verification
+bowery peers add --name web-1 --fp <hex> --pubkey-b64 <b64>
+bowery peers list
+bowery peers remove --fp <hex>
 ```
 
 `bowery doctor` (slice 8c) runs `SELECT 1` against an in-process
@@ -2119,54 +2138,71 @@ without requiring a live agent.
   a query joining every table to itself.
 - Per-query wall-clock timeout, clamped to
   `[sysquery] max_timeout` agent-side so a stolen operator key
-  can't pin the host indefinitely.
+  can't pin the host indefinitely. SQLite progress-handler
+  cancellation (final-6) interrupts the running query within
+  ~1024 VDBE ops of timeout, releasing the blocking-pool slot.
+- Per-cell cap: `MAX_CELL_BYTES = 16 KiB` (final-3). Wide cells
+  truncate to a `Text("<truncated N bytes>")` placeholder.
 - Per-chunk size: 256 rows, well under `MAX_FRAME_BYTES`.
+- Concurrency cap: `[sql] max_concurrent_queries = 4` (final-5)
+  semaphore-gates concurrent operator queries.
 - Per-peer fan-out tasks share a 64-slot mpsc channel; back-
   pressure forces slow peers to wait for the relay→operator
-  link.
+  link. The whole fan-out runs in a `JoinSet` that aborts on
+  operator disconnect.
+- Per-operator fan-out rate limit (final-2): token bucket
+  keyed on operator fp, 1 token / 5 s, burst 6. Bucket-empty
+  returns `OperatorError { kind: "rate_limited" }`.
+- `bowery_audit` table reads through `BufReader` capped at
+  64 MiB so an operator query can't OOM the agent against a
+  multi-GB audit log.
 
-### 22.8 Security audit findings — what's hardened
+### 22.8 Security audit findings — every CRIT/HIGH/MEDIUM closed
 
 A two-pass security audit
 ([`SECURITY-AUDIT-PHASE9.md`](SECURITY-AUDIT-PHASE9.md)) surfaced
-15 findings. The CRIT/HIGH items addressed in this pass:
+15 findings. As of the Phase-9 final-1..8 rollout, every CRIT,
+HIGH, and MEDIUM finding is fixed (or partly fixed where the
+remaining gap is documentation rather than security). Highlights:
 
-- **F-9** Baseline mutex now snapshot-then-iterate via the new
-  `Baseline::snapshot_binaries` helper. The mutex is released
-  before the per-row SQLite INSERTs run, unblocking the
-  analyzer's `upsert_binary` path during operator queries.
-- **F-12** `bowery_audit` reads through a `BufReader` capped at
-  64 MiB instead of `fs::read_to_string`. Operator queries can
-  no longer OOM the agent against a multi-GB audit log (or
-  amplify the cost via fanout).
-- **F-15** Each per-query SQLite connection now has a
-  `set_authorizer` callback installed (after registration). The
-  authorizer allows `Select` / `Read` / `Recursive` / `Function`
-  and a small whitelist of read-only pragmas; everything else
-  (`Attach`, `Detach`, `Pragma writable_schema`, `Drop`,
-  `Insert`/`Update`/`Delete`, `Create*`, `Alter*`, …) is denied.
-  Closes the `ATTACH DATABASE 'file:///etc/secret.db'` escape.
-- **F-16** `relay_to_peers` spawns peer tasks onto a `JoinSet`
-  and calls `abort_all()` on drop or on the first
-  `send_chunk` failure. Operator-disconnect no longer leaks
-  per-peer mesh-amplified work.
+- **F-1/F-2/F-3** End-to-end peer→operator signing via
+  `OperatorAuthorization`. Peers seal `SqlChunk` envelopes for
+  the original operator's fp; the relay forwards bytes verbatim
+  and can no longer forge or tamper with peer rows. Cycle
+  prevention is enforced both at relay-outbound and peer-receive
+  sides.
+- **F-4** `FanoutRateLimit` token bucket (1 / 5 s, burst 6) per
+  operator fp.
+- **F-6** `MAX_CELL_BYTES = 16 KiB` cap in `encode_row`; oversize
+  cells become `Text("<truncated N bytes>")`.
+- **F-8** `processes.cmdline` opt-in via `[sql] expose_cmdline =
+  false` default.
+- **F-9** Baseline mutex now snapshot-then-iterate.
+- **F-12** `bowery_audit` `BufReader`-capped at 64 MiB.
+- **F-13** `[sql] max_concurrent_queries = 4` semaphore.
+- **F-14** SQLite `progress_handler` polls a shared `AtomicBool`
+  for cooperative cancellation.
+- **F-15** SQLite `set_authorizer` allows Select/Read/Function
+  /Recursive only, denies Attach/Pragma-writes/Drop/etc.
+- **F-16** Per-peer fan-out tasks live on a `JoinSet`,
+  `abort_all()` on operator disconnect.
 
-### 22.9 What's deferred
+Slice 2b's `file` / `hash` shipped as **scalar functions**
+(`bowery_file_size`, `bowery_file_sha256_hex`, etc.) instead of
+tables — operator supplies the path, no enumeration possible.
 
-- **Per-row peer→operator end-to-end signing** (audit F-1/F-2/F-3)
-  — currently the relay signs its forwarded chunks with its own
-  key, so a malicious relay could fabricate rows. Rotating to
-  end-to-end (peer signs each chunk for the operator, relay
-  multiplexes verbatim via a new `forwarded_from_operator` proto
-  field) is the architectural follow-up.
-- **vtab pushdown for `file` / `hash` tables** — both need
-  `WHERE path = '...'` to be safe; otherwise an unscoped query
-  walks the entire filesystem. Slice 2b deferred until the
-  rusqlite `vtab` module API can express the constraint.
-- **Operator-side peer manifest** (`bowery peers add/list/remove`) —
-  useful for "did all my expected peers reply?" checks across a
-  fan-out query. Currently the operator inspects the `_agent_fp`
-  column.
+### 22.9 What's deferred (LOW priority)
+
+- **F-7** EOF accounting in fan-out decoder (operator UX —
+  distinguishing "all peers reported" from "relay disconnected
+  early"). Tracked as an observability follow-up.
+- **F-17** Per-peer fan-out warning log rate limit. Currently a
+  malicious operator can cause a few warn lines per failed
+  query; a token bucket on the warn emission would close the
+  log-disk DoS edge.
+- **F-5 (cosmetic)** The shared `max_timeout` config knob lives
+  under `[sysquery]` despite being applied to `[sql]` too.
+  Splitting would be a config-naming cleanup.
 
 ---
 

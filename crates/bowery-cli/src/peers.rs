@@ -59,8 +59,7 @@ impl Manifest {
     /// needed. Operator-controlled file; we write 0600.
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         let bytes = toml::to_string_pretty(self).context("serialising peer manifest")?;
         let tmp = path.with_extension("toml.tmp");
@@ -177,20 +176,8 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("peers.toml");
-        add(
-            &path,
-            "alpha",
-            &"a".repeat(64),
-            &BASE64.encode([1u8; 32]),
-        )
-        .unwrap();
-        add(
-            &path,
-            "beta",
-            &"b".repeat(64),
-            &BASE64.encode([2u8; 32]),
-        )
-        .unwrap();
+        add(&path, "alpha", &"a".repeat(64), &BASE64.encode([1u8; 32])).unwrap();
+        add(&path, "beta", &"b".repeat(64), &BASE64.encode([2u8; 32])).unwrap();
         let mf = Manifest::load(&path).unwrap();
         assert_eq!(mf.peers.len(), 2);
         remove(&path, &"a".repeat(64)).unwrap();
@@ -203,13 +190,7 @@ mod tests {
     fn add_replaces_same_fp() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("peers.toml");
-        add(
-            &path,
-            "alpha",
-            &"a".repeat(64),
-            &BASE64.encode([1u8; 32]),
-        )
-        .unwrap();
+        add(&path, "alpha", &"a".repeat(64), &BASE64.encode([1u8; 32])).unwrap();
         add(
             &path,
             "alpha-renamed",

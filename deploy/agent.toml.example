@@ -92,6 +92,30 @@ enabled = false
 # operator key wedging the host with a deliberately-long query.
 # max_timeout = "30s"
 
+[sql]
+# Phase-9 native SQL surface (always on). Operators query host
+# state via `bowery exec sql --sql '…'`; the agent runs the
+# query inside an in-memory SQLite with a SELECT-only authorizer.
+#
+# expose_cmdline:    when `true`, the `processes` table populates
+#                    the `cmdline` column with full argv. argv
+#                    routinely contains DB connection strings,
+#                    API tokens passed via `--token=…`, and
+#                    `$HOME` paths. With fan-out that crosses to
+#                    operators authorised on the relay but not on
+#                    every peer. OFF by default (SECURITY-AUDIT
+#                    F-8); enable only when the operator workflow
+#                    needs it and the leak is acceptable.
+# expose_cmdline = false
+#
+# max_concurrent_queries: cap on concurrent operator queries
+#                    (each opens a fresh in-memory SQLite,
+#                    registering ~17 tables). Past the cap
+#                    queries queue at the operator-side QUIC
+#                    accept layer until earlier ones drain.
+#                    Default 4.
+# max_concurrent_queries = 4
+
 [response]
 # Phase-7 response engine. Default-deny: with `engine = "noop"` and
 # empty `policy_path`, the agent observes and alerts but takes no
