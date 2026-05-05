@@ -1,12 +1,21 @@
-//! Bounded inference queue with shed-oldest backpressure.
+//! Bounded inference queue with shed-newest backpressure.
 //!
 //! The agent enqueues an [`AnalysisContext`] when the Phase 3 verdict
 //! crosses an LLM-invocation threshold. A worker task pulls from the
-//! queue and runs the configured [`LlmAnalyzer`]. If the queue fills
-//! past `capacity`, the **oldest** pending request is dropped and the
-//! caller is informed. This gives the LLM a hard upper bound on
-//! per-event latency tax: even a slow model can't gum up the rest of
-//! the pipeline.
+//! queue and runs the configured [`LlmAnalyzer`]. If the queue is full
+//! when a new request arrives, the **new** request is rejected and the
+//! caller receives [`ShedReason::QueueFull`]. This gives the LLM a hard
+//! upper bound on per-event latency tax: even a slow model can't gum
+//! up the rest of the pipeline.
+//!
+//! **Tradeoff vs. shed-oldest:** an attacker who can produce a steady
+//! stream of decoy submissions fills the queue, and any genuinely
+//! suspicious verdict that arrives after the flood is silently shed.
+//! Mitigations to add later (Phase-9): a high-priority lane for
+//! `suspicion >= 0.95` verdicts that bypasses the regular bounded
+//! channel; per-source rate limits on the upstream pipeline; or a
+//! true ring-buffered shed-oldest implementation (which `tokio::mpsc`
+//! doesn't support natively).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,8 +31,8 @@ use crate::context::AnalysisContext;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShedReason {
-    /// Backlog was full when a new request arrived; the oldest pending
-    /// request was dropped to make room.
+    /// Backlog was full when this request arrived; the new request
+    /// was dropped (the worker keeps draining what it already has).
     QueueFull,
     /// Worker took longer than the per-request deadline; the request
     /// was abandoned.

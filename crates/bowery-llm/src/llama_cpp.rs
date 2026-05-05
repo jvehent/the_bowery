@@ -77,9 +77,19 @@ impl Default for LlamaCppConfig {
 
 /// llama.cpp-backed analyzer. Holds a worker thread that owns the model.
 pub struct LlamaCppAnalyzer {
-    request_tx: mpsc::UnboundedSender<Request>,
+    request_tx: mpsc::Sender<Request>,
     backend_tag: String,
+    max_tokens: usize,
 }
+
+/// Hard cap on requests in flight between the analyzer and its dedicated
+/// llama.cpp thread. The upstream `InferenceQueue` already bounds + sheds
+/// at its own capacity, so under the queue's single-worker contract this
+/// channel only ever holds one request at a time. The bound exists as
+/// defense-in-depth: any future code path that calls `analyze()` directly
+/// (tests, debug tooling, multi-worker queues) cannot grow this channel
+/// without bound and exhaust memory.
+const REQUEST_CHANNEL_DEPTH: usize = 32;
 
 impl std::fmt::Debug for LlamaCppAnalyzer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -101,9 +111,10 @@ impl LlamaCppAnalyzer {
     pub async fn new(config: LlamaCppConfig) -> Result<Self, LlmError> {
         info!(model = %config.model_path.display(), "loading Qwen3 GGUF (this is slow)");
 
-        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<Request>();
+        let (request_tx, mut request_rx) = mpsc::channel::<Request>(REQUEST_CHANNEL_DEPTH);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), LlmError>>();
 
+        let max_tokens = config.max_tokens;
         let cfg = config.clone();
         std::thread::Builder::new()
             .name("bowery-llm-worker".to_string())
@@ -136,6 +147,7 @@ impl LlamaCppAnalyzer {
         Ok(Self {
             request_tx,
             backend_tag: BACKEND_TAG.to_string(),
+            max_tokens,
         })
     }
 }
@@ -145,10 +157,15 @@ impl LlmAnalyzer for LlamaCppAnalyzer {
     async fn analyze(&self, ctx: &AnalysisContext) -> Result<LlmVerdict, LlmError> {
         let prompt = PromptStyle::Qwen3Chat.render(ctx);
         let (responder, response_rx) = oneshot::channel();
+        // Honor `LlamaCppConfig.max_tokens` instead of hardcoding 256.
+        // try_send (not send().await) so backpressure surfaces as
+        // BadResponse rather than blocking the caller — the upstream
+        // queue already runs us single-worker, so Full here would mean
+        // a concurrent direct caller is racing.
         self.request_tx
-            .send(Request {
+            .try_send(Request {
                 prompt,
-                max_tokens: 256,
+                max_tokens: self.max_tokens,
                 responder,
             })
             .map_err(|_| LlmError::Cancelled)?;
