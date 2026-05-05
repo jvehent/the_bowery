@@ -1,8 +1,8 @@
 //! Phase-6b slice 1 integration: the operator dials a running agent,
-//! sends an `OperatorCommand::Osquery`, and the agent's dispatch
+//! sends an `OperatorCommand::Sysquery`, and the agent's dispatch
 //! returns the slice-1 stub error. Proves the round-trip wiring is
 //! correct end-to-end (proto → handler → seal → operator-side parse)
-//! before the real osquery handler arrives in slice 2.
+//! before the real sysquery handler arrives in slice 2.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -13,15 +13,15 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_agent::config::{
     AlertsConfig, BaselineConfig, BloomConfig, Config, HeartbeatConfig, IdentityConfig,
-    InboxConfig, LlmConfig, MeshConfig, OperatorsConfig, OsqueryConfig, ResponseConfig, RoleConfig,
-    WhisperConfig, WhisperQaConfig,
+    InboxConfig, LlmConfig, MeshConfig, OperatorsConfig, ResponseConfig, RoleConfig,
+    SysqueryConfig, WhisperConfig, WhisperQaConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_crypto::Identity;
 use bowery_events::source::NoopEventSource;
 use bowery_proto::{
-    Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, OsqueryQuery, SqlQuery,
-    SqlValueKind, WhisperPayload,
+    Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, SqlQuery, SqlValueKind,
+    SysqueryQuery, WhisperPayload,
 };
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::BoweryEndpoint;
@@ -42,7 +42,7 @@ fn build_agent_config(
     dir: &Path,
     mesh_addr: SocketAddr,
     operator_pubkey_b64: String,
-    osquery: OsqueryConfig,
+    sysquery: SysqueryConfig,
 ) -> Config {
     Config {
         identity: IdentityConfig {
@@ -80,33 +80,33 @@ fn build_agent_config(
         alerts: AlertsConfig::default(),
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),
-        osquery,
+        sysquery,
     }
 }
 
-/// Write a shim shell script that pretends to be osqueryi: ignores
+/// Write a shim shell script that pretends to be a sysquery binary: ignores
 /// all its args (the agent's hardening flags + the SQL string) and
 /// emits a known JSON payload on stdout.
-fn make_osquery_shim(dir: &Path, body: &str) -> std::path::PathBuf {
+fn make_sysquery_shim(dir: &Path, body: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let p = dir.join("osquery-shim.sh");
+    let p = dir.join("sysquery-shim.sh");
     std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     p
 }
 
-/// Phase-6b slice 2: with a real (shim) osquery binary configured,
-/// the round-trip returns an `OsqueryResult` populated with the
+/// Phase-6b slice 2: with a real (shim) sysquery binary configured,
+/// the round-trip returns a `SysqueryResult` populated with the
 /// shim's stdout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn osquery_command_round_trips_with_shim_handler() {
+async fn sysquery_command_round_trips_with_shim_handler() {
     let workdir = TempDir::new().unwrap();
     let operator_id = Arc::new(Identity::generate());
     let operator_pubkey_b64 = BASE64.encode(operator_id.verifying_key().as_bytes());
 
     // Shim emits a fixed JSON payload regardless of the SQL string.
-    let shim = make_osquery_shim(workdir.path(), r#"echo '[{"pid":42,"name":"shimmed"}]'"#);
-    let osquery = OsqueryConfig {
+    let shim = make_sysquery_shim(workdir.path(), r#"echo '[{"pid":42,"name":"shimmed"}]'"#);
+    let sysquery = SysqueryConfig {
         enabled: true,
         binary_path: shim,
         max_timeout: Duration::from_secs(5),
@@ -115,7 +115,7 @@ async fn osquery_command_round_trips_with_shim_handler() {
         workdir.path(),
         reserve_udp_port(),
         operator_pubkey_b64.clone(),
-        osquery,
+        sysquery,
     );
 
     let agent_id = Arc::new(Identity::generate());
@@ -149,7 +149,7 @@ async fn osquery_command_round_trips_with_shim_handler() {
     let cmd = OperatorCommand {
         request_id: "test-req-1".into(),
         timeout_ms: 5_000,
-        command: Some(OperatorCommandBody::Osquery(OsqueryQuery {
+        command: Some(OperatorCommandBody::Sysquery(SysqueryQuery {
             sql: "SELECT pid, name FROM processes LIMIT 1".into(),
         })),
     };
@@ -164,11 +164,11 @@ async fn osquery_command_round_trips_with_shim_handler() {
     };
     assert_eq!(result.request_id, "test-req-1");
     match result.result {
-        Some(OperatorResultBody::Osquery(o)) => {
+        Some(OperatorResultBody::Sysquery(o)) => {
             assert_eq!(o.exit_code, 0);
             assert!(o.json.contains("shimmed"), "got json: {}", o.json);
         }
-        other => panic!("expected Osquery body, got {other:?}"),
+        other => panic!("expected Sysquery body, got {other:?}"),
     }
 
     // Confirm the AgentEvent fired so dashboards see the dispatch.
@@ -182,7 +182,7 @@ async fn osquery_command_round_trips_with_shim_handler() {
         match tokio::time::timeout(timeout, events.recv()).await {
             Ok(Ok(AgentEvent::OperatorCommandHandled {
                 request_id,
-                kind: "osquery",
+                kind: "sysquery",
                 ..
             })) if request_id == "test-req-1" => break true,
             Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
@@ -198,21 +198,21 @@ async fn osquery_command_round_trips_with_shim_handler() {
     agent.shutdown().await.expect("shutdown");
 }
 
-/// Phase-6b slice 2: when osquery is disabled in config, dispatch
+/// Phase-6b slice 2: when sysquery is disabled in config, dispatch
 /// returns a structured `policy_denied` error rather than a silent
 /// timeout. Operator's CLI sees a clean failure mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn osquery_command_returns_policy_denied_when_disabled() {
+async fn sysquery_command_returns_policy_denied_when_disabled() {
     let workdir = TempDir::new().unwrap();
     let operator_id = Arc::new(Identity::generate());
     let operator_pubkey_b64 = BASE64.encode(operator_id.verifying_key().as_bytes());
 
-    // Default OsqueryConfig has enabled = false.
+    // Default SysqueryConfig has enabled = false.
     let cfg = build_agent_config(
         workdir.path(),
         reserve_udp_port(),
         operator_pubkey_b64.clone(),
-        OsqueryConfig::default(),
+        SysqueryConfig::default(),
     );
 
     let agent_id = Arc::new(Identity::generate());
@@ -244,7 +244,7 @@ async fn osquery_command_returns_policy_denied_when_disabled() {
     let cmd = OperatorCommand {
         request_id: "denied-req".into(),
         timeout_ms: 5_000,
-        command: Some(OperatorCommandBody::Osquery(OsqueryQuery {
+        command: Some(OperatorCommandBody::Sysquery(SysqueryQuery {
             sql: "SELECT 1".into(),
         })),
     };
@@ -260,7 +260,7 @@ async fn osquery_command_returns_policy_denied_when_disabled() {
     match result.result {
         Some(OperatorResultBody::Error(e)) => {
             assert_eq!(e.kind, "policy_denied");
-            assert!(e.message.contains("osquery"));
+            assert!(e.message.contains("sysquery"));
         }
         other => panic!("expected Error body, got {other:?}"),
     }
@@ -291,7 +291,7 @@ async fn non_operator_sender_is_rejected() {
         workdir.path(),
         reserve_udp_port(),
         operator_pubkey_b64.clone(),
-        OsqueryConfig::default(),
+        SysqueryConfig::default(),
     );
     let agent = Agent::start(cfg, agent_id, Box::new(NoopEventSource))
         .await
@@ -323,7 +323,7 @@ async fn non_operator_sender_is_rejected() {
     let cmd = OperatorCommand {
         request_id: "stranger-req".into(),
         timeout_ms: 1_000,
-        command: Some(OperatorCommandBody::Osquery(OsqueryQuery {
+        command: Some(OperatorCommandBody::Sysquery(SysqueryQuery {
             sql: "SELECT 1".into(),
         })),
     };
@@ -357,7 +357,7 @@ async fn sql_command_streams_chunked_response() {
         workdir.path(),
         reserve_udp_port(),
         operator_pubkey_b64.clone(),
-        OsqueryConfig::default(),
+        SysqueryConfig::default(),
     );
     let agent_id = Arc::new(Identity::generate());
     let agent_fp = agent_id.fingerprint();
@@ -472,7 +472,7 @@ async fn sql_syntax_error_returns_structured_error() {
         workdir.path(),
         reserve_udp_port(),
         operator_pubkey_b64.clone(),
-        OsqueryConfig::default(),
+        SysqueryConfig::default(),
     );
     let agent_id = Arc::new(Identity::generate());
     let agent_fp = agent_id.fingerprint();

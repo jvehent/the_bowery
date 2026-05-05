@@ -107,7 +107,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, response: ResponseConfig) -> 
         alerts: AlertsConfig { threshold: 0.4 },
         bloom: BloomConfig::default(),
         response,
-        osquery: bowery_agent::config::OsqueryConfig::default(),
+        sysquery: bowery_agent::config::SysqueryConfig::default(),
     }
 }
 

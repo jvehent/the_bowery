@@ -57,7 +57,7 @@ pub struct Config {
     #[serde(default)]
     pub response: ResponseConfig,
     #[serde(default)]
-    pub osquery: OsqueryConfig,
+    pub sysquery: SysqueryConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -496,48 +496,56 @@ pub struct ResponseConfig {
     pub audit_log_path: Option<PathBuf>,
 }
 
-/// Phase-6b: osquery operator-command settings.
+/// Phase-6b: subprocess-backed `sysquery` operator-command
+/// settings.
 ///
-/// Off by default. When `enabled = false`, any `OperatorCommand::Osquery`
-/// the agent receives is rejected with `kind = "policy_denied"` so the
-/// CLI gets a structured failure (not a silent timeout). When enabled,
-/// the agent runs `osqueryi` at `binary_path` with conservative
-/// hardening flags and a per-call wall-clock cap (operator-supplied
-/// timeouts are clamped down to `max_timeout`).
+/// Off by default. When `enabled = false`, any
+/// `OperatorCommand::Sysquery` the agent receives is rejected with
+/// `kind = "policy_denied"` so the CLI gets a structured failure
+/// (not a silent timeout). When enabled, the agent runs the binary
+/// at `binary_path` with conservative hardening flags and a per-call
+/// wall-clock cap (operator-supplied timeouts are clamped down to
+/// `max_timeout`).
+///
+/// The wrapped binary is the operator's choice — the flag set we
+/// pass matches the upstream osquery interactive shell, but
+/// equivalent compatible binaries can be substituted via
+/// `binary_path`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OsqueryConfig {
+pub struct SysqueryConfig {
     /// Master switch. Default: `false`.
     #[serde(default)]
     pub enabled: bool,
-    /// Path to the `osqueryi` binary. Default: `/usr/bin/osqueryi`.
-    /// Distros sometimes install at `/usr/local/bin/osqueryi`; check
-    /// with `bowery doctor` (Phase-9 will add an osquery probe).
-    #[serde(default = "default_osquery_binary_path")]
+    /// Path to the sysquery binary. Default: `/usr/bin/osqueryi`
+    /// (the historically common deployment); operators with a
+    /// different binary on disk can override it. `bowery doctor`
+    /// reports whether the configured path exists.
+    #[serde(default = "default_sysquery_binary_path")]
     pub binary_path: PathBuf,
     /// Hard ceiling on per-query timeout. The operator's request
     /// timeout is clamped to `min(operator_request, max_timeout)`.
     /// Defends against a compromised operator key hanging the host
     /// with a deliberately long-running query.
-    #[serde(with = "humantime_serde", default = "default_osquery_max_timeout")]
+    #[serde(with = "humantime_serde", default = "default_sysquery_max_timeout")]
     pub max_timeout: Duration,
 }
 
-impl Default for OsqueryConfig {
+impl Default for SysqueryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            binary_path: default_osquery_binary_path(),
-            max_timeout: default_osquery_max_timeout(),
+            binary_path: default_sysquery_binary_path(),
+            max_timeout: default_sysquery_max_timeout(),
         }
     }
 }
 
-fn default_osquery_binary_path() -> PathBuf {
+fn default_sysquery_binary_path() -> PathBuf {
     PathBuf::from("/usr/bin/osqueryi")
 }
 
-fn default_osquery_max_timeout() -> Duration {
+fn default_sysquery_max_timeout() -> Duration {
     Duration::from_secs(30)
 }
 

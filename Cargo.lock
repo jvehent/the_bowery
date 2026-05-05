@@ -278,10 +278,10 @@ dependencies = [
  "bowery-events",
  "bowery-llm",
  "bowery-mesh",
- "bowery-osquery",
  "bowery-proto",
  "bowery-response",
  "bowery-sql",
+ "bowery-sysquery",
  "bowery-whisper",
  "clap",
  "ed25519-dalek",
@@ -418,16 +418,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bowery-osquery"
-version = "0.0.1"
-dependencies = [
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "bowery-proto"
 version = "0.0.1"
 dependencies = [
@@ -462,6 +452,16 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "bowery-sysquery"
+version = "0.0.1"
+dependencies = [
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

@@ -72,7 +72,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>) -> Config
         alerts: AlertsConfig::default(),
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),
-        osquery: bowery_agent::config::OsqueryConfig::default(),
+        sysquery: bowery_agent::config::SysqueryConfig::default(),
     }
 }
 

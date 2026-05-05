@@ -119,7 +119,7 @@ bowery/
 │   ├── bowery-whisper/           # protocol: handshake, RPC, fingerprints
 │   ├── bowery-mesh/              # chitchat integration, role gossip, inbox
 │   ├── bowery-response/          # action engine
-│   ├── bowery-osquery/           # osquery subprocess integration
+│   ├── bowery-sysquery/          # subprocess-backed SQL integration
 │   └── bowery-proto/             # wire types (prost)
 ├── deploy/
 │   ├── systemd/                  # bowery-agent.service
@@ -451,9 +451,9 @@ Failure modes covered by tests:
 - Retention expiry mid-query (CLI flags incomplete results).
 - Operator key rotation mid-query.
 
-### 10.3 OSQuery integration
+### 10.3 Sysquery integration
 
-Subprocess integration (`osqueryi --json`) for v0.1. Library link reconsidered later if continuous-scheduled-query workloads emerge.
+Subprocess-backed SQL surface (`bowery-sysquery`). The wrapper passes osquery-shaped flags (`--json --disable_extensions=true ...`) to whichever binary the operator points it at; common deployments use `osqueryi`. The native Phase-9 SQL surface (`bowery-sql` + `bowery-tables`) is the primary path; sysquery exists for operators who want the wider third-party-table set without writing a new `bowery-tables` table.
 
 ---
 
@@ -502,7 +502,7 @@ For v0.1 the mirror may proxy HuggingFace; the manifest signature is what the ag
 | **3. Pre-filter + scoring** | Rules + baseline scorer + behavior aggregator + role-vector computation | (within `bowery-baseline` + `bowery-mesh`) |
 | **4. LLM analyzer** | candle backend, model fetch, cgroup caps, structured prompts, context builder | `bowery-llm` |
 | **5. Whisper Q&A** | Two-tier privacy fingerprints, role-similarity peer selection, capsule exchange | `bowery-whisper` (full) |
-| **6. Operator IO** | CLI commands, signed envelopes, mesh inbox + roaming subscribe, OSQuery subprocess | `bowery-osquery`, expand `bowery-cli` |
+| **6. Operator IO** | CLI commands, signed envelopes, mesh inbox + roaming subscribe, sysquery subprocess | `bowery-sysquery`, expand `bowery-cli` |
 | **7. Response** | Action engine, two-tier autonomy gating, standing authorization | `bowery-response` |
 | **8. Hardening** | Fuzzing, adversarial tests, key rotation, neighbor add/remove protocol | (all) |
 

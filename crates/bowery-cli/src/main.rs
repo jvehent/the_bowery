@@ -127,8 +127,11 @@ enum ExecCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Run an osquery query on the agent host and print the result.
-    Osquery {
+    /// Run a SQL query via the agent's optional subprocess
+    /// `sysquery` handler (must be enabled in the agent config and
+    /// the binary present on disk). Returns the wrapped binary's
+    /// JSON output verbatim.
+    Sysquery {
         /// Path to the operator's identity key file.
         #[arg(long)]
         operator_key: PathBuf,
@@ -141,8 +144,8 @@ enum ExecCommand {
         /// Base64-encoded Ed25519 verifying key of the agent.
         #[arg(long)]
         agent_pubkey_b64: String,
-        /// SQL string. Read-only by osquery convention; the agent
-        /// may additionally refuse the query at policy-check time.
+        /// SQL string. Read-only by convention; the agent may
+        /// additionally refuse the query at policy-check time.
         #[arg(long)]
         sql: String,
         /// Wall-clock deadline for the agent-side handler. Accepts
@@ -150,7 +153,7 @@ enum ExecCommand {
         #[arg(long, default_value = "10s", value_parser = parse_duration)]
         timeout: Duration,
         /// Emit the result as a single JSON object (full envelope
-        /// shape) instead of just the osquery JSON.
+        /// shape) instead of just the wrapped binary's JSON.
         #[arg(long)]
         json: bool,
     },
@@ -354,7 +357,7 @@ impl Cli {
             } => audit::verify(&path, pubkey_b64, pubkey_from, json),
             Command::Exec {
                 sub:
-                    ExecCommand::Osquery {
+                    ExecCommand::Sysquery {
                         operator_key,
                         agent_addr,
                         agent_fp,
@@ -373,7 +376,7 @@ impl Cli {
                     .enable_all()
                     .build()
                     .context("building tokio runtime")?;
-                runtime.block_on(exec::osquery(
+                runtime.block_on(exec::sysquery(
                     operator_key,
                     agent_addr,
                     agent_fp,

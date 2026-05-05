@@ -1311,7 +1311,7 @@ Single binary, `bowery`. Subcommands:
 | `alerts tail` | [`alerts.rs`](crates/bowery-cli/src/alerts.rs) |
 | `model {list, fetch}` | [`model.rs`](crates/bowery-cli/src/model.rs) |
 | `audit verify` | [`audit.rs`](crates/bowery-cli/src/audit.rs) |
-| `exec osquery` | [`exec.rs`](crates/bowery-cli/src/exec.rs) |
+| `exec sysquery` | [`exec.rs`](crates/bowery-cli/src/exec.rs) |
 
 ### 15.1 doctor
 
@@ -1882,12 +1882,12 @@ OperatorCommand
   request_id  : String          (caller-chosen correlation)
   timeout_ms  : u32             (per-handler deadline)
   command     : oneof
-    Osquery   { sql: String }   (10)
+    Sysquery  { sql: String }   (10)
 
 OperatorResult
   request_id  : String          (echo)
   result      : oneof
-    Osquery   { json, exit_code }     (10)
+    Sysquery  { json, exit_code }     (10)
     Error     { kind, message }       (11)
 ```
 
@@ -1905,10 +1905,10 @@ Mirrors `respond_to_subscribe`'s structure:
 1. Operator-only gate — envelope-verified-as-pinned-peer is **not**
    enough; the sender must be in the configured `[operators]` set.
 2. Clamp the operator's requested timeout to
-   `min(request, [osquery] max_timeout)` so a stolen operator key
+   `min(request, [sysquery] max_timeout)` so a stolen operator key
    can't hang the host with an unbounded query.
 3. Dispatch to a per-command handler. The handler returns either
-   `OperatorResultBody::Osquery` on success or
+   `OperatorResultBody::Sysquery` on success or
    `OperatorResultBody::Error { kind, message }` with stable
    programmatic kinds (`policy_denied`, `timeout`,
    `output_too_large`, `handler_error`, `unsupported_command`).
@@ -1921,20 +1921,20 @@ references; `None` for any handler means the corresponding command
 returns `policy_denied` at dispatch time. This is the Phase-7
 "engines as Arc<dyn>" pattern adapted to operator commands.
 
-### 21.3 osquery handler
+### 21.3 sysquery handler
 
-[`crates/bowery-osquery/src/lib.rs`](crates/bowery-osquery/src/lib.rs).
+[`crates/bowery-sysquery/src/lib.rs`](crates/bowery-sysquery/src/lib.rs).
 
 Standalone crate so the agent's dependency footprint stays
 predictable (just `tokio[process]` + `thiserror`). Public surface:
 
-- `Osquery::new(binary_path) -> Result<Self, OsqueryError>` —
+- `Sysquery::new(binary_path) -> Result<Self, SysqueryError>` —
   stat-checks the binary at startup. The agent only constructs an
-  `Osquery` when both `[osquery] enabled = true` and the binary
+  `Sysquery` when both `[sysquery] enabled = true` and the binary
   resolves.
-- `Osquery::run(sql, timeout) -> Result<OsqueryOutput, OsqueryError>` —
-  spawns `osqueryi` with conservative hardening flags and a wall-
-  clock cap.
+- `Sysquery::run(sql, timeout) -> Result<SysqueryOutput, SysqueryError>` —
+  spawns the configured binary with conservative hardening flags
+  and a wall-clock cap.
 
 Hardening flags (passed verbatim to every invocation):
 
@@ -1945,7 +1945,7 @@ Hardening flags (passed verbatim to every invocation):
 | `--disable_audit=true` | No persistent audit subscribers. |
 | `--disable_events=true` | No kernel-event tables (require persistent state). |
 | `--ephemeral=true` + `--database_path=/tmp` | No on-disk state per query. |
-| `--config_path=/dev/null` | Don't read host osquery config. |
+| `--config_path=/dev/null` | Don't read any host config file (osquery-shaped flag). |
 
 Output capped at 16 MiB stdout + 16 MiB stderr — exceeding either
 surfaces as `OutputTooLarge` rather than unbounded RAM growth.
@@ -1957,7 +1957,7 @@ caller cancellation (`Command::kill_on_drop(true)`).
 [`crates/bowery-cli/src/exec.rs`](crates/bowery-cli/src/exec.rs).
 
 ```sh
-bowery exec osquery \
+bowery exec sysquery \
     --operator-key /path/to/op.key \
     --agent-addr 10.0.0.5:9902 \
     --agent-fp <64-hex> --agent-pubkey-b64 <base64> \
@@ -1969,7 +1969,7 @@ One round-trip per invocation; no follow mode. The CLI wraps the
 exchange in `(operator_request_timeout + 2s)` so a stalled agent
 doesn't hang the operator. `--json` emits the full envelope shape
 (request_id + exit_code + json) for ops piping; default emits the
-osquery JSON verbatim.
+wrapped binary's JSON verbatim.
 
 ### 21.5 What's deferred
 
@@ -1987,14 +1987,15 @@ osquery JSON verbatim.
   `trigger-baseline-rescan`, and operator-signed grants for the
   Phase-7 response engine all extend the same pattern: add a oneof
   variant to `OperatorCommandBody`, wire a handler in the router.
-- **Replacing osquery with a native SQL engine.** Scoped in
-  [`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md) — pure-Rust
-  rusqlite-vtab surface over 15 core tables, streaming results
-  per-row, multi-agent fan-out via a relay pattern. ~10 weeks
-  of focused work; triggers when the bundled osqueryi cost
-  starts mattering or operator workflows reach for Bowery-native
-  tables (`bowery_peers`, `bowery_audit`, etc.) that no osquery
-  extension could expose.
+- **Native SQL surface (Phase 9).** `bowery-sql` + `bowery-tables`
+  ship a pure-Rust rusqlite-backed engine and a growing set of
+  procfs/sysfs/etc-backed tables (`processes`, `listening_ports`,
+  `users`, `systemd_units`, ...). The streaming wire path
+  (`OperatorCommand::Sql` → chunked `OperatorResultBody::SqlChunk`)
+  shipped in slice 6 — see [`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md)
+  for the full slice plan. Sysquery is kept alongside as the
+  fallback for operators who want the wider third-party-binary
+  table set without writing a new `bowery-tables` module.
 
 ---
 

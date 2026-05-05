@@ -305,12 +305,15 @@ pub struct OperatorCommand {
 
 #[derive(Clone, PartialEq, Oneof)]
 pub enum OperatorCommandBody {
-    /// Run an osquery query on the agent host. Read-only by the
-    /// nature of osquery's tables; the agent additionally rejects any
-    /// query containing forbidden keywords (Phase 6b polish — start
-    /// permissive, tighten later).
+    /// Run a SQL query against a host-installed `sysquery` binary
+    /// (subprocess wrapper, see `bowery-sysquery`). Surface is the
+    /// binary's own table set — typically broader than the native
+    /// Bowery tables but pulled in via subprocess. Read-only by
+    /// design; the agent additionally rejects any query containing
+    /// forbidden keywords (Phase 6b polish — start permissive,
+    /// tighten later).
     #[prost(message, tag = "10")]
-    Osquery(OsqueryQuery),
+    Sysquery(SysqueryQuery),
     /// Run a SQL query against the agent's native Phase-9 SQL
     /// surface (`bowery-sql`). The response is *streamed*: the
     /// agent emits one or more `SqlChunk` envelopes (each in its
@@ -323,7 +326,7 @@ pub enum OperatorCommandBody {
 }
 
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
-pub struct OsqueryQuery {
+pub struct SysqueryQuery {
     /// SQL string. Subject to per-agent allow-list policy at handler
     /// time; the agent may refuse any query the local config doesn't
     /// permit.
@@ -358,11 +361,10 @@ pub struct OperatorResult {
 
 #[derive(Clone, PartialEq, Oneof)]
 pub enum OperatorResultBody {
-    /// Successful execution. Schema is per-command — for now, just
-    /// osquery's JSON output as a string. Future commands add their
-    /// own variants here.
+    /// Successful execution of a `Sysquery` command. Schema is
+    /// the wrapped binary's JSON output as a string.
     #[prost(message, tag = "10")]
-    Osquery(OsqueryResult),
+    Sysquery(SysqueryResult),
     /// The handler refused or failed the command. Always populated
     /// when the agent could parse the request but declined to run
     /// it (policy denial, subprocess failure, timeout, etc.). For
@@ -379,15 +381,15 @@ pub enum OperatorResultBody {
 }
 
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
-pub struct OsqueryResult {
-    /// JSON array — the raw output of `osqueryi --json <sql>`.
-    /// Operator-side tooling parses this with `serde_json::Value`;
-    /// keeping it as a string here means we don't have to model
-    /// every column type in protobuf.
+pub struct SysqueryResult {
+    /// JSON array — the raw stdout of the wrapped binary called
+    /// with `--json <sql>`. Operator-side tooling parses this with
+    /// `serde_json::Value`; keeping it as a string here means we
+    /// don't have to model every column type in protobuf.
     #[prost(string, tag = "1")]
     pub json: String,
-    /// `osqueryi`'s exit status (0 = success, non-zero = handler
-    /// fell back without a structured reason).
+    /// Wrapped binary's exit status (0 = success, non-zero =
+    /// handler fell back without a structured reason).
     #[prost(int32, tag = "2")]
     pub exit_code: i32,
 }

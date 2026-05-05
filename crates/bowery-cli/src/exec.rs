@@ -19,21 +19,21 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use bowery_crypto::{Fingerprint, Identity};
 use bowery_proto::{
-    Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, OsqueryQuery, SqlChunk,
-    SqlQuery, SqlValueKind, WhisperPayload,
+    Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, SqlChunk, SqlQuery,
+    SqlValueKind, SysqueryQuery, WhisperPayload,
 };
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::BoweryEndpoint;
 use bowery_whisper::{Sealer, StaticResolver, Verifier};
 use ed25519_dalek::VerifyingKey;
 
-/// Send a single `osquery` command and print the result. Returns
+/// Send a single `sysquery` command and print the result. Returns
 /// `Ok(())` even when the agent's structured `Error` body comes back
 /// — we surface it via `eprintln!` and a non-zero process exit at
 /// the caller; transport-level failures (envelope parse, sig verify,
 /// timeout) bubble up as `Err`.
 #[allow(clippy::too_many_arguments)] // explicit binding from the CLI subcommand
-pub(crate) async fn osquery(
+pub(crate) async fn sysquery(
     operator_key: PathBuf,
     target_addr: SocketAddr,
     target_fp_hex: String,
@@ -80,7 +80,7 @@ pub(crate) async fn osquery(
     let cmd = OperatorCommand {
         request_id: request_id.clone(),
         timeout_ms,
-        command: Some(OperatorCommandBody::Osquery(OsqueryQuery { sql })),
+        command: Some(OperatorCommandBody::Sysquery(SysqueryQuery { sql })),
     };
     let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
 
@@ -319,7 +319,7 @@ fn value_to_json(v: &bowery_proto::SqlValue) -> String {
 
 fn print_result(result: &bowery_proto::OperatorResult, json: bool) -> Result<()> {
     match (&result.result, json) {
-        (Some(OperatorResultBody::Osquery(o)), true) => {
+        (Some(OperatorResultBody::Sysquery(o)), true) => {
             // `--json` mode emits the full envelope shape so callers
             // can pipe it through jq.
             println!(
@@ -329,12 +329,12 @@ fn print_result(result: &bowery_proto::OperatorResult, json: bool) -> Result<()>
                 if o.json.is_empty() { "null" } else { &o.json }
             );
         }
-        (Some(OperatorResultBody::Osquery(o)), false) => {
-            // Human mode prints the osquery JSON verbatim — the
-            // operator can pipe through `jq` themselves.
+        (Some(OperatorResultBody::Sysquery(o)), false) => {
+            // Human mode prints the wrapped binary's JSON verbatim
+            // — the operator can pipe through `jq` themselves.
             println!("{}", o.json);
             if o.exit_code != 0 {
-                eprintln!("warning: osqueryi exited {}", o.exit_code);
+                eprintln!("warning: sysquery binary exited {}", o.exit_code);
             }
         }
         (Some(OperatorResultBody::Error(e)), _) => {
@@ -342,9 +342,9 @@ fn print_result(result: &bowery_proto::OperatorResult, json: bool) -> Result<()>
             bail!("operator command failed: {}", e.kind);
         }
         (Some(OperatorResultBody::SqlChunk(_)), _) => {
-            // The osquery exec path is single-shot; receiving a
+            // The sysquery exec path is single-shot; receiving a
             // SqlChunk on it indicates a wire-protocol mismatch.
-            bail!("agent replied to osquery command with SqlChunk; protocol mismatch");
+            bail!("agent replied to sysquery command with SqlChunk; protocol mismatch");
         }
         (None, _) => bail!("agent returned an OperatorResult with no body"),
     }

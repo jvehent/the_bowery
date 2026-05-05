@@ -71,18 +71,21 @@ request_deadline = "10s"
 # max_tokens = 256
 # temperature = 0.2   # low temp keeps JSON output stable
 
-[osquery]
+[sysquery]
 # Phase-6b operator commands. When enabled, operators can run
-# osquery SQL against this host via `bowery exec osquery`. The
-# operator key (in [operators] pubkeys_b64) authenticates each
-# request; the agent enforces a hard timeout cap and the read-only
-# osquery surface limits the blast radius of a stolen operator key.
-# Off by default — turn on per-host once an operator workflow needs
-# it.
+# subprocess-backed SQL against this host via `bowery exec
+# sysquery`. The operator key (in [operators] pubkeys_b64)
+# authenticates each request; the agent enforces a hard timeout
+# cap and the read-only surface limits the blast radius of a
+# stolen operator key. Off by default — turn on per-host once an
+# operator workflow needs the wider third-party-binary table set
+# (the native bowery-sql surface, used by `bowery exec sql`, is
+# always on).
 enabled = false
-# Path to the osqueryi binary. Distros vary: Debian/Ubuntu from
-# osquery's official repo install at /usr/bin/osqueryi; some
-# distributions land at /usr/local/bin/osqueryi.
+# Path to the sysquery binary. The wrapper passes osquery-shaped
+# `--json --disable_extensions=true` flags, so any binary that
+# accepts that flag set works. Common deployments use
+# /usr/bin/osqueryi or /usr/local/bin/osqueryi.
 # binary_path = "/usr/bin/osqueryi"
 # Hard ceiling on per-query timeout. Operator's request timeout is
 # clamped to min(request, max_timeout). Defends against a stolen

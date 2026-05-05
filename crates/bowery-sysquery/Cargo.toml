@@ -1,6 +1,6 @@
 [package]
-name = "bowery-osquery"
-description = "Phase-6b osquery subprocess wrapper for The Bowery agent."
+name = "bowery-sysquery"
+description = "Phase-6b system-query subprocess wrapper for The Bowery agent."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,26 +1,28 @@
-//! Subprocess wrapper around `osqueryi` for Phase-6b operator
-//! commands.
+//! Subprocess wrapper for the Phase-6b operator command path that
+//! shells out to a host-installed query binary.
 //!
-//! `osquery` exposes the host's state — running processes, network
-//! connections, kernel modules, file integrity, etc. — as SQL tables.
-//! The agent shells out to the `osqueryi` binary with `--json` and
-//! returns the raw JSON to the operator; parsing is done on the
-//! operator side so this crate stays free of `serde_json` and the
-//! agent's CPU/RAM budget for queries stays predictable.
+//! The binary's expected contract is "accept a SQL string on the
+//! command line and emit JSON on stdout". The agent doesn't care
+//! which implementation the operator points it at — historically
+//! this was the upstream osquery interactive shell, but Bowery's
+//! native Phase-9 SQL surface (see `bowery-sql` / `bowery-tables`)
+//! is the going-forward path. This crate exists for the deployment
+//! cases where the operator wants the wider third-party-table
+//! surface available alongside the native Bowery tables.
 //!
 //! ## What this crate does
 //!
-//! - Locates an `osqueryi` binary at a caller-supplied path.
+//! - Locates a query binary at a caller-supplied path.
 //! - Runs a single SQL query under a wall-clock timeout, capturing
 //!   stdout / stderr / exit code.
 //! - Hardens the subprocess: no extensions, no audit subscribers,
-//!   no remote control. The operator's SQL still has the full
-//!   read-only osquery surface, but can't load extensions or write
-//!   anywhere on the host.
+//!   no remote control, no persistent database. The operator's SQL
+//!   keeps the full read-only host-introspection surface but can't
+//!   load extensions or write anywhere.
 //! - Kills the subprocess on drop (the agent's request might time
 //!   out, the operator might disconnect, the agent might shut
-//!   down — none of those should leave a `osqueryi` orphan running
-//!   the operator's query indefinitely).
+//!   down — none of those should leave a query-runner orphan
+//!   running indefinitely).
 //!
 //! ## What this crate does NOT do
 //!
@@ -29,9 +31,9 @@
 //! - Validate or rewrite the SQL. The agent's request handler may
 //!   refuse queries based on a separate allow-list policy; this
 //!   crate trusts its caller.
-//! - Manage long-running osquery daemons. We use `osqueryi`
-//!   (interactive shell, one-shot) intentionally — no persistent
-//!   state, no extension sockets to compromise.
+//! - Manage long-running query daemons. We invoke the binary
+//!   one-shot intentionally — no persistent state, no extension
+//!   sockets to compromise.
 
 #![warn(unreachable_pub)]
 
@@ -45,56 +47,56 @@ use tokio::process::Command;
 use tokio::time::timeout as tokio_timeout;
 use tracing::{debug, warn};
 
-/// Cap on captured stdout/stderr per query. osqueryi can produce
-/// large JSON for tables like `process_open_files` on busy hosts;
-/// 16 MiB is well above any sensible operator query and keeps the
-/// agent's RAM cost bounded if a malicious operator targets a
+/// Cap on captured stdout/stderr per query. Some host-introspection
+/// tables (e.g. `process_open_files` on busy hosts) produce large
+/// JSON; 16 MiB is well above any sensible operator query and keeps
+/// the agent's RAM cost bounded if a malicious operator targets a
 /// pathologically expensive table.
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Output of a single `osqueryi` invocation.
+/// Output of a single subprocess invocation.
 #[derive(Debug, Clone)]
-pub struct OsqueryOutput {
-    /// Raw JSON osqueryi wrote to stdout. Unparsed.
+pub struct SysqueryOutput {
+    /// Raw JSON the binary wrote to stdout. Unparsed.
     pub stdout: String,
     /// Stderr — usually empty on success; carries diagnostic
-    /// messages from osquery on syntax errors etc.
+    /// messages from the underlying binary on syntax errors etc.
     pub stderr: String,
     /// Process exit code. `0` on success.
     pub exit_code: i32,
 }
 
 #[derive(Debug, Error)]
-pub enum OsqueryError {
-    #[error("osqueryi binary not found at {0}")]
+pub enum SysqueryError {
+    #[error("sysquery binary not found at {0}")]
     BinaryNotFound(PathBuf),
 
-    #[error("osqueryi spawn failed: {0}")]
+    #[error("sysquery spawn failed: {0}")]
     Spawn(#[source] std::io::Error),
 
-    #[error("osqueryi I/O error: {0}")]
+    #[error("sysquery I/O error: {0}")]
     Io(#[source] std::io::Error),
 
-    #[error("osqueryi timed out after {0:?}")]
+    #[error("sysquery timed out after {0:?}")]
     Timeout(Duration),
 
-    #[error("osqueryi output exceeded {limit} bytes")]
+    #[error("sysquery output exceeded {limit} bytes")]
     OutputTooLarge { limit: usize },
 }
 
-/// `osqueryi`-backed query runner.
+/// Subprocess-backed query runner.
 #[derive(Debug, Clone)]
-pub struct Osquery {
+pub struct Sysquery {
     binary_path: PathBuf,
 }
 
-impl Osquery {
+impl Sysquery {
     /// Build a runner for the binary at `binary_path`. Returns
     /// `BinaryNotFound` if the path doesn't exist or isn't a file.
-    pub fn new(binary_path: impl Into<PathBuf>) -> Result<Self, OsqueryError> {
+    pub fn new(binary_path: impl Into<PathBuf>) -> Result<Self, SysqueryError> {
         let binary_path = binary_path.into();
         if !binary_path.is_file() {
-            return Err(OsqueryError::BinaryNotFound(binary_path));
+            return Err(SysqueryError::BinaryNotFound(binary_path));
         }
         Ok(Self { binary_path })
     }
@@ -107,15 +109,16 @@ impl Osquery {
     /// clock. The subprocess is killed on timeout (and on drop of
     /// the returned future / on caller cancellation, courtesy of
     /// `kill_on_drop`).
-    pub async fn run(&self, sql: &str, timeout: Duration) -> Result<OsqueryOutput, OsqueryError> {
-        // Hardening flags — narrow osqueryi to the read-only,
-        // single-query path. Each flag's purpose is documented
-        // inline; if you bump osquery, recheck flag names against
-        // `osqueryi --help` (osquery has been known to rename them).
+    pub async fn run(&self, sql: &str, timeout: Duration) -> Result<SysqueryOutput, SysqueryError> {
+        // Hardening flags — narrow the binary to the read-only,
+        // single-query path. These flag names match the upstream
+        // osquery binary; if you point sysquery at a different
+        // binary, adjust accordingly. Each flag's purpose is
+        // documented inline.
         let mut cmd = Command::new(&self.binary_path);
         cmd.arg("--json")
             // No extensions: the operator's SQL can't auto-load a
-            // .so extension that escapes osquery's sandbox.
+            // .so extension that escapes the sandbox.
             .arg("--disable_extensions=true")
             // No audit subscribers / event tables: those write to
             // disk and require persistent state we don't want.
@@ -124,9 +127,8 @@ impl Osquery {
             // No persistent database: each invocation is fresh.
             .arg("--database_path=/tmp")
             .arg("--ephemeral=true")
-            // Don't read the host's osquery config. We're an
-            // operator-driven query runner, not a managed osquery
-            // deployment.
+            // Don't read the host's config. We're an operator-driven
+            // query runner, not a managed deployment.
             .arg("--config_path=/dev/null")
             // The query itself — last positional, exactly one.
             .arg(sql)
@@ -141,10 +143,10 @@ impl Osquery {
         debug!(
             binary = %self.binary_path.display(),
             sql_preview = sql.chars().take(80).collect::<String>(),
-            "spawning osqueryi"
+            "spawning sysquery binary"
         );
 
-        let mut child = cmd.spawn().map_err(OsqueryError::Spawn)?;
+        let mut child = cmd.spawn().map_err(SysqueryError::Spawn)?;
 
         // Take ownership of stdout/stderr handles before awaiting
         // wait_with_output so we can apply our own size cap.
@@ -163,8 +165,8 @@ impl Osquery {
             let stdout_fut = read_capped(&mut stdout_pipe, &mut stdout_buf, MAX_OUTPUT_BYTES);
             let stderr_fut = read_capped(&mut stderr_pipe, &mut stderr_buf, MAX_OUTPUT_BYTES);
             tokio::try_join!(stdout_fut, stderr_fut)?;
-            let status = child.wait().await.map_err(OsqueryError::Io)?;
-            Ok::<_, OsqueryError>(status)
+            let status = child.wait().await.map_err(SysqueryError::Io)?;
+            Ok::<_, SysqueryError>(status)
         };
 
         // Box the inner future so the outer state machine doesn't
@@ -181,13 +183,13 @@ impl Osquery {
                 return Err(e);
             }
             Err(_) => {
-                warn!("osqueryi exceeded timeout {timeout:?}; killing subprocess");
+                warn!("sysquery binary exceeded timeout {timeout:?}; killing subprocess");
                 let _ = child.start_kill();
-                return Err(OsqueryError::Timeout(timeout));
+                return Err(SysqueryError::Timeout(timeout));
             }
         };
 
-        Ok(OsqueryOutput {
+        Ok(SysqueryOutput {
             stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
             stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
             // Linux signals (e.g. our SIGKILL on timeout) yield
@@ -207,18 +209,18 @@ impl Osquery {
 /// Read from `pipe` into `buf` until EOF or the byte cap is hit.
 /// Cap exhaustion produces `OutputTooLarge` rather than a partial
 /// silent truncation.
-async fn read_capped<R>(pipe: &mut R, buf: &mut Vec<u8>, cap: usize) -> Result<(), OsqueryError>
+async fn read_capped<R>(pipe: &mut R, buf: &mut Vec<u8>, cap: usize) -> Result<(), SysqueryError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut chunk = [0u8; 8192];
     loop {
-        let n = pipe.read(&mut chunk).await.map_err(OsqueryError::Io)?;
+        let n = pipe.read(&mut chunk).await.map_err(SysqueryError::Io)?;
         if n == 0 {
             return Ok(());
         }
         if buf.len() + n > cap {
-            return Err(OsqueryError::OutputTooLarge { limit: cap });
+            return Err(SysqueryError::OutputTooLarge { limit: cap });
         }
         buf.extend_from_slice(&chunk[..n]);
     }
@@ -232,9 +234,9 @@ mod tests {
 
     /// Write a small shim shell script that ignores all its
     /// arguments and runs `body`. Returns its path. Used by tests
-    /// to exercise the `run()` pipeline without depending on
-    /// osqueryi being installed (and without our hardening flags
-    /// being interpreted by the test binary).
+    /// to exercise the `run()` pipeline without depending on a real
+    /// query binary being installed (and without our hardening
+    /// flags being interpreted by the test binary).
     fn make_shim(dir: &std::path::Path, body: &str) -> PathBuf {
         let p = dir.join("shim.sh");
         std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).expect("write shim");
@@ -244,8 +246,8 @@ mod tests {
 
     #[test]
     fn new_rejects_missing_binary() {
-        let err = Osquery::new("/no/such/binary").expect_err("missing path must fail");
-        assert!(matches!(err, OsqueryError::BinaryNotFound(_)));
+        let err = Sysquery::new("/no/such/binary").expect_err("missing path must fail");
+        assert!(matches!(err, SysqueryError::BinaryNotFound(_)));
     }
 
     /// Round-trip the spawn / pipe / wait path against a shim that
@@ -254,7 +256,7 @@ mod tests {
     async fn spawn_and_wait_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let shim = make_shim(dir.path(), r#"echo '[{"ok":1}]'"#);
-        let runner = Osquery::new(&shim).expect("shim exists");
+        let runner = Sysquery::new(&shim).expect("shim exists");
         let out = runner
             .run("ignored", Duration::from_secs(2))
             .await
@@ -268,16 +270,16 @@ mod tests {
     async fn timeout_kills_long_running_subprocess() {
         let dir = tempfile::tempdir().unwrap();
         // The shim ignores its args (the hardening flags + the SQL
-        // string osqueryi would consume) and just sleeps. Our 100ms
-        // timeout triggers the kill path.
+        // string the underlying binary would consume) and just
+        // sleeps. Our 100ms timeout triggers the kill path.
         let shim = make_shim(dir.path(), "sleep 5");
-        let runner = Osquery::new(&shim).expect("shim exists");
+        let runner = Sysquery::new(&shim).expect("shim exists");
         let err = runner
             .run("ignored", Duration::from_millis(100))
             .await
             .expect_err("must time out");
         assert!(
-            matches!(err, OsqueryError::Timeout(_)),
+            matches!(err, SysqueryError::Timeout(_)),
             "expected Timeout, got {err:?}"
         );
     }
@@ -289,13 +291,13 @@ mod tests {
         // dd with bs=1M count=32 produces exactly 32 MiB and exits;
         // we should hit the cap before dd finishes.
         let shim = make_shim(dir.path(), "dd if=/dev/zero bs=1M count=32 2>/dev/null");
-        let runner = Osquery::new(&shim).expect("shim exists");
+        let runner = Sysquery::new(&shim).expect("shim exists");
         let err = runner
             .run("ignored", Duration::from_secs(10))
             .await
             .expect_err("must hit output cap");
         assert!(
-            matches!(err, OsqueryError::OutputTooLarge { .. }),
+            matches!(err, SysqueryError::OutputTooLarge { .. }),
             "expected OutputTooLarge, got {err:?}"
         );
     }

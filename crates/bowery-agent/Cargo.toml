@@ -32,7 +32,7 @@ bowery-ebpf-loader = { workspace = true }
 bowery-events = { workspace = true }
 bowery-llm = { workspace = true }
 bowery-mesh = { workspace = true }
-bowery-osquery = { workspace = true }
+bowery-sysquery = { workspace = true }
 bowery-proto = { workspace = true }
 bowery-response = { workspace = true }
 bowery-sql = { workspace = true }

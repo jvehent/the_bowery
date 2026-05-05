@@ -1,7 +1,10 @@
 # The Bowery — Native SQL surface (Phase 9)
 
-**Status:** design proposal. Not implemented. Supersedes the
-"bundle osqueryi" path proposed in Phase 6b once this lands.
+**Status:** in flight. Slices 1–5 of the table set + slice 6 of the
+streaming wire path have shipped (commits `6856fa4`, `b39441d`,
+`50f227b`, `618f655`, `9a929d1`, `bf29998`). This document is the
+remaining-work guide and supersedes the "bundle osqueryi" path
+proposed in Phase 6b.
 
 This document scopes a pure-Rust replacement for osquery: a SQL
 surface over a curated set of host-state tables, queryable by an
@@ -59,9 +62,10 @@ bowery-stream                 new
     Used by both the local-agent path and the relay path.
 ```
 
-`bowery-osquery` stays around as a deprecated path (turn off via
-config) but the default switches to the native engine once
-slices 1–6 land.
+`bowery-sysquery` (formerly `bowery-osquery`) stays around as the
+subprocess-backed path for operators who want the wider third-party-
+binary table set; the native engine is always wired and is the
+default surface (`bowery exec sql`).
 
 ## 4. Tables
 
@@ -139,8 +143,8 @@ with an unbounded scan.
 
 ```rust
 pub enum OperatorCommandBody {
-    Osquery(OsqueryQuery),                    // existing — to be deprecated
-    Sql(SqlQuery),                            // new
+    Sysquery(SysqueryQuery),                  // existing subprocess path
+    Sql(SqlQuery),                            // native engine
 }
 
 pub struct SqlQuery {
@@ -160,10 +164,10 @@ pub struct SqlQuery {
 
 ```rust
 pub enum OperatorResultBody {
-    Osquery(OsqueryResult),     // existing
-    Error(OperatorError),       // existing
-    QueryRow(QueryRow),         // new — emitted N times per agent
-    QueryEof(QueryEof),         // new — terminator per agent
+    Sysquery(SysqueryResult),   // subprocess path
+    Error(OperatorError),       // shared
+    QueryRow(QueryRow),         // emitted N times per agent (slice-7+ shape)
+    QueryEof(QueryEof),         // terminator per agent (slice-7+ shape)
 }
 
 pub struct QueryRow {
@@ -222,7 +226,7 @@ Two operating modes per `SqlQuery.fanout`:
 
 ### 7.1 fanout = false
 
-Local-only. Same shape as today's osquery handler. The
+Local-only. Same shape as the slice-6 streaming Sql path. The
 relay-agent is the sole producer; rows carry `agent_fp =
 self_fp`; the stream ends with a single `QueryEof`.
 
@@ -338,12 +342,12 @@ again. Implemented as: dispatch ignores the `fanout` flag when
 | Per-agent DoS | All Phase-6b/8 caps still apply: max_timeout, output_too_large, kill_on_drop. SQL adds: max-rows cap (1M), max-cell-size (64 KiB). |
 | Mesh-flood DoS via fan-out | Per-operator rate limit on the relay: max 1 fanout query per N seconds per operator fp. |
 | File system traversal via `file` table | `file` and `hash` tables refuse unbounded queries — vtab requires a `path` filter at xBestIndex time. Unbounded scan returns `OperatorError::Invalid("file table requires WHERE path …")`. |
-| Information disclosure (e.g., `/etc/shadow` via `file` table) | Path filter still allows `/etc/shadow` if root-readable. Defense: path-based deny-list configurable in `[osquery] forbidden_paths` (`/etc/shadow`, `/proc/*/maps`, key files). |
+| Information disclosure (e.g., `/etc/shadow` via `file` table) | Path filter still allows `/etc/shadow` if root-readable. Defense: path-based deny-list configurable in `[sql] forbidden_paths` (`/etc/shadow`, `/proc/*/maps`, key files). |
 
 ## 9. CLI surface
 
 ```sh
-# Single-agent (default; today's osquery shape):
+# Single-agent (default; the slice-6 streaming Sql shape):
 bowery exec sql \
     --operator-key … --agent-addr … --agent-fp … --agent-pubkey-b64 … \
     --sql 'SELECT pid, name FROM processes LIMIT 5'
@@ -409,8 +413,9 @@ through CI; no slice leaves the agent broken.
 - Agent-side handler streams rows via per-row OperatorResult
   envelopes.
 - CLI-side streaming receive: print one row per envelope.
-- The `osquery` handler stays in place; operators choose via
-  `bowery exec sql` vs `bowery exec osquery`.
+- The `sysquery` (subprocess) handler stays in place; operators
+  choose via `bowery exec sql` (native) vs `bowery exec sysquery`
+  (subprocess).
 
 ### Slice 7 — Multi-agent fan-out (2 weeks)
 
@@ -431,15 +436,15 @@ through CI; no slice leaves the agent broken.
   manifest.
 - `--format=table` table renderer.
 - Bonus tables: `bowery_peers`, `bowery_baseline_binaries`,
-  `bowery_alerts`, `bowery_audit` — the queries that osquery
-  could never have exposed.
+  `bowery_alerts`, `bowery_audit` — Bowery-internal state no
+  third-party SQL surface can reach.
 - `bowery doctor` learns to run a smoke query (`SELECT 1`) so
   operators can verify the SQL surface is alive.
 
-**Total: ~10 weeks, ~12k LOC, 8 commits.** The osquery handler
-stays as a deprecated path the entire time; operators can
-switch to `bowery exec sql` whenever Slice 6 lands and never
-look back.
+**Total: ~10 weeks, ~12k LOC, 8 commits.** The sysquery
+(subprocess) handler stays alongside the entire time; once
+slice 6 lands, operators choose between `bowery exec sql` (native)
+and `bowery exec sysquery` (wider third-party-binary table set).
 
 ## 11. Open questions
 
@@ -474,9 +479,10 @@ look back.
 | Code | ~12k LOC of Rust |
 | New crates | 3 (`bowery-sql`, `bowery-tables`, `bowery-stream`) |
 | Wire-format additions | 2 command bodies, 2 result bodies, 1 forwarded envelope field |
-| Existing-test impact | low — slice 6 swaps agent config to opt into native engine; osquery tests stay green |
-| Removed code (eventually) | `bowery-osquery` crate (~400 LOC) and its config knob |
+| Existing-test impact | low — native engine ships alongside; sysquery tests stay green |
+| Removed code (eventually) | `bowery-sysquery` crate (~400 LOC) and its config knob, once the native table set covers operator needs |
 
-Trigger to start: the osquery bundle in production growing past
-40 MB, or operator workflows starting to want the Bowery-native
+Trigger to start: the bundled subprocess binary in production
+growing past 40 MB, or operator workflows starting to want the
+Bowery-native
 tables (§4.1).

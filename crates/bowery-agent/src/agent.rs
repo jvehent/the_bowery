@@ -123,7 +123,7 @@ pub enum AgentEvent {
     },
     /// Phase 6b: an operator command was received, dispatched, and a
     /// result was sealed back. `kind` is the command-body
-    /// discriminator (`"osquery"`, etc.) for ops dashboards.
+    /// discriminator (`"sql"`, `"sysquery"`, etc.) for ops dashboards.
     OperatorCommandHandled {
         operator: Fingerprint,
         request_id: String,
@@ -366,25 +366,27 @@ impl Agent {
             shutdown_rx.clone(),
         );
 
-        // Phase-6b operator-command router. Build the osquery handle
-        // only when the operator has explicitly opted in *and* the
-        // binary resolves; otherwise commands fail-shut with
-        // policy_denied at dispatch time.
-        let osquery_handle = if config.osquery.enabled {
-            match bowery_osquery::Osquery::new(&config.osquery.binary_path) {
+        // Phase-6b operator-command router. Build the sysquery
+        // handle only when the operator has explicitly opted in *and*
+        // the binary resolves; otherwise sysquery commands fail-shut
+        // with policy_denied at dispatch time. The native SQL engine
+        // (bowery-sql) is always wired — no external dependency to
+        // gate.
+        let sysquery_handle = if config.sysquery.enabled {
+            match bowery_sysquery::Sysquery::new(&config.sysquery.binary_path) {
                 Ok(o) => {
                     info!(
-                        binary = %config.osquery.binary_path.display(),
-                        max_timeout = ?config.osquery.max_timeout,
-                        "osquery handler enabled"
+                        binary = %config.sysquery.binary_path.display(),
+                        max_timeout = ?config.sysquery.max_timeout,
+                        "sysquery handler enabled"
                     );
                     Some(Arc::new(o))
                 }
                 Err(e) => {
                     warn!(
                         error = %e,
-                        binary = %config.osquery.binary_path.display(),
-                        "osquery enabled in config but binary not found; \
+                        binary = %config.sysquery.binary_path.display(),
+                        "sysquery enabled in config but binary not found; \
                          dispatch will return policy_denied"
                     );
                     None
@@ -394,9 +396,9 @@ impl Agent {
             None
         };
         let op_router = Arc::new(OperatorCommandRouter {
-            osquery: osquery_handle,
+            sysquery: sysquery_handle,
             sql: Some(Arc::new(bowery_sql::Sql::new())),
-            max_timeout: config.osquery.max_timeout,
+            max_timeout: config.sysquery.max_timeout,
         });
 
         let accept_task = spawn_accept_task(
@@ -675,9 +677,10 @@ type ResolverArc = Arc<CompositeResolver<Arc<KnownNeighbors>, Arc<StaticResolver
 /// `policy_denied` instead of being dispatched.
 #[derive(Clone, Default)]
 pub(crate) struct OperatorCommandRouter {
-    /// Phase-6b osquery handler. Some when [`OsqueryConfig::enabled`]
-    /// is true and `binary_path` resolves at startup.
-    pub osquery: Option<Arc<bowery_osquery::Osquery>>,
+    /// Phase-6b sysquery (subprocess) handler. Some when
+    /// [`SysqueryConfig::enabled`] is true and `binary_path`
+    /// resolves at startup.
+    pub sysquery: Option<Arc<bowery_sysquery::Sysquery>>,
     /// Phase-9 native SQL engine. Always populated — `bowery-sql`
     /// has no privileged surface and no external dependencies, so
     /// there's nothing to gate. `Arc` makes the engine
@@ -897,8 +900,9 @@ async fn respond_to_subscribe(
 /// 1. Decodes the typed command body. An empty `command` field
 ///    surfaces as `unsupported_command` so the operator's CLI sees
 ///    the wire-level mismatch rather than a silent timeout.
-/// 2. Dispatches to the per-command handler (osquery for now;
-///    future commands add new arms).
+/// 2. Dispatches to the per-command handler (`Sql` against the
+///    native engine, `Sysquery` against an optional subprocess
+///    binary; future commands add new arms).
 /// 3. Builds an [`OperatorResult`] echoing the `request_id`, seals
 ///    it back to the operator, and emits an event.
 ///
@@ -914,12 +918,12 @@ async fn respond_to_operator_command(
     events_tx: &broadcast::Sender<AgentEvent>,
 ) -> Result<(), bowery_whisper::transport::Error> {
     use bowery_proto::{
-        OperatorCommandBody, OperatorError, OperatorResult, OperatorResultBody, OsqueryResult,
+        OperatorCommandBody, OperatorError, OperatorResult, OperatorResultBody, SysqueryResult,
     };
 
     let request_id = cmd.request_id.clone();
     let command_kind = match cmd.command.as_ref() {
-        Some(OperatorCommandBody::Osquery(_)) => "osquery",
+        Some(OperatorCommandBody::Sysquery(_)) => "sysquery",
         Some(OperatorCommandBody::Sql(_)) => "sql",
         None => "<empty>",
     };
@@ -963,16 +967,16 @@ async fn respond_to_operator_command(
 
     let result = match cmd.command {
         Some(OperatorCommandBody::Sql(_)) => unreachable!("handled above"),
-        Some(OperatorCommandBody::Osquery(q)) => match &op_router.osquery {
-            Some(osq) => match osq.run(&q.sql, effective_timeout).await {
-                Ok(out) => OperatorResultBody::Osquery(OsqueryResult {
+        Some(OperatorCommandBody::Sysquery(q)) => match &op_router.sysquery {
+            Some(sysq) => match sysq.run(&q.sql, effective_timeout).await {
+                Ok(out) => OperatorResultBody::Sysquery(SysqueryResult {
                     json: out.stdout,
                     exit_code: out.exit_code,
                 }),
                 Err(e) => {
                     let kind = match &e {
-                        bowery_osquery::OsqueryError::Timeout(_) => "timeout",
-                        bowery_osquery::OsqueryError::OutputTooLarge { .. } => "output_too_large",
+                        bowery_sysquery::SysqueryError::Timeout(_) => "timeout",
+                        bowery_sysquery::SysqueryError::OutputTooLarge { .. } => "output_too_large",
                         _ => "handler_error",
                     };
                     OperatorResultBody::Error(OperatorError {
@@ -983,7 +987,8 @@ async fn respond_to_operator_command(
             },
             None => OperatorResultBody::Error(OperatorError {
                 kind: "policy_denied".into(),
-                message: "osquery not enabled on this agent (set [osquery] enabled = true)".into(),
+                message: "sysquery not enabled on this agent (set [sysquery] enabled = true)"
+                    .into(),
             }),
         },
         None => OperatorResultBody::Error(OperatorError {
