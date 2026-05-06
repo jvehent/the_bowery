@@ -425,6 +425,7 @@ impl Cli {
                     .enable_all()
                     .build()
                     .context("building tokio runtime")?;
+                let mut sink = exec::make_stdout_sink(format, fanout);
                 runtime.block_on(exec::sql(
                     operator_key,
                     agent_addr,
@@ -434,7 +435,7 @@ impl Cli {
                     sql,
                     timeout,
                     fanout,
-                    format,
+                    sink.as_mut(),
                 ))?;
                 Ok(ExitCode::SUCCESS)
             }

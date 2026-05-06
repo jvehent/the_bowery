@@ -52,13 +52,18 @@ impl std::fmt::Display for SqlFormat {
     }
 }
 
-/// Send a single Phase-9 SQL query and stream the rows back. Each
-/// chunk envelope arrives on its own QUIC stream; the loop
-/// terminates on the first chunk with `end = true` or on an
-/// `Error` body. The exchange-level deadline is the operator-
-/// supplied timeout plus a small slack — the agent enforces its
-/// own timeout server-side and is the authority on "how long
-/// before this query is killed".
+/// Send a single Phase-9 SQL query and stream the rows back into
+/// the caller-provided `sink`. Each chunk envelope arrives on its
+/// own QUIC stream; the loop terminates on the first chunk with
+/// `end = true` (single-agent mode) or on connection close (fanout
+/// mode). The exchange-level deadline is the operator-supplied
+/// timeout plus a small slack — the agent enforces its own timeout
+/// server-side and is the authority on "how long before this query
+/// is killed".
+///
+/// `sink` is `&mut dyn SqlSink` so callers can pick the rendering:
+/// [`make_stdout_sink`] for the CLI, [`CollectSink`] for the
+/// ncurses console.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn sql(
     operator_key: PathBuf,
@@ -69,7 +74,7 @@ pub async fn sql(
     sql: String,
     timeout: Duration,
     fanout: bool,
-    format: SqlFormat,
+    sink: &mut dyn SqlSink,
 ) -> Result<()> {
     let identity = Arc::new(
         Identity::load(&operator_key)
@@ -155,7 +160,6 @@ pub async fn sql(
     let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
 
     let exchange_timeout = timeout + Duration::from_secs(2);
-    let mut sink = make_sink(format, fanout);
     let exchange = async {
         conn.send_envelope(&outbound)
             .await
@@ -247,13 +251,19 @@ pub async fn sql(
 /// Output sink for SQL rows. Streaming sinks (`tsv`, `json`) print
 /// directly in `header`/`row`; the buffered `table` sink defers
 /// every print until `finish` so it can compute column widths.
-trait SqlSink {
+///
+/// Public so the ncurses console can plug in [`CollectSink`] (which
+/// stashes rows in memory for ratatui rendering) instead of writing
+/// to stdout.
+pub trait SqlSink: Send {
     fn header(&mut self, columns: &[String]);
     fn row(&mut self, columns: &[String], agent_fp: &[u8], row: &SqlRow);
     fn finish(&mut self);
 }
 
-fn make_sink(format: SqlFormat, fanout: bool) -> Box<dyn SqlSink> {
+/// Construct the right stdout-rendering sink for the operator CLI's
+/// `--format` flag.
+pub fn make_stdout_sink(format: SqlFormat, fanout: bool) -> Box<dyn SqlSink> {
     match format {
         SqlFormat::Tsv => Box::new(TsvSink {
             printed_header: false,
@@ -269,6 +279,44 @@ fn make_sink(format: SqlFormat, fanout: bool) -> Box<dyn SqlSink> {
             fanout,
         }),
     }
+}
+
+/// One row collected from the wire — used by [`CollectSink`].
+#[derive(Debug, Clone)]
+pub struct CollectedRow {
+    /// Fingerprint of the agent that produced this row. Empty for
+    /// single-agent mode.
+    pub agent_fp: Vec<u8>,
+    /// The row's columnar values, in the order declared by the
+    /// matching [`CollectSink::columns`] entry.
+    pub values: Vec<bowery_proto::SqlValue>,
+}
+
+/// In-memory sink — accumulates the column header (set on the first
+/// chunk; subsequent chunks reuse it) and every row. Used by the
+/// ncurses console so it can paint the table after the stream
+/// closes.
+#[derive(Debug, Default)]
+pub struct CollectSink {
+    /// Column names. Set from the first chunk that declares them;
+    /// kept stable for the rest of the stream.
+    pub columns: Vec<String>,
+    pub rows: Vec<CollectedRow>,
+}
+
+impl SqlSink for CollectSink {
+    fn header(&mut self, columns: &[String]) {
+        if self.columns.is_empty() {
+            self.columns = columns.to_vec();
+        }
+    }
+    fn row(&mut self, _columns: &[String], agent_fp: &[u8], row: &SqlRow) {
+        self.rows.push(CollectedRow {
+            agent_fp: agent_fp.to_vec(),
+            values: row.values.clone(),
+        });
+    }
+    fn finish(&mut self) {}
 }
 
 struct TsvSink {

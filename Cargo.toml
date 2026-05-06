@@ -5,6 +5,7 @@ members = [
     "crates/bowery-analysis",
     "crates/bowery-baseline",
     "crates/bowery-cli",
+    "crates/bowery-console",
     "crates/bowery-crypto",
     "crates/bowery-ebpf-loader",
     "crates/bowery-events",
@@ -35,6 +36,7 @@ readme = "README.md"
 # Internal
 bowery-analysis = { path = "crates/bowery-analysis", version = "0.0.1" }
 bowery-baseline = { path = "crates/bowery-baseline", version = "0.0.1" }
+bowery-cli = { path = "crates/bowery-cli", version = "0.0.1" }
 bowery-crypto = { path = "crates/bowery-crypto", version = "0.0.1" }
 bowery-ebpf-loader = { path = "crates/bowery-ebpf-loader", version = "0.0.1" }
 bowery-events = { path = "crates/bowery-events", version = "0.0.1" }
