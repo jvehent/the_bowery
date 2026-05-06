@@ -20,6 +20,9 @@ use tokio::sync::mpsc;
 
 use crate::input::{InputAction, InputState};
 use crate::palette::PaletteCommand;
+use crate::panes::alerts::AlertsPane;
+use crate::panes::audit::AuditPane;
+use crate::panes::peers::PeersPane;
 use crate::panes::query::QueryPane;
 use crate::panes::{PaneId, stub};
 use crate::theme;
@@ -56,6 +59,14 @@ pub(crate) enum EngineEvent {
         result: Result<CollectSink, String>,
         latency: Duration,
     },
+    AlertsBatch {
+        items: Vec<bowery_proto::Alert>,
+        cursor_unix_ms: u64,
+    },
+    AlertsError(String),
+    AuditDone {
+        result: Result<CollectSink, String>,
+    },
 }
 
 pub(crate) struct App {
@@ -65,6 +76,9 @@ pub(crate) struct App {
 
     pub(crate) current_pane: PaneId,
     pub(crate) query_pane: QueryPane,
+    pub(crate) alerts_pane: AlertsPane,
+    pub(crate) audit_pane: AuditPane,
+    pub(crate) peers_pane: PeersPane,
 
     pub(crate) input: InputState,
     pub(crate) input_mode: InputMode,
@@ -89,6 +103,9 @@ impl App {
             },
             current_pane: PaneId::Query,
             query_pane: QueryPane::new(),
+            alerts_pane: AlertsPane::new(),
+            audit_pane: AuditPane::new(),
+            peers_pane: PeersPane::new(),
             input: InputState::new(),
             input_mode: InputMode::Pane,
             status_message: None,
@@ -137,8 +154,16 @@ impl App {
             {
                 if let Some(p) = PaneId::from_hotkey(c) {
                     self.current_pane = p;
+                    self.activate_pane();
                     return;
                 }
+            }
+            // Pane-specific hotkeys (only when input buffer empty).
+            (KeyCode::Char('r'), KeyModifiers::NONE)
+                if matches!(self.input_mode, InputMode::Pane) && self.input.buffer.is_empty() =>
+            {
+                self.refresh_current_pane();
+                return;
             }
             (KeyCode::Char(':'), KeyModifiers::NONE)
                 if matches!(self.input_mode, InputMode::Pane) && self.input.buffer.is_empty() =>
@@ -217,15 +242,58 @@ impl App {
         }
     }
 
+    fn activate_pane(&mut self) {
+        match self.current_pane {
+            PaneId::Alerts => {
+                self.alerts_pane.ensure_poller(
+                    self.relay.clone(),
+                    self.operator_key.clone(),
+                    self.engine_tx.clone(),
+                );
+            }
+            PaneId::Audit => {
+                self.audit_pane.ensure_loaded(
+                    self.relay.clone(),
+                    self.operator_key.clone(),
+                    self.engine_tx.clone(),
+                );
+            }
+            PaneId::Peers => {
+                self.peers_pane.reload();
+            }
+            _ => {}
+        }
+    }
+
+    fn refresh_current_pane(&mut self) {
+        match self.current_pane {
+            PaneId::Audit => {
+                self.audit_pane.refresh(
+                    self.relay.clone(),
+                    self.operator_key.clone(),
+                    self.engine_tx.clone(),
+                );
+            }
+            PaneId::Peers => {
+                self.peers_pane.reload();
+            }
+            _ => {}
+        }
+    }
+
     fn handle_engine_event(&mut self, ev: EngineEvent) {
         match ev {
             EngineEvent::QueryDone {
                 sql,
                 result,
                 latency,
-            } => {
-                self.query_pane.on_done(sql, result, latency);
-            }
+            } => self.query_pane.on_done(sql, result, latency),
+            EngineEvent::AlertsBatch {
+                items,
+                cursor_unix_ms,
+            } => self.alerts_pane.on_batch(items, cursor_unix_ms),
+            EngineEvent::AlertsError(e) => self.alerts_pane.on_error(e),
+            EngineEvent::AuditDone { result } => self.audit_pane.on_done(result),
         }
     }
 
@@ -280,9 +348,9 @@ impl App {
     fn render_pane(&self, f: &mut Frame<'_>, area: Rect) {
         match self.current_pane {
             PaneId::Query => self.query_pane.render(f, area),
-            PaneId::Alerts => stub::render(f, area, "Alerts", "C-3"),
-            PaneId::Audit => stub::render(f, area, "Audit", "C-3"),
-            PaneId::Peers => stub::render(f, area, "Peers", "C-3"),
+            PaneId::Alerts => self.alerts_pane.render(f, area),
+            PaneId::Audit => self.audit_pane.render(f, area),
+            PaneId::Peers => self.peers_pane.render(f, area),
             PaneId::Doctor => stub::render(f, area, "Doctor", "C-4"),
             PaneId::Map => stub::render(f, area, "Map", "C-5"),
         }

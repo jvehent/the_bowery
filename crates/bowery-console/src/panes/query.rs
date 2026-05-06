@@ -232,7 +232,7 @@ fn render_table(f: &mut Frame<'_>, area: Rect, sink: &CollectSink) {
     f.render_widget(table, area);
 }
 
-fn render_value(v: &bowery_proto::SqlValue) -> String {
+pub(crate) fn render_value(v: &bowery_proto::SqlValue) -> String {
     match &v.value {
         Some(SqlValueKind::Integer(i)) => i.to_string(),
         Some(SqlValueKind::Real(r)) => format!("{r}"),

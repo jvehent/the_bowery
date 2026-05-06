@@ -20,8 +20,77 @@ use bowery_whisper::{Sealer, StaticResolver, Verifier};
 use ed25519_dalek::VerifyingKey;
 use tokio::time::sleep;
 
-/// Drain the inbox once and return the cursor for the next call.
-#[allow(clippy::too_many_arguments)] // explicit binding from the CLI subcommand
+/// Drain the inbox once and return `(alerts, new_cursor)`. Library
+/// API used by the ncurses console — the binary's `tail` loop is a
+/// thin wrapper around this.
+pub async fn poll_once(
+    operator_key: &std::path::Path,
+    target_addr: SocketAddr,
+    target_fp_hex: &str,
+    target_pubkey_b64: &str,
+    since_unix_ms: u64,
+) -> Result<(Vec<Alert>, u64)> {
+    let identity = Arc::new(
+        Identity::load(operator_key)
+            .with_context(|| format!("loading operator key from {}", operator_key.display()))?,
+    );
+
+    let target_fp = parse_fingerprint(target_fp_hex)?;
+    let target_vk = parse_verifying_key(target_pubkey_b64)?;
+    let mut resolver = StaticResolver::new();
+    let inserted_fp = resolver.insert(target_vk);
+    if inserted_fp != target_fp {
+        bail!("target_pubkey_b64 fingerprint {inserted_fp} doesn't match --target-fp {target_fp}");
+    }
+    let resolver = Arc::new(resolver);
+
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
+    let endpoint = BoweryEndpoint::bind(identity.clone(), accept_verifier, bind_addr)
+        .context("binding operator-side endpoint")?;
+
+    let operator_fp = identity.fingerprint();
+    let sealer = Sealer::new(identity);
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
+
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), target_fp));
+    let conn = endpoint
+        .dial(dial_verifier, target_addr)
+        .await
+        .with_context(|| format!("dialing agent at {target_addr}"))?;
+
+    let outbound = sealer.seal_for(
+        &target_fp,
+        &WhisperPayload::subscribe(Subscribe {
+            since_unix_ms,
+            max_items: 0,
+        }),
+    );
+    conn.send_envelope(&outbound)
+        .await
+        .context("sending Subscribe")?;
+    let bytes = conn
+        .recv_envelope()
+        .await
+        .context("awaiting Alerts response")?;
+    let opened = envelope_verifier
+        .open(&bytes)
+        .context("verifying Alerts envelope")?;
+
+    let alerts_payload = match opened.payload.body {
+        Some(Body::Alerts(a)) => a,
+        other => bail!("agent replied with unexpected body: {other:?}"),
+    };
+    drop(conn);
+    endpoint.close().await;
+    let _ = std::any::type_name::<KnownNeighbors>();
+
+    Ok((alerts_payload.items, alerts_payload.cursor_unix_ms))
+}
+
+/// Binary-side wrapper: drain the inbox and print to stdout. Loops
+/// on `poll_interval` when `follow` is set.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     operator_key: PathBuf,
     target_addr: SocketAddr,
@@ -32,90 +101,27 @@ pub async fn run(
     poll_interval: Duration,
     json: bool,
 ) -> Result<()> {
-    let identity = Arc::new(
-        Identity::load(&operator_key)
-            .with_context(|| format!("loading operator key from {}", operator_key.display()))?,
-    );
-
-    let target_fp = parse_fingerprint(&target_fp_hex)?;
-    let target_vk = parse_verifying_key(&target_pubkey_b64)?;
-    let mut resolver = StaticResolver::new();
-    let inserted_fp = resolver.insert(target_vk);
-    if inserted_fp != target_fp {
-        bail!("target_pubkey_b64 fingerprint {inserted_fp} doesn't match --target-fp {target_fp}");
-    }
-    let resolver = Arc::new(resolver);
-
-    // Bind a transient endpoint on a loopback ephemeral port; we never
-    // accept incoming on the operator side.
-    // Bind on loopback only — the operator endpoint never accepts
-    // inbound (it just dials), so exposing on all interfaces would
-    // be unnecessary attack surface.
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
-    let endpoint = BoweryEndpoint::bind(identity.clone(), accept_verifier, bind_addr)
-        .context("binding operator-side endpoint")?;
-
-    let operator_fp = identity.fingerprint();
-    let sealer = Sealer::new(identity);
-    // Operator's own fp is required for the recipient-binding signing
-    // input on inbound envelopes. The agent signs its Alerts response
-    // for this operator specifically (Phase-8 H1).
-    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
-
     let mut cursor = since_unix_ms;
     loop {
-        let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), target_fp));
-        let conn = endpoint
-            .dial(dial_verifier, target_addr)
-            .await
-            .with_context(|| format!("dialing agent at {target_addr}"))?;
-
-        let outbound = sealer.seal_for(
-            &target_fp,
-            &WhisperPayload::subscribe(Subscribe {
-                since_unix_ms: cursor,
-                max_items: 0,
-            }),
-        );
-        conn.send_envelope(&outbound)
-            .await
-            .context("sending Subscribe")?;
-        let bytes = conn
-            .recv_envelope()
-            .await
-            .context("awaiting Alerts response")?;
-        let opened = envelope_verifier
-            .open(&bytes)
-            .context("verifying Alerts envelope")?;
-
-        let alerts = match opened.payload.body {
-            Some(Body::Alerts(a)) => a,
-            other => bail!("agent replied with unexpected body: {other:?}"),
-        };
-
-        for alert in &alerts.items {
+        let (items, next_cursor) = poll_once(
+            &operator_key,
+            target_addr,
+            &target_fp_hex,
+            &target_pubkey_b64,
+            cursor,
+        )
+        .await?;
+        for alert in &items {
             if json {
                 println!("{}", alert_to_json(alert));
             } else {
                 print_human(alert);
             }
         }
-
-        cursor = alerts.cursor_unix_ms;
-
+        cursor = next_cursor;
         if !follow {
-            // KnownNeighbors-style cleanup: drop the connection so the
-            // agent can release the per-conn resources promptly.
-            drop(conn);
-            endpoint.close().await;
-            // Suppress unused-variable warning for the rare KnownNeighbors
-            // import we'll need in later phases (operator-side TOFU).
-            let _ = std::any::type_name::<KnownNeighbors>();
             return Ok(());
         }
-
-        drop(conn);
         sleep(poll_interval).await;
     }
 }
