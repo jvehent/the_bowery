@@ -22,8 +22,9 @@ use crate::input::{InputAction, InputState};
 use crate::palette::PaletteCommand;
 use crate::panes::alerts::AlertsPane;
 use crate::panes::audit::AuditPane;
+use crate::panes::doctor::DoctorPane;
 use crate::panes::peers::PeersPane;
-use crate::panes::query::QueryPane;
+use crate::panes::query::{QueryPane, QueryStatus};
 use crate::panes::{PaneId, stub};
 use crate::theme;
 
@@ -67,6 +68,7 @@ pub(crate) enum EngineEvent {
     AuditDone {
         result: Result<CollectSink, String>,
     },
+    DoctorRemoteDone(Result<Duration, String>),
 }
 
 pub(crate) struct App {
@@ -79,6 +81,7 @@ pub(crate) struct App {
     pub(crate) alerts_pane: AlertsPane,
     pub(crate) audit_pane: AuditPane,
     pub(crate) peers_pane: PeersPane,
+    pub(crate) doctor_pane: DoctorPane,
 
     pub(crate) input: InputState,
     pub(crate) input_mode: InputMode,
@@ -106,7 +109,8 @@ impl App {
             alerts_pane: AlertsPane::new(),
             audit_pane: AuditPane::new(),
             peers_pane: PeersPane::new(),
-            input: InputState::new(),
+            doctor_pane: DoctorPane::new(),
+            input: load_history_into_input(),
             input_mode: InputMode::Pane,
             status_message: None,
             should_quit: false,
@@ -236,6 +240,38 @@ impl App {
                     self.status_message = Some(format!("relay fp → {target} (addr unchanged)"));
                 }
             }
+            Ok(PaletteCommand::PeersReload) => {
+                self.peers_pane.reload();
+                self.status_message = Some("peers manifest reloaded".into());
+            }
+            Ok(PaletteCommand::PeersAdd {
+                name,
+                fp,
+                pubkey_b64,
+            }) => {
+                self.status_message = Some(match peers_add(&name, &fp, &pubkey_b64) {
+                    Ok(()) => {
+                        self.peers_pane.reload();
+                        format!("added peer {name}")
+                    }
+                    Err(e) => format!("peers add failed: {e:#}"),
+                });
+            }
+            Ok(PaletteCommand::PeersRemove { fp }) => {
+                self.status_message = Some(match peers_remove(&fp) {
+                    Ok(()) => {
+                        self.peers_pane.reload();
+                        format!("removed peer {fp}")
+                    }
+                    Err(e) => format!("peers remove failed: {e:#}"),
+                });
+            }
+            Ok(PaletteCommand::ExportQuery { path }) => {
+                self.status_message = Some(match export_query(&self.query_pane.status, &path) {
+                    Ok(n) => format!("exported {n} rows to {path}"),
+                    Err(e) => format!("export failed: {e:#}"),
+                });
+            }
             Err(e) => {
                 self.status_message = Some(e);
             }
@@ -261,6 +297,13 @@ impl App {
             PaneId::Peers => {
                 self.peers_pane.reload();
             }
+            PaneId::Doctor if self.doctor_pane.local.is_none() => {
+                self.doctor_pane.refresh(
+                    self.relay.clone(),
+                    self.operator_key.clone(),
+                    self.engine_tx.clone(),
+                );
+            }
             _ => {}
         }
     }
@@ -276,6 +319,13 @@ impl App {
             }
             PaneId::Peers => {
                 self.peers_pane.reload();
+            }
+            PaneId::Doctor => {
+                self.doctor_pane.refresh(
+                    self.relay.clone(),
+                    self.operator_key.clone(),
+                    self.engine_tx.clone(),
+                );
             }
             _ => {}
         }
@@ -294,6 +344,7 @@ impl App {
             } => self.alerts_pane.on_batch(items, cursor_unix_ms),
             EngineEvent::AlertsError(e) => self.alerts_pane.on_error(e),
             EngineEvent::AuditDone { result } => self.audit_pane.on_done(result),
+            EngineEvent::DoctorRemoteDone(result) => self.doctor_pane.on_remote_done(result),
         }
     }
 
@@ -351,7 +402,7 @@ impl App {
             PaneId::Alerts => self.alerts_pane.render(f, area),
             PaneId::Audit => self.audit_pane.render(f, area),
             PaneId::Peers => self.peers_pane.render(f, area),
-            PaneId::Doctor => stub::render(f, area, "Doctor", "C-4"),
+            PaneId::Doctor => self.doctor_pane.render(f, area),
             PaneId::Map => stub::render(f, area, "Map", "C-5"),
         }
     }
@@ -380,4 +431,111 @@ impl App {
         let y = inner.y;
         f.set_cursor_position((x.min(inner.x + inner.width.saturating_sub(1)), y));
     }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Persist input history on every clean exit (Ctrl-C / :quit /
+        // panic-after-restore). Best-effort: a write failure shouldn't
+        // crash the operator's terminal teardown, so we ignore errors.
+        let _ = save_history(&self.input.history);
+    }
+}
+
+fn history_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".bowery")
+            .join("console-history"),
+    )
+}
+
+fn load_history_into_input() -> InputState {
+    let mut state = InputState::new();
+    if let Some(path) = history_path()
+        && let Ok(contents) = std::fs::read_to_string(&path)
+    {
+        state.history = contents
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    state
+}
+
+fn save_history(history: &[String]) -> std::io::Result<()> {
+    let Some(path) = history_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = history.join("\n");
+    std::fs::write(path, body)
+}
+
+fn peers_add(name: &str, fp: &str, pubkey_b64: &str) -> anyhow::Result<()> {
+    let path = bowery_cli::peers::default_path()?;
+    bowery_cli::peers::add(&path, name, fp, pubkey_b64)
+}
+
+fn peers_remove(fp: &str) -> anyhow::Result<()> {
+    let path = bowery_cli::peers::default_path()?;
+    bowery_cli::peers::remove(&path, fp)
+}
+
+fn export_query(status: &QueryStatus, path: &str) -> anyhow::Result<usize> {
+    use std::io::Write as _;
+    let QueryStatus::Rendered { result, .. } = status else {
+        anyhow::bail!("no rendered query result to export — run a query first");
+    };
+    let mut file = std::fs::File::create(path)?;
+    // First line: column-name array.
+    let cols: Vec<String> = result
+        .columns
+        .iter()
+        .map(|c| format!("\"{}\"", json_escape(c)))
+        .collect();
+    writeln!(file, "[{}]", cols.join(","))?;
+    for row in &result.rows {
+        let mut parts: Vec<String> = Vec::with_capacity(row.values.len());
+        for (i, v) in row.values.iter().enumerate() {
+            let key = result.columns.get(i).map_or("col", String::as_str);
+            parts.push(format!("\"{}\":{}", json_escape(key), value_to_json(v)));
+        }
+        writeln!(file, "{{{}}}", parts.join(","))?;
+    }
+    Ok(result.rows.len())
+}
+
+fn value_to_json(v: &bowery_proto::SqlValue) -> String {
+    use bowery_proto::SqlValueKind;
+    match &v.value {
+        Some(SqlValueKind::Integer(i)) => i.to_string(),
+        Some(SqlValueKind::Real(r)) => r.to_string(),
+        Some(SqlValueKind::Text(s)) => format!("\"{}\"", json_escape(s)),
+        Some(SqlValueKind::Blob(b)) => format!("\"<{} bytes>\"", b.len()),
+        None => "null".into(),
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }

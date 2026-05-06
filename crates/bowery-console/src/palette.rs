@@ -16,6 +16,23 @@ pub(crate) enum PaletteCommand {
         addr: Option<String>,
     },
     Quit,
+    /// `:peers add <name> <fp_hex> <pubkey_b64>`
+    PeersAdd {
+        name: String,
+        fp: String,
+        pubkey_b64: String,
+    },
+    /// `:peers remove <fp_hex>`
+    PeersRemove {
+        fp: String,
+    },
+    /// `:peers reload` — re-read `~/.bowery/peers.toml` from disk.
+    PeersReload,
+    /// `:export query <path>` — dump the Query pane's last result
+    /// to `<path>` as one JSON object per row.
+    ExportQuery {
+        path: String,
+    },
 }
 
 impl PaletteCommand {
@@ -33,6 +50,60 @@ impl PaletteCommand {
                 Ok(Self::Connect { target, addr })
             }
             "quit" | "q" => Ok(Self::Quit),
+            "peers" => {
+                let sub = parts
+                    .next()
+                    .ok_or_else(|| "usage: :peers {add|remove|reload}".to_string())?;
+                match sub {
+                    "reload" => Ok(Self::PeersReload),
+                    "add" => {
+                        let name = parts
+                            .next()
+                            .ok_or_else(|| {
+                                "usage: :peers add <name> <fp> <pubkey_b64>".to_string()
+                            })?
+                            .to_string();
+                        let fp = parts
+                            .next()
+                            .ok_or_else(|| {
+                                "usage: :peers add <name> <fp> <pubkey_b64>".to_string()
+                            })?
+                            .to_string();
+                        let pubkey_b64 = parts
+                            .next()
+                            .ok_or_else(|| {
+                                "usage: :peers add <name> <fp> <pubkey_b64>".to_string()
+                            })?
+                            .to_string();
+                        Ok(Self::PeersAdd {
+                            name,
+                            fp,
+                            pubkey_b64,
+                        })
+                    }
+                    "remove" => {
+                        let fp = parts
+                            .next()
+                            .ok_or_else(|| "usage: :peers remove <fp>".to_string())?
+                            .to_string();
+                        Ok(Self::PeersRemove { fp })
+                    }
+                    other => Err(format!("unknown :peers verb: {other}")),
+                }
+            }
+            "export" => {
+                let what = parts
+                    .next()
+                    .ok_or_else(|| "usage: :export query <path>".to_string())?;
+                if what != "query" {
+                    return Err(format!("unknown :export target: {what}"));
+                }
+                let path = parts
+                    .next()
+                    .ok_or_else(|| "usage: :export query <path>".to_string())?
+                    .to_string();
+                Ok(Self::ExportQuery { path })
+            }
             other => Err(format!("unknown command: :{other}")),
         }
     }
@@ -62,7 +133,7 @@ mod tests {
                 assert_eq!(target, "ab12");
                 assert_eq!(addr, Some("10.0.0.5:9902".into()));
             }
-            PaletteCommand::Quit => panic!("expected connect"),
+            other => panic!("expected connect, got {other:?}"),
         }
     }
 

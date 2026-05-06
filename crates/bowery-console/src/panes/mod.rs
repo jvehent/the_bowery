@@ -4,6 +4,7 @@
 
 pub(crate) mod alerts;
 pub(crate) mod audit;
+pub(crate) mod doctor;
 pub(crate) mod peers;
 pub(crate) mod query;
 pub(crate) mod stub;
