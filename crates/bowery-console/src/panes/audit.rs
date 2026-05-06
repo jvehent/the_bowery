@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use crate::app::{EngineEvent, Relay};
 use crate::theme;
 
-const SNAPSHOT_SQL: &str = "SELECT seq, action, outcome, recorded_at_unix \
+const SNAPSHOT_SQL: &str = "SELECT seq, ts_unix_ms, episode_id, action_id, outcome_kind \
                             FROM bowery_audit ORDER BY seq DESC LIMIT 200";
 
 #[derive(Debug, Default)]
