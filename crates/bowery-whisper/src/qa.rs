@@ -1,11 +1,19 @@
 //! Phase-5 whisper Q&A: end-to-end ask / answer over [`BoweryConnection`].
 //!
-//! Wire pattern (one connection, two unidirectional streams):
+//! Wire pattern (one bidirectional stream — pool slice 3 of the
+//! Phase-10 connection-reuse work):
 //! ```text
 //!   Asker                                       Responder
-//!     |  open_uni { sealed_question }   --->        |
-//!     |  <---- open_uni { sealed_answer }           |
+//!     |  open_bi { sealed_question }    --->        |
+//!     |  <-----  reply { sealed_answer }            |
 //! ```
+//!
+//! Bidi (instead of two uni streams) means both halves of the
+//! exchange ride a single Quinn stream, so the asker doesn't need a
+//! separate `accept_uni` reader to receive the response — and a
+//! pooled connection's inbound handler (which *also* runs
+//! `accept_uni` for peer-initiated whispers) doesn't compete with
+//! the asker for the reply.
 //!
 //! - Both sides reuse [`Sealer`] / [`Verifier`] for envelope crypto, so
 //!   Q&A inherits envelope signing, replay protection, clock-skew
@@ -147,8 +155,7 @@ pub async fn ask<R: FingerprintResolver>(
     let outbound = sealer.seal_for(&responder, &WhisperPayload::question(question));
 
     let exchange = async {
-        conn.send_envelope(&outbound).await?;
-        let answer_bytes = conn.recv_envelope().await?;
+        let answer_bytes = conn.request(&outbound).await?;
         let opened = verifier.open(&answer_bytes)?;
         let answer = match opened.payload.body {
             Some(Body::Answer(a)) => a,
@@ -205,7 +212,7 @@ where
     R: FingerprintResolver,
     F: FnOnce(Tier1Fingerprint) -> LocalSighting,
 {
-    let bytes = conn.recv_envelope().await?;
+    let (bytes, reply) = conn.accept_request().await?;
     let opened = verifier.open(&bytes)?;
     // Asker's fingerprint, recovered from the verified envelope. Used
     // as the recipient when sealing the Answer back to them
@@ -262,7 +269,7 @@ where
         note: note.to_string(),
     };
     let outbound = sealer.seal_for(&asker, &WhisperPayload::answer(answer));
-    conn.send_envelope(&outbound).await?;
+    reply.send(&outbound).await?;
     Ok(question)
 }
 

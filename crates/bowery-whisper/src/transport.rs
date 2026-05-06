@@ -198,6 +198,32 @@ pub struct BoweryConnection {
     inner: quinn::Connection,
 }
 
+/// Reply handle returned by [`BoweryConnection::accept_request`]. The
+/// responder owns the send-half of the bidi stream and writes exactly
+/// one length-prefixed reply on it.
+#[derive(Debug)]
+pub struct Reply {
+    send: quinn::SendStream,
+}
+
+impl Reply {
+    /// Write `reply_bytes` (length-prefixed) and close the send half.
+    pub async fn send(mut self, reply_bytes: &[u8]) -> Result<(), Error> {
+        let len = u32::try_from(reply_bytes.len()).map_err(|_| Error::FrameTooLarge(u32::MAX))?;
+        if reply_bytes.len() > MAX_FRAME_BYTES {
+            return Err(Error::FrameTooLarge(len));
+        }
+        self.send.write_all(&len.to_be_bytes()).await?;
+        self.send.write_all(reply_bytes).await?;
+        self.send.finish()?;
+        // Wait for the asker to consume our reply before letting the
+        // caller drop us. Mirrors the post-finish() stopped() in
+        // send_envelope.
+        let _ = self.send.stopped().await;
+        Ok(())
+    }
+}
+
 impl BoweryConnection {
     /// Send an opaque (already-sealed) envelope on a freshly opened
     /// unidirectional stream. Blocks until the peer has consumed the stream
@@ -232,6 +258,58 @@ impl BoweryConnection {
         let mut buf = vec![0u8; len as usize];
         recv.read_exact(&mut buf).await?;
         Ok(buf)
+    }
+
+    /// Open a bidirectional stream, write `request_bytes`
+    /// (length-prefixed), close the send half, then read exactly one
+    /// length-prefixed reply from the same stream. Used for whisper
+    /// Q&A — slice 3 of the connection-pool work — so request and
+    /// reply share a stream and the responder doesn't need to open a
+    /// new outbound uni stream that would race the dialler's
+    /// inbound-handler accept loop.
+    pub async fn request(&self, request_bytes: &[u8]) -> Result<Vec<u8>, Error> {
+        let len = u32::try_from(request_bytes.len()).map_err(|_| Error::FrameTooLarge(u32::MAX))?;
+        if request_bytes.len() > MAX_FRAME_BYTES {
+            return Err(Error::FrameTooLarge(len));
+        }
+        let (mut send, mut recv) = self.inner.open_bi().await?;
+        send.write_all(&len.to_be_bytes()).await?;
+        send.write_all(request_bytes).await?;
+        send.finish()?;
+
+        let mut reply_len_buf = [0u8; 4];
+        recv.read_exact(&mut reply_len_buf).await?;
+        let reply_len = u32::from_be_bytes(reply_len_buf);
+        if reply_len as usize > MAX_FRAME_BYTES {
+            return Err(Error::FrameTooLarge(reply_len));
+        }
+        let mut reply = vec![0u8; reply_len as usize];
+        recv.read_exact(&mut reply).await?;
+        // Quinn doesn't guarantee delivery once the underlying
+        // Connection is closed; wait for the responder to ack our
+        // send-half close so we know the request landed before the
+        // caller drops the connection. Any error here means the
+        // peer reset our stream — already a transport error from
+        // the read above so we ignore.
+        let _ = send.stopped().await;
+        Ok(reply)
+    }
+
+    /// Accept the next inbound bidirectional request stream. Returns
+    /// the request bytes plus a [`Reply`] handle the caller uses to
+    /// send exactly one reply on the same stream. Pairs with
+    /// [`Self::request`] on the asker side.
+    pub async fn accept_request(&self) -> Result<(Vec<u8>, Reply), Error> {
+        let (send, mut recv) = self.inner.accept_bi().await?;
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf);
+        if len as usize > MAX_FRAME_BYTES {
+            return Err(Error::FrameTooLarge(len));
+        }
+        let mut buf = vec![0u8; len as usize];
+        recv.read_exact(&mut buf).await?;
+        Ok((buf, Reply { send }))
     }
 
     /// Remote socket address.

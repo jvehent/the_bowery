@@ -29,9 +29,9 @@ use bowery_mesh::{Mesh, PeerInfo};
 use bowery_proto::BloomAdvert;
 use bowery_whisper::fingerprint::{BloomFilter, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::KnownNeighbors;
+use bowery_whisper::pool::PeerConnections;
 use bowery_whisper::qa::{self, AskError, LocalSighting};
 use bowery_whisper::tls::PinnedCertVerifier;
-use bowery_whisper::transport::BoweryEndpoint;
 use bowery_whisper::{Sealer, Verifier};
 use futures::future::join_all;
 use prost::Message as _;
@@ -145,7 +145,7 @@ pub fn aggregate_local_sighting(baseline: &Baseline, target: Tier1Fingerprint) -
 #[allow(clippy::too_many_arguments)] // keeps the wiring explicit at the call site
 pub(crate) fn spawn_whisper_qa_task(
     mut triggers: mpsc::Receiver<WhisperQaTrigger>,
-    endpoint: BoweryEndpoint,
+    pool: PeerConnections,
     kn: Arc<KnownNeighbors>,
     sealer: Arc<Sealer>,
     mesh: Arc<Mesh>,
@@ -161,7 +161,7 @@ pub(crate) fn spawn_whisper_qa_task(
             tokio::select! {
                 trigger = triggers.recv() => {
                     let Some(trigger) = trigger else { break };
-                    let endpoint = endpoint.clone();
+                    let pool = pool.clone();
                     let kn = kn.clone();
                     let sealer = sealer.clone();
                     let mesh = mesh.clone();
@@ -174,7 +174,7 @@ pub(crate) fn spawn_whisper_qa_task(
                     tokio::spawn(async move {
                         run_round(
                             trigger,
-                            endpoint,
+                            pool,
                             kn,
                             sealer,
                             mesh,
@@ -196,7 +196,7 @@ pub(crate) fn spawn_whisper_qa_task(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // intentionally one cohesive round
 async fn run_round(
     trigger: WhisperQaTrigger,
-    endpoint: BoweryEndpoint,
+    pool: PeerConnections,
     kn: Arc<KnownNeighbors>,
     sealer: Arc<Sealer>,
     mesh: Arc<Mesh>,
@@ -230,7 +230,7 @@ async fn run_round(
     // each peer's role vector. Peers without a published role vector
     // are skipped — without it we can't rank them, and we'd rather not
     // ask randomly.
-    let local_fp = endpoint.fingerprint();
+    let local_fp = pool.local_fingerprint();
     let mut candidates: Vec<(PeerInfo, RoleVector)> = Vec::new();
     for peer in mesh.peers() {
         if peer.fingerprint == local_fp {
@@ -305,14 +305,14 @@ async fn run_round(
     let asks = ranked
         .into_iter()
         .map(|(peer, similarity)| {
-            let endpoint = endpoint.clone();
+            let pool = pool.clone();
             let kn = kn.clone();
             let sealer = sealer.clone();
             let envelope_verifier = envelope_verifier.clone();
             let timeout = qa_cfg.timeout;
             async move {
                 let outcome = ask_one(
-                    &endpoint,
+                    &pool,
                     kn,
                     &sealer,
                     &envelope_verifier,
@@ -463,7 +463,7 @@ fn short_fp(fp: &Fingerprint) -> String {
 }
 
 async fn ask_one(
-    endpoint: &BoweryEndpoint,
+    pool: &PeerConnections,
     kn: Arc<KnownNeighbors>,
     sealer: &Sealer,
     envelope_verifier: &Verifier<Arc<KnownNeighbors>>,
@@ -472,12 +472,12 @@ async fn ask_one(
     timeout: Duration,
 ) -> Result<bowery_proto::Answer, AskError> {
     let dial_verifier = Arc::new(PinnedCertVerifier::expecting(kn, peer.fingerprint));
-    let conn = endpoint
-        .dial(dial_verifier, peer.whisper_addr)
+    let conn = pool
+        .get_or_dial(peer.fingerprint, peer.whisper_addr, dial_verifier)
         .await
         .map_err(AskError::Transport)?;
     let question = qa::build_question(tier1, timeout, "");
-    let answer = qa::ask(
+    let answer = match qa::ask(
         &conn,
         sealer,
         envelope_verifier,
@@ -485,7 +485,18 @@ async fn ask_one(
         question,
         timeout,
     )
-    .await?;
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            // Transport-shaped errors strongly suggest the cached
+            // connection is dead. Drop it so the next round redials.
+            if matches!(e, AskError::Transport(_)) {
+                pool.invalidate(&peer.fingerprint);
+            }
+            return Err(e);
+        }
+    };
     Ok(answer)
 }
 

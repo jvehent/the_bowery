@@ -165,6 +165,13 @@ impl PeerConnections {
         self.inner.state.lock().expect("pool mutex poisoned").len()
     }
 
+    /// Local fingerprint of the underlying endpoint — convenience
+    /// accessor so callers don't need to plumb a separate
+    /// `BoweryEndpoint` reference alongside the pool.
+    pub fn local_fingerprint(&self) -> Fingerprint {
+        self.inner.endpoint.fingerprint()
+    }
+
     /// `true` when no connections are pooled.
     pub fn is_empty(&self) -> bool {
         self.inner

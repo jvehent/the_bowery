@@ -486,7 +486,7 @@ impl Agent {
         let (whisper_qa_tx, whisper_qa_rx) = mpsc::channel::<WhisperQaTrigger>(64);
         let whisper_qa_task = spawn_whisper_qa_task(
             whisper_qa_rx,
-            endpoint.clone(),
+            peer_connections.clone(),
             known_neighbors.clone(),
             sealer.clone(),
             mesh.clone(),
@@ -848,6 +848,17 @@ fn spawn_accept_task(
     })
 }
 
+/// Spawn the per-connection accept loops. Run two parallel readers:
+///
+/// - **Uni stream loop.** Heartbeats, `Subscribe`, and `OperatorCommand`
+///   land here. Responses go back via fresh outbound uni streams.
+/// - **Bi stream loop (slice 3).** Whisper `Question` lands here.
+///   The reply rides the same bidi stream so it doesn't race the
+///   uni-loop's `accept_uni` for delivery.
+///
+/// Splitting the two readers means a pooled connection can receive
+/// peer-initiated whispers without the dialler's bi-loop racing its
+/// own `ask()` for the response — they use disjoint Quinn streams.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     conn: BoweryConnection,
@@ -855,6 +866,31 @@ async fn handle_connection(
     operators: Arc<StaticResolver>,
     sealer: Arc<Sealer>,
     baseline: Arc<Baseline>,
+    inbox: Arc<AlertInbox>,
+    op_router: Arc<OperatorCommandRouter>,
+    events_tx: broadcast::Sender<AgentEvent>,
+) {
+    let uni = tokio::spawn(handle_uni_stream_loop(
+        conn.clone(),
+        verifier.clone(),
+        operators.clone(),
+        sealer.clone(),
+        inbox,
+        op_router,
+        events_tx.clone(),
+    ));
+    let bi = tokio::spawn(handle_bi_stream_loop(
+        conn, verifier, sealer, baseline, events_tx,
+    ));
+    let _ = tokio::join!(uni, bi);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_uni_stream_loop(
+    conn: BoweryConnection,
+    verifier: Arc<Verifier<ResolverArc>>,
+    operators: Arc<StaticResolver>,
+    sealer: Arc<Sealer>,
     inbox: Arc<AlertInbox>,
     op_router: Arc<OperatorCommandRouter>,
     events_tx: broadcast::Sender<AgentEvent>,
@@ -868,20 +904,16 @@ async fn handle_connection(
                     nonce: env.nonce,
                 });
                 match env.payload.body {
-                    Some(Body::Question(q)) => {
-                        if let Err(e) =
-                            respond_to_question(&conn, &sealer, &baseline, env.sender, q).await
-                        {
-                            warn!(sender = %env.sender, error = %e, "whisper Q&A response failed");
-                        }
+                    Some(Body::Question(_)) => {
+                        // Slice 3: questions ride bidi streams now. A
+                        // Question on a uni stream is a stale-protocol
+                        // peer or an oversight; log and ignore.
+                        warn!(
+                            sender = %env.sender,
+                            "received whisper Question on uni stream; ignoring (Q&A is bidi)"
+                        );
                     }
                     Some(Body::Subscribe(s)) => {
-                        // Only configured operators can drain the
-                        // inbox. The envelope verifier already checked
-                        // the signature against the *composite*
-                        // resolver, but that includes peer agents — we
-                        // need the stricter "is this an operator?"
-                        // check before handing back alerts.
                         if operators.resolve(&env.sender).is_none() {
                             warn!(
                                 sender = %env.sender,
@@ -897,16 +929,6 @@ async fn handle_connection(
                         }
                     }
                     Some(Body::OperatorCommand(c)) => {
-                        // Two acceptable callers (Phase-9 final-1):
-                        //   1. The envelope sender is a configured
-                        //      operator (direct-dial path).
-                        //   2. The envelope sender is a pinned peer
-                        //      AND `forwarded_from_operator` carries
-                        //      a delegation we can verify against
-                        //      `[operators]` further inside
-                        //      `respond_to_operator_command`. F-2
-                        //      closure — peers no longer need the
-                        //      relay listed in `[operators]`.
                         let is_direct_operator = operators.resolve(&env.sender).is_some();
                         let is_relay_forward = !c.forwarded_from_operator.is_empty();
                         if !is_direct_operator && !is_relay_forward {
@@ -935,17 +957,69 @@ async fn handle_connection(
                         // emitting EnvelopeReceived above.
                     }
                 }
-                // After responding (or no-op), the asker closes the
-                // connection. Subsequent recv_envelope returns an
-                // error and we exit the loop.
             }
             Err(e) => warn!(error = %e, "envelope verification failed"),
         }
     }
 }
 
+async fn handle_bi_stream_loop(
+    conn: BoweryConnection,
+    verifier: Arc<Verifier<ResolverArc>>,
+    sealer: Arc<Sealer>,
+    baseline: Arc<Baseline>,
+    events_tx: broadcast::Sender<AgentEvent>,
+) {
+    loop {
+        let Ok((bytes, reply)) = conn.accept_request().await else {
+            break;
+        };
+        let env = match verifier.open(&bytes) {
+            Ok(env) => env,
+            Err(e) => {
+                warn!(error = %e, "bidi envelope verification failed");
+                continue;
+            }
+        };
+        info!(sender = %env.sender, nonce = env.nonce, "received bi envelope");
+        let _ = events_tx.send(AgentEvent::EnvelopeReceived {
+            sender: env.sender,
+            nonce: env.nonce,
+        });
+        match env.payload.body {
+            Some(Body::Question(q)) => {
+                if let Err(e) = respond_to_question(reply, &sealer, &baseline, env.sender, q).await
+                {
+                    warn!(sender = %env.sender, error = %e, "whisper Q&A response failed");
+                }
+            }
+            other => {
+                warn!(
+                    sender = %env.sender,
+                    body = ?other.as_ref().map(body_kind_name),
+                    "unexpected body on bi stream; ignoring"
+                );
+            }
+        }
+    }
+}
+
+fn body_kind_name(body: &Body) -> &'static str {
+    match body {
+        Body::Question(_) => "Question",
+        Body::Answer(_) => "Answer",
+        Body::Alert(_) => "Alert",
+        Body::OperatorCommand(_) => "OperatorCommand",
+        Body::OperatorResult(_) => "OperatorResult",
+        Body::Heartbeat(_) => "Heartbeat",
+        Body::NeighborOp(_) => "NeighborOp",
+        Body::Subscribe(_) => "Subscribe",
+        Body::Alerts(_) => "Alerts",
+    }
+}
+
 async fn respond_to_question(
-    conn: &BoweryConnection,
+    reply: bowery_whisper::transport::Reply,
     sealer: &Sealer,
     baseline: &Arc<Baseline>,
     asker: Fingerprint,
@@ -956,6 +1030,8 @@ async fn respond_to_question(
             len = question.tier1_fp.len(),
             "received question with invalid tier1_fp length; ignoring"
         );
+        // Drop `reply` without sending — Quinn resets the stream and
+        // the asker observes a transport error / timeout.
         return Ok(());
     }
     let mut fp_bytes = [0u8; TIER1_LEN];
@@ -984,7 +1060,7 @@ async fn respond_to_question(
         note: String::new(),
     };
     let outbound = sealer.seal_for(&asker, &WhisperPayload::answer(answer));
-    conn.send_envelope(&outbound).await
+    reply.send(&outbound).await
 }
 
 async fn respond_to_subscribe(
