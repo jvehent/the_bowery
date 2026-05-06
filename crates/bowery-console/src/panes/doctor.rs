@@ -23,6 +23,7 @@ use crate::theme;
 #[derive(Debug, Default)]
 pub(crate) struct DoctorPane {
     pub(crate) local: Option<Report>,
+    pub(crate) local_loading: bool,
     pub(crate) remote: RemoteState,
 }
 
@@ -40,16 +41,37 @@ impl DoctorPane {
         Self::default()
     }
 
-    /// Run both checks. Local one is synchronous (it only reads
-    /// /proc and /sys); the remote SQL smoke is async.
+    /// Run both checks. Local checks call `doctor::run()` which
+    /// builds its own tokio runtime for the SQL smoke — that
+    /// panics if invoked from inside the console's existing
+    /// runtime, so we offload to `spawn_blocking`. Remote check
+    /// is a regular async dial.
     pub(crate) fn refresh(
         &mut self,
         relay: Relay,
         operator_key: std::path::PathBuf,
         engine_tx: mpsc::Sender<EngineEvent>,
     ) {
-        self.local = Some(doctor::run());
+        self.local_loading = true;
         self.remote = RemoteState::Running;
+
+        let local_tx = engine_tx.clone();
+        tokio::spawn(async move {
+            let report = match tokio::task::spawn_blocking(doctor::run).await {
+                Ok(r) => r,
+                Err(join_err) => Report {
+                    checks: vec![Check {
+                        name: "doctor::run",
+                        status: Status::Fail,
+                        detail: format!("background task failed: {join_err}"),
+                        fix: None,
+                    }],
+                    verdict: doctor::Verdict::NotReady,
+                },
+            };
+            let _ = local_tx.send(EngineEvent::DoctorLocalDone(report)).await;
+        });
+
         tokio::spawn(async move {
             let started = std::time::Instant::now();
             let mut sink = CollectSink::default();
@@ -73,6 +95,11 @@ impl DoctorPane {
         });
     }
 
+    pub(crate) fn on_local_done(&mut self, report: Report) {
+        self.local = Some(report);
+        self.local_loading = false;
+    }
+
     pub(crate) fn on_remote_done(&mut self, result: Result<Duration, String>) {
         self.remote = match result {
             Ok(d) => RemoteState::Ok(d),
@@ -87,6 +114,10 @@ impl DoctorPane {
 
         let mut lines: Vec<Line> = Vec::new();
         match &self.local {
+            None if self.local_loading => lines.push(Line::from(Span::styled(
+                "running local checks…",
+                theme::dim(),
+            ))),
             None => lines.push(Line::from(Span::styled(
                 "press 6 to run / r to refresh",
                 theme::dim(),

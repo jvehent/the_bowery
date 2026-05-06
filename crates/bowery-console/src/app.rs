@@ -69,6 +69,7 @@ pub(crate) enum EngineEvent {
     AuditDone {
         result: Result<CollectSink, String>,
     },
+    DoctorLocalDone(bowery_cli::doctor::Report),
     DoctorRemoteDone(Result<Duration, String>),
     MapDone {
         result: Result<CollectSink, String>,
@@ -364,6 +365,7 @@ impl App {
             } => self.alerts_pane.on_batch(items, cursor_unix_ms),
             EngineEvent::AlertsError(e) => self.alerts_pane.on_error(e),
             EngineEvent::AuditDone { result } => self.audit_pane.on_done(result),
+            EngineEvent::DoctorLocalDone(report) => self.doctor_pane.on_local_done(report),
             EngineEvent::DoctorRemoteDone(result) => self.doctor_pane.on_remote_done(result),
             EngineEvent::MapDone { result } => self.map_pane.on_done(result),
         }
