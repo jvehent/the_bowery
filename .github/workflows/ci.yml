@@ -50,3 +50,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release --locked
+
+  integration-sql:
+    name: integration — operator → agent SQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build agent + CLI
+        run: cargo build --release -p bowery-agent -p bowery-cli --locked
+      - name: Run end-to-end SQL smoke
+        run: ./scripts/integration-sql-test.sh
