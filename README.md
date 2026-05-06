@@ -6,10 +6,11 @@ A distributed Linux EDR built around a peer-to-peer **whispering protocol**: age
 
 ## What it is
 
-- A lightweight Rust agent that observes process exec / exit and outgoing TCP connections at the kernel level via eBPF tracepoints, with KRSI (BPF-LSM) hooks coming for response enforcement.
+- A lightweight Rust agent that observes process exec / exit and outgoing TCP connections at the kernel level via eBPF tracepoints, with KRSI (BPF-LSM) hooks for response enforcement.
 - A small embedded LLM (Qwen3-0.6B Q4_K_M via llama.cpp, feature-gated) that turns rule + baseline signal into a refined verdict + rationale.
 - A gossip-based mesh (chitchat) with mTLS-pinned QUIC RPC for direct peer-to-peer whisper Q&A — agents ask role-similar peers "have you seen this fingerprint?" and aggregate the answers as additional context for the LLM.
-- A signed operator CLI that connects to any agent, drains a per-agent alert inbox, and prints (or JSON-streams) high-suspicion verdicts. There is no backend.
+- A native, pure-Rust SQL surface (`bowery-sql` + `bowery-tables`) that turns each agent into a queryable host-state engine — 13 procfs/sysfs/etc-backed tables plus 4 Bowery-internal views, streamed back over the operator wire with end-to-end signed multi-agent fan-out.
+- A signed operator CLI that connects to any agent, drains a per-agent alert inbox, prints (or JSON-streams) high-suspicion verdicts, and fans SQL queries across the mesh. There is no backend.
 
 ## Why
 
@@ -19,7 +20,9 @@ Existing EDRs send everything home and decide centrally. The Bowery flips that: 
 
 - [the_bowery_design.md](the_bowery_design.md) — original product brief.
 - [DESIGN.md](DESIGN.md) — engineering design, locked decisions, phased delivery plan.
-- [IMPLEMENTATION.md](IMPLEMENTATION.md) — deep dive: every crate, every protocol, every architectural decision and why.
+- [DESIGN-NATIVE-SQL.md](DESIGN-NATIVE-SQL.md) — Phase-9 design rationale + operator guide for the native SQL surface.
+- [IMPLEMENTATION.md](IMPLEMENTATION.md) — deep dive: every crate, every protocol, every architectural decision and why. §22 covers the Phase-9 SQL surface in detail.
+- [SECURITY-AUDIT-PHASE9.md](SECURITY-AUDIT-PHASE9.md) — two-pass audit of the SQL/fan-out surface and what shipped to address each finding.
 - [INSTALL.md](INSTALL.md) — building, installing, configuring, and operating an agent.
 - [docs/REMOTE_TESTING.md](docs/REMOTE_TESTING.md) — driving a Linux VM as the build/test target via `scripts/xtest`. Required if your dev machine doesn't have BPF-LSM (macOS, WSL2, etc.).
 
@@ -83,15 +86,14 @@ cargo build --release --features llm-llama-cpp -p bowery-agent
 - **Phase 4 / 4b** — LLM analyzer framework (mock + queue + outcomes bridge); real Qwen3-0.6B inference via `llama-cpp-2`.
 - **Phase 5** — whisper Q&A: two-tier privacy fingerprints (8-byte truncation of `SHA256(domain ‖ sha256)`), bloom filter primitives, role-similarity peer selection by cosine similarity, asker/responder protocol over the existing QUIC transport, per-round aggregator.
 - **Phase 6a** — operator alert inbox: per-agent in-memory ring with TTL retention, signed `Subscribe` over the QUIC transport, `bowery alerts tail` CLI for roaming operators, curated model registry (`bowery model fetch`).
-- **Phase 6b** — typed `OperatorCommand` / `OperatorResult` envelopes, optional `sysquery` subprocess wrapper for operators wanting a third-party SQL surface alongside the native one.
+- **Phase 6b** — typed `OperatorCommand` / `OperatorResult` envelopes, optional `sysquery` subprocess wrapper for operators who want the wider third-party (osquery-shaped) table set alongside the native engine.
 - **Phase 7** — response engine with BPF-LSM block-exec hooks, default-deny policy, signed audit log (Phase-8 hash-chain).
 - **Phase 8** — replay guards, per-recipient envelope binding, fuzzing harness.
-- **Phase 9** — pure-Rust SQL surface: `bowery-sql` engine + `bowery-tables` 13-table set + 4 Bowery-internal bonus tables, streamed as chunked `OperatorResult::SqlChunk` envelopes over QUIC, with one-hop multi-agent fan-out via relay (`bowery exec sql --fanout`).
+- **Phase 9** — native SQL surface: `bowery-sql` engine + `bowery-tables` 13 default + 4 Bowery-internal views + 7 scalar file/hash functions; streamed as chunked `OperatorResult::SqlChunk` envelopes over QUIC; multi-agent fan-out with operator-signed delegation (`OperatorAuthorization`); peers seal chunks **directly for the operator** (relay can drop but cannot forge); SELECT-only authorizer; per-operator rate limit; 16 KiB per-cell cap; SQLite progress-handler cancellation; `bowery peers add/list/remove` operator manifest. Every CRIT/HIGH/MEDIUM finding from [`SECURITY-AUDIT-PHASE9.md`](SECURITY-AUDIT-PHASE9.md) closed.
 
 ## What's next
 
-- **vtab pushdown for `file` / `hash` tables** (Phase 9 slice 2b) — both need a `WHERE path = '...'` filter to be safe.
-- **Per-row peer→operator end-to-end signing** under fan-out — currently the relay signs forwarded chunks with its own key; e2e signing would let the operator detect a tampering relay.
+- **F-7 / F-17** observability tightening — EOF-accounting transcript envelope so the operator can verify "all expected peers reported" in fan-out; per-peer warn rate-limit on the relay's logs.
 - **Phase 10 (deferred)** — fleet-scale Sybil resistance, key rotation ceremony, neighbor add/remove protocol.
 
 ## License

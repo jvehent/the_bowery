@@ -6,9 +6,36 @@
 //! which implementation the operator points it at — historically
 //! this was the upstream osquery interactive shell, but Bowery's
 //! native Phase-9 SQL surface (see `bowery-sql` / `bowery-tables`)
-//! is the going-forward path. This crate exists for the deployment
-//! cases where the operator wants the wider third-party-table
-//! surface available alongside the native Bowery tables.
+//! is the primary path. This crate exists for the deployment cases
+//! where the operator wants the wider third-party-table surface
+//! available alongside the native Bowery tables.
+//!
+//! ## When to enable sysquery
+//!
+//! Sysquery is **disabled by default** (`[sysquery] enabled =
+//! false` in `agent.toml`). Operators turn it on per-host when
+//! they have established osquery query libraries or need a
+//! third-party table the native engine doesn't have. For
+//! day-to-day investigation, the native engine is the right
+//! choice — see `crates/bowery-sql` and
+//! `IMPLEMENTATION.md` § 22.10 for the comparison matrix.
+//!
+//! Differences from the native engine an operator should know:
+//!
+//! - **No fan-out.** `bowery exec sysquery` hits exactly one
+//!   agent. Cross-host hunts go through `bowery exec sql --fanout`
+//!   instead. There's no plan to add fan-out for sysquery —
+//!   operators wanting that should write a `bowery-tables` table.
+//! - **No streaming.** Output is the wrapped binary's full JSON
+//!   blob, returned in a single `OperatorResultBody::Sysquery`
+//!   envelope. Capped at 16 MiB stdout/stderr each.
+//! - **Slower cold start.** ~50–200 ms for an `osqueryi`
+//!   subprocess vs. <5 ms for the in-process native engine.
+//! - **Larger trust boundary.** The operator's SQL goes to a
+//!   third-party binary that runs as the agent. The native
+//!   engine has a SELECT-only `set_authorizer` and pure-Rust
+//!   table impls under our review; the wrapped binary's safety
+//!   is whatever upstream ships.
 //!
 //! ## What this crate does
 //!
@@ -34,6 +61,10 @@
 //! - Manage long-running query daemons. We invoke the binary
 //!   one-shot intentionally — no persistent state, no extension
 //!   sockets to compromise.
+//! - Participate in fan-out. `bowery-agent` only invokes this
+//!   crate from the operator-direct dispatch arm; relay-forwarded
+//!   commands carry `OperatorAuthorization` and route through the
+//!   native engine path.
 
 #![warn(unreachable_pub)]
 

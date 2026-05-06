@@ -162,61 +162,91 @@ pub struct SqlQuery {
 }
 ```
 
-### 6.2 New OperatorResultBody variants — streaming
+### 6.2 OperatorResultBody — streaming (as shipped)
+
+Reality differs slightly from the original sketch: rows arrive
+in **chunks** (~256 rows / chunk by default) rather than per-row,
+and EOF is a flag on the last chunk rather than a separate
+message. Strongly typed `SqlValue` cells avoid the JSON-encoding
+detour.
 
 ```rust
 pub enum OperatorResultBody {
-    Sysquery(SysqueryResult),   // subprocess path
-    Error(OperatorError),       // shared
-    QueryRow(QueryRow),         // emitted N times per agent (slice-7+ shape)
-    QueryEof(QueryEof),         // terminator per agent (slice-7+ shape)
+    Sysquery(SysqueryResult),  // subprocess path
+    Error(OperatorError),      // shared; terminates the whole stream
+    SqlChunk(SqlChunk),        // emitted N times per agent
 }
 
-pub struct QueryRow {
-    /// Which agent produced this row.
+pub struct SqlChunk {
+    /// Column names — only on the first chunk *per agent*.
+    /// Subsequent chunks from the same agent leave it empty.
+    pub columns: Vec<String>,
+    /// Row batch.
+    pub rows: Vec<SqlRow>,
+    /// Terminator flag *for this agent's stream*.
+    pub end: bool,
+    /// 32-byte fingerprint of the agent that produced this
+    /// chunk. Phase-9 final-1: peer chunks are sealed for the
+    /// operator directly, so the operator can also derive
+    /// attribution from the envelope sender — `agent_fp` is
+    /// kept as a courtesy for clients that don't plumb the
+    /// envelope layer into the row decoder.
     pub agent_fp: Vec<u8>,
-    /// The SQL row, JSON-encoded `{column: value, ...}`.
-    /// Strings, ints, floats, nulls. No nested objects.
-    pub row_json: String,
 }
 
-pub struct QueryEof {
-    pub agent_fp: Vec<u8>,
-    /// Per-agent terminal status. Distinct from
-    /// OperatorResultBody::Error which terminates the *whole*
-    /// stream; this only marks one agent done.
-    pub status: QueryAgentStatus,
+pub struct SqlRow {
+    pub values: Vec<SqlValue>,
 }
 
-pub struct QueryAgentStatus {
-    pub kind: String,              // "ok" | "timeout" | "error"
-    pub message: String,           // human-readable
-    pub rows_produced: u64,
+pub struct SqlValue {
+    /// `None` = SQL NULL.
+    pub value: Option<SqlValueKind>,
+}
+
+pub enum SqlValueKind {
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
 }
 ```
 
 ### 6.3 Stream framing
 
 One QUIC connection per operator session. The operator sends
-exactly one `OperatorCommand`. The agent (relay or local)
-emits a sequence of `OperatorResult` envelopes:
+exactly one `OperatorCommand`. The agent (relay or local) emits
+a sequence of `OperatorResult` envelopes, one chunk per envelope,
+each on its own unidirectional QUIC stream:
 
 ```
-operator → relay:    OperatorCommand { request_id, Sql{ sql, fanout=true } }
+operator → relay:    OperatorCommand { request_id, Sql{ sql, fanout=true,
+                                                        forwarded_from_operator=auth } }
 
-relay → operator:    OperatorResult { request_id, QueryRow{ agent_fp=A, row_json=… } }
-relay → operator:    OperatorResult { request_id, QueryRow{ agent_fp=B, row_json=… } }
-relay → operator:    OperatorResult { request_id, QueryRow{ agent_fp=A, row_json=… } }
-…
-relay → operator:    OperatorResult { request_id, QueryEof{ agent_fp=A, status=ok, … } }
-relay → operator:    OperatorResult { request_id, QueryEof{ agent_fp=B, status=ok, … } }
-relay → operator:    OperatorResult { request_id, QueryEof{ agent_fp=relay, status=ok, … } }
-                     # final eof from relay itself signals stream done
+# Phase 1 — relay's own rows (sealed by relay for operator):
+relay → operator:    OperatorResult { request_id, SqlChunk{ columns=[…], rows=[…],
+                                                            end=false, agent_fp=relay } }
+relay → operator:    OperatorResult { request_id, SqlChunk{ rows=[…], end=true,
+                                                            agent_fp=relay } }
+
+# Phase 2 — peer chunks (sealed by each peer DIRECTLY for operator;
+# relay forwards bytes verbatim, can drop but cannot forge):
+peer A → relay → operator:  OperatorResult { request_id, SqlChunk{ columns=[…], rows=[…],
+                                                                    end=true, agent_fp=A } }
+peer B → relay → operator:  OperatorResult { request_id, SqlChunk{ columns=[…], rows=[…],
+                                                                    end=true, agent_fp=B } }
+
+# Connection close = final terminator. Synthetic relay-signed
+# end-true chunk is emitted for any peer that failed to dial /
+# read so the operator-side decoder always observes EOF for
+# every dispatched peer.
 ```
 
-Each envelope is a separately signed envelope on a separate
-unidirectional QUIC stream — the agent owns send order and the
-operator demultiplexes by `agent_fp`.
+Each envelope is independently signed: the relay's own chunks
+by the relay's identity, peer chunks by the peer's identity
+(targeted at the operator's fp). The operator-side `Verifier`
+tries each candidate pubkey in its resolver — populated from
+`~/.bowery/peers.toml` (`bowery peers add`) plus `--peer-pubkey-b64`
+flags — for every incoming envelope.
 
 The operator's CLI accumulates / streams to stdout as it sees
 fit. JSON mode emits one line per row; table mode buffers and
@@ -338,13 +368,13 @@ again. Implemented as: dispatch ignores the `fanout` flag when
 
 | Concern | Defense |
 |---|---|
-| Untrusted operator | Same Phase-6a/6b gate — operator key must be in `[operators]` config of every agent that responds. |
-| Untrusted relay | Per-row envelope is end-to-end signed peer→operator; relay can't fabricate rows. Relay can however **drop** rows; partial-result detection requires the operator to know which agents *should* have responded (via a fleet-wide peer manifest at the operator side). |
-| Cycle / amplification | One-hop fan-out only. Relay runs query against pinned peers from its own KnownNeighbors — bounded set. |
-| Per-agent DoS | All Phase-6b/8 caps still apply: max_timeout, output_too_large, kill_on_drop. SQL adds: max-rows cap (1M), max-cell-size (64 KiB). |
-| Mesh-flood DoS via fan-out | Per-operator rate limit on the relay: max 1 fanout query per N seconds per operator fp. |
-| File system traversal via `file` table | `file` and `hash` tables refuse unbounded queries — vtab requires a `path` filter at xBestIndex time. Unbounded scan returns `OperatorError::Invalid("file table requires WHERE path …")`. |
-| Information disclosure (e.g., `/etc/shadow` via `file` table) | Path filter still allows `/etc/shadow` if root-readable. Defense: path-based deny-list configurable in `[sql] forbidden_paths` (`/etc/shadow`, `/proc/*/maps`, key files). |
+| Untrusted operator | Same Phase-6a/6b gate — operator key must be in `[operators]` config of every agent that responds. SQLite `set_authorizer` denies every non-SELECT op (no ATTACH, no write-pragmas, no DROP/CREATE/ALTER). |
+| Untrusted relay | **Implemented.** `OperatorCommand.forwarded_from_operator` carries an Ed25519-signed `OperatorAuthorization`. Peers verify the operator's signature against their own `[operators]` set, recompute the command digest, and seal `SqlChunk` envelopes directly for the operator. Relay forwards bytes verbatim. Relay can drop chunks but cannot forge or tamper. Partial-result detection requires the operator-side peer manifest (`bowery peers add`) — operator knows which fingerprints *should* have responded. |
+| Cycle / amplification | Enforced both at the relay (always sets `fanout=false` on outbound) AND on peer-receive (rejects any forwarded command with `fanout=true` as `policy_denied`). One-hop fan-out, period. |
+| Per-agent DoS | All Phase-6b/8 caps still apply. SQL adds: row cap (1M), per-cell cap (16 KiB; oversize cells truncate to a `Text("<truncated N bytes>")` placeholder), per-query timeout (clamped to `[sysquery] max_timeout`), concurrency cap (`[sql] max_concurrent_queries = 4` default), SQLite progress-handler interrupt on timeout. |
+| Mesh-flood DoS via fan-out | **Implemented.** Per-operator-fp `FanoutRateLimit` token bucket: 1 token / 5 s, burst 6. Bucket-empty returns `OperatorError { kind: "rate_limited" }`. |
+| File system traversal | **`file` / `hash` shipped as scalar functions, not tables.** `bowery_file_size('/etc/passwd')`, `bowery_file_sha256_hex('/usr/bin/sshd')`, etc. The operator must supply each path explicitly; no enumeration possible. Hash function caps reads at 16 MiB; non-regular files (sockets/pipes/devices) return NULL. |
+| Information disclosure | Operator already authorised on the host can read host-readable files. `[sql] expose_cmdline = false` default keeps `processes.cmdline` out of the row set so argv-borne secrets (DB passwords, API tokens) don't ride fan-out responses. Operators who need cmdline opt in per-host. |
 
 ## 9. CLI surface
 
@@ -389,11 +419,13 @@ through CI; no slice leaves the agent broken.
 
 ### Slice 2 — Process / FS tables (2 weeks)
 
-- Tables: `processes`, `mounts`, `kernel_modules`, `interfaces`,
-  `file`, `hash`.
-- The `file` and `hash` tables include xBestIndex filter
-  pushdown so `WHERE path = …` doesn't fall back to scan.
-- Forbidden-path policy in agent config.
+- Tables: `processes`, `mounts`, `kernel_modules`, `interfaces`.
+- `file` / `hash` shipped as **scalar functions** (slice 2b /
+  Phase-9 final-7) instead of vtab tables: `bowery_file_size`,
+  `bowery_file_sha256_hex`, etc., each takes a path argument.
+  Operator must supply paths explicitly; no enumeration possible.
+  Cleaner safety story than vtab xBestIndex pushdown for the
+  same constraint.
 
 ### Slice 3 — Network tables (1 week)
 
@@ -443,48 +475,50 @@ through CI; no slice leaves the agent broken.
 - `bowery doctor` learns to run a smoke query (`SELECT 1`) so
   operators can verify the SQL surface is alive.
 
-**Total: ~10 weeks, ~12k LOC, 8 commits.** The sysquery
-(subprocess) handler stays alongside the entire time; once
-slice 6 lands, operators choose between `bowery exec sql` (native)
-and `bowery exec sysquery` (wider third-party-binary table set).
+**Shipped.** Slices 1–8 plus a Phase-9 final-1..9 hardening
+pass that closed every CRIT/HIGH/MEDIUM finding from the
+[Phase-9 security audit](SECURITY-AUDIT-PHASE9.md) — including
+the architectural relay-trust closure (peers seal chunks
+directly for the operator; relay forwards bytes verbatim). The
+sysquery (subprocess) handler stays alongside as the fallback
+for operators with established third-party-binary query
+libraries; default-disabled in agent config.
 
-## 11. Open questions
+## 11. Open questions / post-Phase-9 items
 
-1. **JOIN across tables in one query.** rusqlite supports it
-   natively, but a JOIN on `processes × process_open_sockets`
-   walks `/proc` twice. Materialise once into a CTE? Cache for
-   the lifetime of the query?
-2. **utmp byte format** has subtle libc-version-specific
-   padding. Test against multiple distros (Debian, Ubuntu,
-   Fedora, Arch) before claiming `last` works. The `utmp-rs`
-   crate handles this; verify it before depending on it.
-3. **Streaming back-pressure.** A slow operator (network
-   bandwidth) shouldn't block fast agents. Per-peer bounded
-   buffer at the relay; drop oldest on overflow with a
-   `OperatorError::Lagged` chunk.
-4. **JSON column encoding.** Strings as JSON strings, ints as
-   JSON numbers, but Linux `mtime_unix` is u64 which exceeds
-   JSON's safe integer range. Encode as string for u64
-   columns? Document the schema's JSON shape.
-5. **Bowery-native tables** (§4.1) introduce a coupling: the
-   table's data source lives in another agent crate. Cleanest
-   architecturally: `bowery-tables` depends on the data crates;
-   they need to expose a query API that doesn't grab a long-
-   lived lock. The `Baseline::for_each_binary` pattern is the
-   model.
+Most of the original open questions resolved during the slice
+build-out. What's left:
 
-## 12. Effort summary
+1. **JOIN across tables in one query.** Each query opens a
+   fresh in-memory SQLite and materialises every registered
+   table once. JOINs on `processes × process_open_sockets`
+   walk `/proc` exactly once because both tables read from the
+   single per-query snapshot. Acceptable; revisit if a query
+   pattern emerges that needs cross-query caching.
+2. **EOF transcript envelope** (audit F-7). In fan-out the
+   operator sees rows but can't tell whether the relay
+   delivered every expected peer. Adding a final
+   relay-signed-or-cross-signed `(peer_fp, status)` transcript
+   would let operators verify completeness; tracked as a
+   follow-up.
+3. **Per-peer warn rate-limit on relay logs** (audit F-17).
+   Current behaviour can produce a few warn lines per failed
+   fan-out; a token bucket on the warn emission would close
+   the log-disk DoS edge.
 
-| Item | Estimate |
+## 12. Effort summary (final)
+
+| Item | Actual |
 |---|---|
-| Wall-clock | 10 weeks of focused work |
-| Code | ~12k LOC of Rust |
-| New crates | 3 (`bowery-sql`, `bowery-tables`, `bowery-stream`) |
-| Wire-format additions | 2 command bodies, 2 result bodies, 1 forwarded envelope field |
-| Existing-test impact | low — native engine ships alongside; sysquery tests stay green |
-| Removed code (eventually) | `bowery-sysquery` crate (~400 LOC) and its config knob, once the native table set covers operator needs |
+| Wall-clock | Multiple sessions (slice 1 → final-9) |
+| Code | ~5k LOC of Rust across the new crates and fixes |
+| New crates | 2 (`bowery-sql`, `bowery-tables`) |
+| Wire-format additions | 2 command bodies (`Sql`, retained `Sysquery`), 1 result body (`SqlChunk`), 1 forwarded envelope field, plus `OperatorAuthorization` |
+| Tests added | 5 sql-engine + 5 file-func + 7 integration (operator-command) + 3 peer-manifest |
+| Existing-test impact | low — `[sql]` config block default-friendly; sysquery tests stay green |
 
-Trigger to start: the bundled subprocess binary in production
-growing past 40 MB, or operator workflows starting to want the
-Bowery-native
-tables (§4.1).
+The sysquery (subprocess) crate stays in the workspace as the
+fallback for operators wanting the wider osquery-shaped table
+set. Default `[sysquery] enabled = false` means the binary
+isn't even located unless explicitly turned on. Remove only if
+production deployments converge on native-only.

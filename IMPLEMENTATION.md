@@ -2027,7 +2027,7 @@ the in-tree reference for what shipped.
 |---|---|---|
 | `os_version` | 1 | `/etc/os-release` (+ `/usr/lib/os-release` fallback) |
 | `system_info` | 1 | `/proc/sys/kernel/{hostname,osrelease}`, `/proc/cpuinfo`, `/proc/meminfo`, `/sys/class/dmi/id/*` |
-| `processes` | 2a | `procfs::process::all_processes()` |
+| `processes` | 2a | `procfs::process::all_processes()` (`cmdline` opt-in via `[sql] expose_cmdline`) |
 | `mounts` | 2a | `/proc/self/mountinfo` |
 | `kernel_modules` | 2a | `/proc/modules` |
 | `interfaces` | 2a | `/sys/class/net/*` |
@@ -2038,6 +2038,29 @@ the in-tree reference for what shipped.
 | `last` | 4 | `/var/log/wtmp` |
 | `systemd_units` | 5 | unit-file walk under standard search paths |
 | `crontab` | 5 | `/etc/crontab` + `/etc/cron.d/*` |
+
+### 22.2.1 Scalar file/hash functions (final-7)
+
+[`crates/bowery-tables/src/file_funcs.rs`](crates/bowery-tables/src/file_funcs.rs)
+registers seven SQL scalar functions that take a path argument
+and return file metadata or content hashes. Operator must
+supply each path explicitly — no enumeration possible — which
+satisfies the slice-2b safety constraint without the rusqlite
+vtab boilerplate originally planned.
+
+| Function | Returns | Notes |
+|---|---|---|
+| `bowery_file_exists(path)` | INTEGER 0/1 | |
+| `bowery_file_size(path)` | INTEGER bytes | NULL on stat fail |
+| `bowery_file_mode(path)` | INTEGER (raw `st_mode`) | |
+| `bowery_file_mtime_unix(path)` | INTEGER seconds | |
+| `bowery_file_owner_uid(path)` | INTEGER | |
+| `bowery_file_owner_gid(path)` | INTEGER | |
+| `bowery_file_sha256_hex(path)` | TEXT 64-char hex | NULL for non-regular files; reads capped at 16 MiB |
+
+Registered with `SQLITE_DIRECTONLY` so they can't be invoked
+from inside views or triggers (which the SELECT-only authorizer
+already forbids anyway, but defence in depth).
 
 ### 22.3 Streaming wire format (slice 6)
 
@@ -2203,6 +2226,39 @@ tables — operator supplies the path, no enumeration possible.
 - **F-5 (cosmetic)** The shared `max_timeout` config knob lives
   under `[sysquery]` despite being applied to `[sql]` too.
   Splitting would be a config-naming cleanup.
+
+### 22.10 Native SQL vs. sysquery — when to use each
+
+The Bowery agent ships two operator-runnable query paths:
+
+| | Native SQL (`bowery exec sql`) | Sysquery (`bowery exec sysquery`) |
+|---|---|---|
+| Crate | `bowery-sql` + `bowery-tables` | `bowery-sysquery` (subprocess wrapper) |
+| Default | always on | OFF (`[sysquery] enabled = false`) |
+| Tables | 13 + 4 bonus + 7 file/hash funcs | whatever the wrapped binary exposes |
+| Wire | streaming `SqlChunk` chunks; single round-trip per query in single-agent mode, multiple chunks per agent in fan-out | one round-trip; full JSON returned as a string |
+| Multi-agent | `--fanout` with operator-signed delegation; peers seal chunks directly for the operator | not supported |
+| Auth | operator key + operator-signed `OperatorAuthorization` for forwarded peers | operator key only (sysquery is never relay-forwarded) |
+| Cold-start | <5 ms per query (in-process SQLite, fresh per query) | 50–200 ms (subprocess spawn + bundle init) |
+| Authorizer | `set_authorizer` denies every non-SELECT op | the wrapped binary's own behaviour (osquery rejects writes) |
+| Output cap | row cap, per-cell cap, concurrency cap, progress-handler interrupt | 16 MiB stdout/stderr cap, kill-on-timeout |
+| Use case | day-to-day operator queries; cross-host fan-out hunts; querying Bowery-internal state (alerts/audit/peers/baseline) | operators with established osquery query libraries, or when the wrapped binary exposes a table the native engine doesn't have |
+
+The native engine is the going-forward primary path. Sysquery
+exists as a fallback that operators can opt into per-host —
+flip `[sysquery] enabled = true` in `agent.toml` and point
+`binary_path` at any binary that accepts the osquery flag set
+(`--json --disable_extensions=true --disable_audit=true
+--disable_events=true --database_path=/tmp --ephemeral=true
+--config_path=/dev/null <SQL>`). In practice that's almost
+always `osqueryi`.
+
+Sysquery is **never relay-forwarded**: each `bowery exec
+sysquery` query goes to exactly one agent. If you want
+cross-host hunts, use the native `bowery exec sql --fanout`.
+There's no plan to add fan-out for sysquery — operators wanting
+that should write a `bowery-tables` table for their use case
+instead.
 
 ---
 

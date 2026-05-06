@@ -484,6 +484,106 @@ You need the agent's fingerprint and pubkey out-of-band — operators
 don't ride the TOFU pin store. Get them from `journalctl -u
 bowery-agent | grep 'identity'` on the agent host.
 
+### Querying host state with `bowery exec sql`
+
+`bowery exec sql` is the primary investigation tool: every agent
+runs a pure-Rust SQL engine over a curated set of host-state
+tables, and the operator can query it directly over QUIC.
+
+```bash
+bowery exec sql \
+    --operator-key  ~/.bowery/operator.key \
+    --agent-addr    10.0.0.5:9902 \
+    --agent-fp      <agent_fp_hex> \
+    --agent-pubkey-b64 <agent_pubkey_b64> \
+    --sql 'SELECT pid, ppid, name FROM processes WHERE name = "sshd"'
+```
+
+Available tables: `processes`, `mounts`, `kernel_modules`,
+`interfaces`, `listening_ports`, `process_open_sockets`,
+`users`, `logged_in_users`, `last`, `systemd_units`, `crontab`,
+`os_version`, `system_info`, plus four Bowery-internal views
+(`bowery_peers`, `bowery_baseline_binaries`, `bowery_alerts`,
+`bowery_audit`). Plus seven scalar functions for per-path file
+inspection: `bowery_file_exists`, `_size`, `_mode`,
+`_mtime_unix`, `_owner_uid`, `_owner_gid`, `_sha256_hex`.
+
+`--format=table` renders an aligned ASCII table (buffered);
+`--format=json` streams one JSON object per row preceded by a
+column-name array; `--format=tsv` (default) streams one
+tab-separated line per row. See
+[`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md) for the full
+schema and security model.
+
+### Multi-agent fan-out
+
+`--fanout` turns the dialled agent into a relay that runs the
+query locally **and** dispatches it to every pinned peer in
+parallel. Rows from each agent are tagged with an `_agent_fp`
+column so you can attribute results.
+
+```bash
+bowery exec sql ... --fanout \
+    --sql 'SELECT _agent_fp, port FROM listening_ports WHERE port = 22'
+```
+
+For fan-out to verify peer signatures end-to-end, the operator's
+CLI needs each peer's public key. Maintain that list in
+`~/.bowery/peers.toml`:
+
+```bash
+bowery peers add --name web-1 \
+    --fp <peer_fp_hex> --pubkey-b64 <peer_pubkey_b64>
+bowery peers list
+bowery peers remove --fp <peer_fp_hex>
+```
+
+`bowery exec sql --fanout` auto-loads the manifest before
+dialing. Peers absent from the manifest will surface as
+`BadSignature` rejections — visible failure mode rather than
+silent drop.
+
+Fan-out has a per-operator rate limit (1 query / 5 s, burst 6)
+to prevent mesh amplification, and a single-hop cap (peers
+reject relay-forwarded commands that themselves request
+fanout). Each agent independently authorises the original
+operator — the relay does **not** need to be in any peer's
+`[operators]` list — so a compromised relay key cannot grant
+SQL authority over peers.
+
+### Optional: `bowery exec sysquery` (subprocess fallback)
+
+Operators with established osquery query libraries (or who need
+a third-party table the native engine doesn't have) can opt
+into the subprocess wrapper per-host. In `agent.toml`:
+
+```toml
+[sysquery]
+enabled = true
+binary_path = "/usr/bin/osqueryi"
+max_timeout = "30s"
+```
+
+Then on the operator side:
+
+```bash
+bowery exec sysquery \
+    --operator-key  ~/.bowery/operator.key \
+    --agent-addr    10.0.0.5:9902 \
+    --agent-fp      <agent_fp_hex> \
+    --agent-pubkey-b64 <agent_pubkey_b64> \
+    --sql 'SELECT pid, name FROM processes LIMIT 5'
+```
+
+The agent shells out to the configured binary with a hardened
+flag set (`--json --disable_extensions=true …`) and returns
+the JSON output verbatim. Sysquery is **not** relay-forwarded:
+each invocation hits exactly one agent. For cross-host hunts
+use `bowery exec sql --fanout` instead.
+
+See [`IMPLEMENTATION.md` § 22.10](IMPLEMENTATION.md#2210-native-sql-vs-sysquery--when-to-use-each)
+for the comparison matrix.
+
 ### Models
 
 The agent expects an already-on-disk GGUF. Fetch one:
