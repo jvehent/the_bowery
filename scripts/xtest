@@ -37,6 +37,11 @@
 #               the agent (release, with llm-llama-cpp by default) + run
 #               it with sudo. Streams agent stdout/stderr to your terminal
 #               until you ctrl-c.
+#   run-console [--no-llm] [--push-model [NAME]] [-- ARGS...]
+#               sync + build bowery-console (release, with llm-llama-cpp by
+#               default) + run. Forward console flags after `--`. Console
+#               will offer to download Gemma 4 on first run unless --push-model
+#               or a previous fetch already placed it.
 #   stop-ssh    Tear down the SSH ControlMaster connection.
 #
 # Config is read from $REPO/.xtest.env, environment variables override:
@@ -509,6 +514,86 @@ cmd_run_agent() {
             ./target/release/bowery-agent --config '$config'$extra"
 }
 
+cmd_run_console() {
+    require_config
+    local with_llm=1
+    local push_model=0
+    local push_model_name="gemma-4-e2b-it-q4_k_m"
+    local console_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-llm)
+                with_llm=0
+                shift
+                ;;
+            --push-model)
+                push_model=1
+                if [[ -n "${2:-}" && ! "${2:-}" == --* ]]; then
+                    push_model_name="$2"
+                    shift 2
+                else
+                    shift 1
+                fi
+                ;;
+            --)
+                shift
+                console_args+=("$@")
+                break
+                ;;
+            -h|--help)
+                cat <<HELP
+xtest run-console — sync, build, and run the operator console on the VM.
+
+Usage: $0 run-console [--no-llm] [--push-model [NAME]] [-- ARGS...]
+
+Flags:
+  --no-llm          Build without --features llm-llama-cpp (mock chat).
+  --push-model [N]  rsync ~/.bowery/models/<N>.gguf to the same path on
+                    the target before launch. Default N is
+                    'gemma-4-e2b-it-q4_k_m'. Without this the console
+                    will offer to download Gemma 4 on first run.
+  -- ARGS...        Extra args forwarded verbatim to bowery-console
+                    (e.g. --agent-addr, --agent-fp, --agent-pubkey-b64,
+                    --operator-key).
+HELP
+                return 0
+                ;;
+            *)
+                echo "error: unknown run-console flag '$1'" >&2
+                exit 2
+                ;;
+        esac
+    done
+
+    cmd_sync
+
+    if [[ $push_model -eq 1 ]]; then
+        echo
+        cmd_push_model "$push_model_name"
+    fi
+
+    echo
+    if [[ $with_llm -eq 1 ]]; then
+        echo "==> cargo build --release -p bowery-console --features llm-llama-cpp"
+        remote "RUSTFLAGS='-C target-cpu=native' cargo build --release -p bowery-console --features llm-llama-cpp"
+    else
+        echo "==> cargo build --release -p bowery-console (mock chat)"
+        remote "cargo build --release -p bowery-console"
+    fi
+
+    echo
+    echo "==> running bowery-console (ctrl-c to exit; alt screen will tear down cleanly)"
+    local extra=""
+    if [[ ${#console_args[@]} -gt 0 ]]; then
+        extra=" ${console_args[*]}"
+    fi
+    ssh_cmd_tty "set -e
+        if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi
+        cd \"$XTEST_REMOTE_PATH\"
+        ./target/release/bowery-console$extra"
+}
+
 cmd_stop_ssh() {
     # Close every ControlMaster socket xtest has opened against any host.
     local closed=0
@@ -546,8 +631,9 @@ case "$sub" in
     shell)      cmd_shell ;;
     exec)       cmd_exec "$@" ;;
     push-model) cmd_push_model "$@" ;;
-    run-agent)  cmd_run_agent "$@" ;;
-    stop-ssh)   cmd_stop_ssh ;;
+    run-agent)    cmd_run_agent "$@" ;;
+    run-console)  cmd_run_console "$@" ;;
+    stop-ssh)     cmd_stop_ssh ;;
     *)
         echo "error: unknown subcommand '$sub'" >&2
         echo

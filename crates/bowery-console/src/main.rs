@@ -139,6 +139,7 @@ async fn build_chat_backend(
 ) -> std::sync::Arc<dyn bowery_llm::Chat> {
     use bowery_llm::{LlamaCppChat, LlamaCppChatConfig, MockChat};
 
+    eprintln!("Chat backend: llm-llama-cpp feature is ON (Gemma 4 ready).");
     let Some(mut path) = model_path else {
         eprintln!("no chat model configured (try --chat-model). Falling back to mock chat.");
         return std::sync::Arc::new(MockChat);
@@ -232,8 +233,22 @@ async fn build_chat_backend(
     _model_path: Option<PathBuf>,
     _n_ctx: u32,
 ) -> std::sync::Arc<dyn bowery_llm::Chat> {
-    // Mock fallback when the binary wasn't built with the
-    // llama.cpp feature.
+    eprintln!();
+    eprintln!("─── Chat backend: MOCK ─────────────────────────────────────────────────");
+    eprintln!("This bowery-console was built WITHOUT --features llm-llama-cpp, so the");
+    eprintln!("Chat pane will use a deterministic mock that just echoes your message.");
+    eprintln!();
+    eprintln!("To get the real Gemma 4 chatbot, rebuild with the feature on:");
+    eprintln!();
+    eprintln!("    cargo build --release --features llm-llama-cpp -p bowery-console");
+    eprintln!();
+    eprintln!("On the test VM, the same flag is passed automatically by:");
+    eprintln!();
+    eprintln!("    ./scripts/xtest run-console");
+    eprintln!();
+    eprintln!("(or `xtest build` / `xtest ci`, which both also do the LLM-on build).");
+    eprintln!("────────────────────────────────────────────────────────────────────────");
+    eprintln!();
     std::sync::Arc::new(bowery_llm::MockChat)
 }
 

@@ -53,7 +53,21 @@ cargo build --release --features llm-llama-cpp -p bowery-console
 ```
 
 Without that feature the binary stays small (~few MB) and the chat
-pane is mock-only.
+pane is mock-only — at startup the console prints a banner telling
+you so.
+
+On the test VM the same flag is passed for you by:
+
+```bash
+./scripts/xtest run-console -- \
+    --operator-key /tmp/operator.key \
+    --agent-addr 127.0.0.1:9902 \
+    --agent-fp <hex> --agent-pubkey-b64 <base64>
+```
+
+`xtest run-console` syncs the workspace, builds the console with
+`--features llm-llama-cpp`, and launches it. The console will then
+prompt you for the Gemma download on first run.
 
 ---
 

@@ -91,9 +91,10 @@ impl Chat for MockChat {
             .map_or("", |m| m.content.as_str());
         Ok(format!(
             "(mock chat — no model loaded) you said: {}\n\n\
-             To get a real Gemma 4 chatbot, configure `[chat.llama_cpp]` in the \
-             console (see DESIGN-CONSOLE.md / `bowery-console --help`) and ensure \
-             the binary is built with `--features llm-llama-cpp`.",
+             To get a real Gemma 4 chatbot, rebuild bowery-console with \
+             `--features llm-llama-cpp` and re-launch. The binary will then \
+             offer to download the GGUF on first run. See `docs/CONSOLE.md` \
+             or press 8 (Help) for the full handbook.",
             last_user.lines().next().unwrap_or("")
         ))
     }
