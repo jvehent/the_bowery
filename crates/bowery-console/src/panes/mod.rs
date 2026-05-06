@@ -4,7 +4,9 @@
 
 pub(crate) mod alerts;
 pub(crate) mod audit;
+pub(crate) mod chat;
 pub(crate) mod doctor;
+pub(crate) mod help;
 pub(crate) mod map;
 pub(crate) mod peers;
 pub(crate) mod query;
@@ -17,6 +19,8 @@ pub(crate) enum PaneId {
     Audit,
     Peers,
     Doctor,
+    Chat,
+    Help,
 }
 
 impl PaneId {
@@ -29,6 +33,8 @@ impl PaneId {
             Self::Audit => '4',
             Self::Peers => '5',
             Self::Doctor => '6',
+            Self::Chat => '7',
+            Self::Help => '8',
         }
     }
 
@@ -40,16 +46,20 @@ impl PaneId {
             Self::Audit => "Audit",
             Self::Peers => "Peers",
             Self::Doctor => "Doctor",
+            Self::Chat => "Chat",
+            Self::Help => "Help",
         }
     }
 
-    pub(crate) const ALL: [PaneId; 6] = [
+    pub(crate) const ALL: [PaneId; 8] = [
         Self::Query,
         Self::Alerts,
         Self::Map,
         Self::Audit,
         Self::Peers,
         Self::Doctor,
+        Self::Chat,
+        Self::Help,
     ];
 
     /// Resolve `[1]`-style hotkeys back to a `PaneId`.

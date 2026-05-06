@@ -23,7 +23,9 @@ use crate::palette::PaletteCommand;
 use crate::panes::PaneId;
 use crate::panes::alerts::AlertsPane;
 use crate::panes::audit::AuditPane;
+use crate::panes::chat::ChatPane;
 use crate::panes::doctor::DoctorPane;
+use crate::panes::help::HelpPane;
 use crate::panes::map::MapPane;
 use crate::panes::peers::PeersPane;
 use crate::panes::query::{QueryPane, QueryStatus};
@@ -36,13 +38,16 @@ pub(crate) struct Relay {
     pub(crate) pubkey_b64: String,
 }
 
-#[derive(Debug)]
 pub(crate) struct AppArgs {
     pub(crate) operator_key: PathBuf,
     pub(crate) agent_addr: SocketAddr,
     pub(crate) agent_fp: String,
     pub(crate) agent_pubkey_b64: String,
     pub(crate) default_timeout: Duration,
+    /// Chat backend chosen at startup. Mock when the binary was
+    /// built without `--features llm-llama-cpp` or the operator
+    /// didn't pass `--chat-model`.
+    pub(crate) chat_backend: std::sync::Arc<dyn bowery_llm::Chat>,
 }
 
 #[derive(Debug)]
@@ -74,6 +79,7 @@ pub(crate) enum EngineEvent {
     MapDone {
         result: Result<CollectSink, String>,
     },
+    ChatReply(Result<String, String>),
 }
 
 pub(crate) struct App {
@@ -88,6 +94,8 @@ pub(crate) struct App {
     pub(crate) peers_pane: PeersPane,
     pub(crate) doctor_pane: DoctorPane,
     pub(crate) map_pane: MapPane,
+    pub(crate) chat_pane: ChatPane,
+    pub(crate) help_pane: HelpPane,
 
     pub(crate) input: InputState,
     pub(crate) input_mode: InputMode,
@@ -117,6 +125,8 @@ impl App {
             peers_pane: PeersPane::new(),
             doctor_pane: DoctorPane::new(),
             map_pane: MapPane::new(),
+            chat_pane: ChatPane::new(args.chat_backend),
+            help_pane: HelpPane::new(),
             input: load_history_into_input(),
             input_mode: InputMode::Pane,
             status_message: None,
@@ -151,39 +161,92 @@ impl App {
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyEvent) {
-        // Global shortcuts that bypass the input editor.
+    /// Handle keys that operate above the input editor (pane
+    /// switching, refresh, palette, help scroll, draft-run).
+    /// Returns `true` if the key was consumed.
+    fn handle_global_hotkey(&mut self, key: KeyEvent) -> bool {
+        let pane_mode = matches!(self.input_mode, InputMode::Pane);
+        let input_empty = self.input.buffer.is_empty();
+
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.should_quit = true;
-                return;
+                return true;
             }
             (KeyCode::Char(c), KeyModifiers::NONE)
-                if matches!(self.input_mode, InputMode::Pane)
-                    && self.input.buffer.is_empty()
-                    && PaneId::from_hotkey(c).is_some() =>
+                if pane_mode && input_empty && PaneId::from_hotkey(c).is_some() =>
             {
                 if let Some(p) = PaneId::from_hotkey(c) {
                     self.current_pane = p;
                     self.activate_pane();
-                    return;
+                    return true;
                 }
             }
-            // Pane-specific hotkeys (only when input buffer empty).
-            (KeyCode::Char('r'), KeyModifiers::NONE)
-                if matches!(self.input_mode, InputMode::Pane) && self.input.buffer.is_empty() =>
-            {
+            (KeyCode::Char('r'), KeyModifiers::NONE) if pane_mode && input_empty => {
                 self.refresh_current_pane();
-                return;
+                return true;
             }
-            (KeyCode::Char(':'), KeyModifiers::NONE)
-                if matches!(self.input_mode, InputMode::Pane) && self.input.buffer.is_empty() =>
+            (KeyCode::Char('?'), KeyModifiers::NONE) if pane_mode && input_empty => {
+                self.current_pane = PaneId::Help;
+                return true;
+            }
+            (KeyCode::Char('x'), KeyModifiers::NONE)
+                if pane_mode && input_empty && self.current_pane == PaneId::Chat =>
             {
+                if let Some(sql) = self.chat_pane.take_draft() {
+                    self.current_pane = PaneId::Query;
+                    self.query_pane.submit(
+                        &sql,
+                        self.relay.clone(),
+                        self.operator_key.clone(),
+                        self.default_timeout,
+                        self.engine_tx.clone(),
+                    );
+                    self.status_message = Some("running draft SQL from chat".into());
+                } else {
+                    self.status_message = Some("no draft SQL to run".into());
+                }
+                return true;
+            }
+            (KeyCode::Char(':'), KeyModifiers::NONE) if pane_mode && input_empty => {
                 self.input_mode = InputMode::Palette;
                 self.input.clear();
-                return;
+                return true;
             }
             _ => {}
+        }
+
+        if pane_mode && self.current_pane == PaneId::Help {
+            match (key.code, key.modifiers) {
+                (KeyCode::PageDown, _) => {
+                    self.help_pane.scroll_down(20);
+                    return true;
+                }
+                (KeyCode::PageUp, _) => {
+                    self.help_pane.scroll_up(20);
+                    return true;
+                }
+                (KeyCode::Down, KeyModifiers::NONE) if input_empty => {
+                    self.help_pane.scroll_down(1);
+                    return true;
+                }
+                (KeyCode::Up, KeyModifiers::NONE) if input_empty => {
+                    self.help_pane.scroll_up(1);
+                    return true;
+                }
+                (KeyCode::Home, _) if input_empty => {
+                    self.help_pane.home();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        if self.handle_global_hotkey(key) {
+            return;
         }
 
         match self.input.handle_key(key) {
@@ -214,6 +277,11 @@ impl App {
                     self.default_timeout,
                     self.engine_tx.clone(),
                 );
+            }
+            PaneId::Chat => {
+                if let Some(msg) = self.chat_pane.submit(trimmed, self.engine_tx.clone()) {
+                    self.status_message = Some(msg);
+                }
             }
             other => {
                 self.status_message =
@@ -368,6 +436,7 @@ impl App {
             EngineEvent::DoctorLocalDone(report) => self.doctor_pane.on_local_done(report),
             EngineEvent::DoctorRemoteDone(result) => self.doctor_pane.on_remote_done(result),
             EngineEvent::MapDone { result } => self.map_pane.on_done(result),
+            EngineEvent::ChatReply(result) => self.chat_pane.on_reply(result),
         }
     }
 
@@ -427,6 +496,8 @@ impl App {
             PaneId::Peers => self.peers_pane.render(f, area),
             PaneId::Doctor => self.doctor_pane.render(f, area),
             PaneId::Map => self.map_pane.render(f, area),
+            PaneId::Chat => self.chat_pane.render(f, area),
+            PaneId::Help => self.help_pane.render(f, area),
         }
     }
 

@@ -257,6 +257,13 @@ cmd_build() {
     cmd_sync
     echo "==> cargo build $XTEST_CARGO_FLAGS $*"
     remote "cargo build --workspace $XTEST_CARGO_FLAGS $*"
+    # Also exercise the console's llama.cpp feature path. The
+    # workspace build above compiles bowery-console without
+    # features (mock chat backend); this second pass catches
+    # breakage in the LLM-on path before it shows up in
+    # `run-console`.
+    echo "==> cargo build --release -p bowery-console --features llm-llama-cpp"
+    remote "RUSTFLAGS='-C target-cpu=native' cargo build --release -p bowery-console --features llm-llama-cpp"
 }
 
 cmd_test() {
@@ -289,8 +296,11 @@ cmd_ci() {
     echo "==> [3/4] cargo test --workspace"
     remote "cargo test --workspace"
     echo
-    echo "==> [4/4] cargo build --workspace --release"
+    echo "==> [4/5] cargo build --workspace --release"
     remote "cargo build --workspace --release"
+    echo
+    echo "==> [5/5] cargo build --release -p bowery-console --features llm-llama-cpp"
+    remote "RUSTFLAGS='-C target-cpu=native' cargo build --release -p bowery-console --features llm-llama-cpp"
     echo
     echo "All CI steps passed."
 }

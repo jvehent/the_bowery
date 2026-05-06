@@ -355,6 +355,7 @@ dependencies = [
  "anyhow",
  "bowery-cli",
  "bowery-crypto",
+ "bowery-llm",
  "bowery-proto",
  "clap",
  "crossterm",

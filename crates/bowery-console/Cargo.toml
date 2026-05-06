@@ -14,9 +14,18 @@ readme.workspace = true
 name = "bowery-console"
 path = "src/main.rs"
 
+[features]
+default = []
+# Real Gemma 4 chatbot via llama.cpp. Off by default so a console
+# binary built for "just the panes" stays small (~few MB instead of
+# ~30 MB once llama.cpp is linked) and doesn't require a C++
+# toolchain at build time.
+llm-llama-cpp = ["bowery-llm/llama-cpp"]
+
 [dependencies]
 bowery-cli = { workspace = true }
 bowery-crypto = { workspace = true }
+bowery-llm = { workspace = true }
 bowery-proto = { workspace = true }
 
 anyhow = { workspace = true }

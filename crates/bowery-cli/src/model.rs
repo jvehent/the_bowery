@@ -44,12 +44,26 @@ const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 /// Curated registry. Add entries here as we adopt new models. Keeping
 /// this hardcoded (rather than a JSON manifest fetched at runtime) is
 /// deliberate: it forces us to vet new entries via code review.
-const REGISTRY: &[ModelEntry] = &[ModelEntry {
-    name: "qwen3-0.6b-q4_k_m",
-    url: "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
-    sha256_hex: None,
-    expected_bytes: 380 * 1024 * 1024, // ~380 MiB
-}];
+const REGISTRY: &[ModelEntry] = &[
+    ModelEntry {
+        // Agent-side alert verdict path (Phase 4b). Tuned for
+        // ChatML-style JSON-emit prompts.
+        name: "qwen3-0.6b-q4_k_m",
+        url: "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
+        sha256_hex: None,
+        expected_bytes: 380 * 1024 * 1024, // ~380 MiB
+    },
+    ModelEntry {
+        // Operator-side console chat (Console phase C-6). Gemma 4
+        // E2B-it — 2.3B effective params, 128K context window,
+        // <start_of_turn> chat template. Use this on the operator
+        // workstation, not on agents (agents stay on Qwen3).
+        name: "gemma-4-e2b-it-q4_k_m",
+        url: "https://huggingface.co/Monster/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf",
+        sha256_hex: None,
+        expected_bytes: 1_500 * 1024 * 1024, // ~1.5 GiB
+    },
+];
 
 pub fn list() {
     println!("{:<24} {:>10}  url", "name", "size");

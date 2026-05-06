@@ -23,6 +23,9 @@
 //! the rules + scorer instead of running it on every event.
 
 pub mod backend;
+pub mod chat;
+#[cfg(feature = "llama-cpp")]
+pub mod chat_llama_cpp;
 pub mod context;
 #[cfg(feature = "llama-cpp")]
 pub mod llama_cpp;
@@ -31,6 +34,9 @@ pub mod prompt;
 pub mod queue;
 
 pub use backend::{LlmAnalyzer, LlmError, LlmVerdict, MockLlmAnalyzer, MockMode};
+pub use chat::{Chat, ChatMessage, ChatRole, MockChat, render_gemma_prompt};
+#[cfg(feature = "llama-cpp")]
+pub use chat_llama_cpp::{LlamaCppChat, LlamaCppChatConfig};
 pub use context::AnalysisContext;
 #[cfg(feature = "llama-cpp")]
 pub use llama_cpp::{LlamaCppAnalyzer, LlamaCppConfig};
