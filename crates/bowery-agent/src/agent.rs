@@ -335,10 +335,6 @@ impl Agent {
         let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
         let endpoint =
             BoweryEndpoint::bind(identity.clone(), accept_verifier, config.whisper.bind_addr)?;
-        // Persistent outbound-connection pool — Phase-10 slice 1.
-        // Heartbeat (and, in later slices, Q&A and operator fanout)
-        // borrow connections from here instead of dialing every time.
-        let peer_connections = PeerConnections::new(endpoint.clone());
         let sealer = Arc::new(Sealer::new(identity.clone()));
         let whisper_addr = endpoint
             .local_addr()
@@ -408,6 +404,41 @@ impl Agent {
             fanout_rate_limit: Arc::new(FanoutRateLimit::new()),
             max_timeout: config.sql.max_timeout,
         });
+
+        // Persistent outbound-connection pool — Phase-10 slices 1+2.
+        // Heartbeat (and, in later slices, Q&A and operator fanout)
+        // borrow connections from here instead of dialing every time.
+        // The inbound handler runs `handle_connection` on every fresh
+        // outbound connection so peers can initiate streams *back*
+        // through the same QUIC socket without us needing them to
+        // dial our listener.
+        let peer_connections = {
+            let envelope_verifier = Arc::new(Verifier::new(resolver.clone(), sealer.fingerprint()));
+            let operators_for_handler = operators.clone();
+            let sealer_for_handler = sealer.clone();
+            let baseline_for_handler = baseline.clone();
+            let inbox_for_handler = inbox.clone();
+            let op_router_for_handler = op_router.clone();
+            let events_for_handler = events_tx.clone();
+            let handler: bowery_whisper::pool::InboundHandler = Arc::new(move |peer_fp, conn| {
+                let verifier = envelope_verifier.clone();
+                let operators = operators_for_handler.clone();
+                let sealer = sealer_for_handler.clone();
+                let baseline = baseline_for_handler.clone();
+                let inbox = inbox_for_handler.clone();
+                let op_router = op_router_for_handler.clone();
+                let events = events_for_handler.clone();
+                debug!(
+                    peer = %peer_fp,
+                    conn_id = conn.stable_id(),
+                    "spawning inbound handler on outbound-pooled connection"
+                );
+                tokio::spawn(handle_connection(
+                    conn, verifier, operators, sealer, baseline, inbox, op_router, events,
+                ));
+            });
+            PeerConnections::with_handler(endpoint.clone(), handler)
+        };
 
         let accept_task = spawn_accept_task(
             endpoint.clone(),

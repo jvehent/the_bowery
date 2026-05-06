@@ -43,18 +43,33 @@ use crate::envelope::FingerprintResolver;
 use crate::tls::PinnedCertVerifier;
 use crate::transport::{self, BoweryConnection, BoweryEndpoint};
 
+/// Hook invoked exactly once per fresh outbound dial, with the
+/// newly-pooled connection. The agent uses this to spawn its
+/// `handle_connection` accept loop on outbound connections so peers
+/// can initiate streams *back* through the same QUIC socket — the
+/// "no inbound listener needed for B" property of Phase-10 slice 2.
+pub type InboundHandler = Arc<dyn Fn(Fingerprint, BoweryConnection) + Send + Sync + 'static>;
+
 /// A pool of authenticated outbound connections, one per peer
 /// fingerprint. Cheap to clone — every clone shares the same backing
 /// state.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PeerConnections {
     inner: Arc<Inner>,
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for PeerConnections {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerConnections")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
 struct Inner {
     endpoint: BoweryEndpoint,
     state: Mutex<HashMap<Fingerprint, Entry>>,
+    handler: Option<InboundHandler>,
 }
 
 #[derive(Debug)]
@@ -67,12 +82,31 @@ struct Entry {
 }
 
 impl PeerConnections {
-    /// Construct a pool that dials through `endpoint`.
+    /// Construct a pool that dials through `endpoint`. No inbound
+    /// handler — outbound connections are write-only from the
+    /// dialler's perspective. Useful for the operator CLI.
     pub fn new(endpoint: BoweryEndpoint) -> Self {
+        Self::new_inner(endpoint, None)
+    }
+
+    /// Construct a pool that runs `handler` on every fresh outbound
+    /// connection. Agents use this so a peer can initiate whisper
+    /// streams back through the connection the agent dialled — the
+    /// connection is bidirectional even when only one side has an
+    /// inbound listener.
+    ///
+    /// The handler is `Fn`, called immediately on the calling task —
+    /// it should `tokio::spawn` the actual accept loop and return.
+    pub fn with_handler(endpoint: BoweryEndpoint, handler: InboundHandler) -> Self {
+        Self::new_inner(endpoint, Some(handler))
+    }
+
+    fn new_inner(endpoint: BoweryEndpoint, handler: Option<InboundHandler>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 endpoint,
                 state: Mutex::new(HashMap::new()),
+                handler,
             }),
         }
     }
@@ -105,6 +139,13 @@ impl PeerConnections {
             "pool dialled new connection"
         );
         self.insert(peer_fp, conn.clone());
+        // Slice 2 — invoke the inbound handler so the dialler
+        // processes peer-initiated streams on this connection. The
+        // handler is responsible for tokio::spawning the loop; we
+        // don't await it here.
+        if let Some(handler) = &self.inner.handler {
+            handler(peer_fp, conn.clone());
+        }
         Ok(conn)
     }
 
@@ -298,6 +339,71 @@ mod tests {
             conn_b.stable_id(),
             "invalidate must result in a fresh connection"
         );
+    }
+
+    #[tokio::test]
+    async fn handler_runs_once_per_fresh_dial() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let id_alpha = Arc::new(Identity::generate());
+        let id_beta = Arc::new(Identity::generate());
+
+        let mut resolver_alpha = StaticResolver::new();
+        resolver_alpha.insert(id_beta.verifying_key());
+        let mut resolver_beta = StaticResolver::new();
+        resolver_beta.insert(id_alpha.verifying_key());
+
+        let dial_verifier = Arc::new(PinnedCertVerifier::expecting(
+            resolver_alpha.clone(),
+            id_beta.fingerprint(),
+        ));
+        let accept_verifier_alpha = Arc::new(PinnedCertVerifier::new(resolver_alpha));
+        let accept_verifier_beta = Arc::new(PinnedCertVerifier::new(resolver_beta));
+
+        let endpoint_beta =
+            BoweryEndpoint::bind(id_beta.clone(), accept_verifier_beta, loopback()).unwrap();
+        let endpoint_alpha =
+            BoweryEndpoint::bind(id_alpha, accept_verifier_alpha, loopback()).unwrap();
+
+        let beta_addr = endpoint_beta.local_addr().unwrap();
+        let beta_clone = endpoint_beta.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(conn)) = beta_clone.accept().await {
+                tokio::spawn(async move {
+                    loop {
+                        if conn.recv_envelope().await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = calls.clone();
+        let handler: InboundHandler = Arc::new(move |_fp, _conn| {
+            calls_for_handler.fetch_add(1, Ordering::SeqCst);
+        });
+        let pool = PeerConnections::with_handler(endpoint_alpha, handler);
+
+        let beta_fp = id_beta.fingerprint();
+        let _ = pool
+            .get_or_dial(beta_fp, beta_addr, dial_verifier.clone())
+            .await
+            .unwrap();
+        let _ = pool
+            .get_or_dial(beta_fp, beta_addr, dial_verifier.clone())
+            .await
+            .unwrap();
+        // Handler runs only on the *fresh* dial — second call hits cache.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        pool.invalidate(&beta_fp);
+        let _ = pool
+            .get_or_dial(beta_fp, beta_addr, dial_verifier)
+            .await
+            .unwrap();
+        // Invalidate forces redial → handler runs again.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
