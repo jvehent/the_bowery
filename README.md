@@ -43,7 +43,6 @@ crates/
   bowery-proto/            # prost messages (envelope, payloads)
   bowery-response/         # Phase-7 action engine (block_exec / kill_process)
   bowery-sql/              # Phase-9 in-process SQL engine (rusqlite)
-  bowery-sysquery/         # subprocess wrapper for an osquery-shaped binary
   bowery-tables/           # Phase-9 default table set (procfs/sysfs/etc-backed)
   bowery-whisper/          # envelope sealing, replay guard, mTLS, QUIC, Q&A, fingerprints
 deploy/systemd/            # service unit + slice
@@ -86,7 +85,7 @@ cargo build --release --features llm-llama-cpp -p bowery-agent
 - **Phase 4 / 4b** — LLM analyzer framework (mock + queue + outcomes bridge); real Qwen3-0.6B inference via `llama-cpp-2`.
 - **Phase 5** — whisper Q&A: two-tier privacy fingerprints (8-byte truncation of `SHA256(domain ‖ sha256)`), bloom filter primitives, role-similarity peer selection by cosine similarity, asker/responder protocol over the existing QUIC transport, per-round aggregator.
 - **Phase 6a** — operator alert inbox: per-agent in-memory ring with TTL retention, signed `Subscribe` over the QUIC transport, `bowery alerts tail` CLI for roaming operators, curated model registry (`bowery model fetch`).
-- **Phase 6b** — typed `OperatorCommand` / `OperatorResult` envelopes, optional `sysquery` subprocess wrapper for operators who want the wider third-party (osquery-shaped) table set alongside the native engine.
+- **Phase 6b** — typed `OperatorCommand` / `OperatorResult` envelopes for operator → agent dispatch.
 - **Phase 7** — response engine with BPF-LSM block-exec hooks, default-deny policy, signed audit log (Phase-8 hash-chain).
 - **Phase 8** — replay guards, per-recipient envelope binding, fuzzing harness.
 - **Phase 9** — native SQL surface: `bowery-sql` engine + `bowery-tables` 13 default + 4 Bowery-internal views + 7 scalar file/hash functions; streamed as chunked `OperatorResult::SqlChunk` envelopes over QUIC; multi-agent fan-out with operator-signed delegation (`OperatorAuthorization`); peers seal chunks **directly for the operator** (relay can drop but cannot forge); SELECT-only authorizer; per-operator rate limit; 16 KiB per-cell cap; SQLite progress-handler cancellation; `bowery peers add/list/remove` operator manifest. Every CRIT/HIGH/MEDIUM finding from [`SECURITY-AUDIT-PHASE9.md`](SECURITY-AUDIT-PHASE9.md) closed.

@@ -121,7 +121,6 @@ bowery/
 │   ├── bowery-response/          # action engine
 │   ├── bowery-sql/               # Phase-9 in-process SQL engine (rusqlite)
 │   ├── bowery-tables/            # Phase-9 default table set + scalar file/hash funcs
-│   ├── bowery-sysquery/          # subprocess wrapper (fallback for third-party SQL surfaces)
 │   └── bowery-proto/             # wire types (prost)
 ├── deploy/
 │   ├── systemd/                  # bowery-agent.service
@@ -455,12 +454,20 @@ Failure modes covered by tests:
 
 ### 10.3 SQL surface
 
-Two query paths, by operator choice:
-
-- **Native (`bowery exec sql`, default)** — `bowery-sql` is an in-process rusqlite engine fed by `bowery-tables`. 13 default procfs/sysfs/etc-backed tables plus 4 Bowery-internal views (peers, baseline binaries, alerts, audit) plus 7 scalar file/hash functions. Streams chunked `OperatorResult::SqlChunk` envelopes over QUIC. Multi-agent fan-out with operator-signed delegation (the original operator's Ed25519 signature on an `OperatorAuthorization` rides inside the relay-forwarded envelope; peers verify against their own `[operators]` set; peers seal `SqlChunk` envelopes directly for the operator, so the relay can drop but cannot forge or tamper). See [`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md) for the full design + slice plan.
-- **Sysquery (`bowery exec sysquery`, opt-in)** — `bowery-sysquery` is a subprocess wrapper around any binary that accepts osquery-shaped flags (`--json --disable_extensions=true …`). The wrapped binary is the operator's choice; in practice that's typically `osqueryi`. Off by default (`[sysquery] enabled = false`); operators turn it on per-host when they need a third-party table set the native engine doesn't provide. JSON output is returned to the operator verbatim — no streaming, single round-trip per query.
-
-Native is the going-forward primary path; sysquery exists as a fallback for operators with established osquery query libraries or third-party-table needs.
+`bowery exec sql` runs against the native, in-process SQL
+engine: `bowery-sql` (rusqlite + a SELECT-only authorizer) fed
+by `bowery-tables` (13 default procfs/sysfs/etc-backed tables +
+4 Bowery-internal views — peers, baseline binaries, alerts,
+audit — + 7 scalar file/hash functions). Streams chunked
+`OperatorResult::SqlChunk` envelopes over QUIC. Multi-agent
+fan-out uses operator-signed delegation: the original
+operator's Ed25519 signature on an `OperatorAuthorization`
+rides inside the relay-forwarded envelope; peers verify
+against their own `[operators]` set and seal `SqlChunk`
+envelopes directly for the operator, so the relay can drop
+but cannot forge or tamper. See
+[`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md) for the full
+design + slice plan.
 
 ---
 
@@ -509,7 +516,7 @@ For v0.1 the mirror may proxy HuggingFace; the manifest signature is what the ag
 | **3. Pre-filter + scoring** | Rules + baseline scorer + behavior aggregator + role-vector computation | (within `bowery-baseline` + `bowery-mesh`) |
 | **4. LLM analyzer** | candle backend, model fetch, cgroup caps, structured prompts, context builder | `bowery-llm` |
 | **5. Whisper Q&A** | Two-tier privacy fingerprints, role-similarity peer selection, capsule exchange | `bowery-whisper` (full) |
-| **6. Operator IO** | CLI commands, signed envelopes, mesh inbox + roaming subscribe, sysquery subprocess | `bowery-sysquery`, expand `bowery-cli` |
+| **6. Operator IO** | CLI commands, typed `OperatorCommand` / `OperatorResult` envelopes, mesh inbox + roaming subscribe | expand `bowery-cli` |
 | **7. Response** | Action engine, two-tier autonomy gating, standing authorization | `bowery-response` |
 | **8. Hardening** | Fuzzing, adversarial tests, key rotation, neighbor add/remove protocol | (all) |
 | **9. Native SQL surface** | Pure-Rust SQL engine + table set, streaming wire, multi-agent fan-out with operator-signed delegation, scalar file/hash funcs, operator peer manifest CLI, security audit closure | `bowery-sql`, `bowery-tables` |

@@ -10,7 +10,6 @@ members = [
     "crates/bowery-events",
     "crates/bowery-llm",
     "crates/bowery-mesh",
-    "crates/bowery-sysquery",
     "crates/bowery-proto",
     "crates/bowery-response",
     "crates/bowery-sql",
@@ -41,7 +40,6 @@ bowery-ebpf-loader = { path = "crates/bowery-ebpf-loader", version = "0.0.1" }
 bowery-events = { path = "crates/bowery-events", version = "0.0.1" }
 bowery-llm = { path = "crates/bowery-llm", version = "0.0.1" }
 bowery-mesh = { path = "crates/bowery-mesh", version = "0.0.1" }
-bowery-sysquery = { path = "crates/bowery-sysquery", version = "0.0.1" }
 bowery-proto = { path = "crates/bowery-proto", version = "0.0.1" }
 bowery-response = { path = "crates/bowery-response", version = "0.0.1" }
 bowery-sql = { path = "crates/bowery-sql", version = "0.0.1" }

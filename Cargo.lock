@@ -281,7 +281,6 @@ dependencies = [
  "bowery-proto",
  "bowery-response",
  "bowery-sql",
- "bowery-sysquery",
  "bowery-tables",
  "bowery-whisper",
  "clap",
@@ -457,16 +456,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "bowery-sysquery"
-version = "0.0.1"
-dependencies = [
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

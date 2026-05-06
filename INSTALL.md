@@ -551,39 +551,6 @@ operator — the relay does **not** need to be in any peer's
 `[operators]` list — so a compromised relay key cannot grant
 SQL authority over peers.
 
-### Optional: `bowery exec sysquery` (subprocess fallback)
-
-Operators with established osquery query libraries (or who need
-a third-party table the native engine doesn't have) can opt
-into the subprocess wrapper per-host. In `agent.toml`:
-
-```toml
-[sysquery]
-enabled = true
-binary_path = "/usr/bin/osqueryi"
-max_timeout = "30s"
-```
-
-Then on the operator side:
-
-```bash
-bowery exec sysquery \
-    --operator-key  ~/.bowery/operator.key \
-    --agent-addr    10.0.0.5:9902 \
-    --agent-fp      <agent_fp_hex> \
-    --agent-pubkey-b64 <agent_pubkey_b64> \
-    --sql 'SELECT pid, name FROM processes LIMIT 5'
-```
-
-The agent shells out to the configured binary with a hardened
-flag set (`--json --disable_extensions=true …`) and returns
-the JSON output verbatim. Sysquery is **not** relay-forwarded:
-each invocation hits exactly one agent. For cross-host hunts
-use `bowery exec sql --fanout` instead.
-
-See [`IMPLEMENTATION.md` § 22.10](IMPLEMENTATION.md#2210-native-sql-vs-sysquery--when-to-use-each)
-for the comparison matrix.
-
 ### Models
 
 The agent expects an already-on-disk GGUF. Fetch one:

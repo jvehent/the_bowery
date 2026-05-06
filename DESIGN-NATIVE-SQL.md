@@ -1,24 +1,22 @@
 # The Bowery — Native SQL surface (Phase 9)
 
-**Status:** shipped. Phase 9 slices 1–8 are in tree. The native
-engine (`bowery-sql`) lives alongside `bowery-sysquery` (the
-renamed subprocess wrapper); operators choose between them via
-`bowery exec sql` (native, default) and `bowery exec sysquery`
-(subprocess fallback). This document is the design rationale +
+**Status:** shipped. Phase 9 slices 1–8 are in tree. The agent
+exposes a native, in-process SQL engine (`bowery-sql`) reachable
+through `bowery exec sql`. This document is the design rationale +
 operator guide; for the in-tree implementation reference see
 [`IMPLEMENTATION.md` § 22](IMPLEMENTATION.md#22-phase-9-native-sql-surface).
 
-This document scopes a pure-Rust replacement for osquery: a SQL
-surface over a curated set of host-state tables, queryable by an
-operator from anywhere in the mesh, with results streaming back
-over time and an explicit multi-agent fan-out model.
+This document scopes a pure-Rust SQL surface over a curated set
+of host-state tables, queryable by an operator from anywhere in
+the mesh, with results streaming back over time and an explicit
+multi-agent fan-out model.
 
 ## 1. Goals
 
 1. **Pure Rust, single binary.** No subprocess, no bundled C++
    binary. A query runs in-process inside the agent.
-2. **Fast.** Cold start under 5 ms (vs osqueryi's ~50–200 ms);
-   per-row marshalling under 100 µs.
+2. **Fast.** Cold start under 5 ms; per-row marshalling under
+   100 µs.
 3. **Streaming.** Rows flow back to the operator as they are
    produced — slow tables don't block fast ones.
 4. **Multi-agent.** One operator query reaches N agents
@@ -31,18 +29,20 @@ over time and an explicit multi-agent fan-out model.
 ## 2. Non-goals
 
 - **Cross-platform.** Linux only. Phase 10+ may revisit macOS /
-  Windows; until then, osquery's portability cost is not paid.
-- **Feature parity with osquery's 250 tables.** Fifteen are in
-  scope (§4). Others arrive when an operator workflow demands
-  one.
+  Windows; for now the table substrates assume `/proc`, `/sys`,
+  netlink, and systemd D-Bus.
+- **Sprawling table catalogue.** Thirteen host-state tables are
+  in scope (§4) plus four Bowery-internal views. Others arrive
+  when an operator workflow demands one.
 - **File integrity monitoring (FIM) / continuous file events.**
-  osquery's `file_events` table requires kernel hookup we don't
-  want to take on yet. Operators get point-in-time `file` and
-  `hash` lookups; continuous file change detection stays a
-  separate eBPF-fed event stream (Phase 11).
-- **Operator-defined extensions.** osquery's extension SDK is
-  out of scope. New tables ship as code review against this
-  repo.
+  Continuous file change detection requires kernel hookup we
+  don't want to take on yet. Operators get point-in-time
+  scalar lookups via `bowery_file_*` and `bowery_sha256_hex`;
+  continuous file change detection stays a separate eBPF-fed
+  event stream (Phase 11).
+- **Operator-defined extensions.** Loadable third-party
+  extensions are out of scope. New tables ship as code review
+  against this repo.
 
 ## 3. Crates
 
@@ -64,15 +64,13 @@ bowery-stream                 new
     Used by both the local-agent path and the relay path.
 ```
 
-`bowery-sysquery` (formerly `bowery-osquery`) stays around as the
-subprocess-backed path for operators who want the wider third-party-
-binary table set; the native engine is always wired and is the
-default surface (`bowery exec sql`).
+The native engine is always wired; `bowery exec sql` is the
+sole operator-facing entry point.
 
 ## 4. Tables
 
-The 15 tables operators have asked for, with implementation
-substrate per table.
+The 13 host-state tables plus 4 Bowery-internal views, with
+implementation substrate per table.
 
 | Table | Substrate | Notes |
 |---|---|---|
@@ -95,14 +93,14 @@ substrate per table.
 ### 4.1 Bowery-native bonus tables (write once we have the vtab framework)
 
 These ride along for free because the vtab interface is generic.
-None are in osquery; they expose Bowery's own state.
+They expose Bowery's own internal state.
 
 - `bowery_peers` — known_neighbors store: fingerprint, vk_b64, pinned_at, role_vector_hex.
 - `bowery_baseline_binaries` — baseline DB rows: sha256, first_seen, last_seen, seen_count.
 - `bowery_alerts` — alert inbox: episode_id, suspicion, exe_path, ts.
 - `bowery_audit` — last N audit envelopes: seq, action, outcome, recorded_at.
 
-These are what makes the reimplementation worth doing — operator
+These are what makes the surface worth building — operator
 queries that join host state with the agent's own observation
 state.
 
@@ -145,7 +143,6 @@ with an unbounded scan.
 
 ```rust
 pub enum OperatorCommandBody {
-    Sysquery(SysqueryQuery),                  // existing subprocess path
     Sql(SqlQuery),                            // native engine
 }
 
@@ -172,8 +169,7 @@ detour.
 
 ```rust
 pub enum OperatorResultBody {
-    Sysquery(SysqueryResult),  // subprocess path
-    Error(OperatorError),      // shared; terminates the whole stream
+    Error(OperatorError),      // terminates the whole stream
     SqlChunk(SqlChunk),        // emitted N times per agent
 }
 
@@ -371,7 +367,7 @@ again. Implemented as: dispatch ignores the `fanout` flag when
 | Untrusted operator | Same Phase-6a/6b gate — operator key must be in `[operators]` config of every agent that responds. SQLite `set_authorizer` denies every non-SELECT op (no ATTACH, no write-pragmas, no DROP/CREATE/ALTER). |
 | Untrusted relay | **Implemented.** `OperatorCommand.forwarded_from_operator` carries an Ed25519-signed `OperatorAuthorization`. Peers verify the operator's signature against their own `[operators]` set, recompute the command digest, and seal `SqlChunk` envelopes directly for the operator. Relay forwards bytes verbatim. Relay can drop chunks but cannot forge or tamper. Partial-result detection requires the operator-side peer manifest (`bowery peers add`) — operator knows which fingerprints *should* have responded. |
 | Cycle / amplification | Enforced both at the relay (always sets `fanout=false` on outbound) AND on peer-receive (rejects any forwarded command with `fanout=true` as `policy_denied`). One-hop fan-out, period. |
-| Per-agent DoS | All Phase-6b/8 caps still apply. SQL adds: row cap (1M), per-cell cap (16 KiB; oversize cells truncate to a `Text("<truncated N bytes>")` placeholder), per-query timeout (clamped to `[sysquery] max_timeout`), concurrency cap (`[sql] max_concurrent_queries = 4` default), SQLite progress-handler interrupt on timeout. |
+| Per-agent DoS | All Phase-6b/8 caps still apply. SQL adds: row cap (1M), per-cell cap (16 KiB; oversize cells truncate to a `Text("<truncated N bytes>")` placeholder), per-query timeout (clamped to `[sql] max_timeout`), concurrency cap (`[sql] max_concurrent_queries = 4` default), SQLite progress-handler interrupt on timeout. |
 | Mesh-flood DoS via fan-out | **Implemented.** Per-operator-fp `FanoutRateLimit` token bucket: 1 token / 5 s, burst 6. Bucket-empty returns `OperatorError { kind: "rate_limited" }`. |
 | File system traversal | **`file` / `hash` shipped as scalar functions, not tables.** `bowery_file_size('/etc/passwd')`, `bowery_file_sha256_hex('/usr/bin/sshd')`, etc. The operator must supply each path explicitly; no enumeration possible. Hash function caps reads at 16 MiB; non-regular files (sockets/pipes/devices) return NULL. |
 | Information disclosure | Operator already authorised on the host can read host-readable files. `[sql] expose_cmdline = false` default keeps `processes.cmdline` out of the row set so argv-borne secrets (DB passwords, API tokens) don't ride fan-out responses. Operators who need cmdline opt in per-host. |
@@ -447,9 +443,7 @@ through CI; no slice leaves the agent broken.
 - Agent-side handler streams rows via per-row OperatorResult
   envelopes.
 - CLI-side streaming receive: print one row per envelope.
-- The `sysquery` (subprocess) handler stays in place; operators
-  choose via `bowery exec sql` (native) vs `bowery exec sysquery`
-  (subprocess).
+- `bowery exec sql` is the sole operator entry point.
 
 ### Slice 7 — Multi-agent fan-out (2 weeks)
 
@@ -479,10 +473,7 @@ through CI; no slice leaves the agent broken.
 pass that closed every CRIT/HIGH/MEDIUM finding from the
 [Phase-9 security audit](SECURITY-AUDIT-PHASE9.md) — including
 the architectural relay-trust closure (peers seal chunks
-directly for the operator; relay forwards bytes verbatim). The
-sysquery (subprocess) handler stays alongside as the fallback
-for operators with established third-party-binary query
-libraries; default-disabled in agent config.
+directly for the operator; relay forwards bytes verbatim).
 
 ## 11. Open questions / post-Phase-9 items
 
@@ -513,12 +504,6 @@ build-out. What's left:
 | Wall-clock | Multiple sessions (slice 1 → final-9) |
 | Code | ~5k LOC of Rust across the new crates and fixes |
 | New crates | 2 (`bowery-sql`, `bowery-tables`) |
-| Wire-format additions | 2 command bodies (`Sql`, retained `Sysquery`), 1 result body (`SqlChunk`), 1 forwarded envelope field, plus `OperatorAuthorization` |
+| Wire-format additions | 1 command body (`Sql`), 1 result body (`SqlChunk`), 1 forwarded envelope field, plus `OperatorAuthorization` |
 | Tests added | 5 sql-engine + 5 file-func + 7 integration (operator-command) + 3 peer-manifest |
-| Existing-test impact | low — `[sql]` config block default-friendly; sysquery tests stay green |
-
-The sysquery (subprocess) crate stays in the workspace as the
-fallback for operators wanting the wider osquery-shaped table
-set. Default `[sysquery] enabled = false` means the binary
-isn't even located unless explicitly turned on. Remove only if
-production deployments converge on native-only.
+| Existing-test impact | low — `[sql]` config block default-friendly |

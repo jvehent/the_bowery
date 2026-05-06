@@ -123,7 +123,7 @@ pub enum AgentEvent {
     },
     /// Phase 6b: an operator command was received, dispatched, and a
     /// result was sealed back. `kind` is the command-body
-    /// discriminator (`"sql"`, `"sysquery"`, etc.) for ops dashboards.
+    /// discriminator (`"sql"`, `<empty>`, etc.) for ops dashboards.
     OperatorCommandHandled {
         operator: Fingerprint,
         request_id: String,
@@ -366,35 +366,6 @@ impl Agent {
             shutdown_rx.clone(),
         );
 
-        // Phase-6b operator-command router. Build the sysquery
-        // handle only when the operator has explicitly opted in *and*
-        // the binary resolves; otherwise sysquery commands fail-shut
-        // with policy_denied at dispatch time. The native SQL engine
-        // (bowery-sql) is always wired — no external dependency to
-        // gate.
-        let sysquery_handle = if config.sysquery.enabled {
-            match bowery_sysquery::Sysquery::new(&config.sysquery.binary_path) {
-                Ok(o) => {
-                    info!(
-                        binary = %config.sysquery.binary_path.display(),
-                        max_timeout = ?config.sysquery.max_timeout,
-                        "sysquery handler enabled"
-                    );
-                    Some(Arc::new(o))
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        binary = %config.sysquery.binary_path.display(),
-                        "sysquery enabled in config but binary not found; \
-                         dispatch will return policy_denied"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
         let relay_ctx = Arc::new(RelayContext {
             endpoint: endpoint.clone(),
             known_neighbors: known_neighbors.clone(),
@@ -427,11 +398,10 @@ impl Agent {
                 config.response.audit_log_path.clone(),
             )));
         let op_router = Arc::new(OperatorCommandRouter {
-            sysquery: sysquery_handle,
             sql: Some(Arc::new(sql_engine)),
             relay: Some(relay_ctx),
             fanout_rate_limit: Arc::new(FanoutRateLimit::new()),
-            max_timeout: config.sysquery.max_timeout,
+            max_timeout: config.sql.max_timeout,
         });
 
         let accept_task = spawn_accept_task(
@@ -710,10 +680,6 @@ type ResolverArc = Arc<CompositeResolver<Arc<KnownNeighbors>, Arc<StaticResolver
 /// `policy_denied` instead of being dispatched.
 #[derive(Clone, Default)]
 pub(crate) struct OperatorCommandRouter {
-    /// Phase-6b sysquery (subprocess) handler. Some when
-    /// [`SysqueryConfig::enabled`] is true and `binary_path`
-    /// resolves at startup.
-    pub sysquery: Option<Arc<bowery_sysquery::Sysquery>>,
     /// Phase-9 native SQL engine. Always populated — `bowery-sql`
     /// has no privileged surface and no external dependencies, so
     /// there's nothing to gate. `Arc` makes the engine
@@ -733,8 +699,7 @@ pub(crate) struct OperatorCommandRouter {
     /// Operator-direct queries aren't throttled — the blast radius
     /// is one host and `max_timeout` already caps per-query work.
     pub fanout_rate_limit: Arc<FanoutRateLimit>,
-    /// Hard ceiling on per-query timeout, applied to every
-    /// command kind.
+    /// Hard ceiling on per-query wall-clock timeout.
     pub max_timeout: Duration,
 }
 
@@ -1030,8 +995,7 @@ async fn respond_to_subscribe(
 ///    surfaces as `unsupported_command` so the operator's CLI sees
 ///    the wire-level mismatch rather than a silent timeout.
 /// 2. Dispatches to the per-command handler (`Sql` against the
-///    native engine, `Sysquery` against an optional subprocess
-///    binary; future commands add new arms).
+///    native engine; future commands add new arms).
 /// 3. Builds an [`OperatorResult`] echoing the `request_id`, seals
 ///    it back to the operator, and emits an event.
 ///
@@ -1048,13 +1012,10 @@ async fn respond_to_operator_command(
     operators: &Arc<StaticResolver>,
     events_tx: &broadcast::Sender<AgentEvent>,
 ) -> Result<(), bowery_whisper::transport::Error> {
-    use bowery_proto::{
-        OperatorCommandBody, OperatorError, OperatorResult, OperatorResultBody, SysqueryResult,
-    };
+    use bowery_proto::OperatorCommandBody;
 
     let request_id = cmd.request_id.clone();
     let command_kind = match cmd.command.as_ref() {
-        Some(OperatorCommandBody::Sysquery(_)) => "sysquery",
         Some(OperatorCommandBody::Sql(_)) => "sql",
         None => "<empty>",
     };
@@ -1188,45 +1149,17 @@ async fn respond_to_operator_command(
         return outcome;
     }
 
-    let result = match cmd.command {
-        Some(OperatorCommandBody::Sql(_)) => unreachable!("handled above"),
-        Some(OperatorCommandBody::Sysquery(q)) => match &op_router.sysquery {
-            Some(sysq) => match sysq.run(&q.sql, effective_timeout).await {
-                Ok(out) => OperatorResultBody::Sysquery(SysqueryResult {
-                    json: out.stdout,
-                    exit_code: out.exit_code,
-                }),
-                Err(e) => {
-                    let kind = match &e {
-                        bowery_sysquery::SysqueryError::Timeout(_) => "timeout",
-                        bowery_sysquery::SysqueryError::OutputTooLarge { .. } => "output_too_large",
-                        _ => "handler_error",
-                    };
-                    OperatorResultBody::Error(OperatorError {
-                        kind: kind.into(),
-                        message: e.to_string(),
-                    })
-                }
-            },
-            None => OperatorResultBody::Error(OperatorError {
-                kind: "policy_denied".into(),
-                message: "sysquery not enabled on this agent (set [sysquery] enabled = true)"
-                    .into(),
-            }),
-        },
-        None => OperatorResultBody::Error(OperatorError {
-            kind: "unsupported_command".into(),
-            message: "OperatorCommand.command is empty".into(),
-        }),
-    };
-
-    let response = OperatorResult {
-        request_id: request_id.clone(),
-        result: Some(result),
-    };
-    let outbound = sealer.seal_for(&operator, &WhisperPayload::operator_result(response));
-    conn.send_envelope(&outbound).await?;
-
+    // The `Sql` body is the only command kind; everything is
+    // returned above. An empty `command` falls through here.
+    send_sql_error(
+        conn,
+        &sealer,
+        &operator,
+        &request_id,
+        "unsupported_command",
+        "OperatorCommand.command is empty",
+    )
+    .await?;
     let _ = events_tx.send(AgentEvent::OperatorCommandHandled {
         operator,
         request_id,

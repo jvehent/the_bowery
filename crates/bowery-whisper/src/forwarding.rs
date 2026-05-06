@@ -110,14 +110,12 @@ pub fn verify_operator_authorization(
 /// doesn't change *what data the peer returns*, so excluding it
 /// from the integrity binding is correct.
 pub fn command_body_digest(body: &OperatorCommandBody) -> [u8; 32] {
-    let normalised = match body {
-        OperatorCommandBody::Sql(q) => OperatorCommandBody::Sql(bowery_proto::SqlQuery {
-            sql: q.sql.clone(),
-            fanout: false,
-            peers: Vec::new(),
-        }),
-        OperatorCommandBody::Sysquery(_) => body.clone(),
-    };
+    let OperatorCommandBody::Sql(q) = body;
+    let normalised = OperatorCommandBody::Sql(bowery_proto::SqlQuery {
+        sql: q.sql.clone(),
+        fanout: false,
+        peers: Vec::new(),
+    });
     let wrapper = OperatorCommand {
         request_id: String::new(),
         timeout_ms: 0,
@@ -138,7 +136,7 @@ fn current_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bowery_proto::{SqlQuery, SysqueryQuery};
+    use bowery_proto::SqlQuery;
 
     #[test]
     fn signed_authorization_round_trips() {
@@ -167,18 +165,38 @@ mod tests {
     }
 
     #[test]
-    fn different_command_body_fails_digest_match() {
+    fn different_sql_strings_produce_different_digests() {
         // Caller-side digest check (the agent-side flow) catches
-        // a relay swapping the command. Here we just confirm two
-        // different bodies produce different digests.
+        // a relay swapping the SQL. Here we just confirm two
+        // different SQL strings produce different digests.
         let body_a = OperatorCommandBody::Sql(SqlQuery {
             sql: "SELECT 1".into(),
             fanout: false,
             peers: Vec::new(),
         });
-        let body_b = OperatorCommandBody::Sysquery(SysqueryQuery {
-            sql: "SELECT 1".into(),
+        let body_b = OperatorCommandBody::Sql(SqlQuery {
+            sql: "SELECT 2".into(),
+            fanout: false,
+            peers: Vec::new(),
         });
         assert_ne!(command_body_digest(&body_a), command_body_digest(&body_b));
+    }
+
+    #[test]
+    fn fanout_field_is_normalised_out_of_digest() {
+        // The relay rewrites SqlQuery.fanout from true → false
+        // when forwarding; the digest must NOT change across that
+        // hop or peer-side verification fails.
+        let body_a = OperatorCommandBody::Sql(SqlQuery {
+            sql: "SELECT 1".into(),
+            fanout: true,
+            peers: Vec::new(),
+        });
+        let body_b = OperatorCommandBody::Sql(SqlQuery {
+            sql: "SELECT 1".into(),
+            fanout: false,
+            peers: Vec::new(),
+        });
+        assert_eq!(command_body_digest(&body_a), command_body_digest(&body_b));
     }
 }

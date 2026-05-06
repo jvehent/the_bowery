@@ -75,7 +75,6 @@ fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: St
         },
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),
-        sysquery: bowery_agent::config::SysqueryConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
     }
 }

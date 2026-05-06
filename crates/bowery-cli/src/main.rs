@@ -198,36 +198,6 @@ enum ExecCommand {
         #[arg(long, default_value_t = SqlFormat::Tsv)]
         format: SqlFormat,
     },
-    /// Run a SQL query via the agent's optional subprocess
-    /// `sysquery` handler (must be enabled in the agent config and
-    /// the binary present on disk). Returns the wrapped binary's
-    /// JSON output verbatim.
-    Sysquery {
-        /// Path to the operator's identity key file.
-        #[arg(long)]
-        operator_key: PathBuf,
-        /// Agent's whisper bind address (e.g. `127.0.0.1:9902`).
-        #[arg(long)]
-        agent_addr: SocketAddr,
-        /// Hex-encoded fingerprint of the agent's identity key.
-        #[arg(long)]
-        agent_fp: String,
-        /// Base64-encoded Ed25519 verifying key of the agent.
-        #[arg(long)]
-        agent_pubkey_b64: String,
-        /// SQL string. Read-only by convention; the agent may
-        /// additionally refuse the query at policy-check time.
-        #[arg(long)]
-        sql: String,
-        /// Wall-clock deadline for the agent-side handler. Accepts
-        /// humantime expressions (e.g. `5s`, `30s`, `2m`).
-        #[arg(long, default_value = "10s", value_parser = parse_duration)]
-        timeout: Duration,
-        /// Emit the result as a single JSON object (full envelope
-        /// shape) instead of just the wrapped binary's JSON.
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -447,38 +417,6 @@ impl Cli {
                         json,
                     },
             } => audit::verify(&path, pubkey_b64, pubkey_from, json),
-            Command::Exec {
-                sub:
-                    ExecCommand::Sysquery {
-                        operator_key,
-                        agent_addr,
-                        agent_fp,
-                        agent_pubkey_b64,
-                        sql,
-                        timeout,
-                        json,
-                    },
-            } => {
-                tracing_subscriber::fmt()
-                    .with_max_level(tracing::Level::WARN)
-                    .with_target(false)
-                    .with_writer(std::io::stderr)
-                    .init();
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("building tokio runtime")?;
-                runtime.block_on(exec::sysquery(
-                    operator_key,
-                    agent_addr,
-                    agent_fp,
-                    agent_pubkey_b64,
-                    sql,
-                    timeout,
-                    json,
-                ))?;
-                Ok(ExitCode::SUCCESS)
-            }
             Command::Exec {
                 sub:
                     ExecCommand::Sql {

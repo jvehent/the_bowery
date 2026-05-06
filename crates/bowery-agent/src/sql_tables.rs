@@ -12,8 +12,7 @@
 //! These tables are deliberately Bowery-specific: they expose the
 //! agent's own awareness of the mesh (peers it has pinned, alerts
 //! it has emitted, the audit-log envelope chain) — exactly the
-//! questions a third-party query surface like sysquery can never
-//! answer.
+//! questions a generic host-state SQL surface can't answer.
 
 use std::path::PathBuf;
 use std::sync::Arc;

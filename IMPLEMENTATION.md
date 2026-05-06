@@ -1312,7 +1312,7 @@ Single binary, `bowery`. Subcommands:
 | `alerts tail` | [`alerts.rs`](crates/bowery-cli/src/alerts.rs) |
 | `model {list, fetch}` | [`model.rs`](crates/bowery-cli/src/model.rs) |
 | `audit verify` | [`audit.rs`](crates/bowery-cli/src/audit.rs) |
-| `exec sysquery` | [`exec.rs`](crates/bowery-cli/src/exec.rs) |
+| `exec sql` | [`exec.rs`](crates/bowery-cli/src/exec.rs) |
 
 ### 15.1 doctor
 
@@ -1883,13 +1883,14 @@ OperatorCommand
   request_id  : String          (caller-chosen correlation)
   timeout_ms  : u32             (per-handler deadline)
   command     : oneof
-    Sysquery  { sql: String }   (10)
+    Sql       { sql, fanout, peers }       (11)
+  forwarded_from_operator : bytes         (3; relay-pass-through)
 
 OperatorResult
   request_id  : String          (echo)
   result      : oneof
-    Sysquery  { json, exit_code }     (10)
     Error     { kind, message }       (11)
+    SqlChunk  { columns, rows, end, agent_fp }  (12)
 ```
 
 New commands extend the oneof — never via free-form strings, so
@@ -1906,13 +1907,14 @@ Mirrors `respond_to_subscribe`'s structure:
 1. Operator-only gate — envelope-verified-as-pinned-peer is **not**
    enough; the sender must be in the configured `[operators]` set.
 2. Clamp the operator's requested timeout to
-   `min(request, [sysquery] max_timeout)` so a stolen operator key
+   `min(request, [sql] max_timeout)` so a stolen operator key
    can't hang the host with an unbounded query.
-3. Dispatch to a per-command handler. The handler returns either
-   `OperatorResultBody::Sysquery` on success or
-   `OperatorResultBody::Error { kind, message }` with stable
-   programmatic kinds (`policy_denied`, `timeout`,
-   `output_too_large`, `handler_error`, `unsupported_command`).
+3. Dispatch to a per-command handler. The handler streams
+   `OperatorResultBody::SqlChunk` envelopes back to the operator
+   on success, or returns a single `OperatorResultBody::Error
+   { kind, message }` with stable programmatic kinds
+   (`policy_denied`, `timeout`, `output_too_large`,
+   `handler_error`, `unsupported_command`).
 4. Seal the result back to the operator and emit
    `AgentEvent::OperatorCommandHandled { operator, request_id, kind }`
    for ops dashboards.
@@ -1922,43 +1924,18 @@ references; `None` for any handler means the corresponding command
 returns `policy_denied` at dispatch time. This is the Phase-7
 "engines as Arc<dyn>" pattern adapted to operator commands.
 
-### 21.3 sysquery handler
+### 21.3 SQL handler
 
-[`crates/bowery-sysquery/src/lib.rs`](crates/bowery-sysquery/src/lib.rs).
-
-Standalone crate so the agent's dependency footprint stays
-predictable (just `tokio[process]` + `thiserror`). Public surface:
-
-- `Sysquery::new(binary_path) -> Result<Self, SysqueryError>` —
-  stat-checks the binary at startup. The agent only constructs an
-  `Sysquery` when both `[sysquery] enabled = true` and the binary
-  resolves.
-- `Sysquery::run(sql, timeout) -> Result<SysqueryOutput, SysqueryError>` —
-  spawns the configured binary with conservative hardening flags
-  and a wall-clock cap.
-
-Hardening flags (passed verbatim to every invocation):
-
-| Flag | Why |
-|---|---|
-| `--json` | Structured output, parsed operator-side. |
-| `--disable_extensions=true` | Operator SQL can't auto-load a `.so` extension. |
-| `--disable_audit=true` | No persistent audit subscribers. |
-| `--disable_events=true` | No kernel-event tables (require persistent state). |
-| `--ephemeral=true` + `--database_path=/tmp` | No on-disk state per query. |
-| `--config_path=/dev/null` | Don't read any host config file (osquery-shaped flag). |
-
-Output capped at 16 MiB stdout + 16 MiB stderr — exceeding either
-surfaces as `OutputTooLarge` rather than unbounded RAM growth.
-Subprocess SIGKILL'd on timeout (`tokio::time::timeout`) and on
-caller cancellation (`Command::kill_on_drop(true)`).
+The Phase-9 native SQL surface (`bowery-sql` + `bowery-tables`) is
+the only command body. Streaming behaviour, per-cell caps,
+authorizer policy, and fan-out are documented in detail in §22.
 
 ### 21.4 Operator CLI
 
 [`crates/bowery-cli/src/exec.rs`](crates/bowery-cli/src/exec.rs).
 
 ```sh
-bowery exec sysquery \
+bowery exec sql \
     --operator-key /path/to/op.key \
     --agent-addr 10.0.0.5:9902 \
     --agent-fp <64-hex> --agent-pubkey-b64 <base64> \
@@ -1966,11 +1943,9 @@ bowery exec sysquery \
     --timeout 5s
 ```
 
-One round-trip per invocation; no follow mode. The CLI wraps the
-exchange in `(operator_request_timeout + 2s)` so a stalled agent
-doesn't hang the operator. `--json` emits the full envelope shape
-(request_id + exit_code + json) for ops piping; default emits the
-wrapped binary's JSON verbatim.
+The CLI wraps the exchange in `(operator_request_timeout + 2s)` so
+a stalled agent doesn't hang the operator. JSON mode emits one row
+per line; table mode buffers and prints on close.
 
 ### 21.5 What's deferred
 
@@ -1994,17 +1969,15 @@ wrapped binary's JSON verbatim.
   `users`, `systemd_units`, ...). The streaming wire path
   (`OperatorCommand::Sql` → chunked `OperatorResultBody::SqlChunk`)
   shipped in slice 6 — see [`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md)
-  for the full slice plan. Sysquery is kept alongside as the
-  fallback for operators who want the wider third-party-binary
-  table set without writing a new `bowery-tables` module.
+  for the full slice plan, and §22 below for the implementation
+  reference.
 
 ## 22. Phase 9 native SQL surface
 
 Phase 9 builds a pure-Rust SQL surface over Bowery's host-state
-view as the going-forward replacement for the sysquery
-(subprocess) path. The full slice plan lives in
-[`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md); this section is
-the in-tree reference for what shipped.
+view, with end-to-end signed multi-agent fan-out. The full slice
+plan lives in [`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md);
+this section is the in-tree reference for what shipped.
 
 ### 22.1 Crates
 
@@ -2127,7 +2100,7 @@ intentionally doesn't depend on:
 - `bowery_audit` — Phase-7 audit log entries (parsed JSONL).
 
 These expose Bowery's own awareness of the mesh — questions a
-third-party SQL surface like sysquery can never answer.
+generic host-state SQL surface can't answer.
 
 ### 22.6 Operator CLI (slice 6 + 8 + final-8)
 
@@ -2160,7 +2133,7 @@ without requiring a live agent.
 - Per-query row cap (`DEFAULT_ROW_CAP = 1M`) — defends against
   a query joining every table to itself.
 - Per-query wall-clock timeout, clamped to
-  `[sysquery] max_timeout` agent-side so a stolen operator key
+  `[sql] max_timeout` agent-side so a stolen operator key
   can't pin the host indefinitely. SQLite progress-handler
   cancellation (final-6) interrupts the running query within
   ~1024 VDBE ops of timeout, releasing the blocking-pool slot.
@@ -2223,43 +2196,6 @@ tables — operator supplies the path, no enumeration possible.
   malicious operator can cause a few warn lines per failed
   query; a token bucket on the warn emission would close the
   log-disk DoS edge.
-- **F-5 (cosmetic)** The shared `max_timeout` config knob lives
-  under `[sysquery]` despite being applied to `[sql]` too.
-  Splitting would be a config-naming cleanup.
-
-### 22.10 Native SQL vs. sysquery — when to use each
-
-The Bowery agent ships two operator-runnable query paths:
-
-| | Native SQL (`bowery exec sql`) | Sysquery (`bowery exec sysquery`) |
-|---|---|---|
-| Crate | `bowery-sql` + `bowery-tables` | `bowery-sysquery` (subprocess wrapper) |
-| Default | always on | OFF (`[sysquery] enabled = false`) |
-| Tables | 13 + 4 bonus + 7 file/hash funcs | whatever the wrapped binary exposes |
-| Wire | streaming `SqlChunk` chunks; single round-trip per query in single-agent mode, multiple chunks per agent in fan-out | one round-trip; full JSON returned as a string |
-| Multi-agent | `--fanout` with operator-signed delegation; peers seal chunks directly for the operator | not supported |
-| Auth | operator key + operator-signed `OperatorAuthorization` for forwarded peers | operator key only (sysquery is never relay-forwarded) |
-| Cold-start | <5 ms per query (in-process SQLite, fresh per query) | 50–200 ms (subprocess spawn + bundle init) |
-| Authorizer | `set_authorizer` denies every non-SELECT op | the wrapped binary's own behaviour (osquery rejects writes) |
-| Output cap | row cap, per-cell cap, concurrency cap, progress-handler interrupt | 16 MiB stdout/stderr cap, kill-on-timeout |
-| Use case | day-to-day operator queries; cross-host fan-out hunts; querying Bowery-internal state (alerts/audit/peers/baseline) | operators with established osquery query libraries, or when the wrapped binary exposes a table the native engine doesn't have |
-
-The native engine is the going-forward primary path. Sysquery
-exists as a fallback that operators can opt into per-host —
-flip `[sysquery] enabled = true` in `agent.toml` and point
-`binary_path` at any binary that accepts the osquery flag set
-(`--json --disable_extensions=true --disable_audit=true
---disable_events=true --database_path=/tmp --ephemeral=true
---config_path=/dev/null <SQL>`). In practice that's almost
-always `osqueryi`.
-
-Sysquery is **never relay-forwarded**: each `bowery exec
-sysquery` query goes to exactly one agent. If you want
-cross-host hunts, use the native `bowery exec sql --fanout`.
-There's no plan to add fan-out for sysquery — operators wanting
-that should write a `bowery-tables` table for their use case
-instead.
-
 ---
 
 This document is meant to be a living reference. When a phase lands

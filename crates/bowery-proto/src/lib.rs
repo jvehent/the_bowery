@@ -294,8 +294,8 @@ pub struct OperatorCommand {
     #[prost(string, tag = "1")]
     pub request_id: String,
     /// Per-command deadline in milliseconds. The agent enforces this on
-    /// the handler side (e.g. as a wall-clock timeout on the osquery
-    /// subprocess) and the CLI uses it to size its receive timeout.
+    /// the handler side (e.g. as a SQL wall-clock timeout) and the CLI
+    /// uses it to size its receive timeout.
     #[prost(uint32, tag = "2")]
     pub timeout_ms: u32,
     /// Phase-9 final-1: when non-empty, this command is being
@@ -319,21 +319,12 @@ pub struct OperatorCommand {
     #[prost(bytes = "vec", tag = "3")]
     pub forwarded_from_operator: Vec<u8>,
     /// One of the typed command bodies.
-    #[prost(oneof = "OperatorCommandBody", tags = "10, 11")]
+    #[prost(oneof = "OperatorCommandBody", tags = "11")]
     pub command: Option<OperatorCommandBody>,
 }
 
 #[derive(Clone, PartialEq, Oneof)]
 pub enum OperatorCommandBody {
-    /// Run a SQL query against a host-installed `sysquery` binary
-    /// (subprocess wrapper, see `bowery-sysquery`). Surface is the
-    /// binary's own table set — typically broader than the native
-    /// Bowery tables but pulled in via subprocess. Read-only by
-    /// design; the agent additionally rejects any query containing
-    /// forbidden keywords (Phase 6b polish — start permissive,
-    /// tighten later).
-    #[prost(message, tag = "10")]
-    Sysquery(SysqueryQuery),
     /// Run a SQL query against the agent's native Phase-9 SQL
     /// surface (`bowery-sql`). The response is *streamed*: the
     /// agent emits one or more `SqlChunk` envelopes (each in its
@@ -343,15 +334,6 @@ pub enum OperatorCommandBody {
     /// `recv_envelope` until it sees the terminal frame.
     #[prost(message, tag = "11")]
     Sql(SqlQuery),
-}
-
-#[derive(Clone, PartialEq, Eq, ProstMessage)]
-pub struct SysqueryQuery {
-    /// SQL string. Subject to per-agent allow-list policy at handler
-    /// time; the agent may refuse any query the local config doesn't
-    /// permit.
-    #[prost(string, tag = "1")]
-    pub sql: String,
 }
 
 /// Phase-9 final-1: operator-signed delegation that authorises a
@@ -469,19 +451,15 @@ pub struct OperatorResult {
     /// `error` field so a future "always populated alongside the
     /// concrete result" pattern (e.g. structured warnings) can
     /// extend cleanly.
-    #[prost(oneof = "OperatorResultBody", tags = "10, 11, 12")]
+    #[prost(oneof = "OperatorResultBody", tags = "11, 12")]
     pub result: Option<OperatorResultBody>,
 }
 
 #[derive(Clone, PartialEq, Oneof)]
 pub enum OperatorResultBody {
-    /// Successful execution of a `Sysquery` command. Schema is
-    /// the wrapped binary's JSON output as a string.
-    #[prost(message, tag = "10")]
-    Sysquery(SysqueryResult),
     /// The handler refused or failed the command. Always populated
     /// when the agent could parse the request but declined to run
-    /// it (policy denial, subprocess failure, timeout, etc.). For
+    /// it (policy denial, handler error, timeout, etc.). For
     /// "I couldn't even decode the envelope" the asker sees a
     /// transport-level error, not this.
     #[prost(message, tag = "11")]
@@ -492,20 +470,6 @@ pub enum OperatorResultBody {
     /// final chunk has `end = true` (and may also carry rows).
     #[prost(message, tag = "12")]
     SqlChunk(SqlChunk),
-}
-
-#[derive(Clone, PartialEq, Eq, ProstMessage)]
-pub struct SysqueryResult {
-    /// JSON array — the raw stdout of the wrapped binary called
-    /// with `--json <sql>`. Operator-side tooling parses this with
-    /// `serde_json::Value`; keeping it as a string here means we
-    /// don't have to model every column type in protobuf.
-    #[prost(string, tag = "1")]
-    pub json: String,
-    /// Wrapped binary's exit status (0 = success, non-zero =
-    /// handler fell back without a structured reason).
-    #[prost(int32, tag = "2")]
-    pub exit_code: i32,
 }
 
 /// One chunk of a streaming SQL response. See

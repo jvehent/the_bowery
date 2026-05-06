@@ -57,8 +57,6 @@ pub struct Config {
     #[serde(default)]
     pub response: ResponseConfig,
     #[serde(default)]
-    pub sysquery: SysqueryConfig,
-    #[serde(default)]
     pub sql: SqlConfig,
 }
 
@@ -498,63 +496,10 @@ pub struct ResponseConfig {
     pub audit_log_path: Option<PathBuf>,
 }
 
-/// Phase-6b: subprocess-backed `sysquery` operator-command
-/// settings.
-///
-/// Off by default. When `enabled = false`, any
-/// `OperatorCommand::Sysquery` the agent receives is rejected with
-/// `kind = "policy_denied"` so the CLI gets a structured failure
-/// (not a silent timeout). When enabled, the agent runs the binary
-/// at `binary_path` with conservative hardening flags and a per-call
-/// wall-clock cap (operator-supplied timeouts are clamped down to
-/// `max_timeout`).
-///
-/// The wrapped binary is the operator's choice — the flag set we
-/// pass matches the upstream osquery interactive shell, but
-/// equivalent compatible binaries can be substituted via
-/// `binary_path`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SysqueryConfig {
-    /// Master switch. Default: `false`.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Path to the sysquery binary. Default: `/usr/bin/osqueryi`
-    /// (the historically common deployment); operators with a
-    /// different binary on disk can override it. `bowery doctor`
-    /// reports whether the configured path exists.
-    #[serde(default = "default_sysquery_binary_path")]
-    pub binary_path: PathBuf,
-    /// Hard ceiling on per-query timeout. The operator's request
-    /// timeout is clamped to `min(operator_request, max_timeout)`.
-    /// Defends against a compromised operator key hanging the host
-    /// with a deliberately long-running query.
-    #[serde(with = "humantime_serde", default = "default_sysquery_max_timeout")]
-    pub max_timeout: Duration,
-}
-
-impl Default for SysqueryConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            binary_path: default_sysquery_binary_path(),
-            max_timeout: default_sysquery_max_timeout(),
-        }
-    }
-}
-
-fn default_sysquery_binary_path() -> PathBuf {
-    PathBuf::from("/usr/bin/osqueryi")
-}
-
-fn default_sysquery_max_timeout() -> Duration {
-    Duration::from_secs(30)
-}
-
-/// Phase-9 final-4 + final-5: native SQL surface tunables. All
-/// fields default-friendly so an existing agent.toml without a
+/// Phase-9: native SQL surface tunables. All fields
+/// default-friendly so an existing `agent.toml` without a
 /// `[sql]` block keeps working.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqlConfig {
     /// SECURITY-AUDIT-PHASE9 F-8: when `true`, the `processes`
@@ -574,10 +519,31 @@ pub struct SqlConfig {
     /// Default `4`.
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
+    /// Hard ceiling on per-query wall-clock timeout. The
+    /// operator's requested timeout is clamped to
+    /// `min(operator_request, max_timeout)`; defends against a
+    /// compromised operator key hanging the host with a
+    /// deliberately long-running query. Default `30s`.
+    #[serde(with = "humantime_serde", default = "default_sql_max_timeout")]
+    pub max_timeout: Duration,
+}
+
+impl Default for SqlConfig {
+    fn default() -> Self {
+        Self {
+            expose_cmdline: false,
+            max_concurrent_queries: default_max_concurrent_queries(),
+            max_timeout: default_sql_max_timeout(),
+        }
+    }
 }
 
 fn default_max_concurrent_queries() -> usize {
     4
+}
+
+fn default_sql_max_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

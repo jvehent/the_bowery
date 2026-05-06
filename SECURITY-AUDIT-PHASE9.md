@@ -47,7 +47,7 @@ Trust positions:
 | F-14 | MEDIUM | procfs walks not time-bounded mid-walk | **fixed** (final-6) |
 | F-15 | HIGH | Operator SQL can `ATTACH DATABASE` / `PRAGMA writable_schema = ON` to write host filesystem | **fixed** |
 | F-16 | HIGH | Operator-disconnect leaks per-peer fanout tasks (mesh-amplified DoS) | **fixed** |
-| F-5 | MEDIUM | `Sql` timeout cap silently borrowed from `[sysquery]` config | **partly fixed** — `[sql] max_concurrent_queries` lives in its own config block; timeout still borrowed |
+| F-5 | MEDIUM | `Sql` timeout cap previously borrowed from a sibling config block | **fixed** — `[sql] max_timeout` and `[sql] max_concurrent_queries` both live in the dedicated `[sql]` block |
 | F-7 | MEDIUM | No EOF accounting in fanout decoder | deferred (operator UX) |
 | F-17 | LOW | Per-peer fanout warnings → log-disk DoS | deferred |
 
@@ -191,13 +191,12 @@ finishing."
 
 ## MEDIUM
 
-### F-5 `[sysquery] max_timeout` reused for SQL — **partly fixed (Phase 9 final-5)**
+### F-5 SQL timeout cap previously lived in a sibling config block — **fixed**
 
-`[sql] max_concurrent_queries` lives in its own config block.
-The wall-clock `max_timeout` is still borrowed from
-`[sysquery]`; that's a documentation cleanup rather than a
-security concern (the cap still applies; it's just badly named).
-Tracked as a low-priority follow-up.
+The wall-clock `max_timeout` and the concurrency cap
+(`max_concurrent_queries`) both live in the dedicated `[sql]`
+block. The earlier subprocess-wrapper config (and its borrowed
+`max_timeout` knob) was deleted during the post-Phase-9 cleanup.
 
 ### F-6 No per-cell size cap — **fixed (Phase 9 final-3)**
 

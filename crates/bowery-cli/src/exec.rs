@@ -21,7 +21,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bowery_crypto::{Fingerprint, Identity};
 use bowery_proto::{
     Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, SqlChunk, SqlQuery, SqlRow,
-    SqlValueKind, SysqueryQuery, WhisperPayload,
+    SqlValueKind, WhisperPayload,
 };
 
 use crate::SqlFormat;
@@ -29,115 +29,6 @@ use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::BoweryEndpoint;
 use bowery_whisper::{Sealer, StaticResolver, Verifier};
 use ed25519_dalek::VerifyingKey;
-
-/// Send a single `sysquery` command and print the result. Returns
-/// `Ok(())` even when the agent's structured `Error` body comes back
-/// — we surface it via `eprintln!` and a non-zero process exit at
-/// the caller; transport-level failures (envelope parse, sig verify,
-/// timeout) bubble up as `Err`.
-#[allow(clippy::too_many_arguments)] // explicit binding from the CLI subcommand
-pub(crate) async fn sysquery(
-    operator_key: PathBuf,
-    target_addr: SocketAddr,
-    target_fp_hex: String,
-    target_pubkey_b64: String,
-    sql: String,
-    timeout: Duration,
-    json: bool,
-) -> Result<()> {
-    let identity = Arc::new(
-        Identity::load(&operator_key)
-            .with_context(|| format!("loading operator key from {}", operator_key.display()))?,
-    );
-
-    let target_fp = parse_fingerprint(&target_fp_hex)?;
-    let target_vk = parse_verifying_key(&target_pubkey_b64)?;
-    let mut resolver = StaticResolver::new();
-    let inserted_fp = resolver.insert(target_vk);
-    if inserted_fp != target_fp {
-        bail!("target_pubkey_b64 fingerprint {inserted_fp} doesn't match --agent-fp {target_fp}");
-    }
-    let resolver = Arc::new(resolver);
-
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
-    let endpoint = BoweryEndpoint::bind(identity.clone(), accept_verifier, bind_addr)
-        .context("binding operator-side endpoint")?;
-
-    let operator_fp = identity.fingerprint();
-    let sealer = Sealer::new(identity);
-    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
-
-    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), target_fp));
-    let conn = endpoint
-        .dial(dial_verifier, target_addr)
-        .await
-        .with_context(|| format!("dialing agent at {target_addr}"))?;
-
-    // request_id ties our response to this specific request — useful
-    // when the operator runs multiple commands in flight against the
-    // same agent.
-    let request_id = format!("op-{}", current_unix_ms());
-    let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
-
-    let cmd = OperatorCommand {
-        forwarded_from_operator: Vec::new(),
-        request_id: request_id.clone(),
-        timeout_ms,
-        command: Some(OperatorCommandBody::Sysquery(SysqueryQuery { sql })),
-    };
-    let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
-
-    // Wrap the whole exchange in the operator-supplied deadline so
-    // we don't hang on a stalled agent. The agent enforces its own
-    // timeout on the handler side; the CLI timeout is generous (the
-    // requested timeout + a small slack for the round-trip).
-    let exchange_timeout = timeout + Duration::from_secs(2);
-    let exchange = async {
-        conn.send_envelope(&outbound)
-            .await
-            .context("sending OperatorCommand")?;
-        let bytes = conn
-            .recv_envelope()
-            .await
-            .context("awaiting OperatorResult")?;
-        let opened = envelope_verifier
-            .open(&bytes)
-            .context("verifying OperatorResult envelope")?;
-        Ok::<_, anyhow::Error>(opened)
-    };
-    let opened = match tokio::time::timeout(exchange_timeout, exchange).await {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            drop(conn);
-            endpoint.close().await;
-            return Err(e);
-        }
-        Err(_) => {
-            drop(conn);
-            endpoint.close().await;
-            bail!("operator command timed out after {exchange_timeout:?}");
-        }
-    };
-
-    let result = match opened.payload.body {
-        Some(Body::OperatorResult(r)) => r,
-        other => bail!("agent replied with unexpected body: {other:?}"),
-    };
-
-    if result.request_id != request_id {
-        bail!(
-            "agent echoed request_id={:?}, expected {:?}",
-            result.request_id,
-            request_id
-        );
-    }
-
-    drop(conn);
-    endpoint.close().await;
-
-    print_result(&result, json)
-}
 
 /// Send a single Phase-9 SQL query and stream the rows back. Each
 /// chunk envelope arrives on its own QUIC stream; the loop
@@ -314,7 +205,6 @@ pub(crate) async fn sql(
                     eprintln!("agent refused query: {} ({})", e.message, e.kind);
                     bail!("sql query failed: {}", e.kind);
                 }
-                Some(other) => bail!("unexpected OperatorResult body: {other:?}"),
                 None => bail!("agent returned an OperatorResult with no body"),
             }
         }
@@ -540,40 +430,6 @@ fn value_to_json(v: &bowery_proto::SqlValue) -> String {
         Some(SqlValueKind::Text(s)) => format!("\"{}\"", escape_json_string(s)),
         Some(SqlValueKind::Blob(b)) => format!("\"<{} bytes>\"", b.len()),
     }
-}
-
-fn print_result(result: &bowery_proto::OperatorResult, json: bool) -> Result<()> {
-    match (&result.result, json) {
-        (Some(OperatorResultBody::Sysquery(o)), true) => {
-            // `--json` mode emits the full envelope shape so callers
-            // can pipe it through jq.
-            println!(
-                "{{\"request_id\":\"{}\",\"exit_code\":{},\"json\":{}}}",
-                escape_json_string(&result.request_id),
-                o.exit_code,
-                if o.json.is_empty() { "null" } else { &o.json }
-            );
-        }
-        (Some(OperatorResultBody::Sysquery(o)), false) => {
-            // Human mode prints the wrapped binary's JSON verbatim
-            // — the operator can pipe through `jq` themselves.
-            println!("{}", o.json);
-            if o.exit_code != 0 {
-                eprintln!("warning: sysquery binary exited {}", o.exit_code);
-            }
-        }
-        (Some(OperatorResultBody::Error(e)), _) => {
-            eprintln!("agent refused command: {} ({})", e.message, e.kind);
-            bail!("operator command failed: {}", e.kind);
-        }
-        (Some(OperatorResultBody::SqlChunk(_)), _) => {
-            // The sysquery exec path is single-shot; receiving a
-            // SqlChunk on it indicates a wire-protocol mismatch.
-            bail!("agent replied to sysquery command with SqlChunk; protocol mismatch");
-        }
-        (None, _) => bail!("agent returned an OperatorResult with no body"),
-    }
-    Ok(())
 }
 
 fn current_unix_ms() -> u64 {

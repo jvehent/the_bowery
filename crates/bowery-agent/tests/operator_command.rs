@@ -1,8 +1,6 @@
-//! Phase-6b slice 1 integration: the operator dials a running agent,
-//! sends an `OperatorCommand::Sysquery`, and the agent's dispatch
-//! returns the slice-1 stub error. Proves the round-trip wiring is
-//! correct end-to-end (proto → handler → seal → operator-side parse)
-//! before the real sysquery handler arrives in slice 2.
+//! Phase-6b operator-command integration: dials a running agent,
+//! sends typed `OperatorCommand` envelopes, and asserts that
+//! the dispatch path returns the expected `OperatorResult`.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -16,15 +14,15 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_agent::config::{
     AlertsConfig, BaselineConfig, BloomConfig, Config, HeartbeatConfig, IdentityConfig,
-    InboxConfig, LlmConfig, MeshConfig, OperatorsConfig, ResponseConfig, RoleConfig,
-    SysqueryConfig, WhisperConfig, WhisperQaConfig,
+    InboxConfig, LlmConfig, MeshConfig, OperatorsConfig, ResponseConfig, RoleConfig, WhisperConfig,
+    WhisperQaConfig,
 };
 use bowery_agent::{Agent, AgentEvent};
 use bowery_crypto::Identity;
 use bowery_events::source::NoopEventSource;
 use bowery_proto::{
     Body, OperatorCommand, OperatorCommandBody, OperatorResultBody, SqlQuery, SqlValueKind,
-    SysqueryQuery, WhisperPayload,
+    WhisperPayload,
 };
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::BoweryEndpoint;
@@ -41,12 +39,7 @@ fn reserve_udp_port() -> SocketAddr {
     socket.local_addr().expect("local_addr")
 }
 
-fn build_agent_config(
-    dir: &Path,
-    mesh_addr: SocketAddr,
-    operator_pubkey_b64: String,
-    sysquery: SysqueryConfig,
-) -> Config {
+fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: String) -> Config {
     Config {
         identity: IdentityConfig {
             path: dir.join("identity.key"),
@@ -83,197 +76,8 @@ fn build_agent_config(
         alerts: AlertsConfig::default(),
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),
-        sysquery,
         sql: bowery_agent::config::SqlConfig::default(),
     }
-}
-
-/// Write a shim shell script that pretends to be a sysquery binary: ignores
-/// all its args (the agent's hardening flags + the SQL string) and
-/// emits a known JSON payload on stdout.
-fn make_sysquery_shim(dir: &Path, body: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let p = dir.join("sysquery-shim.sh");
-    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-    p
-}
-
-/// Phase-6b slice 2: with a real (shim) sysquery binary configured,
-/// the round-trip returns a `SysqueryResult` populated with the
-/// shim's stdout.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sysquery_command_round_trips_with_shim_handler() {
-    let workdir = TempDir::new().unwrap();
-    let operator_id = Arc::new(Identity::generate());
-    let operator_pubkey_b64 = BASE64.encode(operator_id.verifying_key().as_bytes());
-
-    // Shim emits a fixed JSON payload regardless of the SQL string.
-    let shim = make_sysquery_shim(workdir.path(), r#"echo '[{"pid":42,"name":"shimmed"}]'"#);
-    let sysquery = SysqueryConfig {
-        enabled: true,
-        binary_path: shim,
-        max_timeout: Duration::from_secs(5),
-    };
-    let cfg = build_agent_config(
-        workdir.path(),
-        reserve_udp_port(),
-        operator_pubkey_b64.clone(),
-        sysquery,
-    );
-
-    let agent_id = Arc::new(Identity::generate());
-    let agent_fp = agent_id.fingerprint();
-    let agent_vk = agent_id.verifying_key();
-
-    let agent = Agent::start(cfg, agent_id, Box::new(NoopEventSource))
-        .await
-        .expect("start agent");
-    let agent_whisper_addr = agent.whisper_addr().expect("whisper addr");
-
-    // Operator side: build a Sealer + Verifier + endpoint that can
-    // dial the agent and round-trip an envelope.
-    let mut resolver = StaticResolver::new();
-    resolver.insert(agent_vk);
-    let resolver = Arc::new(resolver);
-    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
-    let operator_endpoint =
-        BoweryEndpoint::bind(operator_id.clone(), accept_verifier, loopback_ephemeral())
-            .expect("bind operator endpoint");
-    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), agent_fp));
-    let conn = operator_endpoint
-        .dial(dial_verifier, agent_whisper_addr)
-        .await
-        .expect("operator dial");
-
-    let operator_fp = operator_id.fingerprint();
-    let sealer = Sealer::new(operator_id.clone());
-    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
-
-    let cmd = OperatorCommand {
-        forwarded_from_operator: Vec::new(),
-        request_id: "test-req-1".into(),
-        timeout_ms: 5_000,
-        command: Some(OperatorCommandBody::Sysquery(SysqueryQuery {
-            sql: "SELECT pid, name FROM processes LIMIT 1".into(),
-        })),
-    };
-    let outbound = sealer.seal_for(&agent_fp, &WhisperPayload::operator_command(cmd));
-    conn.send_envelope(&outbound).await.expect("send");
-    let bytes = conn.recv_envelope().await.expect("recv");
-    let opened = envelope_verifier.open(&bytes).expect("verify");
-
-    let result = match opened.payload.body {
-        Some(Body::OperatorResult(r)) => r,
-        other => panic!("unexpected body: {other:?}"),
-    };
-    assert_eq!(result.request_id, "test-req-1");
-    match result.result {
-        Some(OperatorResultBody::Sysquery(o)) => {
-            assert_eq!(o.exit_code, 0);
-            assert!(o.json.contains("shimmed"), "got json: {}", o.json);
-        }
-        other => panic!("expected Sysquery body, got {other:?}"),
-    }
-
-    // Confirm the AgentEvent fired so dashboards see the dispatch.
-    let mut events = agent.subscribe();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let saw_event = loop {
-        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if timeout.is_zero() {
-            break false;
-        }
-        match tokio::time::timeout(timeout, events.recv()).await {
-            Ok(Ok(AgentEvent::OperatorCommandHandled {
-                request_id,
-                kind: "sysquery",
-                ..
-            })) if request_id == "test-req-1" => break true,
-            Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
-            Ok(Err(RecvError::Closed)) | Err(_) => break false,
-        }
-    };
-    // The event might already have been emitted before our subscribe;
-    // tolerate that as long as the round-trip itself succeeded.
-    let _ = saw_event;
-
-    drop(conn);
-    operator_endpoint.close().await;
-    agent.shutdown().await.expect("shutdown");
-}
-
-/// Phase-6b slice 2: when sysquery is disabled in config, dispatch
-/// returns a structured `policy_denied` error rather than a silent
-/// timeout. Operator's CLI sees a clean failure mode.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sysquery_command_returns_policy_denied_when_disabled() {
-    let workdir = TempDir::new().unwrap();
-    let operator_id = Arc::new(Identity::generate());
-    let operator_pubkey_b64 = BASE64.encode(operator_id.verifying_key().as_bytes());
-
-    // Default SysqueryConfig has enabled = false.
-    let cfg = build_agent_config(
-        workdir.path(),
-        reserve_udp_port(),
-        operator_pubkey_b64.clone(),
-        SysqueryConfig::default(),
-    );
-
-    let agent_id = Arc::new(Identity::generate());
-    let agent_fp = agent_id.fingerprint();
-    let agent_vk = agent_id.verifying_key();
-
-    let agent = Agent::start(cfg, agent_id, Box::new(NoopEventSource))
-        .await
-        .expect("start agent");
-    let agent_whisper_addr = agent.whisper_addr().expect("whisper addr");
-
-    let mut resolver = StaticResolver::new();
-    resolver.insert(agent_vk);
-    let resolver = Arc::new(resolver);
-    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
-    let operator_endpoint =
-        BoweryEndpoint::bind(operator_id.clone(), accept_verifier, loopback_ephemeral())
-            .expect("bind operator endpoint");
-    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), agent_fp));
-    let conn = operator_endpoint
-        .dial(dial_verifier, agent_whisper_addr)
-        .await
-        .expect("operator dial");
-
-    let operator_fp = operator_id.fingerprint();
-    let sealer = Sealer::new(operator_id.clone());
-    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
-
-    let cmd = OperatorCommand {
-        forwarded_from_operator: Vec::new(),
-        request_id: "denied-req".into(),
-        timeout_ms: 5_000,
-        command: Some(OperatorCommandBody::Sysquery(SysqueryQuery {
-            sql: "SELECT 1".into(),
-        })),
-    };
-    let outbound = sealer.seal_for(&agent_fp, &WhisperPayload::operator_command(cmd));
-    conn.send_envelope(&outbound).await.expect("send");
-    let bytes = conn.recv_envelope().await.expect("recv");
-    let opened = envelope_verifier.open(&bytes).expect("verify");
-
-    let result = match opened.payload.body {
-        Some(Body::OperatorResult(r)) => r,
-        other => panic!("unexpected body: {other:?}"),
-    };
-    match result.result {
-        Some(OperatorResultBody::Error(e)) => {
-            assert_eq!(e.kind, "policy_denied");
-            assert!(e.message.contains("sysquery"));
-        }
-        other => panic!("expected Error body, got {other:?}"),
-    }
-
-    drop(conn);
-    operator_endpoint.close().await;
-    agent.shutdown().await.expect("shutdown");
 }
 
 /// A non-operator pinned peer must not be able to issue
@@ -297,7 +101,6 @@ async fn non_operator_sender_is_rejected() {
         workdir.path(),
         reserve_udp_port(),
         operator_pubkey_b64.clone(),
-        SysqueryConfig::default(),
     );
     let agent = Agent::start(cfg, agent_id, Box::new(NoopEventSource))
         .await
@@ -330,8 +133,10 @@ async fn non_operator_sender_is_rejected() {
         forwarded_from_operator: Vec::new(),
         request_id: "stranger-req".into(),
         timeout_ms: 1_000,
-        command: Some(OperatorCommandBody::Sysquery(SysqueryQuery {
+        command: Some(OperatorCommandBody::Sql(SqlQuery {
             sql: "SELECT 1".into(),
+            fanout: false,
+            peers: Vec::new(),
         })),
     };
     let outbound = sealer.seal_for(&agent_fp, &WhisperPayload::operator_command(cmd));
@@ -364,7 +169,6 @@ async fn sql_command_streams_chunked_response() {
         workdir.path(),
         reserve_udp_port(),
         operator_pubkey_b64.clone(),
-        SysqueryConfig::default(),
     );
     let agent_id = Arc::new(Identity::generate());
     let agent_fp = agent_id.fingerprint();
@@ -482,7 +286,6 @@ async fn sql_syntax_error_returns_structured_error() {
         workdir.path(),
         reserve_udp_port(),
         operator_pubkey_b64.clone(),
-        SysqueryConfig::default(),
     );
     let agent_id = Arc::new(Identity::generate());
     let agent_fp = agent_id.fingerprint();
@@ -626,7 +429,6 @@ async fn fanout_streams_rows_from_relay_and_peer() {
         alerts: AlertsConfig::default(),
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),
-        sysquery: bowery_agent::config::SysqueryConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
     };
     let cfg_beta = Config {
@@ -665,7 +467,6 @@ async fn fanout_streams_rows_from_relay_and_peer() {
         alerts: AlertsConfig::default(),
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),
-        sysquery: bowery_agent::config::SysqueryConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
     };
 
@@ -839,22 +640,12 @@ async fn bowery_peers_table_surfaces_pinned_peers() {
     let operator_id = Arc::new(Identity::generate());
     let operator_pub = BASE64.encode(operator_id.verifying_key().as_bytes());
 
-    let mut cfg_alpha = build_agent_config(
-        dir_alpha.path(),
-        mesh_addr_alpha,
-        operator_pub.clone(),
-        SysqueryConfig::default(),
-    );
+    let mut cfg_alpha = build_agent_config(dir_alpha.path(), mesh_addr_alpha, operator_pub.clone());
     cfg_alpha.mesh.seeds = vec![mesh_addr_beta.to_string()];
     cfg_alpha.mesh.cluster_id = Some("bowery-bonus-test".into());
     cfg_alpha.heartbeat.interval = Duration::from_millis(200);
 
-    let mut cfg_beta = build_agent_config(
-        dir_beta.path(),
-        mesh_addr_beta,
-        operator_pub.clone(),
-        SysqueryConfig::default(),
-    );
+    let mut cfg_beta = build_agent_config(dir_beta.path(), mesh_addr_beta, operator_pub.clone());
     cfg_beta.mesh.seeds = vec![mesh_addr_alpha.to_string()];
     cfg_beta.mesh.cluster_id = Some("bowery-bonus-test".into());
     cfg_beta.heartbeat.interval = Duration::from_millis(200);
