@@ -50,8 +50,9 @@ const REGISTRY: &[ModelEntry] = &[
         // ChatML-style JSON-emit prompts.
         name: "qwen3-0.6b-q4_k_m",
         url: "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf",
-        sha256_hex: None,
-        expected_bytes: 380 * 1024 * 1024, // ~380 MiB
+        // SHA-256 from the unsloth repo's LFS pointer.
+        sha256_hex: Some("ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a"),
+        expected_bytes: 396_705_472, // 378.3 MiB exact
     },
     ModelEntry {
         // Operator-side console chat (Console phase C-6). Gemma 4
@@ -65,8 +66,12 @@ const REGISTRY: &[ModelEntry] = &[
         // unsloth/* one instead.
         name: "gemma-4-e2b-it-q4_k_m",
         url: "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf",
-        sha256_hex: None,
-        expected_bytes: 3_100 * 1024 * 1024, // 3.11 GiB per the repo listing
+        // SHA-256 from the unsloth repo's LFS pointer at
+        // …/raw/main/gemma-4-E2B-it-Q4_K_M.gguf — `validate()`
+        // streams the file post-download and bails on mismatch.
+        // Update this whenever the upstream commit hash changes.
+        sha256_hex: Some("9378bc471710229ef165709b62e34bfb62231420ddaf6d729e727305b5b8672d"),
+        expected_bytes: 3_106_736_256, // 2.96 GiB exact
     },
 ];
 
@@ -124,6 +129,11 @@ pub fn fetch(name: &str, out_dir: &Path, force: bool) -> Result<()> {
         url = entry.url,
     );
     download(entry.url, &target)?;
+    if let Some(want) = entry.sha256_hex {
+        println!("verifying sha256 (expected {want})…");
+    } else {
+        println!("verifying gguf magic + size (no sha pinned in registry)…");
+    }
     validate(&target, entry).with_context(|| {
         format!(
             "validation failed for {} after download — file is at {}",

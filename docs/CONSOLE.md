@@ -36,9 +36,21 @@ Download now? [y/N]
 
 `y` triggers the same fetch path as `bowery model fetch
 gemma-4-e2b-it-q4_k_m` and drops the GGUF into
-`~/.bowery/models/`. Anything else (or `Enter`) falls back to the
-deterministic mock chat backend — the pane is still reachable for
-keybind testing but doesn't actually generate SQL.
+`~/.bowery/models/`. The downloader verifies the file before
+declaring success:
+
+1. **GGUF magic** — first four bytes must be `GGUF` (catches HTTP
+   error pages saved as the file).
+2. **Size band** — actual size must be within ±25 % of the
+   registry's expected count.
+3. **SHA-256** — registry pins the hash from the upstream repo's
+   LFS pointer; the downloader re-streams the file and bails on
+   mismatch. A hex line is printed so you can compare against
+   the source repo if you want to audit by hand.
+
+Anything else (or `Enter`) falls back to the deterministic mock
+chat backend — the pane is still reachable for keybind testing
+but doesn't actually generate SQL.
 
 You can also fetch ahead of time:
 
