@@ -26,6 +26,7 @@ use bowery_response::{
 use crate::config::ResponseEngineKind;
 use bowery_whisper::fingerprint::{TIER1_LEN, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
+use bowery_whisper::pool::PeerConnections;
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::{BoweryConnection, BoweryEndpoint};
 use bowery_whisper::{CompositeResolver, FingerprintResolver, Sealer, StaticResolver, Verifier};
@@ -334,6 +335,10 @@ impl Agent {
         let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
         let endpoint =
             BoweryEndpoint::bind(identity.clone(), accept_verifier, config.whisper.bind_addr)?;
+        // Persistent outbound-connection pool — Phase-10 slice 1.
+        // Heartbeat (and, in later slices, Q&A and operator fanout)
+        // borrow connections from here instead of dialing every time.
+        let peer_connections = PeerConnections::new(endpoint.clone());
         let sealer = Arc::new(Sealer::new(identity.clone()));
         let whisper_addr = endpoint
             .local_addr()
@@ -417,7 +422,7 @@ impl Agent {
         );
 
         let heartbeat_task = spawn_heartbeat_task(
-            endpoint.clone(),
+            peer_connections.clone(),
             mesh.peers_watcher(),
             known_neighbors.clone(),
             sealer.clone(),
@@ -1740,7 +1745,7 @@ fn encode_row(row: &bowery_sql::Row) -> bowery_proto::SqlRow {
 }
 
 fn spawn_heartbeat_task(
-    endpoint: BoweryEndpoint,
+    pool: PeerConnections,
     peers_watcher: watch::Receiver<Vec<PeerInfo>>,
     kn: Arc<KnownNeighbors>,
     sealer: Arc<Sealer>,
@@ -1759,12 +1764,12 @@ fn spawn_heartbeat_task(
                         if kn.resolve(&peer.fingerprint).is_none() {
                             continue;
                         }
-                        let endpoint = endpoint.clone();
+                        let pool = pool.clone();
                         let kn_for_dial = kn.clone();
                         let sealer = sealer.clone();
                         let events = events_tx.clone();
                         tokio::spawn(async move {
-                            send_heartbeat(endpoint, kn_for_dial, sealer, peer, events).await;
+                            send_heartbeat(pool, kn_for_dial, sealer, peer, events).await;
                         });
                     }
                 }
@@ -1775,7 +1780,7 @@ fn spawn_heartbeat_task(
 }
 
 async fn send_heartbeat(
-    endpoint: BoweryEndpoint,
+    pool: PeerConnections,
     kn: Arc<KnownNeighbors>,
     sealer: Arc<Sealer>,
     peer: PeerInfo,
@@ -1783,17 +1788,29 @@ async fn send_heartbeat(
 ) {
     let bytes = sealer.seal_for(&peer.fingerprint, &WhisperPayload::heartbeat(AGENT_VERSION));
     let verifier = Arc::new(PinnedCertVerifier::expecting(kn, peer.fingerprint));
-    match endpoint.dial(verifier, peer.whisper_addr).await {
-        Ok(conn) => match conn.send_envelope(&bytes).await {
-            Ok(()) => {
-                debug!(peer = %peer.fingerprint, "heartbeat sent");
-                let _ = events_tx.send(AgentEvent::HeartbeatSent {
-                    peer: peer.fingerprint,
-                });
-            }
-            Err(e) => warn!(peer = %peer.fingerprint, error = %e, "heartbeat send failed"),
-        },
-        Err(e) => debug!(peer = %peer.fingerprint, error = %e, "heartbeat dial failed"),
+    let conn = match pool
+        .get_or_dial(peer.fingerprint, peer.whisper_addr, verifier)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(peer = %peer.fingerprint, error = %e, "heartbeat dial failed");
+            return;
+        }
+    };
+    match conn.send_envelope(&bytes).await {
+        Ok(()) => {
+            debug!(peer = %peer.fingerprint, "heartbeat sent");
+            let _ = events_tx.send(AgentEvent::HeartbeatSent {
+                peer: peer.fingerprint,
+            });
+        }
+        Err(e) => {
+            warn!(peer = %peer.fingerprint, error = %e, "heartbeat send failed");
+            // The cached connection is dead; drop it so the next
+            // heartbeat redials instead of looping over a corpse.
+            pool.invalidate(&peer.fingerprint);
+        }
     }
 }
 

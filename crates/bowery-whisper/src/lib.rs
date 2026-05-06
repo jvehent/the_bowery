@@ -11,6 +11,7 @@ mod envelope;
 pub mod fingerprint;
 pub mod forwarding;
 pub mod known_neighbors;
+pub mod pool;
 pub mod qa;
 mod replay;
 pub mod tls;

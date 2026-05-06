@@ -238,6 +238,26 @@ impl BoweryConnection {
     pub fn remote_address(&self) -> SocketAddr {
         self.inner.remote_address()
     }
+
+    /// `true` if the underlying QUIC connection has been closed
+    /// (either side, any reason). Used by the pool to lazily evict
+    /// dead entries before handing them to a caller.
+    pub fn is_closed(&self) -> bool {
+        self.inner.close_reason().is_some()
+    }
+
+    /// Awaits the connection's close. Resolves with the
+    /// `ConnectionError` that closed it. Used by the pool's
+    /// background watcher tasks.
+    pub async fn closed(&self) -> quinn::ConnectionError {
+        self.inner.closed().await
+    }
+
+    /// Stable per-process connection id. Useful in logs to tell
+    /// "same connection reused" from "redialled".
+    pub fn stable_id(&self) -> usize {
+        self.inner.stable_id()
+    }
 }
 
 // ---------------------------------------------------------------------------
