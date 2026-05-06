@@ -20,12 +20,13 @@ use tokio::sync::mpsc;
 
 use crate::input::{InputAction, InputState};
 use crate::palette::PaletteCommand;
+use crate::panes::PaneId;
 use crate::panes::alerts::AlertsPane;
 use crate::panes::audit::AuditPane;
 use crate::panes::doctor::DoctorPane;
+use crate::panes::map::MapPane;
 use crate::panes::peers::PeersPane;
 use crate::panes::query::{QueryPane, QueryStatus};
-use crate::panes::{PaneId, stub};
 use crate::theme;
 
 #[derive(Debug, Clone)]
@@ -69,6 +70,9 @@ pub(crate) enum EngineEvent {
         result: Result<CollectSink, String>,
     },
     DoctorRemoteDone(Result<Duration, String>),
+    MapDone {
+        result: Result<CollectSink, String>,
+    },
 }
 
 pub(crate) struct App {
@@ -82,6 +86,7 @@ pub(crate) struct App {
     pub(crate) audit_pane: AuditPane,
     pub(crate) peers_pane: PeersPane,
     pub(crate) doctor_pane: DoctorPane,
+    pub(crate) map_pane: MapPane,
 
     pub(crate) input: InputState,
     pub(crate) input_mode: InputMode,
@@ -110,6 +115,7 @@ impl App {
             audit_pane: AuditPane::new(),
             peers_pane: PeersPane::new(),
             doctor_pane: DoctorPane::new(),
+            map_pane: MapPane::new(),
             input: load_history_into_input(),
             input_mode: InputMode::Pane,
             status_message: None,
@@ -304,6 +310,13 @@ impl App {
                     self.engine_tx.clone(),
                 );
             }
+            PaneId::Map => {
+                self.map_pane.ensure_loaded(
+                    self.relay.clone(),
+                    self.operator_key.clone(),
+                    self.engine_tx.clone(),
+                );
+            }
             _ => {}
         }
     }
@@ -327,6 +340,13 @@ impl App {
                     self.engine_tx.clone(),
                 );
             }
+            PaneId::Map => {
+                self.map_pane.refresh(
+                    self.relay.clone(),
+                    self.operator_key.clone(),
+                    self.engine_tx.clone(),
+                );
+            }
             _ => {}
         }
     }
@@ -345,6 +365,7 @@ impl App {
             EngineEvent::AlertsError(e) => self.alerts_pane.on_error(e),
             EngineEvent::AuditDone { result } => self.audit_pane.on_done(result),
             EngineEvent::DoctorRemoteDone(result) => self.doctor_pane.on_remote_done(result),
+            EngineEvent::MapDone { result } => self.map_pane.on_done(result),
         }
     }
 
@@ -403,7 +424,7 @@ impl App {
             PaneId::Audit => self.audit_pane.render(f, area),
             PaneId::Peers => self.peers_pane.render(f, area),
             PaneId::Doctor => self.doctor_pane.render(f, area),
-            PaneId::Map => stub::render(f, area, "Map", "C-5"),
+            PaneId::Map => self.map_pane.render(f, area),
         }
     }
 
