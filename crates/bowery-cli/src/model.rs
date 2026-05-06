@@ -51,7 +51,7 @@ const REGISTRY: &[ModelEntry] = &[ModelEntry {
     expected_bytes: 380 * 1024 * 1024, // ~380 MiB
 }];
 
-pub(crate) fn list() {
+pub fn list() {
     println!("{:<24} {:>10}  url", "name", "size");
     for entry in REGISTRY {
         println!(
@@ -64,13 +64,13 @@ pub(crate) fn list() {
 }
 
 /// Default cache directory: `~/.bowery/models/`.
-pub(crate) fn default_out_dir() -> Result<PathBuf> {
+pub fn default_out_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| anyhow!("$HOME is not set; pass --out to choose an explicit directory"))?;
     Ok(PathBuf::from(home).join(".bowery").join("models"))
 }
 
-pub(crate) fn fetch(name: &str, out_dir: &Path, force: bool) -> Result<()> {
+pub fn fetch(name: &str, out_dir: &Path, force: bool) -> Result<()> {
     let entry = REGISTRY
         .iter()
         .find(|e| e.name == name)

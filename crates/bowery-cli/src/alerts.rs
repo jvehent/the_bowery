@@ -22,7 +22,7 @@ use tokio::time::sleep;
 
 /// Drain the inbox once and return the cursor for the next call.
 #[allow(clippy::too_many_arguments)] // explicit binding from the CLI subcommand
-pub(crate) async fn run(
+pub async fn run(
     operator_key: PathBuf,
     target_addr: SocketAddr,
     target_fp_hex: String,

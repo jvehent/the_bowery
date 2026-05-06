@@ -39,7 +39,7 @@ struct LineReport<'a> {
     engine: Option<&'a str>,
 }
 
-pub(crate) fn verify(
+pub fn verify(
     path: &Path,
     pubkey_b64: Option<String>,
     pubkey_from: Option<PathBuf>,

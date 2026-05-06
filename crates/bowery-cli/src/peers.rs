@@ -29,22 +29,22 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub(crate) struct Manifest {
+pub struct Manifest {
     #[serde(default, rename = "peer")]
-    pub(crate) peers: Vec<Peer>,
+    pub peers: Vec<Peer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Peer {
-    pub(crate) name: String,
-    pub(crate) fp: String,
-    pub(crate) pubkey_b64: String,
+pub struct Peer {
+    pub name: String,
+    pub fp: String,
+    pub pubkey_b64: String,
 }
 
 impl Manifest {
     /// Load from `path`. Returns an empty manifest when the file
     /// doesn't exist (first-run convenience).
-    pub(crate) fn load(path: &Path) -> Result<Self> {
+    pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -57,7 +57,7 @@ impl Manifest {
 
     /// Atomically save to `path`. Creates parent directories as
     /// needed. Operator-controlled file; we write 0600.
-    pub(crate) fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
@@ -90,13 +90,13 @@ impl Manifest {
 /// Default location: `$HOME/.bowery/peers.toml`. Returns an
 /// error when `$HOME` isn't set; callers can override with an
 /// explicit path.
-pub(crate) fn default_path() -> Result<PathBuf> {
+pub fn default_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("$HOME is not set"))?;
     Ok(PathBuf::from(home).join(".bowery").join("peers.toml"))
 }
 
 /// `bowery peers add` — append (or replace) a peer entry.
-pub(crate) fn add(path: &Path, name: &str, fp: &str, pubkey_b64: &str) -> Result<()> {
+pub fn add(path: &Path, name: &str, fp: &str, pubkey_b64: &str) -> Result<()> {
     validate_fp(fp)?;
     validate_pubkey(pubkey_b64)?;
     let mut mf = Manifest::load(path)?;
@@ -112,7 +112,7 @@ pub(crate) fn add(path: &Path, name: &str, fp: &str, pubkey_b64: &str) -> Result
 }
 
 /// `bowery peers list` — print the manifest as a table.
-pub(crate) fn list(path: &Path) -> Result<()> {
+pub fn list(path: &Path) -> Result<()> {
     let mf = Manifest::load(path)?;
     if mf.peers.is_empty() {
         println!("(no peers in {})", path.display());
@@ -134,7 +134,7 @@ pub(crate) fn list(path: &Path) -> Result<()> {
 }
 
 /// `bowery peers remove --fp …`. Idempotent.
-pub(crate) fn remove(path: &Path, fp: &str) -> Result<()> {
+pub fn remove(path: &Path, fp: &str) -> Result<()> {
     validate_fp(fp)?;
     let mut mf = Manifest::load(path)?;
     let before = mf.peers.len();

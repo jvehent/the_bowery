@@ -15,7 +15,7 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum Status {
+pub enum Status {
     /// Requirement met.
     Pass,
     /// Requirement met but worth noting (e.g. degraded but functional).
@@ -27,7 +27,7 @@ pub(crate) enum Status {
 }
 
 impl Status {
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Pass => "PASS",
             Self::Warn => "WARN",
@@ -38,23 +38,23 @@ impl Status {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct Check {
-    pub(crate) name: &'static str,
-    pub(crate) status: Status,
-    pub(crate) detail: String,
+pub struct Check {
+    pub name: &'static str,
+    pub status: Status,
+    pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) fix: Option<String>,
+    pub fix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct Report {
-    pub(crate) checks: Vec<Check>,
-    pub(crate) verdict: Verdict,
+pub struct Report {
+    pub checks: Vec<Check>,
+    pub verdict: Verdict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Verdict {
+pub enum Verdict {
     /// All checks pass (warnings allowed).
     Ready,
     /// One or more checks fail; the agent will not start (or will misbehave).
@@ -62,7 +62,7 @@ pub(crate) enum Verdict {
 }
 
 /// Run every check and produce a verdict.
-pub(crate) fn run() -> Report {
+pub fn run() -> Report {
     let checks = vec![
         check_kernel_version(),
         check_btf(),
@@ -168,7 +168,7 @@ fn check_kernel_version() -> Check {
     }
 }
 
-pub(crate) fn parse_kernel_version(s: &str) -> (u32, u32) {
+pub fn parse_kernel_version(s: &str) -> (u32, u32) {
     let mut parts = s.split(['.', '-']);
     let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
     let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
@@ -371,7 +371,7 @@ fn read_kernel_config() -> Option<String> {
 // Output
 // ---------------------------------------------------------------------------
 
-pub(crate) fn print_human(report: &Report) {
+pub fn print_human(report: &Report) {
     println!("== Bowery host readiness ==\n");
     let name_width = report
         .checks

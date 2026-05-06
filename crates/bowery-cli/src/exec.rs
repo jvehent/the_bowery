@@ -24,11 +24,33 @@ use bowery_proto::{
     SqlValueKind, WhisperPayload,
 };
 
-use crate::SqlFormat;
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::BoweryEndpoint;
 use bowery_whisper::{Sealer, StaticResolver, Verifier};
+use clap::ValueEnum;
 use ed25519_dalek::VerifyingKey;
+
+/// Output format for the streamed SQL rows.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SqlFormat {
+    /// Tab-separated values, one row per line. Streams.
+    Tsv,
+    /// One JSON object per row, column-name array on first line.
+    /// Streams.
+    Json,
+    /// Aligned ASCII table. Buffered — emitted on stream close.
+    Table,
+}
+
+impl std::fmt::Display for SqlFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Tsv => "tsv",
+            Self::Json => "json",
+            Self::Table => "table",
+        })
+    }
+}
 
 /// Send a single Phase-9 SQL query and stream the rows back. Each
 /// chunk envelope arrives on its own QUIC stream; the loop
@@ -38,7 +60,7 @@ use ed25519_dalek::VerifyingKey;
 /// own timeout server-side and is the authority on "how long
 /// before this query is killed".
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(crate) async fn sql(
+pub async fn sql(
     operator_key: PathBuf,
     target_addr: SocketAddr,
     target_fp_hex: String,

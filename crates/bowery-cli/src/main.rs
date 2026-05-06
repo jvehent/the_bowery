@@ -14,14 +14,9 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_crypto::Identity;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
-mod alerts;
-mod audit;
-mod doctor;
-mod exec;
-mod model;
-mod peers;
+use bowery_cli::{alerts, audit, doctor, exec, model, peers};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -287,26 +282,10 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| e.to_string())
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub(crate) enum SqlFormat {
-    /// Tab-separated values, one row per line. Streams.
-    Tsv,
-    /// One JSON object per row, column-name array on first line.
-    /// Streams.
-    Json,
-    /// Aligned ASCII table. Buffered — emitted on stream close.
-    Table,
-}
-
-impl std::fmt::Display for SqlFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Tsv => "tsv",
-            Self::Json => "json",
-            Self::Table => "table",
-        })
-    }
-}
+// SqlFormat now lives in `bowery_cli::exec` so the library can
+// expose it to console-style consumers; the binary references it
+// through the same path.
+pub use bowery_cli::exec::SqlFormat;
 
 #[derive(Subcommand, Debug)]
 enum KeyCommand {

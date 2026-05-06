@@ -10,6 +10,10 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 
+[lib]
+name = "bowery_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bowery"
 path = "src/main.rs"
