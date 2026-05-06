@@ -28,7 +28,7 @@ bowery-console \
 console prompts on stdin:
 
 ```
-The Chat pane needs Gemma 4 (GGUF, ~2 GB).
+The Chat pane needs Gemma 4 (GGUF, ~3 GB).
   expected at:  /home/you/.bowery/models/gemma-4-e2b-it-q4_k_m.gguf
   registry id:  gemma-4-e2b-it-q4_k_m
 Download now? [y/N]

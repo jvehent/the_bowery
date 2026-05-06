@@ -58,10 +58,15 @@ const REGISTRY: &[ModelEntry] = &[
         // E2B-it — 2.3B effective params, 128K context window,
         // <start_of_turn> chat template. Use this on the operator
         // workstation, not on agents (agents stay on Qwen3).
+        //
+        // Source: Unsloth's public Gemma-4-E2B-it GGUF repo (no
+        // HF auth required). The Monster/* mirror returned 401 on
+        // first try, so we point at the better-maintained
+        // unsloth/* one instead.
         name: "gemma-4-e2b-it-q4_k_m",
-        url: "https://huggingface.co/Monster/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf",
         sha256_hex: None,
-        expected_bytes: 1_500 * 1024 * 1024, // ~1.5 GiB
+        expected_bytes: 3_100 * 1024 * 1024, // 3.11 GiB per the repo listing
     },
 ];
 

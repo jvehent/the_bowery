@@ -189,7 +189,7 @@ fn prompt_and_fetch_gemma(missing_path: &Path) -> anyhow::Result<Option<PathBuf>
     use std::io::{Write as _, stdin, stdout};
 
     const MODEL_NAME: &str = "gemma-4-e2b-it-q4_k_m";
-    const APPROX_SIZE_GB: u64 = 2; // q4_k_m is ~1.5 GiB; round up
+    const APPROX_SIZE_GB: u64 = 3; // q4_k_m is 3.11 GiB per the unsloth repo listing
 
     println!();
     println!("The Chat pane needs Gemma 4 (GGUF, ~{APPROX_SIZE_GB} GB).");
