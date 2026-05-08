@@ -2196,6 +2196,242 @@ tables — operator supplies the path, no enumeration possible.
   malicious operator can cause a few warn lines per failed
   query; a token bucket on the warn emission would close the
   log-disk DoS edge.
+
+## 23. Phase 10 — persistent peer-connection pool
+
+Phase 10 splits Bowery's whisper transport into three slices, all
+shipped. The goal: agents in restrictive networks (no inbound
+9902/UDP) participate fully by riding a persistent outbound
+connection that one of their pinned peers initiated.
+
+### 23.1 `PeerConnections` (slice 1)
+
+[`crates/bowery-whisper/src/pool.rs`](crates/bowery-whisper/src/pool.rs).
+
+Cache of `BoweryConnection`s keyed by `Fingerprint`. API:
+
+- `PeerConnections::new(endpoint)` — pool with no inbound
+  handler (operator CLI use).
+- `PeerConnections::with_handler(endpoint, InboundHandler)` —
+  agent use; runs `handler(fp, conn)` on every fresh outbound
+  dial.
+- `get_or_dial(peer_fp, addr, verifier)` — returns a cached
+  connection (verifying it isn't closed) or dials fresh.
+- `invalidate(peer_fp)` — drop after a known send failure.
+
+Eviction is multi-level:
+
+- **Lazy on get**: `BoweryConnection::is_closed()` checked
+  before returning a cached entry.
+- **Background watcher**: per-entry tokio task awaits Quinn's
+  `closed()` future and removes the slot. Watcher dedupes
+  against `stable_id` so a racing redial doesn't lose its
+  successor.
+- **Explicit invalidate**: caller-driven for "send failed"
+  paths.
+
+Quinn's existing 10 s keep-alive + 30 s idle timeout (see
+[`hardened_transport_config`](crates/bowery-whisper/src/transport.rs#L261)) keep idle pooled connections alive
+without protocol changes.
+
+### 23.2 `InboundHandler` on outbound (slice 2)
+
+The agent constructs an `InboundHandler` closure that captures
+the same Arcs `handle_connection` needs (verifier, sealer,
+baseline, inbox, op_router, events). On every fresh outbound
+dial, the closure spawns a new `handle_connection` task on the
+dialed connection. Net effect: A → B outbound connection serves
+both directions. B can `open_uni` / `open_bi` at any time and
+A's task picks it up — B never has to dial A's listener.
+
+This is the load-bearing change for "no inbound port required."
+Agents behind firewalls can still participate as long as they
+can dial *one* reachable seed; that connection then carries
+peer-initiated whispers back through the same socket.
+
+### 23.3 Bidi streams for whisper Q&A (slice 3)
+
+Slice 2 introduced a race: the asker's `recv_envelope` (call to
+`accept_uni`) competes with the inbound handler's
+`accept_uni` for the responder's reply. Solution: migrate Q&A
+to a single bidirectional stream so the response shares the
+exact stream the question went out on.
+
+[`crates/bowery-whisper/src/transport.rs`](crates/bowery-whisper/src/transport.rs):
+
+- `BoweryConnection::request(question_bytes) -> Result<answer_bytes>` —
+  open_bi → write question → finish send half → read one
+  length-prefixed reply on the same stream.
+- `BoweryConnection::accept_request() -> Result<(bytes, Reply)>` —
+  pairs with `request`; returns the question bytes and a
+  `Reply` send-half wrapper.
+- `Reply::send(answer_bytes)` — writes the reply, finishes,
+  waits for the asker to consume before letting the connection
+  drop.
+
+[`crates/bowery-whisper/src/qa.rs`](crates/bowery-whisper/src/qa.rs) wraps
+these. `qa::ask` calls `conn.request`; `qa::answer_one` accepts
+via `conn.accept_request` and replies through the `Reply`.
+
+[`crates/bowery-agent/src/agent.rs::handle_connection`](crates/bowery-agent/src/agent.rs)
+splits into two parallel readers:
+
+- `handle_uni_stream_loop`: heartbeats, `Subscribe`,
+  `OperatorCommand`. Replies still ride fresh outbound uni
+  streams.
+- `handle_bi_stream_loop`: whisper `Question`. Reply rides the
+  same stream via `Reply::send`.
+
+The loops run via `tokio::join!`; a single connection close
+exits both.
+
+### 23.4 Heartbeat + Q&A both reuse the pool
+
+[`agent::send_heartbeat`](crates/bowery-agent/src/agent.rs) and
+[`whisper_qa::ask_one`](crates/bowery-agent/src/whisper_qa.rs) call
+`pool.get_or_dial(peer.fp, peer.whisper_addr, verifier)` instead
+of `endpoint.dial(...)`. Transport-shaped errors invalidate the
+entry so the next round redials cleanly.
+
+Operator transport (`bowery exec sql`, `bowery alerts tail`) is
+single-shot by design and stays out of the pool.
+
+### 23.5 What's deferred
+
+- **Outbound-only mode**. Config flag (`[whisper] accept = false`)
+  to disable the inbound listener entirely for fully-firewalled
+  agents. Currently every agent still binds 9902/UDP — slice 4.
+- **Per-fingerprint dial-in-progress slot**. Two concurrent
+  callers asking for the same fp while the cache is cold both
+  dial; one wins the insert. Heartbeats are 30 s apart per peer
+  so the dedupe window almost never fires; revisit if
+  empirically it does.
+
+## 24. Operator console (`bowery-console`)
+
+Phases C-1..C-6. Ratatui workspace built on top of the
+[`bowery-cli`](crates/bowery-cli/) library refactor. Eight panes,
+schema-aware chatbot, embedded operator handbook.
+
+### 24.1 `bowery-cli` lib + bin (C-1)
+
+`bowery-cli` exposes a public library
+[`bowery_cli`](crates/bowery-cli/src/lib.rs) re-exporting:
+
+- `alerts` (`run`, `poll_once`)
+- `audit` (`verify`)
+- `doctor` (`run`, `Report`, `Check`, `Status`, `Verdict`,
+  `print_human`)
+- `exec` (`sql`, `SqlSink`, `make_stdout_sink`, `CollectSink`,
+  `CollectedRow`, `SqlFormat`)
+- `model` (`fetch`, `list`, `default_out_dir`)
+- `peers` (`Manifest`, `Peer`, `default_path`, `add`, `list`,
+  `remove`)
+
+`exec::sql` takes a `&mut dyn SqlSink`. The binary passes
+`make_stdout_sink(format, fanout)`; the console passes
+`&mut CollectSink::default()` and reads `sink.rows` /
+`sink.columns` after the await.
+
+### 24.2 Console architecture
+
+[`crates/bowery-console/`](crates/bowery-console/).
+
+```
+src/
+  main.rs       — clap arg parsing, model auto-fetch prompt,
+                  ratatui terminal lifecycle.
+  app.rs        — App state, render loop, EngineEvent dispatch,
+                  global hotkey routing.
+  input.rs      — single-line editor with persisted history
+                  (~/.bowery/console-history).
+  palette.rs    — `:command` parser.
+  theme.rs      — centralized styles.
+  panes/
+    query.rs    — SQL REPL (uses CollectSink).
+    alerts.rs   — live tail (5 s poll via alerts::poll_once).
+    map.rs      — 1-hop topology tree (SELECT FROM bowery_peers).
+    audit.rs    — bowery_audit snapshot.
+    peers.rs    — manifest CRUD via bowery_cli::peers.
+    doctor.rs   — local doctor::run() + remote `SELECT 1`.
+    chat.rs     — Gemma 4 dialog + draft-SQL extraction.
+    chat_system_prompt.txt — schema-grounded prompt with examples.
+    help.rs     — renders docs/CONSOLE.md (include_str!).
+```
+
+Backed by a single tokio multi-thread runtime. The render loop
+uses `tokio::select!` over `crossterm::EventStream` and an
+`mpsc::Receiver<EngineEvent>`. Background work (queries,
+alert polling, chat completions) sends results via the channel;
+the UI never blocks.
+
+### 24.3 Chat pane (Gemma 4 via llama.cpp)
+
+Behind the `llm-llama-cpp` feature on `bowery-console`. Loads
+`gemma-4-e2b-it-q4_k_m.gguf` (2.96 GiB; pinned SHA in the model
+registry) via the new `bowery_llm::Chat` trait.
+
+[`crates/bowery-llm/src/chat.rs`](crates/bowery-llm/src/chat.rs):
+- `Chat: Send + Sync` async trait, `complete(messages) -> reply`.
+- `MockChat` — always-on echo backend.
+- `render_gemma_prompt(messages)` — folds `system` into the
+  first `user` turn (Gemma has no `system` marker, matches the
+  Transformers chat template).
+
+[`crates/bowery-llm/src/chat_llama_cpp.rs`](crates/bowery-llm/src/chat_llama_cpp.rs):
+- `LlamaCppChat` — same dedicated-OS-thread + tokio-channel
+  pattern as `LlamaCppAnalyzer`. Tokens streamed lossily
+  (UTF-8 may straddle), end-of-turn marker stripped.
+
+The Chat pane:
+
+- Multi-turn buffer, system prompt seeded on every `complete()`
+  call (Gemma's template re-folds it into the first user turn
+  automatically).
+- After each reply, scans for ```` ```sql … ``` ```` blocks; the
+  most recent draft sits in a "DRAFT SQL" footer.
+- `x` hotkey takes the draft, switches to the Query pane, and
+  dispatches via the existing `query_pane.submit` path.
+
+Privacy: prompts stay on-host; `bowery_alerts` / `bowery_audit`
+rows are NOT auto-fed into the prompt — operators paste what
+they want grounded.
+
+### 24.4 Model registry + auto-fetch
+
+[`crates/bowery-cli/src/model.rs`](crates/bowery-cli/src/model.rs).
+Curated registry with two entries today:
+
+| name | url | sha256 | size |
+|---|---|---|---|
+| `qwen3-0.6b-q4_k_m` | unsloth/Qwen3-0.6B-GGUF | `ac2d977…0d524a` | 378 MiB |
+| `gemma-4-e2b-it-q4_k_m` | unsloth/gemma-4-E2B-it-GGUF | `9378bc4…b8672d` | 2.96 GiB |
+
+`validate()` runs three checks post-download: GGUF magic, size
+band (±25 %), SHA-256. The console's launch-time
+`prompt_and_fetch_gemma` call uses the same `bowery_cli::model::fetch`
+function, so the GGUF lands at `~/.bowery/models/<name>.gguf`
+verified against the pinned hash.
+
+### 24.5 Help pane = handbook
+
+[`docs/CONSOLE.md`](docs/CONSOLE.md) is the canonical operator
+reference. The Help pane includes it via `include_str!` so the
+binary stays self-contained. The chatbot's system prompt is a
+condensed mirror of the same content (schema, palette, rules,
+few-shot examples) — same source of truth, three audiences.
+
+### 24.6 xtest integration
+
+[`scripts/xtest`](scripts/xtest):
+
+- `xtest build` and `xtest ci` now also run
+  `cargo build --release -p bowery-console --features llm-llama-cpp`
+  on the test VM so the LLM-on path doesn't rot.
+- `xtest run-console [-- ARGS...]` — sync + build console with
+  the LLM feature + run. `--push-model` rsyncs the GGUF ahead
+  of launch.
+
 ---
 
 This document is meant to be a living reference. When a phase lands

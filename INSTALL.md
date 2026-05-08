@@ -557,16 +557,69 @@ The agent expects an already-on-disk GGUF. Fetch one:
 
 ```bash
 bowery model list
-bowery model fetch qwen3-0.6b-q4_k_m   # → ~/.bowery/models/qwen3-0.6b-q4_k_m.gguf
+bowery model fetch qwen3-0.6b-q4_k_m       # agent-side analyzer
+bowery model fetch gemma-4-e2b-it-q4_k_m   # operator-side console chat
 ```
 
-`fetch` validates the GGUF magic and approximate size before declaring
-success; if a HuggingFace mirror starts returning HTML error pages
-(we've seen it), the validator catches it and removes the partial. The
-agent never downloads at runtime or compile time.
+`fetch` validates every download in three steps before declaring
+success:
 
-For the dev VM workflow, see `xtest run-agent --push-model` in
-[docs/REMOTE_TESTING.md](docs/REMOTE_TESTING.md).
+1. **GGUF magic** — first 4 bytes must be `GGUF`. Catches HTTP error
+   pages saved as the file.
+2. **Size band** — actual size must be within ±25 % of the
+   registry's expected count.
+3. **SHA-256** — registry pins the upstream LFS hash; the
+   downloader streams the file post-download and bails on
+   mismatch.
+
+The agent never downloads at runtime or compile time.
+
+For the dev VM workflow, see `xtest run-agent --push-model` and
+`xtest run-console` in [docs/REMOTE_TESTING.md](docs/REMOTE_TESTING.md).
+
+### Interactive console (`bowery-console`)
+
+For day-to-day investigation, install the ratatui workspace
+binary alongside `bowery`:
+
+```bash
+cargo build --release --features llm-llama-cpp -p bowery-console
+sudo install -m755 target/release/bowery-console /usr/bin/
+```
+
+It pulls in eight panes — Query (SQL REPL), Alerts (live tail),
+Map (1-hop topology), Audit, Peers (manifest CRUD), Doctor (local
++ remote readiness), Chat (Gemma 4 chatbot that drafts SQL —
+press `x` to run), Help (operator handbook). The full reference
+(hotkeys, palette, schema, recipes, troubleshooting) is in
+[docs/CONSOLE.md](docs/CONSOLE.md), and the same content renders
+in-pane via the Help tab (hotkey `8`).
+
+Launch:
+
+```bash
+bowery-console \
+    --operator-key  ~/.bowery/operator.key \
+    --agent-addr    10.0.0.5:9902 \
+    --agent-fp      <hex>           \
+    --agent-pubkey-b64 <base64>
+```
+
+On first launch the console offers to download Gemma 4 if the
+GGUF isn't on disk yet:
+
+```
+The Chat pane needs Gemma 4 (GGUF, ~3 GB).
+  expected at:  /home/you/.bowery/models/gemma-4-e2b-it-q4_k_m.gguf
+  registry id:  gemma-4-e2b-it-q4_k_m
+Download now? [y/N]
+```
+
+`y` runs the same `bowery model fetch` path with full
+GGUF-magic + size + SHA-256 verification. Without the
+`llm-llama-cpp` feature the chat pane falls back to a deterministic
+mock backend and prints a banner explaining the rebuild
+incantation.
 
 ---
 
