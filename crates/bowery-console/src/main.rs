@@ -168,8 +168,25 @@ async fn build_chat_backend(
         n_ctx,
         ..LlamaCppChatConfig::default()
     };
+    // llama.cpp loads + runs C++ here. If the binary was compiled
+    // for a different CPU than it's running on, that dispatch can
+    // abort the whole process with SIGILL ("Illegal instruction")
+    // and no catchable Rust error — so warn *before* the load and
+    // flush, giving the operator the cause if the next line never
+    // prints. `scripts/build-console` sets the flag that avoids it.
+    eprintln!(
+        "loading Gemma 4 (llama.cpp)… if this aborts with \
+         `Illegal instruction (core dumped)`, the binary was built \
+         for a different CPU — rebuild with `./scripts/build-console`."
+    );
+    use std::io::Write as _;
+    std::io::stderr().flush().ok();
+
     match LlamaCppChat::new(cfg).await {
-        Ok(chat) => std::sync::Arc::new(chat),
+        Ok(chat) => {
+            eprintln!("Gemma 4 loaded — Chat pane is live.");
+            std::sync::Arc::new(chat)
+        }
         Err(e) => {
             eprintln!("chat model load failed: {e}. Falling back to mock chat.");
             std::sync::Arc::new(MockChat)
@@ -238,11 +255,12 @@ async fn build_chat_backend(
     eprintln!("This bowery-console was built WITHOUT --features llm-llama-cpp, so the");
     eprintln!("Chat pane will use a deterministic mock that just echoes your message.");
     eprintln!();
-    eprintln!("To get the real Gemma 4 chatbot, rebuild with the feature on:");
+    eprintln!("To get the real Gemma 4 chatbot, rebuild with the wrapper that");
+    eprintln!("also pins the CPU target (plain `cargo build --features` can SIGILL):");
     eprintln!();
-    eprintln!("    cargo build --release --features llm-llama-cpp -p bowery-console");
+    eprintln!("    ./scripts/build-console");
     eprintln!();
-    eprintln!("On the test VM, the same flag is passed automatically by:");
+    eprintln!("On the test VM, the same build is run automatically by:");
     eprintln!();
     eprintln!("    ./scripts/xtest run-console");
     eprintln!();

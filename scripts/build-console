@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# build-console — build the operator console with the real Gemma 4
+# chatbot (llama.cpp) enabled, using the CPU the build host runs on.
+#
+# Why this wrapper exists:
+#   The `llm-llama-cpp` feature links llama.cpp, whose bundled CPU
+#   dispatch can select an AVX/AVX-512 code path the *running* core
+#   doesn't support — the process then dies with SIGILL ("Illegal
+#   instruction (core dumped)") and no Rust-level error. Forcing
+#   `-C target-cpu=native` pins the build to the exact CPU it will
+#   run on, which removes the mismatch. This is the same flag the
+#   agent's LLM build uses (see scripts/xtest).
+#
+#   Because the flag targets the *build* host's CPU, the resulting
+#   binary is NOT portable — build it on the workstation you'll run
+#   the console on (the normal case for an operator). Do not ship
+#   this binary to a machine with a different CPU.
+#
+# Output: target/release/bowery-console
+#
+# Extra args are forwarded to cargo, e.g.:
+#   ./scripts/build-console --locked
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+echo "==> building bowery-console (release, llm-llama-cpp, target-cpu=native)"
+RUSTFLAGS="-C target-cpu=native" \
+    cargo build --release -p bowery-console --features llm-llama-cpp "$@"
+
+echo
+echo "built: $REPO_ROOT/target/release/bowery-console"
+echo "note:  this binary is tuned for THIS machine's CPU; don't copy it"
+echo "       to a host with a different processor (it may SIGILL there)."

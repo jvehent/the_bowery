@@ -58,13 +58,25 @@ You can also fetch ahead of time:
 bowery model fetch gemma-4-e2b-it-q4_k_m
 ```
 
-Build with the LLM feature on if you want real Gemma 4 inference:
+Build with the LLM feature on if you want real Gemma 4 inference.
+Use the wrapper — it pins the build to this host's CPU:
 
 ```bash
-cargo build --release --features llm-llama-cpp -p bowery-console
+./scripts/build-console          # → target/release/bowery-console
 ```
 
-Without that feature the binary stays small (~few MB) and the chat
+> **Why the wrapper?** The `llm-llama-cpp` feature links llama.cpp,
+> whose CPU dispatch can select an AVX/AVX-512 path the running core
+> doesn't support, aborting the process with `Illegal instruction
+> (core dumped)` and no Rust error. The wrapper sets
+> `RUSTFLAGS='-C target-cpu=native'`, matching the binary to the CPU
+> it's built on. Because of that, the binary is **not portable** —
+> build it on the workstation you'll run it on, and don't copy it to
+> a host with a different processor. A plain
+> `cargo build --features llm-llama-cpp -p bowery-console` omits the
+> flag and is the usual cause of that crash.
+
+Without the feature the binary stays small (~few MB) and the chat
 pane is mock-only — at startup the console prints a banner telling
 you so.
 

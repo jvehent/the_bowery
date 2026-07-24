@@ -583,9 +583,15 @@ For day-to-day investigation, install the ratatui workspace
 binary alongside `bowery`:
 
 ```bash
-cargo build --release --features llm-llama-cpp -p bowery-console
+./scripts/build-console          # RUSTFLAGS='-C target-cpu=native' for you
 sudo install -m755 target/release/bowery-console /usr/bin/
 ```
+
+> The wrapper pins the build to this host's CPU. A plain
+> `cargo build --features llm-llama-cpp -p bowery-console` can abort
+> at chat-model load with `Illegal instruction (core dumped)` when
+> llama.cpp's dispatch picks an instruction the running core lacks;
+> the resulting native binary is not portable to a different CPU.
 
 It pulls in eight panes — Query (SQL REPL), Alerts (live tail),
 Map (1-hop topology), Audit, Peers (manifest CRUD), Doctor (local

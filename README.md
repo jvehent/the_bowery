@@ -49,6 +49,7 @@ crates/
                            # persistent peer-connection pool, fingerprints
 deploy/systemd/            # service unit + slice
 scripts/
+  build-console            # console build with llama.cpp + target-cpu=native
   build-ebpf               # wraps `cargo +nightly build` for the BPF target
   integration-sql-test.sh  # end-to-end operator → agent SQL CI smoke
   xtest                    # SSH-based remote-VM driver (sync, build, run-agent,
@@ -70,11 +71,16 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 
-# Agent with real Qwen3-0.6B inference (needs cmake + clang):
-cargo build --release --features llm-llama-cpp -p bowery-agent
+# Agent with real Qwen3-0.6B inference (needs cmake + clang).
+# RUSTFLAGS pins the build to this host's CPU — llama.cpp otherwise
+# SIGILLs when its dispatch picks an instruction the runtime core
+# lacks. Build on the same CPU you deploy to.
+RUSTFLAGS='-C target-cpu=native' \
+  cargo build --release --features llm-llama-cpp -p bowery-agent
 
-# Operator console with real Gemma 4 chatbot:
-cargo build --release --features llm-llama-cpp -p bowery-console
+# Operator console with real Gemma 4 chatbot (same CPU caveat —
+# the wrapper sets the flag for you):
+./scripts/build-console
 
 # Kernel-side BPF programs (needs nightly + bpf-linker):
 ./scripts/build-ebpf
