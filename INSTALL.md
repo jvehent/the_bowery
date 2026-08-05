@@ -289,6 +289,12 @@ the program. The shipped systemd unit grants these.
 
 ## 4. Installing the agent (root)
 
+> **Remote / cross-arch node (e.g. a Raspberry Pi over Tailscale)?**
+> Use the turnkey kit in [`deploy/remote/`](deploy/remote/README.md):
+> `package-agent.sh` cross-compiles a tarball on your laptop and
+> `install-agent.sh` sets up the user, systemd unit, and config on
+> the node. The steps below are the manual, same-arch equivalent.
+
 ```bash
 # 4.1 Dedicated user/group
 sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin bowery

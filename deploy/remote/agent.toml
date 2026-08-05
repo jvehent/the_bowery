@@ -1,0 +1,82 @@
+# The Bowery agent — standalone remote node (e.g. a Raspberry Pi
+# reachable over Tailscale). Installed at /etc/bowery/agent.toml by
+# install-agent.sh, which fills in the bind addresses, cluster id,
+# and operator-key placeholders below.
+#
+# This is a *single-node* profile: no mesh seeds, no peers. The
+# operator reaches it directly over the whisper QUIC port. The SQL
+# host-state surface, alert inbox, and baseline all work without a
+# BPF-LSM kernel; only the real-time eBPF event stream and
+# block_exec enforcement need one (a stock Raspberry Pi OS kernel
+# does not have it — the agent detects this and runs degraded).
+
+[identity]
+# Ed25519 identity key. Generated on first start if absent (mode 0600).
+path = "/var/lib/bowery/identity.key"
+
+[known_neighbors]
+# TOFU pin store. Irrelevant for a single node with no peers, but the
+# agent still writes it. Short bootstrap window since nothing should
+# auto-pin on a standalone node.
+path = "/var/lib/bowery/known_neighbors.json"
+bootstrap_window = "5m"
+max_pinned_peers = 64
+
+[mesh]
+# Chitchat gossip socket. Idle on a single node (no seeds). Bind is
+# still opened so future Bowery nodes on the tailnet can peer later.
+listen_addr = "@@MESH_LISTEN@@"
+# No seeds → standalone. Add other Bowery nodes' mesh addresses here
+# to form a mesh later.
+seeds = []
+# Peers with a mismatched cluster id ignore each other. Keep the same
+# value across every node you want in one mesh.
+cluster_id = "@@CLUSTER_ID@@"
+
+[whisper]
+# QUIC socket the operator connects to (`bowery exec sql`,
+# `bowery alerts tail`, `bowery-console`). Over Tailscale this is
+# reachable at the node's 100.x address.
+bind_addr = "@@WHISPER_BIND@@"
+
+[heartbeat]
+interval = "30s"
+
+[baseline]
+# SQLite baseline of observed binaries + lineage. Persisted so the
+# node keeps its memory across restarts.
+path = "/var/lib/bowery/baseline.db"
+
+[role]
+publish_interval = "60s"
+
+[llm]
+# Deterministic mock analyzer. The real Qwen3 model is not bundled;
+# a Pi has limited RAM and the mock keeps rule + baseline scoring
+# working. To enable real inference, build the agent with
+# `--features llm-llama-cpp`, fetch a GGUF, and add an [llm.llama_cpp]
+# block (see INSTALL.md §4b) — not recommended on a low-RAM Pi.
+invocation_threshold = 0.7
+queue_capacity = 32
+request_deadline = "10s"
+
+[sql]
+# Native SQL host-state surface (always on). This is the main reason
+# to run a remote node: query the host over Tailscale. `expose_cmdline`
+# stays OFF — argv routinely carries secrets and this node has no mesh
+# fan-out to scope it to, but leaving it off is the safe default.
+# expose_cmdline = false
+# max_concurrent_queries = 4
+# max_timeout = "30s"
+
+[operators]
+# Base64 of each operator verifying key allowed to issue commands to
+# this node. Get yours from `bowery key info ~/.bowery/operator.key`
+# on your laptop. install-agent.sh substitutes @@OPERATOR_PUBKEY@@;
+# without a real key here, no one can query the node.
+pubkeys_b64 = ["@@OPERATOR_PUBKEY@@"]
+
+[response]
+# Observe-only. A remote Pi in NoopEventSource mode has no exec
+# stream to enforce against anyway; keep enforcement off.
+engine = "noop"
