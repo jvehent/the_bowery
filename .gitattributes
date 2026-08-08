@@ -1,0 +1,19 @@
+# The Bowery is a Unix project: shell scripts have `#!` shebangs and
+# systemd units / TOML configs are read on Linux hosts. A CRLF working
+# tree breaks the shebang (`/usr/bin/env: 'bash\r'`), so pin LF endings
+# in the working tree for everyone, regardless of a checkout host's
+# core.autocrlf setting.
+
+# Normalize all detected-text files to LF on checkout and commit.
+* text=auto eol=lf
+
+# Be explicit for the executable / config file types that must be LF.
+*.sh    text eol=lf
+*.toml  text eol=lf
+*.service text eol=lf
+*.slice   text eol=lf
+*.md    text eol=lf
+*.rs    text eol=lf
+
+# Extension-less scripts under scripts/ (xtest, build-ebpf, build-console).
+scripts/*  text eol=lf
