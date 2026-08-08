@@ -59,11 +59,19 @@ bowery model fetch gemma-4-e2b-it-q4_k_m
 ```
 
 Build with the LLM feature on if you want real Gemma 4 inference.
-Use the wrapper — it pins the build to this host's CPU:
+It compiles llama.cpp, so install the C/C++/clang toolchain first
+(the base agent/CLI build doesn't need this):
 
 ```bash
+sudo apt install -y cmake clang libclang-dev build-essential   # Debian/Ubuntu
 ./scripts/build-console          # → target/release/bowery-console
 ```
+
+Without `clang`'s builtin headers you'll hit `'stdbool.h' file not
+found` from bindgen; `build-console` pre-checks for the toolchain and
+prints this same hint. If you don't need the on-host chatbot, skip all
+of it — `cargo build --release -p bowery-console` gives a fully working
+console (every pane but Chat, which falls back to a mock).
 
 > **Why the wrapper?** The `llm-llama-cpp` feature links llama.cpp,
 > whose CPU dispatch can select an AVX/AVX-512 path the running core

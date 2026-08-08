@@ -26,6 +26,31 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# The llm-llama-cpp feature compiles llama.cpp (cmake) and runs bindgen
+# (libclang). Missing pieces surface as a deep panic like
+# `'stdbool.h' file not found` — pre-check and give the exact fix.
+missing=()
+for tool in cmake clang cc; do command -v "$tool" >/dev/null 2>&1 || missing+=("$tool"); done
+# libclang.so is a library, not a command — probe common locations.
+if ! ls /usr/lib*/libclang*.so* /usr/lib/*/libclang*.so* >/dev/null 2>&1; then
+    missing+=("libclang")
+fi
+if [[ ${#missing[@]} -gt 0 ]]; then
+    cat >&2 <<EOF
+error: the console's LLM (Gemma 4) feature needs a C/C++/clang toolchain
+       that isn't fully installed. Missing: ${missing[*]}
+
+  Debian/Ubuntu:  sudo apt install -y cmake clang libclang-dev build-essential
+  Fedora/RHEL:    sudo dnf install -y cmake clang clang-devel gcc-c++
+
+Or build the console WITHOUT the chatbot (all other panes work; Chat is a
+mock) — no cmake/clang needed:
+
+  cargo build --release -p bowery-console
+EOF
+    exit 1
+fi
+
 echo "==> building bowery-console (release, llm-llama-cpp, target-cpu=native)"
 RUSTFLAGS="-C target-cpu=native" \
     cargo build --release -p bowery-console --features llm-llama-cpp "$@"
