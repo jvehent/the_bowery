@@ -135,26 +135,27 @@ out of SSH.
 
 **`bowery-agent.service: Main process exited, code=killed, status=31/SYS`**
 (restart-looping right after "starting agent"). `status=31/SYS` is
-SIGSYS — the fleet systemd unit's strict `SystemCallFilter` allow-list
-rejected a syscall the agent makes at startup. That list was validated
-on x86_64 BPF hosts and over-blocks on some arch/systemd combos
-(notably aarch64 Raspberry Pi OS). `install-agent.sh` installs a
-drop-in (`10-remote-node.conf`) that clears the filter for you; if you
-installed with `--strict-syscalls` or hand-rolled the unit, apply it
-manually:
+SIGSYS — the systemd unit's `SystemCallFilter` rejected a syscall. The
+known cause is **`fchown`**: the agent runs as root and its SQLite
+baseline `fchown()`s its WAL/SHM (or journal) to the DB owner when
+root, but `fchown` isn't in `@system-service`. Both the current fleet
+unit and this kit's drop-in (`10-remote-node.conf`) re-allow the
+`@chown` family. If you're on an older unit without it, add the
+drop-in manually:
 ```bash
 sudo mkdir -p /etc/systemd/system/bowery-agent.service.d
-printf '[Service]\nSystemCallFilter=\n' | \
+printf '[Service]\nSystemCallFilter=@chown\n' | \
   sudo tee /etc/systemd/system/bowery-agent.service.d/10-remote-node.conf
 sudo systemctl daemon-reload && sudo systemctl restart bowery-agent
 ```
-Everything else in the sandbox (ProtectSystem, NoNewPrivileges,
+Every other sandbox control (ProtectSystem, NoNewPrivileges,
 RestrictAddressFamilies, MemoryDenyWriteExecute, capability bounding)
-stays in force. To re-tighten later, capture the needed syscalls with
-`SystemCallLog=~@system-service` and add them back (see the drop-in's
-header). The exact blocked syscall from a crash is in:
+stays in force. If a node still SIGSYS-dies on a *different* syscall,
+capture it and add that group too (last resort: a bare
+`SystemCallFilter=` clears the whole list):
 ```bash
 sudo journalctl -k -b | grep -iE "seccomp|audit.*syscall=" | tail
+# arch=c00000b7 → aarch64 ; map the number via `ausyscall aarch64 <n>`
 ```
 
 **`bowery doctor` says BPF-LSM not ready.** Expected on a stock Pi —

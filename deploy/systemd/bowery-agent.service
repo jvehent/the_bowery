@@ -59,6 +59,13 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# Re-allow the chown family. The agent runs as root and its SQLite
+# baseline, when creating the WAL/SHM (or rollback journal) as root,
+# fchown()s those aux files to match the DB owner. fchown is not in
+# @system-service, so without this the agent is SIGSYS-killed at
+# baseline init (systemd: code=killed, status=31/SYS; audit: aarch64
+# syscall 55 / x86_64 syscall 93 = fchown).
+SystemCallFilter=@chown
 
 [Install]
 WantedBy=multi-user.target

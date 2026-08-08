@@ -21,12 +21,12 @@
 #   --start                   Enable + start the service now. Implied
 #                             when --operator-pubkey is a real key.
 #   --no-start                Install only; don't enable/start.
-#   --strict-syscalls         Keep the fleet unit's strict SystemCallFilter.
-#                             Default installs a drop-in that clears it,
-#                             because the strict list SIGSYS-kills the agent
-#                             on some arch/systemd combos (aarch64 Pi OS).
-#                             Use this only on a host where you've verified
-#                             the filter doesn't over-block.
+#   --strict-syscalls         Skip the syscall-filter drop-in. By default a
+#                             drop-in re-allows the @chown family, which the
+#                             root agent needs (SQLite fchown()s its WAL/SHM
+#                             as root) — without it the agent is SIGSYS-killed
+#                             at startup (status=31/SYS). Use --strict-syscalls
+#                             only if your unit already allows @chown.
 #   -h, --help                This help.
 
 set -euo pipefail
@@ -93,16 +93,16 @@ install -m 0755 "$BIN"   /usr/bin/bowery-agent
 install -m 0644 "$SVC"   /lib/systemd/system/bowery-agent.service
 install -m 0644 "$SLICE" /lib/systemd/system/bowery.slice
 
-# Remote-node drop-in: clears the fleet unit's strict SystemCallFilter,
-# which SIGSYS-kills the agent on some arch/systemd combos (e.g. aarch64
-# Raspberry Pi OS). All other sandbox controls are kept. See the file's
-# header for how to re-tighten. Skip with --strict-syscalls.
+# Remote-node drop-in: re-allows the @chown syscall family, which the
+# root agent needs (SQLite fchown()s its WAL/SHM as root). Without it
+# the strict fleet-unit filter SIGSYS-kills the agent at baseline init.
+# All other sandbox controls stay in force. Skip with --strict-syscalls.
 if [[ "$STRICT_SYSCALLS" == "yes" ]]; then
-    echo "==> --strict-syscalls: NOT installing the syscall-filter relaxation"
+    echo "==> --strict-syscalls: NOT installing the @chown syscall drop-in"
     echo "    (if the agent SIGSYS-dies with status=31/SYS, remove --strict-syscalls)"
     rm -f /etc/systemd/system/bowery-agent.service.d/10-remote-node.conf 2>/dev/null || true
 else
-    echo "==> installing remote-node drop-in (relaxes SystemCallFilter)"
+    echo "==> installing remote-node drop-in (re-allows @chown syscalls)"
     install -d -m 0755 /etc/systemd/system/bowery-agent.service.d
     install -m 0644 "$DROPIN" /etc/systemd/system/bowery-agent.service.d/10-remote-node.conf
 fi
