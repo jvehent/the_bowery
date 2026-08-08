@@ -81,13 +81,17 @@ fingerprint:
 journalctl -u bowery-agent | grep fingerprint
 #   ... agent ready fingerprint=<64-hex> ... whisper=0.0.0.0:9902 ...
 ```
-You need both the **fingerprint** and the node's **pubkey_b64**. If
-you also install the `bowery` CLI on the Pi:
+You need both the **fingerprint** (`--agent-fp`) and the node's
+**pubkey_b64** (`--agent-pubkey-b64`). The package bundles the `bowery`
+CLI, so read both directly on the node (the identity key is root-owned,
+so use plain `sudo`):
 ```bash
-sudo -u bowery bowery key info /var/lib/bowery/identity.key
+sudo bowery key info /var/lib/bowery/identity.key
+#   fingerprint: <64-hex>
+#   pubkey_b64:  <base64>
 ```
-Otherwise copy the identity key to your laptop once and read it there,
-or (simplest) install the CLI on the Pi just to print it.
+The installer also prints this at the end of `install-agent.sh`. (The
+journal line above has the fingerprint but not the pubkey.)
 
 ## Step 5 — connect from your laptop
 

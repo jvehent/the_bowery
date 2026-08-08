@@ -27,14 +27,18 @@ command -v cross >/dev/null 2>&1 || {
     exit 1
 }
 
-echo "==> cross build bowery-agent for $TARGET (default features = mock LLM)"
+echo "==> cross build bowery-agent + bowery CLI for $TARGET (default features = mock LLM)"
 # No --features llm-llama-cpp: llama.cpp cross-compilation is heavy and
 # a low-RAM Pi shouldn't run local inference. Mock analyzer + rule +
-# baseline scoring + the full SQL surface all work without it.
-cross build --release --target "$TARGET" -p bowery-agent --locked
+# baseline scoring + the full SQL surface all work without it. The CLI
+# is bundled so the node can print its own fingerprint + pubkey
+# (`bowery key info`) and run `bowery doctor` locally.
+cross build --release --target "$TARGET" -p bowery-agent -p bowery-cli --locked
 
 BIN="target/$TARGET/release/bowery-agent"
-[[ -f "$BIN" ]] || { echo "error: build produced no binary at $BIN" >&2; exit 1; }
+CLI="target/$TARGET/release/bowery"
+[[ -f "$BIN" ]] || { echo "error: build produced no agent binary at $BIN" >&2; exit 1; }
+[[ -f "$CLI" ]] || { echo "error: build produced no CLI binary at $CLI" >&2; exit 1; }
 
 STAGE_NAME="bowery-agent-$TARGET"
 DIST="deploy/remote/dist"
@@ -44,6 +48,7 @@ mkdir -p "$STAGE"
 
 echo "==> staging $STAGE"
 install -m 0755 "$BIN"                                   "$STAGE/bowery-agent"
+install -m 0755 "$CLI"                                   "$STAGE/bowery"
 install -m 0644 deploy/systemd/bowery-agent.service      "$STAGE/bowery-agent.service"
 install -m 0644 deploy/systemd/bowery.slice              "$STAGE/bowery.slice"
 install -m 0644 deploy/remote/10-remote-node.conf        "$STAGE/10-remote-node.conf"

@@ -93,6 +93,15 @@ install -m 0755 "$BIN"   /usr/bin/bowery-agent
 install -m 0644 "$SVC"   /lib/systemd/system/bowery-agent.service
 install -m 0644 "$SLICE" /lib/systemd/system/bowery.slice
 
+# Operator CLI, if the package bundled it. Handy on the node itself for
+# `bowery key info` (to read the node's fingerprint + pubkey) and
+# `bowery doctor`. Optional — the agent works without it.
+CLI="$SRC/bowery"
+if [[ -f "$CLI" ]]; then
+    echo "==> installing bowery CLI"
+    install -m 0755 "$CLI" /usr/bin/bowery
+fi
+
 # Remote-node drop-in: re-allows the @chown syscall family, which the
 # root agent needs (SQLite fchown()s its WAL/SHM as root). Without it
 # the strict fleet-unit filter SIGSYS-kills the agent at baseline init.
@@ -148,19 +157,19 @@ else
 fi
 
 echo
-echo "Node identity (share the fingerprint + pubkey with your operator laptop):"
-if [[ -f /var/lib/bowery/identity.key ]]; then
-    /usr/bin/bowery-agent --help >/dev/null 2>&1 || true
-    # The agent prints its fingerprint on start; read the key directly
-    # if the operator CLI is also installed here, else point at the log.
+echo "Node identity — pass these to the operator laptop as --agent-fp / --agent-pubkey-b64:"
+KEYFILE=/var/lib/bowery/identity.key
+if [[ -f "$KEYFILE" ]]; then
+    # We are root here, and the key is root-owned 0600 (the service runs
+    # as root), so read it directly — no `sudo -u bowery`.
     if command -v bowery >/dev/null 2>&1; then
-        sudo -u bowery bowery key info /var/lib/bowery/identity.key || true
+        bowery key info "$KEYFILE" || true
     else
-        echo "  (install the 'bowery' CLI here and run:"
-        echo "     sudo -u bowery bowery key info /var/lib/bowery/identity.key )"
-        echo "  or read it from:  journalctl -u bowery-agent | grep fingerprint"
+        echo "  install the 'bowery' CLI on this node, then:"
+        echo "     sudo bowery key info $KEYFILE"
+        echo "  (fingerprint alone is also in: journalctl -u bowery-agent | grep fingerprint)"
     fi
 else
-    echo "  identity key not generated yet — it is created on first start."
-    echo "  after starting:  journalctl -u bowery-agent | grep fingerprint"
+    echo "  identity key not generated yet — created on first start."
+    echo "  after starting:  sudo bowery key info $KEYFILE   (or grep the journal for the fp)"
 fi
