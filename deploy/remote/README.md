@@ -47,7 +47,7 @@ Copy the `pubkey_b64`.
 ```bash
 ./deploy/remote/package-agent.sh            # aarch64 (Pi 3/4/5, 64-bit OS)
 # 32-bit Pi OS instead:
-# ./deploy/remote/package-agent.sh armv7-unknown-linux-gnueabihf
+# ./deploy/remote/package-agent.sh armv7-unknown-linux-musleabihf
 ```
 Produces `deploy/remote/dist/bowery-agent-<target>.tar.gz` — a
 self-contained tarball (binary + systemd unit + config template +
@@ -58,12 +58,12 @@ cross-build is quick and the artifact is small.
 
 ```bash
 # from the laptop:
-scp deploy/remote/dist/bowery-agent-aarch64-unknown-linux-gnu.tar.gz  pi5:      # tailnet name or 100.x IP
+scp deploy/remote/dist/bowery-agent-aarch64-unknown-linux-musl.tar.gz  pi5:      # tailnet name or 100.x IP
 ssh pi5
 
 # on the Pi:
-tar xzf bowery-agent-aarch64-unknown-linux-gnu.tar.gz
-sudo ./bowery-agent-aarch64-unknown-linux-gnu/install-agent.sh \
+tar xzf bowery-agent-aarch64-unknown-linux-musl.tar.gz
+sudo ./bowery-agent-aarch64-unknown-linux-musl/install-agent.sh \
     --operator-pubkey '<paste pubkey_b64 from step 1>' \
     --cluster-id my-tailnet
 ```
@@ -164,6 +164,12 @@ sudo journalctl -k -b | grep -iE "seccomp|audit.*syscall=" | tail
 
 **`bowery doctor` says BPF-LSM not ready.** Expected on a stock Pi —
 see the top of this README. The agent runs degraded (SQL + alerts).
+
+**`libc.so.6: version 'GLIBC_2.xx' not found`** when running a bundled
+binary. You packaged a dynamically-linked `…-gnu` build whose glibc is
+newer than the Pi's. `package-agent.sh` now defaults to a **static musl
+target** (no glibc dependency, runs on any Pi OS version) — re-run it
+and redeploy. `file bowery-agent` should say `statically linked`.
 
 ## Upgrading
 

@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
 # package-agent.sh — cross-compile the Bowery agent and assemble a
 # self-contained install tarball for a remote node (default target:
-# 64-bit Raspberry Pi / aarch64).
+# 64-bit Raspberry Pi / aarch64, statically linked against musl).
+#
+# Why musl (static): the binaries have NO glibc dependency, so they
+# run on any Pi OS version regardless of its glibc. A dynamically
+# linked (…-gnu) build fails at runtime on an older Pi with
+# `GLIBC_2.xx not found` when the build image's glibc is newer than
+# the target's. musl sidesteps that entirely.
 #
 # Run ON YOUR LAPTOP (the build host):
-#   ./deploy/remote/package-agent.sh                 # aarch64 (Pi 3/4/5, 64-bit OS)
-#   ./deploy/remote/package-agent.sh armv7-unknown-linux-gnueabihf   # 32-bit Pi OS
+#   ./deploy/remote/package-agent.sh                 # aarch64 musl (Pi 3/4/5, 64-bit OS)
+#   ./deploy/remote/package-agent.sh armv7-unknown-linux-musleabihf   # 32-bit Pi OS
 #
 # Requires `cross` (Docker-based; no local cross-linker needed):
 #   cargo install cross --git https://github.com/cross-rs/cross
 # Docker or Podman must be running.
 #
 # Output: deploy/remote/dist/bowery-agent-<target>.tar.gz
-# The tarball extracts to a directory containing the binary, the
+# The tarball extracts to a directory containing the binaries, the
 # systemd unit + slice, the config template, and install-agent.sh.
 
 set -euo pipefail
 
-TARGET="${1:-aarch64-unknown-linux-gnu}"
+TARGET="${1:-aarch64-unknown-linux-musl}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
