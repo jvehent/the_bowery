@@ -116,6 +116,11 @@ enum PeersCommand {
         /// Base64-encoded Ed25519 verifying key.
         #[arg(long)]
         pubkey_b64: String,
+        /// Optional whisper address (`host:port`, e.g.
+        /// `100.64.0.5:9902`). Enables `bowery peers check` and
+        /// direct per-agent queries. Omit for fan-out-only entries.
+        #[arg(long)]
+        addr: Option<String>,
         /// Manifest path. Default `$HOME/.bowery/peers.toml`.
         #[arg(long)]
         path: Option<PathBuf>,
@@ -130,6 +135,18 @@ enum PeersCommand {
     },
     /// Print every entry in the manifest.
     List {
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Dial every peer with an address and report reachability
+    /// (QUIC handshake + cert pin + operator auth + `SELECT 1`).
+    Check {
+        /// Operator identity key used to authenticate the probe.
+        #[arg(long)]
+        operator_key: PathBuf,
+        /// Per-agent dial deadline (`5s`, `10s`, …).
+        #[arg(long, default_value = "5s", value_parser = parse_duration)]
+        timeout: Duration,
         #[arg(long)]
         path: Option<PathBuf>,
     },
@@ -449,10 +466,28 @@ impl Cli {
                         name,
                         fp,
                         pubkey_b64,
+                        addr,
                         ..
-                    } => peers::add(&path, &name, &fp, &pubkey_b64)?,
+                    } => peers::add(&path, &name, &fp, &pubkey_b64, addr.as_deref())?,
                     PeersCommand::Remove { fp, .. } => peers::remove(&path, &fp)?,
                     PeersCommand::List { .. } => peers::list(&path)?,
+                    PeersCommand::Check {
+                        operator_key,
+                        timeout,
+                        ..
+                    } => {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .context("building tokio runtime")?;
+                        let all_ok =
+                            runtime.block_on(peers::check(&path, &operator_key, timeout))?;
+                        return Ok(if all_ok {
+                            ExitCode::SUCCESS
+                        } else {
+                            ExitCode::FAILURE
+                        });
+                    }
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -464,7 +499,8 @@ fn peers_path_for(cmd: &PeersCommand) -> Option<PathBuf> {
     match cmd {
         PeersCommand::Add { path, .. }
         | PeersCommand::Remove { path, .. }
-        | PeersCommand::List { path } => path.clone(),
+        | PeersCommand::List { path }
+        | PeersCommand::Check { path, .. } => path.clone(),
     }
 }
 

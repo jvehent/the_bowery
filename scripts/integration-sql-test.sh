@@ -136,4 +136,18 @@ echo "$OUT"
     exit 1
 }
 
+echo "==> exercise bowery_mesh_peers view (registers + queryable)"
+# A single agent has no gossip peers, so the view is empty — but it must
+# register and be queryable (a broken register() would fail every query).
+OUT=$(run_sql 'SELECT COUNT(*) AS n FROM bowery_mesh_peers')
+echo "$OUT"
+[[ "$(echo "$OUT" | head -1)" == "n" ]] || {
+    echo "FAIL: expected header 'n' from bowery_mesh_peers, got '$(echo "$OUT" | head -1)'" >&2
+    exit 1
+}
+[[ "$(echo "$OUT" | awk 'NR==2')" == "0" ]] || {
+    echo "FAIL: expected 0 mesh peers for a solo agent, got '$(echo "$OUT" | awk 'NR==2')'" >&2
+    exit 1
+}
+
 echo "==> all integration checks passed"

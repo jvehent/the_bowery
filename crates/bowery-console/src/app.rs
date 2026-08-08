@@ -572,7 +572,9 @@ fn save_history(history: &[String]) -> std::io::Result<()> {
 
 fn peers_add(name: &str, fp: &str, pubkey_b64: &str) -> anyhow::Result<()> {
     let path = bowery_cli::peers::default_path()?;
-    bowery_cli::peers::add(&path, name, fp, pubkey_b64)
+    // Console palette add is fan-out-oriented (no reachability addr);
+    // use `bowery peers add --addr` on the CLI to record a whisper addr.
+    bowery_cli::peers::add(&path, name, fp, pubkey_b64, None)
 }
 
 fn peers_remove(fp: &str) -> anyhow::Result<()> {

@@ -294,14 +294,22 @@ return to the previous pane.
 `processes.cmdline` is empty unless `[sql] expose_cmdline = true` is
 set in the agent config.
 
-### 5.2 Bowery-internal views (4)
+### 5.2 Bowery-internal views (5)
 
 | Table | Columns |
 |---|---|
 | `bowery_peers` | fingerprint_hex |
+| `bowery_mesh_peers` | fingerprint_hex, whisper_addr, agent_version, pinned, has_role_vector, has_bloom_advert |
 | `bowery_baseline_binaries` | sha256_hex, first_seen_unix, last_seen_unix, seen_count |
 | `bowery_alerts` | episode_id, suspicion, exe_path, ts_unix_ms |
 | `bowery_audit` | seq, ts_unix_ms, episode_id, action_id, outcome_kind |
+
+`bowery_peers` is the *pinned* (trusted) set; `bowery_mesh_peers` is
+the *discovered* set — every peer this agent currently sees over the
+gossip mesh, with `pinned = 1` when it's also in the trusted set. Query
+`bowery_mesh_peers` on agent A to confirm it's discovering agent B
+(B's fingerprint appears once gossip flows A↔B); an empty result means
+A has found no peers at all.
 
 ### 5.3 Scalar file/hash functions (7)
 

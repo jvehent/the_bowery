@@ -19,9 +19,11 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use bowery_baseline::Baseline;
+use bowery_mesh::PeerInfo;
 use bowery_tables::{BoweryTable, TableError};
 use bowery_whisper::known_neighbors::KnownNeighbors;
 use rusqlite::{Connection, params};
+use tokio::sync::watch;
 
 use crate::inbox::AlertInbox;
 
@@ -58,6 +60,78 @@ impl BoweryTable for BoweryPeersTable {
         let mut stmt = conn.prepare("INSERT INTO bowery_peers (fingerprint_hex) VALUES (?1)")?;
         for fp in self.kn.fingerprints() {
             stmt.execute(params![fp.to_string()])?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bowery_mesh_peers — everything the agent has DISCOVERED over the
+// chitchat mesh, whether or not it has been pinned.
+// ---------------------------------------------------------------------------
+
+/// `bowery_mesh_peers` table — one row per live peer the agent
+/// currently sees in the gossip mesh. This is the *discovery* view,
+/// distinct from `bowery_peers` (the *pinned* set): a peer shows up
+/// here as soon as gossip carries its state, and the `pinned` column
+/// says whether it also made it into `KnownNeighbors`.
+///
+/// Diagnostic use: to check whether agent A can reach agent B over
+/// the mesh, query this on A — if B's fingerprint appears, gossip is
+/// flowing A↔B. A peer that's `pinned = 0` was discovered *after* the
+/// bootstrap window closed (so A sees it but won't trust it for
+/// fan-out); an empty table means A has discovered no peers at all
+/// (no seeds, wrong `advertise_addr`, or the mesh port isn't
+/// reachable).
+#[derive(Debug)]
+pub struct BoweryMeshPeersTable {
+    peers_rx: watch::Receiver<Vec<PeerInfo>>,
+    kn: Arc<KnownNeighbors>,
+}
+
+impl BoweryMeshPeersTable {
+    pub fn new(peers_rx: watch::Receiver<Vec<PeerInfo>>, kn: Arc<KnownNeighbors>) -> Self {
+        Self { peers_rx, kn }
+    }
+}
+
+impl BoweryTable for BoweryMeshPeersTable {
+    fn name(&self) -> &'static str {
+        "bowery_mesh_peers"
+    }
+
+    fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bowery_mesh_peers (
+                fingerprint_hex   TEXT,
+                whisper_addr      TEXT,
+                agent_version     TEXT,
+                pinned            INTEGER,
+                has_role_vector   INTEGER,
+                has_bloom_advert  INTEGER
+            );",
+        )?;
+        // Snapshot the pinned set once so we don't re-lock KnownNeighbors
+        // per row. The mesh peer list is a cheap watch-channel borrow.
+        let pinned = self.kn.fingerprints();
+        let mut stmt = conn.prepare(
+            "INSERT INTO bowery_mesh_peers
+                (fingerprint_hex, whisper_addr, agent_version, pinned,
+                 has_role_vector, has_bloom_advert)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for peer in self.peers_rx.borrow().iter() {
+            let is_pinned = i64::from(pinned.contains(&peer.fingerprint));
+            let has_role = i64::from(peer.role_vector.is_some());
+            let has_bloom = i64::from(peer.bloom_advert.is_some());
+            stmt.execute(params![
+                peer.fingerprint.to_string(),
+                peer.whisper_addr.to_string(),
+                peer.agent_version,
+                is_pinned,
+                has_role,
+                has_bloom,
+            ])?;
         }
         Ok(())
     }

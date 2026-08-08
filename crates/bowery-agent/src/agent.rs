@@ -389,6 +389,10 @@ impl Agent {
             .with_extra_table(Arc::new(crate::sql_tables::BoweryPeersTable::new(
                 known_neighbors.clone(),
             )))
+            .with_extra_table(Arc::new(crate::sql_tables::BoweryMeshPeersTable::new(
+                mesh.peers_watcher(),
+                known_neighbors.clone(),
+            )))
             .with_extra_table(Arc::new(
                 crate::sql_tables::BoweryBaselineBinariesTable::new(baseline.clone()),
             ))

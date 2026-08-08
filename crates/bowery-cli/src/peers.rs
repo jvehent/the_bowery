@@ -21,7 +21,9 @@
 //! with `bowery peers remove --fp …`.
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -39,6 +41,12 @@ pub struct Peer {
     pub name: String,
     pub fp: String,
     pub pubkey_b64: String,
+    /// Optional whisper address (`host:port`) this agent is reachable
+    /// at. Populated via `bowery peers add --addr …`. Enables
+    /// `bowery peers check` (reachability probe) and direct
+    /// per-agent queries. Left out for fan-out-only manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
 }
 
 impl Manifest {
@@ -96,15 +104,20 @@ pub fn default_path() -> Result<PathBuf> {
 }
 
 /// `bowery peers add` — append (or replace) a peer entry.
-pub fn add(path: &Path, name: &str, fp: &str, pubkey_b64: &str) -> Result<()> {
+pub fn add(path: &Path, name: &str, fp: &str, pubkey_b64: &str, addr: Option<&str>) -> Result<()> {
     validate_fp(fp)?;
     validate_pubkey(pubkey_b64)?;
+    if let Some(a) = addr {
+        a.parse::<SocketAddr>()
+            .map_err(|e| anyhow!("--addr {a:?} is not a valid host:port: {e}"))?;
+    }
     let mut mf = Manifest::load(path)?;
     mf.peers.retain(|p| p.fp != fp);
     mf.peers.push(Peer {
         name: name.to_string(),
         fp: fp.to_string(),
         pubkey_b64: pubkey_b64.to_string(),
+        addr: addr.map(str::to_string),
     });
     mf.save(path)?;
     println!("added peer {name} ({}) to {}", &fp[..16], path.display());
@@ -125,12 +138,122 @@ pub fn list(path: &Path) -> Result<()> {
         .max()
         .unwrap_or(4)
         .max(4);
-    println!("{:name_w$}  fingerprint", "name", name_w = name_w);
-    println!("{}  {}", "-".repeat(name_w), "-".repeat(64));
+    println!(
+        "{:name_w$}  {:22}  fingerprint",
+        "name",
+        "addr",
+        name_w = name_w
+    );
+    println!(
+        "{}  {}  {}",
+        "-".repeat(name_w),
+        "-".repeat(22),
+        "-".repeat(64)
+    );
     for p in &mf.peers {
-        println!("{:name_w$}  {}", p.name, p.fp, name_w = name_w);
+        println!(
+            "{:name_w$}  {:22}  {}",
+            p.name,
+            p.addr.as_deref().unwrap_or("-"),
+            p.fp,
+            name_w = name_w
+        );
     }
     Ok(())
+}
+
+/// `bowery peers check` — dial every peer that has an `addr` and
+/// report reachability. A peer is "OK" when the full round-trip
+/// succeeds: QUIC handshake + cert pin match + operator
+/// authorisation + a `SELECT 1` against its SQL surface. Anything
+/// short of that (timeout, cert mismatch, `policy_denied`) is a
+/// failure with the reason. Returns `true` if every addressed peer
+/// was reachable. Reuses [`crate::exec::sql`], so it exercises the
+/// exact path a real query takes.
+pub async fn check(path: &Path, operator_key: &Path, timeout: Duration) -> Result<bool> {
+    let mf = Manifest::load(path)?;
+    if mf.peers.is_empty() {
+        println!(
+            "(no peers in {} — add some with `bowery peers add`)",
+            path.display()
+        );
+        return Ok(true);
+    }
+    let name_w = mf
+        .peers
+        .iter()
+        .map(|p| p.name.chars().count())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    println!("{:name_w$}  {:22}  status", "name", "addr", name_w = name_w);
+    println!(
+        "{}  {}  {}",
+        "-".repeat(name_w),
+        "-".repeat(22),
+        "-".repeat(30)
+    );
+
+    let mut all_ok = true;
+    for p in &mf.peers {
+        let Some(addr_str) = p.addr.as_deref() else {
+            println!(
+                "{:name_w$}  {:22}  SKIP (no addr — `peers add --addr host:port`)",
+                p.name,
+                "-",
+                name_w = name_w
+            );
+            continue;
+        };
+        let addr: SocketAddr = match addr_str.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                all_ok = false;
+                println!(
+                    "{:name_w$}  {:22}  BAD ADDR: {e}",
+                    p.name,
+                    addr_str,
+                    name_w = name_w
+                );
+                continue;
+            }
+        };
+        let mut sink = crate::exec::CollectSink::default();
+        let start = Instant::now();
+        let res = crate::exec::sql(
+            operator_key.to_path_buf(),
+            addr,
+            p.fp.clone(),
+            p.pubkey_b64.clone(),
+            Vec::new(),
+            "SELECT 1".to_string(),
+            timeout,
+            false,
+            &mut sink,
+        )
+        .await;
+        match res {
+            Ok(()) => println!(
+                "{:name_w$}  {:22}  OK ({} ms)",
+                p.name,
+                addr_str,
+                start.elapsed().as_millis(),
+                name_w = name_w
+            ),
+            Err(e) => {
+                all_ok = false;
+                // One-line reason: the top-level context is the most
+                // useful (e.g. "dialing agent … timed out").
+                println!(
+                    "{:name_w$}  {:22}  UNREACHABLE: {e}",
+                    p.name,
+                    addr_str,
+                    name_w = name_w
+                );
+            }
+        }
+    }
+    Ok(all_ok)
 }
 
 /// `bowery peers remove --fp …`. Idempotent.
@@ -176,10 +299,25 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("peers.toml");
-        add(&path, "alpha", &"a".repeat(64), &BASE64.encode([1u8; 32])).unwrap();
-        add(&path, "beta", &"b".repeat(64), &BASE64.encode([2u8; 32])).unwrap();
+        add(
+            &path,
+            "alpha",
+            &"a".repeat(64),
+            &BASE64.encode([1u8; 32]),
+            None,
+        )
+        .unwrap();
+        add(
+            &path,
+            "beta",
+            &"b".repeat(64),
+            &BASE64.encode([2u8; 32]),
+            Some("100.0.0.2:9902"),
+        )
+        .unwrap();
         let mf = Manifest::load(&path).unwrap();
         assert_eq!(mf.peers.len(), 2);
+        assert_eq!(mf.peers[1].addr.as_deref(), Some("100.0.0.2:9902"));
         remove(&path, &"a".repeat(64)).unwrap();
         let mf = Manifest::load(&path).unwrap();
         assert_eq!(mf.peers.len(), 1);
@@ -190,17 +328,41 @@ mod tests {
     fn add_replaces_same_fp() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("peers.toml");
-        add(&path, "alpha", &"a".repeat(64), &BASE64.encode([1u8; 32])).unwrap();
+        add(
+            &path,
+            "alpha",
+            &"a".repeat(64),
+            &BASE64.encode([1u8; 32]),
+            None,
+        )
+        .unwrap();
         add(
             &path,
             "alpha-renamed",
             &"a".repeat(64),
             &BASE64.encode([1u8; 32]),
+            None,
         )
         .unwrap();
         let mf = Manifest::load(&path).unwrap();
         assert_eq!(mf.peers.len(), 1);
         assert_eq!(mf.peers[0].name, "alpha-renamed");
+    }
+
+    #[test]
+    fn add_rejects_bad_addr() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.toml");
+        assert!(
+            add(
+                &path,
+                "x",
+                &"a".repeat(64),
+                &BASE64.encode([1u8; 32]),
+                Some("not-an-addr")
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -33,9 +33,11 @@ system_info(hostname, uuid, cpu_brand, cpu_count, cpu_logical_cores,
             hardware_model, hardware_vendor, board_model,
             physical_memory_bytes, kernel_version)
 
-# Bowery-internal views (4)
+# Bowery-internal views (5)
 
-bowery_peers(fingerprint_hex)
+bowery_peers(fingerprint_hex)   -- pinned/trusted peers
+bowery_mesh_peers(fingerprint_hex, whisper_addr, agent_version, pinned,
+                  has_role_vector, has_bloom_advert)  -- discovered over gossip
 bowery_baseline_binaries(sha256_hex, first_seen_unix, last_seen_unix,
                          seen_count)
 bowery_alerts(episode_id, suspicion, exe_path, ts_unix_ms)
