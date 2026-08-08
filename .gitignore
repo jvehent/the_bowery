@@ -40,3 +40,6 @@ tarpaulin-report.html
 .xtest.env
 .xtest-ssh-*.sock
 .claude/
+
+# Build outputs from deploy/remote/package-agent.sh (binaries + tarballs)
+deploy/remote/dist/

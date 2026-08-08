@@ -21,6 +21,12 @@
 #   --start                   Enable + start the service now. Implied
 #                             when --operator-pubkey is a real key.
 #   --no-start                Install only; don't enable/start.
+#   --strict-syscalls         Keep the fleet unit's strict SystemCallFilter.
+#                             Default installs a drop-in that clears it,
+#                             because the strict list SIGSYS-kills the agent
+#                             on some arch/systemd combos (aarch64 Pi OS).
+#                             Use this only on a host where you've verified
+#                             the filter doesn't over-block.
 #   -h, --help                This help.
 
 set -euo pipefail
@@ -30,6 +36,7 @@ MESH_LISTEN="0.0.0.0:9901"
 CLUSTER_ID="bowery-tailnet"
 OPERATOR_PUBKEY=""
 DO_START="auto"
+STRICT_SYSCALLS="no"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -41,7 +48,8 @@ while [[ $# -gt 0 ]]; do
         --cluster-id)      CLUSTER_ID="${2:?}";      shift 2 ;;
         --start)           DO_START="yes";           shift ;;
         --no-start)        DO_START="no";            shift ;;
-        -h|--help)         sed -n '2,30p' "$0";      exit 0 ;;
+        --strict-syscalls) STRICT_SYSCALLS="yes";    shift ;;
+        -h|--help)         sed -n '2,34p' "$0";      exit 0 ;;
         *) die "unknown flag: $1 (see --help)" ;;
     esac
 done
@@ -53,8 +61,9 @@ BIN="$SRC/bowery-agent"
 SVC="$SRC/bowery-agent.service"
 SLICE="$SRC/bowery.slice"
 CFG_TEMPLATE="$SRC/agent.toml"
+DROPIN="$SRC/10-remote-node.conf"
 
-for f in "$BIN" "$SVC" "$SLICE" "$CFG_TEMPLATE"; do
+for f in "$BIN" "$SVC" "$SLICE" "$CFG_TEMPLATE" "$DROPIN"; do
     [[ -f "$f" ]] || die "missing bundled file: $f (extract the full tarball first)"
 done
 
@@ -83,6 +92,20 @@ echo "==> installing binary + unit"
 install -m 0755 "$BIN"   /usr/bin/bowery-agent
 install -m 0644 "$SVC"   /lib/systemd/system/bowery-agent.service
 install -m 0644 "$SLICE" /lib/systemd/system/bowery.slice
+
+# Remote-node drop-in: clears the fleet unit's strict SystemCallFilter,
+# which SIGSYS-kills the agent on some arch/systemd combos (e.g. aarch64
+# Raspberry Pi OS). All other sandbox controls are kept. See the file's
+# header for how to re-tighten. Skip with --strict-syscalls.
+if [[ "$STRICT_SYSCALLS" == "yes" ]]; then
+    echo "==> --strict-syscalls: NOT installing the syscall-filter relaxation"
+    echo "    (if the agent SIGSYS-dies with status=31/SYS, remove --strict-syscalls)"
+    rm -f /etc/systemd/system/bowery-agent.service.d/10-remote-node.conf 2>/dev/null || true
+else
+    echo "==> installing remote-node drop-in (relaxes SystemCallFilter)"
+    install -d -m 0755 /etc/systemd/system/bowery-agent.service.d
+    install -m 0644 "$DROPIN" /etc/systemd/system/bowery-agent.service.d/10-remote-node.conf
+fi
 
 CFG=/etc/bowery/agent.toml
 if [[ -f "$CFG" ]]; then

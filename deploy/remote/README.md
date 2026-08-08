@@ -131,6 +131,35 @@ sudo nft add rule inet filter input udp dport 9901-9902 ip saddr != 100.64.0.0/1
 Apply firewall rules carefully on a remote box — don't lock yourself
 out of SSH.
 
+## Troubleshooting
+
+**`bowery-agent.service: Main process exited, code=killed, status=31/SYS`**
+(restart-looping right after "starting agent"). `status=31/SYS` is
+SIGSYS — the fleet systemd unit's strict `SystemCallFilter` allow-list
+rejected a syscall the agent makes at startup. That list was validated
+on x86_64 BPF hosts and over-blocks on some arch/systemd combos
+(notably aarch64 Raspberry Pi OS). `install-agent.sh` installs a
+drop-in (`10-remote-node.conf`) that clears the filter for you; if you
+installed with `--strict-syscalls` or hand-rolled the unit, apply it
+manually:
+```bash
+sudo mkdir -p /etc/systemd/system/bowery-agent.service.d
+printf '[Service]\nSystemCallFilter=\n' | \
+  sudo tee /etc/systemd/system/bowery-agent.service.d/10-remote-node.conf
+sudo systemctl daemon-reload && sudo systemctl restart bowery-agent
+```
+Everything else in the sandbox (ProtectSystem, NoNewPrivileges,
+RestrictAddressFamilies, MemoryDenyWriteExecute, capability bounding)
+stays in force. To re-tighten later, capture the needed syscalls with
+`SystemCallLog=~@system-service` and add them back (see the drop-in's
+header). The exact blocked syscall from a crash is in:
+```bash
+sudo journalctl -k -b | grep -iE "seccomp|audit.*syscall=" | tail
+```
+
+**`bowery doctor` says BPF-LSM not ready.** Expected on a stock Pi —
+see the top of this README. The agent runs degraded (SQL + alerts).
+
 ## Upgrading
 
 Re-run steps 2–3. The installer overwrites the binary and reloads
