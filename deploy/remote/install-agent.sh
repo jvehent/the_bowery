@@ -57,14 +57,24 @@ done
 [[ $EUID -eq 0 ]] || die "must run as root (use sudo)"
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$SRC/bowery-agent"
-SVC="$SRC/bowery-agent.service"
-SLICE="$SRC/bowery.slice"
+# Two supported layouts:
+#   1. Packaged tarball  — every file sits next to this script.
+#   2. Repo checkout      — this script is at deploy/remote/, the systemd
+#      units are at deploy/systemd/, and the freshly-built binaries are
+#      at target/release/. Resolve either.
+REPO="$(cd "$SRC/../.." 2>/dev/null && pwd || echo "$SRC")"
+pick() { local p; for p in "$@"; do [[ -f "$p" ]] && { printf '%s' "$p"; return 0; }; done; printf '%s' "$1"; }
+
+BIN="$(pick "$SRC/bowery-agent"          "$REPO/target/release/bowery-agent")"
+CLI="$(pick "$SRC/bowery"                "$REPO/target/release/bowery")"
+SVC="$(pick "$SRC/bowery-agent.service"  "$REPO/deploy/systemd/bowery-agent.service")"
+SLICE="$(pick "$SRC/bowery.slice"        "$REPO/deploy/systemd/bowery.slice")"
 CFG_TEMPLATE="$SRC/agent.toml"
 DROPIN="$SRC/10-remote-node.conf"
 
 for f in "$BIN" "$SVC" "$SLICE" "$CFG_TEMPLATE" "$DROPIN"; do
-    [[ -f "$f" ]] || die "missing bundled file: $f (extract the full tarball first)"
+    [[ -f "$f" ]] || die "missing file: $f
+       run from the extracted tarball, or from a repo checkout after \`cargo build --release\`"
 done
 
 # Sanity: refuse to install an x86_64 binary on an arm host, etc.
@@ -93,10 +103,9 @@ install -m 0755 "$BIN"   /usr/bin/bowery-agent
 install -m 0644 "$SVC"   /lib/systemd/system/bowery-agent.service
 install -m 0644 "$SLICE" /lib/systemd/system/bowery.slice
 
-# Operator CLI, if the package bundled it. Handy on the node itself for
-# `bowery key info` (to read the node's fingerprint + pubkey) and
-# `bowery doctor`. Optional — the agent works without it.
-CLI="$SRC/bowery"
+# Operator CLI (resolved above from the tarball or target/release). Handy
+# on the node itself for `bowery key info` (to read the node's fingerprint
+# + pubkey) and `bowery doctor`. Optional — the agent works without it.
 if [[ -f "$CLI" ]]; then
     echo "==> installing bowery CLI"
     install -m 0755 "$CLI" /usr/bin/bowery
