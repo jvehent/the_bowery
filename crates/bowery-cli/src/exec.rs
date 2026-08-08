@@ -117,7 +117,19 @@ pub async fn sql(
     }
     let resolver = Arc::new(resolver);
 
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    // Bind the client socket to the unspecified address, NOT loopback, so
+    // the kernel selects the correct source interface per destination:
+    // loopback for a local target, `tailscale0` for a tailnet peer, `eth0`
+    // for a LAN host. A `127.0.0.1`-bound socket can only reach locally
+    // deliverable addresses, so it silently strands every remote dial
+    // (the packets never egress) — the target's own tailnet IP happens to
+    // be local on that host, which is why a self-dial deceptively works.
+    // Match the target's address family so an IPv6 tailnet address works.
+    let bind_addr: SocketAddr = if target_addr.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
     let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
     let endpoint = BoweryEndpoint::bind(identity.clone(), accept_verifier, bind_addr)
         .context("binding operator-side endpoint")?;

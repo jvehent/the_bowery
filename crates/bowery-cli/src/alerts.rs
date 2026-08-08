@@ -44,7 +44,15 @@ pub async fn poll_once(
     }
     let resolver = Arc::new(resolver);
 
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    // Bind the unspecified address (not loopback) so the kernel picks the
+    // right source interface for `target_addr`; a `127.0.0.1`-bound socket
+    // can't reach a remote tailnet/LAN peer. See exec::sql for the full
+    // rationale. Match the target's address family.
+    let bind_addr: SocketAddr = if target_addr.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
     let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
     let endpoint = BoweryEndpoint::bind(identity.clone(), accept_verifier, bind_addr)
         .context("binding operator-side endpoint")?;
