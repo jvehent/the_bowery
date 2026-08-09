@@ -1,5 +1,7 @@
 # The Bowery
 
+![The Bowery](assets/hero.png)
+
 A distributed Linux EDR built around a peer-to-peer **whispering protocol**: agents validate anomalies with their neighbors instead of phoning home to a central backend.
 
 > **Status:** pre-alpha, Phase 0 → 9 of the [implementation plan](DESIGN.md#13-phased-delivery) complete. Native Phase-9 SQL surface ([`bowery-sql` + `bowery-tables`](DESIGN-NATIVE-SQL.md)) ships 13 procfs/sysfs-backed tables plus 5 Bowery-internal views, streamed over the operator wire with one-hop multi-agent fan-out — deployable as a multi-node mesh over a Tailscale tailnet ([deploy/remote/MESH.md](deploy/remote/MESH.md)). Not production-ready, but every layer is end-to-end testable today.
