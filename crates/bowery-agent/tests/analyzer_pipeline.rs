@@ -66,6 +66,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, role_interval: Duration) -> C
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
+        monitor: bowery_agent::config::MonitorConfig::default(),
     }
 }
 

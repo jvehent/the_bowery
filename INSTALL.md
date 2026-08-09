@@ -403,7 +403,42 @@ retention = "72h"   # TTL on individual alerts (lazy sweep)
 
 [alerts]
 threshold = 0.7     # suspicion at which a verdict becomes an Alert
+
+# Operator-configurable monitoring (both lists default empty = feature off).
+# Query the effective rules with: SELECT * FROM bowery_monitor_rules
+[monitor]
+
+# Watch specific files. A matching change ALWAYS alerts (you asked to be
+# told), with `severity` setting the alert's suspicion. Userspace inotify:
+# no extra capabilities, but observe-only and no pid attribution.
+[[monitor.file_rules]]
+id       = "sudoers"                            # optional; defaults to the basename
+path     = "/etc/sudoers"
+ops      = ["modify", "attrib", "delete", "move"]   # this is also the default set
+severity = "high"                               # info | low | medium | high
+
+# Operator process detections, layered onto the built-in rules. Every
+# matcher you set must hit (AND). A rule with no matchers is rejected at
+# startup (it would fire on every exec).
+[[monitor.process_rules]]
+id         = "netcat-reverse-shell"
+exe_prefix = "/usr/bin/nc"    # exe_path starts with
+comm       = "nc"             # task->comm exact match
+arg_substr = "-e"             # any argv element contains
+severity   = "high"           # high (0.9) clears the default alerts threshold
 ```
+
+Notes:
+
+- **File watches are directory-based under the hood** — the agent watches
+  the file's parent directory and filters by name, so atomic-replace edits
+  (write temp + `rename()`, what most editors and package managers do) are
+  caught, not just in-place writes.
+- **Process rules feed the analyzer**, so they compose with baseline
+  novelty and obey `[alerts] threshold` via their severity weight
+  (high 0.9, medium 0.6, low 0.3, info 0.1). File rules bypass the
+  threshold by design.
+- Rules are loaded once at startup; changing them needs a restart.
 
 ### Sizing notes
 

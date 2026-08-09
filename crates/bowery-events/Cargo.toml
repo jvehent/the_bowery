@@ -11,6 +11,7 @@ homepage.workspace = true
 readme.workspace = true
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "time"] }

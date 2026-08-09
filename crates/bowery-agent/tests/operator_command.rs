@@ -78,6 +78,7 @@ fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: St
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
+        monitor: bowery_agent::config::MonitorConfig::default(),
     }
 }
 
@@ -432,6 +433,7 @@ async fn fanout_streams_rows_from_relay_and_peer() {
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
+        monitor: bowery_agent::config::MonitorConfig::default(),
     };
     let cfg_beta = Config {
         identity: IdentityConfig {
@@ -471,6 +473,7 @@ async fn fanout_streams_rows_from_relay_and_peer() {
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
+        monitor: bowery_agent::config::MonitorConfig::default(),
     };
 
     let agent_alpha = Agent::start(cfg_alpha, id_alpha.clone(), Box::new(NoopEventSource))

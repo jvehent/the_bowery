@@ -72,7 +72,26 @@ bind_addr = "127.0.0.1:$WHISPER_PORT"
 path = ":memory:"
 [operators]
 pubkeys_b64 = ["$OP_PUBKEY"]
+
+# Operator-configurable monitoring. The file rule also drives the
+# file-alert check further down (touching \$TEST_DIR/watched.conf).
+[monitor]
+[[monitor.file_rules]]
+id = "watched-conf"
+path = "$TEST_DIR/watched.conf"
+ops = ["modify"]
+severity = "high"
+
+[[monitor.process_rules]]
+id = "netcat-exec"
+comm = "nc"
+arg_substr = "-e"
+severity = "high"
 EOF
+
+# The watched file must exist before the agent starts so the watch on its
+# parent directory is registered against a real target.
+touch "$TEST_DIR/watched.conf"
 
 echo "==> start agent (no BPF, mock LLM)"
 "$BOWERY_AGENT_BIN" --config "$TEST_DIR/agent.toml" >"$TEST_DIR/agent.log" 2>&1 &
@@ -163,6 +182,35 @@ echo "$OUT"
     echo "FAIL: expected 0 mesh peers for a solo agent, got '$(echo "$OUT" | awk 'NR==2')'" >&2
     exit 1
 }
+
+echo "==> exercise bowery_monitor_rules view (operator-configured rules)"
+# Both rules from [monitor] in the config above must be listed, so an
+# operator can query "what is this agent watching?" over SQL.
+OUT=$(run_sql "SELECT kind, rule_id, severity FROM bowery_monitor_rules ORDER BY kind")
+echo "$OUT"
+echo "$OUT" | grep -q "watched-conf" || {
+    echo "FAIL: file rule 'watched-conf' missing from bowery_monitor_rules" >&2
+    exit 1
+}
+echo "$OUT" | grep -q "netcat-exec" || {
+    echo "FAIL: process rule 'netcat-exec' missing from bowery_monitor_rules" >&2
+    exit 1
+}
+
+echo "==> file monitor: changing a watched file raises an alert"
+# inotify IN_CLOSE_WRITE on the watched path -> Event::FileChange -> alert.
+printf 'tampered\n' > "$TEST_DIR/watched.conf"
+ALERTED=0
+for _ in $(seq 1 20); do
+    N=$(run_sql "SELECT COUNT(*) AS n FROM bowery_alerts WHERE exe_path = '$TEST_DIR/watched.conf'" | awk 'NR==2')
+    if [[ "${N:-0}" -ge 1 ]]; then ALERTED=1; break; fi
+    sleep 0.5
+done
+[[ "$ALERTED" == "1" ]] || {
+    echo "FAIL: no alert for the watched file within 10s" >&2
+    exit 1
+}
+echo "watched-file alert observed"
 
 echo "==> fan-out with no peers returns local row promptly (terminator, not a 12s hang)"
 START=$(date +%s)

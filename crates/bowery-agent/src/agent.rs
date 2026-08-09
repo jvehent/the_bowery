@@ -34,6 +34,7 @@ use ed25519_dalek::VerifyingKey;
 
 use crate::bloom_publisher;
 use crate::inbox::{AlertInbox, current_unix_ms};
+use crate::monitor::MonitorRules;
 use crate::whisper_qa::{
     WhisperContext, WhisperQaTrigger, aggregate_local_sighting, spawn_whisper_qa_task,
 };
@@ -46,6 +47,10 @@ use crate::config::Config;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const EVENT_CHANNEL_CAPACITY: usize = 4096;
+/// Buffer for operator file-watch events. Smaller than the kernel event
+/// channel: inotify fires on a handful of explicitly-watched paths, not
+/// every exec on the host.
+const FILE_EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Observable events emitted by a running agent.
 #[derive(Debug, Clone)]
@@ -181,6 +186,8 @@ pub struct Agent {
     accept_task: JoinHandle<()>,
     heartbeat_task: JoinHandle<()>,
     pipeline_task: JoinHandle<()>,
+    /// `None` when no file rules are configured (or inotify is unavailable).
+    file_monitor_task: Option<JoinHandle<()>>,
     role_publisher_task: JoinHandle<()>,
     bloom_publisher_task: JoinHandle<()>,
     llm_outcomes_task: JoinHandle<()>,
@@ -246,7 +253,38 @@ impl Agent {
         ));
 
         let baseline = Arc::new(open_baseline(&config.baseline.path)?);
-        let analyzer = Arc::new(Analyzer::with_default_rules(baseline.clone()));
+
+        // Operator-configurable monitoring: validated once here, then shared
+        // with the analyzer (process rules), the inotify file monitor (file
+        // rules), and the `bowery_monitor_rules` SQL table.
+        let monitor_rules =
+            Arc::new(MonitorRules::from_config(&config.monitor).map_err(AgentError::Config)?);
+        if !monitor_rules.is_empty() {
+            info!(
+                file_rules = monitor_rules.file_rules().len(),
+                process_rules = monitor_rules.process_rules().len(),
+                "operator monitoring rules loaded"
+            );
+        }
+
+        // Built-in detections plus the operator's process rules. Operator ids
+        // are leaked once (rules live for the process lifetime) because
+        // `RuleHit::rule_id` is `&'static str`.
+        let mut rules = bowery_analysis::rule::default_rules();
+        for spec in monitor_rules.process_rules() {
+            let id: &'static str = Box::leak(spec.id.clone().into_boxed_str());
+            rules.push(Box::new(bowery_analysis::OperatorProcessRule::new(
+                id,
+                spec.exe_prefix.clone(),
+                spec.comm.clone(),
+                spec.arg_substr.clone(),
+                spec.severity,
+            )));
+        }
+        let analyzer = Arc::new(Analyzer::new(
+            rules,
+            bowery_analysis::BinaryScorer::new(baseline.clone()),
+        ));
         let inbox = Arc::new(AlertInbox::new(
             config.inbox.capacity,
             config.inbox.retention,
@@ -411,6 +449,9 @@ impl Agent {
             )))
             .with_extra_table(Arc::new(crate::sql_tables::BoweryAuditTable::new(
                 config.response.audit_log_path.clone(),
+            )))
+            .with_extra_table(Arc::new(crate::sql_tables::BoweryMonitorRulesTable::new(
+                monitor_rules.clone(),
             )));
         let op_router = Arc::new(OperatorCommandRouter {
             sql: Some(Arc::new(sql_engine)),
@@ -512,10 +553,22 @@ impl Agent {
             shutdown_rx.clone(),
         );
 
+        // Operator file watches (inotify). `None` when there are no file
+        // rules or inotify is unavailable — the channel then closes and the
+        // pipeline just serves kernel events.
+        let (file_events_tx, file_events_rx) = mpsc::channel::<Event>(FILE_EVENT_CHANNEL_CAPACITY);
+        let file_monitor_task = crate::monitor::spawn_file_monitor_task(
+            &monitor_rules,
+            file_events_tx,
+            shutdown_rx.clone(),
+        );
+
         let pipeline_task = spawn_pipeline_task(
             event_source.start(),
+            file_events_rx,
             baseline.clone(),
             analyzer.clone(),
+            monitor_rules.clone(),
             llm_submitter,
             config.llm.invocation_threshold,
             config.whisper.qa.threshold,
@@ -567,6 +620,7 @@ impl Agent {
             accept_task,
             heartbeat_task,
             pipeline_task,
+            file_monitor_task,
             role_publisher_task,
             bloom_publisher_task,
             llm_outcomes_task,
@@ -627,6 +681,9 @@ impl Agent {
         let _ = self.accept_task.await;
         let _ = self.heartbeat_task.await;
         let _ = self.pipeline_task.await;
+        if let Some(task) = self.file_monitor_task.take() {
+            let _ = task.await;
+        }
         let _ = self.role_publisher_task.await;
         let _ = self.bloom_publisher_task.await;
         let _ = self.llm_outcomes_task.await;
@@ -2022,8 +2079,10 @@ async fn send_heartbeat(
 #[allow(clippy::too_many_arguments)]
 fn spawn_pipeline_task(
     mut events: mpsc::Receiver<Event>,
+    mut file_events: mpsc::Receiver<Event>,
     baseline: Arc<Baseline>,
     analyzer: Arc<Analyzer>,
+    monitor_rules: Arc<MonitorRules>,
     llm_submitter: Submitter,
     llm_threshold: f32,
     whisper_threshold: f32,
@@ -2036,13 +2095,24 @@ fn spawn_pipeline_task(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Each source can end independently, and a closed channel returns
+        // `None` on every poll — which would spin the select. Track both and
+        // disable the drained branch; exit only when BOTH are done. Notably
+        // a dead kernel event source (e.g. the BPF source exiting) must not
+        // take operator file monitoring down with it, and vice versa.
+        let mut events_open = true;
+        let mut file_events_open = true;
         loop {
+            if !events_open && !file_events_open {
+                break;
+            }
             tokio::select! {
-                event = events.recv() => {
-                    let Some(event) = event else { break };
+                event = events.recv(), if events_open => {
+                    let Some(event) = event else { events_open = false; continue };
                     process_event(
                         &baseline,
                         &analyzer,
+                        &monitor_rules,
                         &llm_submitter,
                         llm_threshold,
                         whisper_threshold,
@@ -2055,6 +2125,29 @@ fn spawn_pipeline_task(
                         event,
                     ).await;
                 }
+                // Operator-configured file watches (inotify) fan in here.
+                file_event = file_events.recv(), if file_events_open => {
+                    match file_event {
+                        Some(event) => {
+                            process_event(
+                                &baseline,
+                                &analyzer,
+                                &monitor_rules,
+                                &llm_submitter,
+                                llm_threshold,
+                                whisper_threshold,
+                                &whisper_qa_tx,
+                                &inbox,
+                                originator_fp,
+                                alert_threshold,
+                                &backend_label,
+                                &events_tx,
+                                event,
+                            ).await;
+                        }
+                        None => file_events_open = false,
+                    }
+                }
                 _ = shutdown_rx.changed() => break,
             }
         }
@@ -2065,6 +2158,7 @@ fn spawn_pipeline_task(
 async fn process_event(
     baseline: &Arc<Baseline>,
     analyzer: &Arc<Analyzer>,
+    monitor_rules: &Arc<MonitorRules>,
     llm_submitter: &Submitter,
     llm_threshold: f32,
     whisper_threshold: f32,
@@ -2076,25 +2170,104 @@ async fn process_event(
     events_tx: &broadcast::Sender<AgentEvent>,
     event: Event,
 ) {
-    // Phase 2 only persists ProcessExec; other variants are silently
-    // consumed until later phases wire in network/file/exit handlers.
-    if let Event::ProcessExec(exec) = event {
-        process_exec(
-            baseline,
-            analyzer,
-            llm_submitter,
-            llm_threshold,
-            whisper_threshold,
-            whisper_qa_tx,
-            inbox,
-            originator_fp,
-            alert_threshold,
-            backend_label,
-            events_tx,
-            exec,
-        )
-        .await;
+    // ProcessExec drives the full analyzer pipeline; FileChange is the
+    // operator-configured file-integrity signal. Other variants are still
+    // silently consumed until later phases wire in network/exit handlers.
+    match event {
+        Event::ProcessExec(exec) => {
+            process_exec(
+                baseline,
+                analyzer,
+                llm_submitter,
+                llm_threshold,
+                whisper_threshold,
+                whisper_qa_tx,
+                inbox,
+                originator_fp,
+                alert_threshold,
+                backend_label,
+                events_tx,
+                exec,
+            )
+            .await;
+        }
+        Event::FileChange(change) => {
+            process_file_change(
+                monitor_rules,
+                inbox,
+                originator_fp,
+                backend_label,
+                events_tx,
+                change,
+            )
+            .await;
+        }
+        Event::ProcessExit(_) | Event::FileOpen(_) | Event::NetworkConnect(_) => {}
     }
+}
+
+/// Emit an alert for a change to an operator-watched file.
+///
+/// Unlike exec events there's no scoring step: the operator explicitly asked
+/// to be told about this file, so a matching change always alerts. The rule's
+/// severity becomes the alert's suspicion so existing consumers (inbox
+/// ordering, the console, `bowery_alerts`) rank it sensibly.
+///
+/// The file is hashed after the change so the operator sees what it became;
+/// a deleted (or unreadable) file yields an empty hash rather than dropping
+/// the alert — "it's gone" is exactly what you want to hear about.
+async fn process_file_change(
+    monitor_rules: &Arc<MonitorRules>,
+    inbox: &Arc<AlertInbox>,
+    originator_fp: Fingerprint,
+    backend_label: &str,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    change: bowery_events::FileChange,
+) {
+    // The watcher only emits changes that already matched a rule, but
+    // re-resolve here so the alert can name it (and so a future producer
+    // can't inject unmatched paths).
+    let Some(rule) = monitor_rules
+        .file_rules()
+        .iter()
+        .find(|r| r.path == change.path && r.ops.contains(&change.op))
+    else {
+        return;
+    };
+
+    let path_for_hash = change.path.clone();
+    let sha_hex =
+        match tokio::task::spawn_blocking(move || enrich::sha256_file(&path_for_hash)).await {
+            Ok(Ok(sha)) => sha_to_hex(&sha),
+            // Deleted/unreadable file: still alert, just without a hash.
+            Ok(Err(_)) | Err(_) => String::new(),
+        };
+
+    let op = crate::monitor::file_op_label(change.op);
+    let suspicion = crate::monitor::severity_weight(rule.severity);
+    let alert = Alert {
+        originator_fp: originator_fp.as_bytes().to_vec(),
+        episode_id: format!("file-{}-{}", rule.id, current_unix_ms()),
+        exe_sha256_hex: sha_hex,
+        exe_path: change.path.display().to_string(),
+        suspicion,
+        rationale: format!(
+            "file rule `{}`: {} was {}",
+            rule.id,
+            change.path.display(),
+            op
+        ),
+        suggested_actions: Vec::new(),
+        ts_unix_ms: current_unix_ms(),
+        backend: backend_label.to_string(),
+    };
+    let episode_id = alert.episode_id.clone();
+    info!(rule = %rule.id, path = %change.path.display(), op, "file monitor alert");
+    inbox.append(alert);
+    let _ = events_tx.send(AgentEvent::AlertEmitted {
+        episode_id,
+        suspicion,
+    });
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

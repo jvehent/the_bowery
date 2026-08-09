@@ -74,6 +74,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>) -> Config
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
+        monitor: bowery_agent::config::MonitorConfig::default(),
     }
 }
 

@@ -109,6 +109,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, response: ResponseConfig) -> 
         bloom: BloomConfig::default(),
         response,
         sql: bowery_agent::config::SqlConfig::default(),
+        monitor: bowery_agent::config::MonitorConfig::default(),
     }
 }
 

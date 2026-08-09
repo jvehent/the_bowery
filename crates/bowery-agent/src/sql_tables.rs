@@ -26,6 +26,7 @@ use rusqlite::{Connection, params};
 use tokio::sync::watch;
 
 use crate::inbox::AlertInbox;
+use crate::monitor::{MonitorRules, file_op_label, severity_label};
 
 // ---------------------------------------------------------------------------
 // bowery_peers — fingerprints currently pinned in KnownNeighbors.
@@ -60,6 +61,87 @@ impl BoweryTable for BoweryPeersTable {
         let mut stmt = conn.prepare("INSERT INTO bowery_peers (fingerprint_hex) VALUES (?1)")?;
         for fp in self.kn.fingerprints() {
             stmt.execute(params![fp.to_string()])?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bowery_monitor_rules — the operator's configured file + process rules.
+// ---------------------------------------------------------------------------
+
+/// `bowery_monitor_rules` table — one row per operator-configured
+/// monitoring rule, so an operator can ask an agent "what are you
+/// actually watching?" over SQL instead of reading its config file
+/// (and can fan that question across the fleet with `--fanout`).
+///
+/// `kind` is `file` or `process`. `pattern` is the watched path for a
+/// file rule, or the `key=value` matchers (joined by ` AND `) for a
+/// process rule. `ops` is the comma-separated change classes for a
+/// file rule and empty for a process rule.
+#[derive(Debug)]
+pub struct BoweryMonitorRulesTable {
+    rules: Arc<MonitorRules>,
+}
+
+impl BoweryMonitorRulesTable {
+    pub fn new(rules: Arc<MonitorRules>) -> Self {
+        Self { rules }
+    }
+}
+
+impl BoweryTable for BoweryMonitorRulesTable {
+    fn name(&self) -> &'static str {
+        "bowery_monitor_rules"
+    }
+
+    fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bowery_monitor_rules (
+                kind      TEXT,
+                rule_id   TEXT,
+                pattern   TEXT,
+                ops       TEXT,
+                severity  TEXT
+            );",
+        )?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO bowery_monitor_rules (kind, rule_id, pattern, ops, severity)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for r in self.rules.file_rules() {
+            let ops = r
+                .ops
+                .iter()
+                .map(|o| file_op_label(*o))
+                .collect::<Vec<_>>()
+                .join(",");
+            stmt.execute(params![
+                "file",
+                r.id,
+                r.path.display().to_string(),
+                ops,
+                severity_label(r.severity),
+            ])?;
+        }
+        for r in self.rules.process_rules() {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(v) = &r.exe_prefix {
+                parts.push(format!("exe_prefix={v}"));
+            }
+            if let Some(v) = &r.comm {
+                parts.push(format!("comm={v}"));
+            }
+            if let Some(v) = &r.arg_substr {
+                parts.push(format!("arg_substr={v}"));
+            }
+            stmt.execute(params![
+                "process",
+                r.id,
+                parts.join(" AND "),
+                "",
+                severity_label(r.severity),
+            ])?;
         }
         Ok(())
     }

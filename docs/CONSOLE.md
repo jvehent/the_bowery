@@ -294,12 +294,13 @@ return to the previous pane.
 `processes.cmdline` is empty unless `[sql] expose_cmdline = true` is
 set in the agent config.
 
-### 5.2 Bowery-internal views (5)
+### 5.2 Bowery-internal views (6)
 
 | Table | Columns |
 |---|---|
 | `bowery_peers` | fingerprint_hex |
 | `bowery_mesh_peers` | fingerprint_hex, whisper_addr, agent_version, pinned, has_role_vector, has_bloom_advert |
+| `bowery_monitor_rules` | kind, rule_id, pattern, ops, severity |
 | `bowery_baseline_binaries` | sha256_hex, first_seen_unix, last_seen_unix, seen_count |
 | `bowery_alerts` | episode_id, suspicion, exe_path, ts_unix_ms |
 | `bowery_audit` | seq, ts_unix_ms, episode_id, action_id, outcome_kind |
@@ -310,6 +311,17 @@ gossip mesh, with `pinned = 1` when it's also in the trusted set. Query
 `bowery_mesh_peers` on agent A to confirm it's discovering agent B
 (B's fingerprint appears once gossip flows A↔B); an empty result means
 A has found no peers at all.
+
+`bowery_monitor_rules` lists the operator-configured monitoring rules
+(`[monitor]` in the agent config) so you can ask an agent — or the whole
+fleet with `--fanout` — *what are you actually watching?* without reading
+config files. `kind` is `file` or `process`; `pattern` is the watched
+path (file) or the `key=value` matchers joined by ` AND ` (process).
+
+```sql
+-- which nodes are missing the sudoers watch?
+SELECT rule_id, pattern, severity FROM bowery_monitor_rules WHERE kind = 'file';
+```
 
 ### 5.3 Scalar file/hash functions (7)
 

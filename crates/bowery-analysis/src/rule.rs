@@ -9,13 +9,14 @@
 //! [`ExecFromWritablePathRule`], [`ExecMissingExePathRule`],
 //! [`ExecWithSuspiciousArgsRule`]. More land as we get more event types.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::episode::Episode;
 
 /// Severity buckets. Used by the response engine to decide how aggressively
-/// to gate further actions; not a literal CVSS score.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// to gate further actions; not a literal CVSS score. `Deserialize` so
+/// operator-configured rules can set it from TOML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleSeverity {
     Info,
@@ -163,6 +164,95 @@ impl Rule for ExecWithSuspiciousArgsRule {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Operator-defined rules
+// ---------------------------------------------------------------------------
+
+/// An operator-configured process detection (`[monitor] process_rules` in
+/// the agent config), layered onto [`default_rules`].
+///
+/// Every matcher that is `Some` must hit (AND semantics); the agent rejects
+/// an all-`None` rule at load so it can never match every exec. Matching is
+/// case-sensitive and deliberately simple — prefix on `exe_path`, exact on
+/// `comm`, substring on any argv element — so an operator can predict
+/// exactly what fires without learning a query language.
+///
+/// `id` is `&'static str` to satisfy [`RuleHit`]; the agent leaks the
+/// configured id once at construction (rules live for the process lifetime).
+#[derive(Debug, Clone)]
+pub struct OperatorProcessRule {
+    id: &'static str,
+    exe_prefix: Option<String>,
+    comm: Option<String>,
+    arg_substr: Option<String>,
+    severity: RuleSeverity,
+}
+
+impl OperatorProcessRule {
+    pub fn new(
+        id: &'static str,
+        exe_prefix: Option<String>,
+        comm: Option<String>,
+        arg_substr: Option<String>,
+        severity: RuleSeverity,
+    ) -> Self {
+        Self {
+            id,
+            exe_prefix,
+            comm,
+            arg_substr,
+            severity,
+        }
+    }
+}
+
+impl Rule for OperatorProcessRule {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn check(&self, episode: &Episode) -> Option<RuleHit> {
+        let mut why: Vec<String> = Vec::new();
+
+        if let Some(prefix) = &self.exe_prefix {
+            let path = episode.root.exe_path.as_deref()?;
+            if !path.to_string_lossy().starts_with(prefix.as_str()) {
+                return None;
+            }
+            why.push(format!("exe_prefix={prefix}"));
+        }
+        if let Some(comm) = &self.comm {
+            if episode.root.comm != *comm {
+                return None;
+            }
+            why.push(format!("comm={comm}"));
+        }
+        if let Some(needle) = &self.arg_substr {
+            if !episode
+                .root
+                .args
+                .iter()
+                .any(|a| a.contains(needle.as_str()))
+            {
+                return None;
+            }
+            why.push(format!("arg_substr={needle}"));
+        }
+
+        // An all-`None` rule would match everything; the agent rejects that
+        // at config load, but stay defensive here too.
+        if why.is_empty() {
+            return None;
+        }
+
+        Some(RuleHit {
+            rule_id: self.id,
+            severity: self.severity,
+            reason: format!("operator rule matched ({})", why.join(", ")),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -242,5 +332,93 @@ mod tests {
         let ids: Vec<_> = hits.iter().map(|h| h.rule_id).collect();
         assert!(ids.contains(&"exec_from_writable_path"));
         assert!(ids.contains(&"exec_suspicious_args"));
+    }
+
+    fn make_exec_comm(comm: &str, args: Vec<&str>, exe: Option<&str>) -> Episode {
+        Episode::from_exec(ProcessExec {
+            pid: 42,
+            ppid: 1,
+            uid: 1000,
+            comm: comm.into(),
+            exe_path: exe.map(PathBuf::from),
+            args: args.into_iter().map(String::from).collect(),
+            ts: SystemTime::UNIX_EPOCH,
+        })
+    }
+
+    #[test]
+    fn operator_rule_matchers_are_anded() {
+        // exe_prefix AND comm AND arg_substr — all must hit.
+        let r = OperatorProcessRule::new(
+            "netcat-exec",
+            Some("/usr/bin/nc".to_string()),
+            Some("nc".to_string()),
+            Some("-e".to_string()),
+            RuleSeverity::High,
+        );
+
+        let hit = r
+            .check(&make_exec_comm(
+                "nc",
+                vec!["nc", "-e", "/bin/sh"],
+                Some("/usr/bin/nc"),
+            ))
+            .expect("all three matchers hit");
+        assert_eq!(hit.rule_id, "netcat-exec");
+        assert_eq!(hit.severity, RuleSeverity::High);
+
+        // Each individual mismatch suppresses the hit.
+        assert!(
+            r.check(&make_exec_comm(
+                "nc",
+                vec!["nc", "-e"],
+                Some("/usr/bin/curl")
+            ))
+            .is_none(),
+            "exe_prefix mismatch must not fire"
+        );
+        assert!(
+            r.check(&make_exec_comm(
+                "curl",
+                vec!["nc", "-e"],
+                Some("/usr/bin/nc")
+            ))
+            .is_none(),
+            "comm mismatch must not fire"
+        );
+        assert!(
+            r.check(&make_exec_comm("nc", vec!["nc", "-l"], Some("/usr/bin/nc")))
+                .is_none(),
+            "arg_substr mismatch must not fire"
+        );
+    }
+
+    #[test]
+    fn operator_rule_with_single_matcher_fires() {
+        let r = OperatorProcessRule::new(
+            "any-nc",
+            None,
+            Some("nc".to_string()),
+            None,
+            RuleSeverity::Medium,
+        );
+        let hit = r
+            .check(&make_exec_comm("nc", vec!["nc"], Some("/usr/bin/nc")))
+            .expect("comm-only rule fires");
+        assert_eq!(hit.severity, RuleSeverity::Medium);
+        assert!(r.check(&make_exec_comm("ls", vec!["ls"], None)).is_none());
+    }
+
+    #[test]
+    fn operator_rule_exe_prefix_requires_known_exe_path() {
+        // exe_path None must not panic or match an exe_prefix rule.
+        let r = OperatorProcessRule::new(
+            "exe-only",
+            Some("/usr/bin/".to_string()),
+            None,
+            None,
+            RuleSeverity::High,
+        );
+        assert!(r.check(&make_exec_comm("x", vec!["x"], None)).is_none());
     }
 }

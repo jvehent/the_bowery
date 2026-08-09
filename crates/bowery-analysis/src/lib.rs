@@ -23,5 +23,5 @@ pub use analyzer::{Analyzer, Verdict};
 pub use episode::Episode;
 pub use peer_select::{DEFAULT_FANOUT, DEFAULT_MIN_SIMILARITY, rank_by_similarity};
 pub use role::{ROLE_VECTOR_DIMS, RoleFeatures, RoleVector};
-pub use rule::{Rule, RuleHit, RuleSeverity};
+pub use rule::{OperatorProcessRule, Rule, RuleHit, RuleSeverity};
 pub use score::{BinaryScore, BinaryScorer};

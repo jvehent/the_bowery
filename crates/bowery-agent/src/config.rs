@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bowery_analysis::RuleSeverity;
+use bowery_events::FileOp;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_IDENTITY_PATH: &str = "/var/lib/bowery/identity.key";
@@ -58,6 +60,8 @@ pub struct Config {
     pub response: ResponseConfig,
     #[serde(default)]
     pub sql: SqlConfig,
+    #[serde(default)]
+    pub monitor: MonitorConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,6 +434,71 @@ impl Default for AlertsConfig {
 
 fn default_alert_threshold() -> f32 {
     0.7
+}
+
+/// Operator-configurable monitoring: watch specific files (via userspace
+/// inotify) and add operator-defined process detections to the analyzer.
+/// Both lists default empty — the feature is off until the operator adds
+/// rules. Query the effective rules over SQL via `bowery_monitor_rules`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MonitorConfig {
+    /// File-integrity rules: a change to `path` matching any of `ops` emits
+    /// an alert. Always alerts on match (an operator watch is explicit).
+    #[serde(default)]
+    pub file_rules: Vec<FileRule>,
+    /// Process-detection rules layered onto the analyzer's built-in rules;
+    /// they contribute to the exec suspicion score (so `[alerts] threshold`
+    /// applies via their severity, like the built-ins).
+    #[serde(default)]
+    pub process_rules: Vec<ProcessRule>,
+}
+
+/// One watched-file rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRule {
+    /// Stable id used in the alert rationale. Derived from `path` if omitted.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Absolute path to watch (a specific file — not a glob or directory).
+    pub path: PathBuf,
+    /// Which change classes fire. Default: modify/attrib/delete/move.
+    #[serde(default = "default_file_ops")]
+    pub ops: Vec<FileOp>,
+    /// Severity carried on the emitted alert. Default `high`.
+    #[serde(default = "default_monitor_severity")]
+    pub severity: RuleSeverity,
+}
+
+/// One operator process-detection rule. Every matcher that is set must hit
+/// (AND); an all-empty rule is rejected at load so it can't match everything.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessRule {
+    /// Stable id used in the rule-hit rationale. Derived if omitted.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// `exe_path` starts with this prefix (e.g. `/usr/bin/nc`).
+    #[serde(default)]
+    pub exe_prefix: Option<String>,
+    /// `task->comm` equals this exactly (kernel truncates comm to 15 bytes).
+    #[serde(default)]
+    pub comm: Option<String>,
+    /// Any argv element contains this substring.
+    #[serde(default)]
+    pub arg_substr: Option<String>,
+    /// Severity → suspicion weight (high=0.9, medium=0.6, …). Default `high`.
+    #[serde(default = "default_monitor_severity")]
+    pub severity: RuleSeverity,
+}
+
+fn default_file_ops() -> Vec<FileOp> {
+    vec![FileOp::Modify, FileOp::Attrib, FileOp::Delete, FileOp::Move]
+}
+
+fn default_monitor_severity() -> RuleSeverity {
+    RuleSeverity::High
 }
 
 /// Phase-5 bloom-advert publisher tunables.
