@@ -147,6 +147,13 @@ pub struct WhisperConfig {
     /// UDP socket the QUIC server binds to. `0.0.0.0:9902` by default.
     #[serde(default = "default_whisper_bind_addr")]
     pub bind_addr: SocketAddr,
+    /// Address gossiped to mesh peers as this node's whisper dial target
+    /// (what a relay dials for fan-out). Defaults to the bound socket's
+    /// `local_addr()` when unset — which is unroutable if `bind_addr` is a
+    /// wildcard like `0.0.0.0:9902`. On a tailnet, bind the wildcard for
+    /// boot robustness and set this to the node's routable `100.x:9902`.
+    #[serde(default)]
+    pub advertise_addr: Option<SocketAddr>,
     #[serde(default)]
     pub qa: WhisperQaConfig,
 }
@@ -155,6 +162,7 @@ impl Default for WhisperConfig {
     fn default() -> Self {
         Self {
             bind_addr: default_whisper_bind_addr(),
+            advertise_addr: None,
             qa: WhisperQaConfig::default(),
         }
     }

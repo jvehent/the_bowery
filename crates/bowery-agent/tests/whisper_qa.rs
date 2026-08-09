@@ -47,6 +47,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>) -> Config
             cluster_id: Some("bowery-test-whisper-qa".to_string()),
         },
         whisper: WhisperConfig {
+            advertise_addr: None,
             qa: WhisperQaConfig {
                 threshold: 0.5, // first-time exec scores 1.0; well above
                 fanout: 4,

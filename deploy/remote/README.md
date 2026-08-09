@@ -5,6 +5,10 @@ Tailscale and lets you query it from your laptop with the `bowery`
 CLI / `bowery-console`. It's built for the single-node case: one
 remote host, no mesh peers, operator connects directly.
 
+To join several nodes into a mesh so one `bowery exec sql --fanout`
+query relays across all of them, follow [MESH.md](MESH.md) after the
+per-node install below.
+
 ## What you get (and what you don't) on a Raspberry Pi
 
 Raspberry Pi OS ships **without BPF-LSM**, so the agent runs in its

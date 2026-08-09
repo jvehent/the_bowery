@@ -3,12 +3,16 @@
 # install-agent.sh, which fills in the bind addresses, cluster id,
 # and operator-key placeholders below.
 #
-# This is a *single-node* profile: no mesh seeds, no peers. The
+# Defaults to a *single-node* profile: no mesh seeds, no peers. The
 # operator reaches it directly over the whisper QUIC port. The SQL
 # host-state surface, alert inbox, and baseline all work without a
 # BPF-LSM kernel; only the real-time eBPF event stream and
 # block_exec enforcement need one (a stock Raspberry Pi OS kernel
 # does not have it — the agent detects this and runs degraded).
+#
+# To join several nodes into a mesh so `bowery exec sql --fanout`
+# relays a query across all of them, see deploy/remote/MESH.md and the
+# seeds / advertise_addr fields in [mesh] and [whisper] below.
 
 [identity]
 # Ed25519 identity key. Generated on first start if absent (mode 0600).
@@ -23,12 +27,17 @@ bootstrap_window = "5m"
 max_pinned_peers = 64
 
 [mesh]
-# Chitchat gossip socket. Idle on a single node (no seeds). Bind is
-# still opened so future Bowery nodes on the tailnet can peer later.
+# Chitchat gossip socket (UDP 9901). Idle on a single node (no seeds).
+# Bind is still opened so nodes on the tailnet can peer later.
 listen_addr = "@@MESH_LISTEN@@"
-# No seeds → standalone. Add other Bowery nodes' mesh addresses here
-# to form a mesh later.
+# No seeds → standalone. To form a mesh (so `bowery exec sql --fanout`
+# relays across nodes), list the OTHER nodes' mesh addresses here, e.g.
+#   seeds = ["100.111.5.24:9901", "100.126.81.123:9901"]
 seeds = []
+# Address peers use to reach THIS node's gossip. Unset → falls back to
+# listen_addr, which is unroutable when that's a wildcard (0.0.0.0). On
+# a tailnet, set this to this node's own routable address:
+#   advertise_addr = "100.105.157.53:9901"
 # Peers with a mismatched cluster id ignore each other. Keep the same
 # value across every node you want in one mesh.
 cluster_id = "@@CLUSTER_ID@@"
@@ -36,8 +45,15 @@ cluster_id = "@@CLUSTER_ID@@"
 [whisper]
 # QUIC socket the operator connects to (`bowery exec sql`,
 # `bowery alerts tail`, `bowery-console`). Over Tailscale this is
-# reachable at the node's 100.x address.
+# reachable at the node's 100.x address. Bind the wildcard for boot
+# robustness (a specific 100.x bind fails if the agent starts before
+# Tailscale assigns the address).
 bind_addr = "@@WHISPER_BIND@@"
+# Address peers use to dial THIS node for whisper RPC (the relay's
+# fan-out target). Unset → the bound socket addr, which is unroutable
+# when bind_addr is a wildcard. On a tailnet set this node's own
+# routable whisper address so fan-out peers can reach it:
+#   advertise_addr = "100.105.157.53:9902"
 
 [heartbeat]
 interval = "30s"

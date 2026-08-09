@@ -46,6 +46,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, publish_interval: Duration) -
             cluster_id: Some("bowery-test-bloom".to_string()),
         },
         whisper: WhisperConfig {
+            advertise_addr: None,
             qa: WhisperQaConfig::default(),
             bind_addr: loopback_ephemeral(),
         },

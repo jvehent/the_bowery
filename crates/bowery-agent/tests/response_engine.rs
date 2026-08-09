@@ -76,6 +76,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, response: ResponseConfig) -> 
             cluster_id: Some("bowery-test-response".to_string()),
         },
         whisper: WhisperConfig {
+            advertise_addr: None,
             qa: WhisperQaConfig {
                 // Force whisper-Q&A to NOT trigger so the LLM
                 // submission goes via the direct path (faster + no

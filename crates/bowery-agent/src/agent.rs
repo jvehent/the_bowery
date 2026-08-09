@@ -336,9 +336,19 @@ impl Agent {
         let endpoint =
             BoweryEndpoint::bind(identity.clone(), accept_verifier, config.whisper.bind_addr)?;
         let sealer = Arc::new(Sealer::new(identity.clone()));
-        let whisper_addr = endpoint
-            .local_addr()
-            .map_err(|e| AgentError::Config(format!("local_addr: {e}")))?;
+        // The whisper address gossiped to peers (their fan-out dial target).
+        // When the socket binds a wildcard like 0.0.0.0:9902 — which we want
+        // for boot robustness, since binding a specific tailnet IP fails if
+        // the agent starts before Tailscale assigns it — `local_addr()`
+        // returns that unroutable 0.0.0.0. `whisper.advertise_addr` lets a
+        // node bind the wildcard yet advertise its routable 100.x:9902 so
+        // peers can actually dial it for relay fan-out.
+        let whisper_addr = match config.whisper.advertise_addr {
+            Some(addr) => addr,
+            None => endpoint
+                .local_addr()
+                .map_err(|e| AgentError::Config(format!("local_addr: {e}")))?,
+        };
 
         let mut mesh_cfg = MeshConfig::new(
             identity.clone(),
@@ -1413,6 +1423,28 @@ async fn stream_sql_response(
             timeout,
         )
         .await?;
+    }
+
+    // -- Phase 3: fan-out completion terminator. --
+    //
+    // In fan-out mode the operator can't know how many peers will reply,
+    // so it reads until it sees this explicit end marker: a chunk with an
+    // empty `agent_fp` and `end = true`. No real chunk ever has an empty
+    // agent_fp — the relay stamps its own 32-byte fingerprint and every
+    // peer stamps its own — so the sentinel is unambiguous. We send it
+    // whenever fan-out was requested (even with zero peers, or with the
+    // relay disabled), which is what makes an empty-peer fan-out return
+    // immediately instead of hanging until the operator's exchange
+    // timeout. Single-agent mode never sends it (the operator stops on
+    // the first `end && !fanout`).
+    if fanout {
+        let terminator = SqlChunk {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            end: true,
+            agent_fp: Vec::new(),
+        };
+        send_chunk(conn, sealer, &operator, request_id, terminator).await?;
     }
     Ok(())
 }

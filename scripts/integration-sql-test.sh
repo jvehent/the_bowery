@@ -108,6 +108,20 @@ run_sql() {
         --sql "$1"
 }
 
+# Fan-out against this single agent (no mesh peers). Exercises the
+# relay path + the fan-out completion terminator: with a short 3s
+# timeout, a regression to the old "hang until timeout" behaviour would
+# make this error out instead of returning the local row promptly.
+run_sql_fanout() {
+    "$BOWERY_BIN" exec sql \
+        --operator-key "$TEST_DIR/op/operator.key" \
+        --agent-addr "127.0.0.1:$WHISPER_PORT" \
+        --agent-fp "$AGENT_FP" \
+        --agent-pubkey-b64 "$AGENT_PUB" \
+        --fanout --timeout 3s \
+        --sql "$1"
+}
+
 echo "==> smoke: SELECT 1"
 OUT=$(run_sql 'SELECT 1 AS hello')
 echo "$OUT"
@@ -147,6 +161,23 @@ echo "$OUT"
 }
 [[ "$(echo "$OUT" | awk 'NR==2')" == "0" ]] || {
     echo "FAIL: expected 0 mesh peers for a solo agent, got '$(echo "$OUT" | awk 'NR==2')'" >&2
+    exit 1
+}
+
+echo "==> fan-out with no peers returns local row promptly (terminator, not a 12s hang)"
+START=$(date +%s)
+OUT=$(run_sql_fanout 'SELECT 1 AS hello')
+ELAPSED=$(( $(date +%s) - START ))
+echo "$OUT"
+# Fan-out output prepends an `_agent_fp` column, so the value is the
+# last tab-separated field of the data row.
+GOT=$(echo "$OUT" | awk -F'\t' 'NR==2 {print $NF}')
+[[ "$GOT" == "1" ]] || {
+    echo "FAIL: expected fan-out to return local row value '1', got '$GOT'" >&2
+    exit 1
+}
+[[ "$ELAPSED" -lt 3 ]] || {
+    echo "FAIL: 0-peer fan-out took ${ELAPSED}s (expected <3s); terminator likely not sent" >&2
     exit 1
 }
 

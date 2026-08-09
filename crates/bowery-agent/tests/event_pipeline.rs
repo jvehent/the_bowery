@@ -47,6 +47,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr) -> Config {
             cluster_id: Some("bowery-test".to_string()),
         },
         whisper: WhisperConfig {
+            advertise_addr: None,
             qa: WhisperQaConfig::default(),
             bind_addr: loopback_ephemeral(),
         },

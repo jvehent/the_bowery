@@ -56,6 +56,7 @@ fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: St
             cluster_id: Some("bowery-test-opcmd".to_string()),
         },
         whisper: WhisperConfig {
+            advertise_addr: None,
             qa: WhisperQaConfig::default(),
             bind_addr: loopback_ephemeral(),
         },
@@ -404,6 +405,7 @@ async fn fanout_streams_rows_from_relay_and_peer() {
             cluster_id: Some("bowery-fanout-test".to_string()),
         },
         whisper: WhisperConfig {
+            advertise_addr: None,
             qa: WhisperQaConfig::default(),
             bind_addr: loopback_ephemeral(),
         },
@@ -447,6 +449,7 @@ async fn fanout_streams_rows_from_relay_and_peer() {
             cluster_id: Some("bowery-fanout-test".to_string()),
         },
         whisper: WhisperConfig {
+            advertise_addr: None,
             qa: WhisperQaConfig::default(),
             bind_addr: loopback_ephemeral(),
         },

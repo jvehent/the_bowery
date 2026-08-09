@@ -221,6 +221,15 @@ pub async fn sql(
                         end,
                         agent_fp,
                     } = chunk;
+                    // Fan-out completion terminator: the relay sends a
+                    // final chunk with an empty agent_fp and end=true once
+                    // every peer has finished (and even when there were no
+                    // peers). No real chunk has an empty agent_fp, so this
+                    // unambiguously ends the fan-out read loop without
+                    // waiting for the connection to close.
+                    if fanout && end && agent_fp.is_empty() {
+                        return Ok::<(), anyhow::Error>(());
+                    }
                     let columns: Vec<String> = if chunk_cols.is_empty() {
                         columns_by_agent
                             .get(&agent_fp)
