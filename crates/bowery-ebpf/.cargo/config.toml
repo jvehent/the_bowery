@@ -6,6 +6,15 @@ linker = "bpf-linker"
 rustflags = [
     "-C", "panic=abort",
     "-C", "lto=true",
+    # Debug info must be present for bpf-linker to derive BTF from it.
+    # Set here (not just via [profile] debug) so it also applies to the
+    # `build-std` core rebuild.
+    "-C", "debuginfo=2",
+    # bpf-linker only emits the object's `.BTF` section when explicitly
+    # asked (`--btf` is opt-in). Without it there is no BTF — and the
+    # agent's loader (aya CO-RE + the LSM program) cannot load a BTF-less
+    # object. build-ebpf verifies `.BTF` is present after the build.
+    "-C", "link-arg=--btf",
 ]
 
 [unstable]
