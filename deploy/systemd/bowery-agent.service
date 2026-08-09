@@ -21,15 +21,22 @@ TasksMax=256
 # Capabilities. The eBPF loader needs CAP_BPF + CAP_PERFMON to load
 # tracepoint programs and create ring-buffer maps. CAP_SYS_ADMIN is
 # required as a fallback on kernels without CAP_BPF granularity
-# (< 5.8). The agent drops to no privileges after BPF is loaded;
-# Bowery never persists CAP_SYS_ADMIN in the run loop.
+# (< 5.8). CAP_KILL lets the process-kill response engine SIGKILL a
+# flagged process owned by another uid — WITHOUT it, kill(2) returns
+# EPERM against any non-root target (the common malware case) and
+# enforcement silently no-ops, giving false assurance of containment.
 #
 # Note: NoNewPrivileges interacts with eBPF — when set, only programs
 # whose perf event creation is allowed for unprivileged users will
 # load. For our tracepoints and ring buffers it's compatible. Keep
 # the rest of the hardening intact.
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN
-AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN
+#
+# TODO(hardening): the agent currently retains these caps for its whole
+# lifetime — it does NOT drop CAP_SYS_ADMIN after BPF load. Dropping to
+# CAP_BPF+CAP_PERFMON+CAP_KILL post-load (and removing CAP_SYS_ADMIN on
+# kernels ≥ 5.8) is tracked as a follow-up.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN CAP_KILL
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN CAP_KILL
 NoNewPrivileges=yes
 
 # Filesystem hardening.

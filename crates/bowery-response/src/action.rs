@@ -91,6 +91,14 @@ pub enum ActionOutcome {
     /// `reason` is short, human-readable, and stable enough for ops
     /// dashboards to group on.
     Suppressed { reason: String },
+    /// The engine *attempted* the action and it FAILED (e.g. `kill(2)`
+    /// returned EPERM because the agent lacks `CAP_KILL`). Distinct from
+    /// `Suppressed`: the action was not deliberately withheld — the host
+    /// state was NOT changed and containment did NOT happen. Operators must
+    /// be able to tell a genuine enforcement failure apart from a policy
+    /// suppression (in `bowery_audit` this is `outcome_kind = "failed"`),
+    /// or a silently-failing kill reads as successful containment.
+    Failed { reason: String },
 }
 
 impl ActionOutcome {
@@ -105,6 +113,12 @@ impl ActionOutcome {
 
     pub fn suppressed(reason: impl Into<String>) -> Self {
         Self::Suppressed {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self::Failed {
             reason: reason.into(),
         }
     }
@@ -157,6 +171,24 @@ pub fn _suppress_unused_duration() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_outcome_is_distinct_from_suppressed_in_audit_kind() {
+        // `bowery_audit` derives `outcome_kind` from the serde `outcome`
+        // tag. A genuine enforcement failure must NOT read as "suppressed"
+        // (a deliberate withholding) or the operator can't tell that
+        // containment silently failed.
+        let failed = serde_json::to_value(ActionOutcome::failed("EPERM")).unwrap();
+        assert_eq!(failed.get("outcome").unwrap(), "failed");
+        assert_eq!(failed.get("reason").unwrap(), "EPERM");
+
+        let suppressed = serde_json::to_value(ActionOutcome::suppressed("policy denied")).unwrap();
+        assert_eq!(suppressed.get("outcome").unwrap(), "suppressed");
+        assert_ne!(
+            failed.get("outcome").unwrap(),
+            suppressed.get("outcome").unwrap()
+        );
+    }
 
     #[test]
     fn id_roundtrips_through_from_id() {

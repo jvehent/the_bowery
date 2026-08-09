@@ -272,6 +272,14 @@ pub struct Alerts {
     pub items: Vec<Alert>,
     #[prost(uint64, tag = "2")]
     pub cursor_unix_ms: u64,
+    /// True on the final chunk of a response. A large inbox is split
+    /// across several sub-frame-sized `Alerts` envelopes so none exceeds
+    /// the transport frame cap — a single oversized frame is rejected,
+    /// which would silently deliver *zero* alerts. The operator reads
+    /// `Alerts` envelopes until it sees `end = true`; only the final
+    /// chunk's `cursor_unix_ms` is authoritative.
+    #[prost(bool, tag = "3")]
+    pub end: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -749,6 +757,7 @@ mod tests {
                 backend: "test".into(),
             }],
             cursor_unix_ms: 8,
+            end: true,
         };
         let bytes = WhisperPayload::alerts(resp.clone()).encode_to_vec();
         match WhisperPayload::decode(bytes.as_slice()).unwrap().body {

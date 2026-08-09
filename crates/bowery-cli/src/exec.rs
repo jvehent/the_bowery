@@ -202,6 +202,12 @@ pub async fn sql(
             let opened = envelope_verifier
                 .open(&bytes)
                 .context("verifying SqlChunk envelope")?;
+            // The authenticated envelope sender — the identity whose key
+            // sealed this chunk. Trust THIS, never the self-declared
+            // `chunk.agent_fp`: in fan-out every peer's key is in our
+            // resolver, so `agent_fp` is attacker-settable but the envelope
+            // signature is not.
+            let sender = opened.sender;
             let result = match opened.payload.body {
                 Some(Body::OperatorResult(r)) => r,
                 other => bail!("agent replied with unexpected body: {other:?}"),
@@ -219,17 +225,22 @@ pub async fn sql(
                         columns: chunk_cols,
                         rows,
                         end,
-                        agent_fp,
+                        agent_fp: declared_fp,
                     } = chunk;
-                    // Fan-out completion terminator: the relay sends a
-                    // final chunk with an empty agent_fp and end=true once
-                    // every peer has finished (and even when there were no
-                    // peers). No real chunk has an empty agent_fp, so this
-                    // unambiguously ends the fan-out read loop without
-                    // waiting for the connection to close.
-                    if fanout && end && agent_fp.is_empty() {
+                    // Fan-out completion terminator: an empty-agent_fp,
+                    // end=true chunk — but ONLY honored from the relay we
+                    // dialled (`sender == target_fp`). The relay seals the
+                    // terminator with its own identity, so this holds for the
+                    // legitimate one; a compromised fan-out peer cannot forge
+                    // a terminator to truncate the fleet-wide result stream
+                    // (previously the shape alone ended the loop).
+                    if is_fanout_terminator(fanout, end, &declared_fp, sender, target_fp) {
                         return Ok::<(), anyhow::Error>(());
                     }
+                    // Attribute rows to the authenticated sender, not the
+                    // self-declared agent_fp, so a peer cannot stamp another
+                    // host's fingerprint onto fabricated rows.
+                    let agent_fp = sender.as_bytes().to_vec();
                     let columns: Vec<String> = if chunk_cols.is_empty() {
                         columns_by_agent
                             .get(&agent_fp)
@@ -578,4 +589,49 @@ fn escape_json_string(s: &str) -> String {
         }
     }
     out
+}
+
+/// Whether a received chunk is the fan-out completion terminator — an
+/// empty declared `agent_fp` with `end = true`, which the relay sends to
+/// signal "all peers done". Honored ONLY when it comes from the relay we
+/// dialled (`sender == target_fp`), because the relay seals the terminator
+/// with its own identity. A compromised fan-out peer's key is in our
+/// resolver (so its envelopes verify), but binding the terminator to the
+/// authenticated sender stops it from forging one to truncate the
+/// fleet-wide result stream.
+fn is_fanout_terminator(
+    fanout: bool,
+    end: bool,
+    declared_fp: &[u8],
+    sender: Fingerprint,
+    target_fp: Fingerprint,
+) -> bool {
+    fanout && end && declared_fp.is_empty() && sender == target_fp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fanout_terminator_only_honored_from_relay() {
+        let relay = Fingerprint::from_bytes([1u8; 32]);
+        let peer = Fingerprint::from_bytes([2u8; 32]);
+
+        // The relay's own empty-agent_fp end chunk ends the fan-out stream.
+        assert!(is_fanout_terminator(true, true, &[], relay, relay));
+
+        // A compromised fan-out peer CANNOT forge a terminator to truncate
+        // the fleet-wide result stream: same shape, but sender != the relay.
+        assert!(!is_fanout_terminator(true, true, &[], peer, relay));
+
+        // A non-empty agent_fp is a data chunk, never a terminator.
+        assert!(!is_fanout_terminator(true, true, &[7u8; 32], relay, relay));
+
+        // end=false is never a terminator.
+        assert!(!is_fanout_terminator(true, false, &[], relay, relay));
+
+        // Single-agent mode never uses the terminator sentinel.
+        assert!(!is_fanout_terminator(false, true, &[], relay, relay));
+    }
 }

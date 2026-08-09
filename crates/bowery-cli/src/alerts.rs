@@ -77,23 +77,52 @@ pub async fn poll_once(
     conn.send_envelope(&outbound)
         .await
         .context("sending Subscribe")?;
-    let bytes = conn
-        .recv_envelope()
-        .await
-        .context("awaiting Alerts response")?;
-    let opened = envelope_verifier
-        .open(&bytes)
-        .context("verifying Alerts envelope")?;
 
-    let alerts_payload = match opened.payload.body {
-        Some(Body::Alerts(a)) => a,
-        other => bail!("agent replied with unexpected body: {other:?}"),
-    };
+    // The agent chunks a large inbox across several `Alerts` envelopes so
+    // none exceeds the transport frame cap; read until the final chunk
+    // (`end = true`), accumulating items. A per-chunk timeout bounds the
+    // wait and degrades gracefully (return what arrived) rather than
+    // hanging — which also tolerates an older agent that sends a single
+    // chunk without the `end` flag.
+    let mut all_items: Vec<Alert> = Vec::new();
+    let mut cursor = since_unix_ms;
+    loop {
+        let recv = tokio::time::timeout(Duration::from_secs(10), conn.recv_envelope()).await;
+        let bytes = match recv {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                if all_items.is_empty() {
+                    return Err(anyhow::Error::from(e).context("awaiting Alerts response"));
+                }
+                break; // connection closed after some chunks → end of stream
+            }
+            Err(_elapsed) => {
+                if all_items.is_empty() {
+                    bail!("timed out awaiting Alerts response");
+                }
+                break; // no further chunk in time → return what we have
+            }
+        };
+        let opened = envelope_verifier
+            .open(&bytes)
+            .context("verifying Alerts envelope")?;
+        let alerts_payload = match opened.payload.body {
+            Some(Body::Alerts(a)) => a,
+            other => bail!("agent replied with unexpected body: {other:?}"),
+        };
+        let is_end = alerts_payload.end;
+        let chunk_cursor = alerts_payload.cursor_unix_ms;
+        all_items.extend(alerts_payload.items);
+        if is_end {
+            cursor = chunk_cursor;
+            break;
+        }
+    }
     drop(conn);
     endpoint.close().await;
     let _ = std::any::type_name::<KnownNeighbors>();
 
-    Ok((alerts_payload.items, alerts_payload.cursor_unix_ms))
+    Ok((all_items, cursor))
 }
 
 /// Binary-side wrapper: drain the inbox and print to stdout. Loops

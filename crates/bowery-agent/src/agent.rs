@@ -40,7 +40,7 @@ use crate::whisper_qa::{
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 
@@ -1096,12 +1096,22 @@ async fn respond_to_subscribe(
             });
 
     let delivered = items.len();
-    let response = Alerts {
-        items,
-        cursor_unix_ms: cursor,
-    };
-    let outbound = sealer.seal_for(&operator, &WhisperPayload::alerts(response));
-    conn.send_envelope(&outbound).await?;
+
+    // Chunk the response so no single envelope exceeds the transport frame
+    // cap. A full inbox serialized as one `Alerts` envelope overflows the
+    // cap and is rejected by `send_envelope`, which would silently deliver
+    // ZERO alerts — an EDR blind spot precisely when a host is noisy. Each
+    // batch is its own envelope; the last is flagged `end = true` and
+    // carries the authoritative cursor. The operator reassembles until it
+    // sees `end`.
+    let batches = chunk_alerts(items, ALERTS_CHUNK_BUDGET_BYTES);
+    let last = batches.len() - 1; // chunk_alerts always returns ≥ 1 batch
+    for (i, batch) in batches.into_iter().enumerate() {
+        let end = i == last;
+        // Only the terminal chunk carries the authoritative cursor.
+        let cursor_for = if end { cursor } else { 0 };
+        send_alerts_chunk(conn, sealer, &operator, batch, cursor_for, end).await?;
+    }
 
     let _ = events_tx.send(AgentEvent::AlertsDelivered {
         operator,
@@ -1109,6 +1119,54 @@ async fn respond_to_subscribe(
         cursor_unix_ms: cursor,
     });
     Ok(())
+}
+
+/// Budget for one `Alerts` envelope's items, well under `MAX_FRAME_BYTES`
+/// (64 KiB) so the sealed envelope (signature + header + wrapper) still
+/// fits the transport frame cap.
+const ALERTS_CHUNK_BUDGET_BYTES: usize = 48 * 1024;
+
+/// Split alerts into batches that each encode to under `budget` bytes.
+/// Order is preserved and no item is dropped; a single oversized alert
+/// still goes out alone (best effort) so the stream always progresses.
+/// Always returns at least one batch (possibly empty) so the caller emits
+/// a terminal `end` chunk even for an empty inbox.
+fn chunk_alerts(items: Vec<Alert>, budget: usize) -> Vec<Vec<Alert>> {
+    use prost::Message as _;
+    let mut batches: Vec<Vec<Alert>> = Vec::new();
+    let mut batch: Vec<Alert> = Vec::new();
+    let mut batch_bytes = 0usize;
+    for item in items {
+        let item_bytes = item.encoded_len();
+        if !batch.is_empty() && batch_bytes + item_bytes > budget {
+            batches.push(std::mem::take(&mut batch));
+            batch_bytes = 0;
+        }
+        batch_bytes += item_bytes;
+        batch.push(item);
+    }
+    batches.push(batch);
+    batches
+}
+
+/// Seal and send one `Alerts` chunk to the operator. `end` marks the final
+/// chunk of a (possibly multi-envelope) response; only the final chunk's
+/// `cursor_unix_ms` is authoritative on the operator side.
+async fn send_alerts_chunk(
+    conn: &BoweryConnection,
+    sealer: &Sealer,
+    operator: &Fingerprint,
+    items: Vec<Alert>,
+    cursor_unix_ms: u64,
+    end: bool,
+) -> Result<(), bowery_whisper::transport::Error> {
+    let response = Alerts {
+        items,
+        cursor_unix_ms,
+        end,
+    };
+    let outbound = sealer.seal_for(operator, &WhisperPayload::alerts(response));
+    conn.send_envelope(&outbound).await
 }
 
 /// Phase-6b operator-command dispatch.
@@ -2322,13 +2380,20 @@ fn handle_llm_outcome(
                             outcome
                         }
                         Err(e) => {
-                            warn!(
+                            // A genuine enforcement FAILURE (e.g. kill(2)
+                            // EPERM — the agent lacks CAP_KILL). Record it as
+                            // `Failed`, NOT `Suppressed`: containment did not
+                            // happen, and the operator must see that in the
+                            // audit trail (`bowery_audit` outcome_kind =
+                            // "failed") rather than mistaking it for a
+                            // deliberate policy suppression.
+                            error!(
                                 action_id = id,
                                 episode = %episode,
                                 error = %e,
-                                "response engine returned an error"
+                                "response engine FAILED to enforce action"
                             );
-                            let outcome = ActionOutcome::suppressed(format!("error: {e}"));
+                            let outcome = ActionOutcome::failed(e.to_string());
                             let _ = events_tx_inner.send(AgentEvent::ActionAttempted {
                                 episode_id: episode.clone(),
                                 action_id: id,
@@ -2424,4 +2489,59 @@ async fn publish_role_vector(
     }
     debug!(binary_count, "published role vector");
     let _ = events_tx.send(AgentEvent::RoleVectorPublished { binary_count });
+}
+
+#[cfg(test)]
+mod alert_chunk_tests {
+    use super::*;
+
+    fn sample_alert(i: u64, rationale_len: usize) -> Alert {
+        Alert {
+            originator_fp: vec![0u8; 32],
+            episode_id: format!("ep-{i}"),
+            exe_sha256_hex: "ab".repeat(32),
+            exe_path: "/usr/bin/example".to_string(),
+            suspicion: 0.9,
+            rationale: "x".repeat(rationale_len),
+            suggested_actions: vec![],
+            ts_unix_ms: i,
+            backend: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn chunk_alerts_preserves_all_items_in_order_and_bounds_batches() {
+        let items: Vec<Alert> = (0..50).map(|i| sample_alert(i, 500)).collect();
+        let budget = 4 * 1024;
+        let batches = chunk_alerts(items.clone(), budget);
+
+        // Splitting actually happened (50 * ~550B >> 4 KiB).
+        assert!(
+            batches.len() > 1,
+            "expected multiple batches, got {}",
+            batches.len()
+        );
+
+        // No item dropped; order preserved — the whole point (the bug this
+        // fixes silently delivered ZERO alerts).
+        let flat: Vec<Alert> = batches.iter().flatten().cloned().collect();
+        assert_eq!(flat, items);
+
+        // Every batch fits the budget, except a lone oversized item.
+        for b in &batches {
+            let bytes: usize = b.iter().map(prost::Message::encoded_len).sum();
+            assert!(
+                b.len() == 1 || bytes <= budget,
+                "batch of {} = {bytes}B exceeds budget {budget}",
+                b.len()
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_alerts_empty_yields_one_terminal_batch() {
+        // An empty inbox still yields one (empty) batch → one `end` chunk,
+        // so the operator's read loop always terminates.
+        assert_eq!(chunk_alerts(Vec::new(), ALERTS_CHUNK_BUDGET_BYTES).len(), 1);
+    }
 }
