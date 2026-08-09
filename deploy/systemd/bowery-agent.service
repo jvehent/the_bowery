@@ -25,6 +25,12 @@ TasksMax=256
 # flagged process owned by another uid — WITHOUT it, kill(2) returns
 # EPERM against any non-root target (the common malware case) and
 # enforcement silently no-ops, giving false assurance of containment.
+# CAP_SYS_PTRACE lets the agent resolve OTHER processes' /proc entries
+# (readlink /proc/<pid>/exe, read /proc/<pid>/fd/*) — the core of host
+# inspection. Without it, ptrace_may_access() denies a root-but-
+# capability-restricted agent access to any process owned by a different
+# uid, so EVERY non-root exec fails exe_path enrichment (baseline never
+# populates) and the process_open_sockets table can't see other procs.
 #
 # Note: NoNewPrivileges interacts with eBPF — when set, only programs
 # whose perf event creation is allowed for unprivileged users will
@@ -33,10 +39,10 @@ TasksMax=256
 #
 # TODO(hardening): the agent currently retains these caps for its whole
 # lifetime — it does NOT drop CAP_SYS_ADMIN after BPF load. Dropping to
-# CAP_BPF+CAP_PERFMON+CAP_KILL post-load (and removing CAP_SYS_ADMIN on
-# kernels ≥ 5.8) is tracked as a follow-up.
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN CAP_KILL
-AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN CAP_KILL
+# CAP_BPF+CAP_PERFMON+CAP_KILL+CAP_SYS_PTRACE post-load (and removing
+# CAP_SYS_ADMIN on kernels ≥ 5.8) is tracked as a follow-up.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN CAP_KILL CAP_SYS_PTRACE
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN CAP_KILL CAP_SYS_PTRACE
 NoNewPrivileges=yes
 
 # Filesystem hardening.
