@@ -62,7 +62,10 @@ LogsDirectory=bowery
 # Network. Allow IPv4/IPv6 + Unix; later phases may tighten.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
-# System call filter. Conservative default; Phase 2 may need to relax for eBPF.
+# System call filter. Start from @system-service, then deny the
+# @privileged and @resources groups, then re-allow the specific
+# privileged syscalls the agent genuinely needs. Order matters: the
+# re-allow lines come AFTER the ~deny so they win.
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
@@ -73,6 +76,14 @@ SystemCallFilter=~@privileged @resources
 # baseline init (systemd: code=killed, status=31/SYS; audit: aarch64
 # syscall 55 / x86_64 syscall 93 = fchown).
 SystemCallFilter=@chown
+# Re-allow the eBPF load path. On a BPF-LSM (KRSI) host the agent calls
+# bpf(2) to load its tracepoint/LSM programs and create ring-buffer maps,
+# and perf_event_open(2) to attach the tracepoints. Both live in
+# @privileged (denied above), so without this the agent SIGSYS-crashloops
+# the instant it finds the BPF object at /usr/local/lib/bowery/bowery-ebpf
+# (same class of failure as the fchown one). Hosts without the object run
+# NoopEventSource and never hit these — the allowance is harmless there.
+SystemCallFilter=bpf perf_event_open
 
 [Install]
 WantedBy=multi-user.target
