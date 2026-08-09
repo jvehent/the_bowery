@@ -18,31 +18,41 @@ MemoryMax=1G
 CPUWeight=100
 TasksMax=256
 
-# Capabilities. The eBPF loader needs CAP_BPF + CAP_PERFMON to load
-# tracepoint programs and create ring-buffer maps. CAP_SYS_ADMIN is
-# required as a fallback on kernels without CAP_BPF granularity
-# (< 5.8). CAP_KILL lets the process-kill response engine SIGKILL a
-# flagged process owned by another uid — WITHOUT it, kill(2) returns
-# EPERM against any non-root target (the common malware case) and
-# enforcement silently no-ops, giving false assurance of containment.
-# CAP_SYS_PTRACE lets the agent resolve OTHER processes' /proc entries
-# (readlink /proc/<pid>/exe, read /proc/<pid>/fd/*) — the core of host
-# inspection. Without it, ptrace_may_access() denies a root-but-
-# capability-restricted agent access to any process owned by a different
-# uid, so EVERY non-root exec fails exe_path enrichment (baseline never
-# populates) and the process_open_sockets table can't see other procs.
+# Capabilities — the minimal set the agent actually needs:
+#   CAP_BPF + CAP_PERFMON  load tracepoint programs + create ring-buffer
+#                          maps + attach tracepoints (the whole KRSI ≥ 5.8
+#                          model; no CAP_SYS_ADMIN needed at that granularity).
+#   CAP_NET_ADMIN          network-side observation.
+#   CAP_KILL               process-kill response engine SIGKILLs a flagged
+#                          process owned by another uid; without it kill(2)
+#                          returns EPERM against any non-root target and
+#                          enforcement silently no-ops (false containment).
+#   CAP_SYS_PTRACE         resolve OTHER processes' /proc entries (readlink
+#                          /proc/<pid>/exe for exec enrichment, /proc/<pid>/fd
+#                          for process_open_sockets). Without it,
+#                          ptrace_may_access() denies a root-but-capability-
+#                          restricted agent access to any process owned by a
+#                          different uid, so non-root execs never populate the
+#                          baseline.
 #
-# Note: NoNewPrivileges interacts with eBPF — when set, only programs
-# whose perf event creation is allowed for unprivileged users will
-# load. For our tracepoints and ring buffers it's compatible. Keep
-# the rest of the hardening intact.
+# CAP_SYS_ADMIN was REMOVED (audit finding #7): it's only a pre-CAP_BPF
+# (< 5.8) fallback, and any host that passes `bowery doctor` (BPF-LSM,
+# kernel ≥ 5.13) has CAP_BPF granularity. If you must support a < 5.8
+# kernel, add CAP_SYS_ADMIN back here.
 #
-# TODO(hardening): the agent currently retains these caps for its whole
-# lifetime — it does NOT drop CAP_SYS_ADMIN after BPF load. Dropping to
-# CAP_BPF+CAP_PERFMON+CAP_KILL+CAP_SYS_PTRACE post-load (and removing
-# CAP_SYS_ADMIN on kernels ≥ 5.8) is tracked as a follow-up.
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN CAP_KILL CAP_SYS_PTRACE
-AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN CAP_KILL CAP_SYS_PTRACE
+# AmbientCapabilities was REMOVED: a root service already receives its
+# effective caps from the bounding set (kernel root rule), so ambient added
+# nothing for the agent itself — it only leaked these caps into any child
+# the agent might exec. The agent execs no privileged children, so dropping
+# ambient is a pure hardening win.
+#
+# NOTE: enabling the `bpf-lsm` block-exec ENGINE (not the default) also
+# needs CAP_MAC_ADMIN to attach the LSM program — add it if you turn that on.
+#
+# NoNewPrivileges interacts with eBPF — when set, only programs whose perf
+# event creation is allowed for unprivileged users will load; our tracepoints
+# and ring buffers are compatible. Keep the rest of the hardening intact.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_KILL CAP_SYS_PTRACE
 NoNewPrivileges=yes
 
 # Filesystem hardening.
