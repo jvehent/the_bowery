@@ -2,6 +2,15 @@
 # aya-ebpf requires the unstable `build-std` feature to compile core
 # for bpfel-unknown-none. This crate is its own workspace so we pin
 # nightly only here, not for the main agent.
-channel = "nightly"
+#
+# PINNED, not floating. bpf-linker is tightly coupled to an LLVM major
+# version (0.10.4 → llvm-sys 221 → LLVM 22). A floating `nightly` rolls
+# forward to a newer LLVM than the linker understands; bpf-linker then
+# still links but silently drops the `.BTF` section, and the object fails
+# to load in the agent (aya CO-RE + the LSM program need BTF). This date's
+# nightly ships LLVM 22.1, matching bpf-linker 0.10.4. When bumping
+# bpf-linker, pick a nightly whose `rustc --version --verbose` LLVM major
+# matches the new linker's llvm-sys, and re-verify `.BTF` (build-ebpf does).
+channel = "nightly-2026-06-01"
 components = ["rust-src"]
 profile = "minimal"

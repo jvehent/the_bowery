@@ -219,11 +219,18 @@ else
 fi
 
 echo
-echo "==> installing BPF build toolchain (nightly + rust-src + bpf-linker)"
+echo "==> installing BPF build toolchain (pinned nightly + rust-src + bpf-linker)"
 . "$HOME/.cargo/env"
-rustup toolchain install nightly --profile minimal --component rust-src
-# bpf-linker is the LLVM-backed linker that produces BPF bytecode.
-# It builds against the system LLVM. Skip if already present.
+# Install the exact nightly the eBPF crate pins (its LLVM major must match
+# bpf-linker's llvm-sys). rustc-dev/llvm-tools provide the libLLVM bpf-linker
+# loads at runtime.
+EBPF_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' \
+    "$(dirname "${BASH_SOURCE[0]}")/../crates/bowery-ebpf/rust-toolchain.toml")
+rustup toolchain install "$EBPF_TOOLCHAIN" --profile minimal \
+    --component rust-src --component rustc-dev --component llvm-tools
+# bpf-linker is the LLVM-backed linker that produces BPF bytecode. Skip if
+# already present. See crates/bowery-ebpf/rust-toolchain.toml for why the
+# nightly + LLVM versions must line up.
 if ! command -v bpf-linker >/dev/null; then
     cargo install bpf-linker
 fi

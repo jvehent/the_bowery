@@ -249,9 +249,22 @@ Prerequisites (`scripts/xtest setup` does this on the remote target,
 otherwise install manually):
 
 ```sh
-rustup toolchain install nightly --profile minimal --component rust-src
+# The eBPF crate PINS its nightly in crates/bowery-ebpf/rust-toolchain.toml
+# (rustup auto-installs it on build). bpf-linker is coupled to an LLVM
+# major version, so a floating nightly silently breaks the build — see the
+# note in that file. Install bpf-linker so it can load the matching LLVM:
 cargo install bpf-linker
 ```
+
+> **The LLVM version must match.** `bpf-linker 0.10.4` needs **LLVM 22**
+> (`llvm-sys 221`), which is why the toolchain is pinned to a nightly that
+> ships LLVM 22.1. `bpf-linker` loads that LLVM either from a system
+> install (`apt install llvm` when it's v22) or from the toolchain via
+> `rustup component add rustc-dev llvm-tools`. If the toolchain's
+> `libLLVM-<ver>.so` is a GNU-ld `INPUT(...)` stub rather than a symlink to
+> the real `libLLVM.so.*`, recreate it as a symlink. `build-ebpf` verifies
+> the resulting object actually carries a `.BTF` section and fails loudly
+> otherwise.
 
 Build:
 

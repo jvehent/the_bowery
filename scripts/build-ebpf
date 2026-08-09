@@ -9,8 +9,15 @@
 # Output: crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf
 #
 # Requirements (one-time, installed by `scripts/xtest setup`):
-#   - Rust nightly with rust-src component
-#   - bpf-linker  (cargo install bpf-linker)
+#   - The PINNED nightly + rust-src (crates/bowery-ebpf/rust-toolchain.toml;
+#     rustup auto-installs it). The pin exists because bpf-linker is coupled
+#     to an LLVM major version — see that file.
+#   - bpf-linker (cargo install bpf-linker), able to load LLVM matching the
+#     pinned nightly (LLVM 22 for bpf-linker 0.10.4). On Ubuntu that means
+#     either a system LLVM 22 (`apt install llvm`) or the toolchain's
+#     libLLVM via `rustup component add rustc-dev llvm-tools`. Note: if the
+#     toolchain's libLLVM-<ver>.so is a GNU-ld `INPUT(...)` stub instead of
+#     a symlink to the real libLLVM.so.*, recreate it as a symlink.
 
 set -euo pipefail
 
@@ -24,7 +31,10 @@ if ! command -v bpf-linker >/dev/null; then
 fi
 
 cd "$EBPF_DIR"
-cargo +nightly build --release "$@"
+# No `+nightly` override — the crate's rust-toolchain.toml pins the exact
+# nightly (LLVM major must match bpf-linker's llvm-sys). rustup honors it
+# and auto-installs it on first use.
+cargo build --release "$@"
 
 OUT="$EBPF_DIR/target/bpfel-unknown-none/release/bowery-ebpf"
 if [[ ! -f "$OUT" ]]; then

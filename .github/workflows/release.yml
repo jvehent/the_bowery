@@ -39,12 +39,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install nightly + rust-src + bpf-linker
+      - name: Install pinned nightly + rust-src + bpf-linker
         run: |
-          rustup toolchain install nightly --component rust-src
+          # The eBPF crate pins its nightly in rust-toolchain.toml (LLVM major
+          # must match bpf-linker's llvm-sys). rustup auto-installs the pinned
+          # toolchain when build-ebpf runs; rustc-dev/llvm-tools provide the
+          # libLLVM bpf-linker loads.
+          TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' crates/bowery-ebpf/rust-toolchain.toml)
+          rustup toolchain install "$TOOLCHAIN" --component rust-src --component rustc-dev --component llvm-tools
           cargo install bpf-linker --locked
 
-      - name: Build BPF object
+      - name: Build BPF object (verifies .BTF)
         run: bash scripts/build-ebpf
 
       - name: Stash BPF object for downstream jobs
