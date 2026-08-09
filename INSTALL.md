@@ -540,12 +540,18 @@ schema and security model.
 
 `--fanout` turns the dialled agent into a relay that runs the
 query locally **and** dispatches it to every pinned peer in
-parallel. Rows from each agent are tagged with an `_agent_fp`
-column so you can attribute results.
+parallel. Rows from each agent are prefixed with two attribution
+columns: `_agent_name` (the operator-assigned name from
+`~/.bowery/peers.toml`, or `?` if the fingerprint isn't in the
+manifest) and `_agent_fp` (the raw fingerprint). Attribution is
+derived from the authenticated envelope sender, not a
+self-declared field, so a peer can't spoof another host's rows.
 
 ```bash
 bowery exec sql ... --fanout \
-    --sql 'SELECT _agent_fp, port FROM listening_ports WHERE port = 22'
+    --sql 'SELECT port FROM listening_ports WHERE port = 22'
+# → _agent_name  _agent_fp            port
+#   web-1        3f9a…                22
 ```
 
 Fan-out relays only to peers that are both **discovered in the

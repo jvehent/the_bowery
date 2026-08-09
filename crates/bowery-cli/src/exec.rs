@@ -104,11 +104,16 @@ pub async fn sql(
         && let Ok(manifest_path) = crate::peers::default_path()
         && let Ok(manifest) = crate::peers::Manifest::load(&manifest_path)
     {
+        // fingerprint-hex → operator-assigned name, so fan-out output can
+        // show a readable agent name beside each row's fingerprint.
+        let mut agent_names: HashMap<String, String> = HashMap::new();
         for peer in &manifest.peers {
             let vk = parse_verifying_key(&peer.pubkey_b64)
                 .with_context(|| format!("decoding peer manifest entry {} pubkey", peer.name))?;
             resolver.insert(vk);
+            agent_names.insert(peer.fp.to_ascii_lowercase(), peer.name.clone());
         }
+        sink.set_agent_names(agent_names);
     }
     for b64 in &peer_pubkeys_b64 {
         let vk = parse_verifying_key(b64)
@@ -291,6 +296,22 @@ pub trait SqlSink: Send {
     fn header(&mut self, columns: &[String]);
     fn row(&mut self, columns: &[String], agent_fp: &[u8], row: &SqlRow);
     fn finish(&mut self);
+    /// Provide fingerprint-hex → operator-assigned name (from the peer
+    /// manifest) so fan-out output can show a readable agent name beside
+    /// the raw fingerprint. Default no-op — the ncurses console's
+    /// [`CollectSink`] renders attribution itself.
+    fn set_agent_names(&mut self, _names: HashMap<String, String>) {}
+}
+
+/// Resolve an agent fingerprint to its operator-assigned name from the
+/// peer manifest, for fan-out output. Falls back to `"?"` when the
+/// fingerprint isn't in `~/.bowery/peers.toml` (the full fingerprint is
+/// still shown in the adjacent `_agent_fp` column).
+fn agent_name_for(names: &HashMap<String, String>, agent_fp: &[u8]) -> String {
+    names
+        .get(&hex_fp(agent_fp))
+        .cloned()
+        .unwrap_or_else(|| "?".to_string())
 }
 
 /// Construct the right stdout-rendering sink for the operator CLI's
@@ -300,15 +321,18 @@ pub fn make_stdout_sink(format: SqlFormat, fanout: bool) -> Box<dyn SqlSink> {
         SqlFormat::Tsv => Box::new(TsvSink {
             printed_header: false,
             fanout,
+            agent_names: HashMap::new(),
         }),
         SqlFormat::Json => Box::new(JsonSink {
             printed_header: false,
             fanout,
+            agent_names: HashMap::new(),
         }),
         SqlFormat::Table => Box::new(TableSink {
             columns: Vec::new(),
             rows: Vec::new(),
             fanout,
+            agent_names: HashMap::new(),
         }),
     }
 }
@@ -354,15 +378,22 @@ impl SqlSink for CollectSink {
 struct TsvSink {
     printed_header: bool,
     fanout: bool,
+    agent_names: HashMap<String, String>,
 }
 
 impl SqlSink for TsvSink {
+    fn set_agent_names(&mut self, names: HashMap<String, String>) {
+        self.agent_names = names;
+    }
+
     fn header(&mut self, columns: &[String]) {
         if self.printed_header || columns.is_empty() {
             return;
         }
-        let mut head: Vec<String> = Vec::with_capacity(columns.len() + usize::from(self.fanout));
+        let mut head: Vec<String> =
+            Vec::with_capacity(columns.len() + 2 * usize::from(self.fanout));
         if self.fanout {
+            head.push("_agent_name".to_string());
             head.push("_agent_fp".to_string());
         }
         head.extend(columns.iter().cloned());
@@ -372,8 +403,9 @@ impl SqlSink for TsvSink {
 
     fn row(&mut self, _columns: &[String], agent_fp: &[u8], row: &SqlRow) {
         let mut cells: Vec<String> =
-            Vec::with_capacity(row.values.len() + usize::from(self.fanout));
+            Vec::with_capacity(row.values.len() + 2 * usize::from(self.fanout));
         if self.fanout {
+            cells.push(agent_name_for(&self.agent_names, agent_fp));
             cells.push(hex_fp(agent_fp));
         }
         cells.extend(row.values.iter().map(value_to_text));
@@ -386,9 +418,14 @@ impl SqlSink for TsvSink {
 struct JsonSink {
     printed_header: bool,
     fanout: bool,
+    agent_names: HashMap<String, String>,
 }
 
 impl SqlSink for JsonSink {
+    fn set_agent_names(&mut self, names: HashMap<String, String>) {
+        self.agent_names = names;
+    }
+
     fn header(&mut self, columns: &[String]) {
         if self.printed_header || columns.is_empty() {
             return;
@@ -403,8 +440,12 @@ impl SqlSink for JsonSink {
 
     fn row(&mut self, columns: &[String], agent_fp: &[u8], row: &SqlRow) {
         let mut parts: Vec<String> =
-            Vec::with_capacity(row.values.len() + usize::from(self.fanout));
+            Vec::with_capacity(row.values.len() + 2 * usize::from(self.fanout));
         if self.fanout {
+            parts.push(format!(
+                "\"_agent_name\":\"{}\"",
+                escape_json_string(&agent_name_for(&self.agent_names, agent_fp))
+            ));
             parts.push(format!("\"_agent_fp\":\"{}\"", hex_fp(agent_fp)));
         }
         for (i, v) in row.values.iter().enumerate() {
@@ -429,14 +470,20 @@ struct TableSink {
     columns: Vec<String>,
     rows: Vec<Vec<String>>,
     fanout: bool,
+    agent_names: HashMap<String, String>,
 }
 
 impl SqlSink for TableSink {
+    fn set_agent_names(&mut self, names: HashMap<String, String>) {
+        self.agent_names = names;
+    }
+
     fn header(&mut self, columns: &[String]) {
         if !self.columns.is_empty() || columns.is_empty() {
             return;
         }
         if self.fanout {
+            self.columns.push("_agent_name".to_string());
             self.columns.push("_agent_fp".to_string());
         }
         self.columns.extend(columns.iter().cloned());
@@ -444,8 +491,9 @@ impl SqlSink for TableSink {
 
     fn row(&mut self, _columns: &[String], agent_fp: &[u8], row: &SqlRow) {
         let mut cells: Vec<String> =
-            Vec::with_capacity(row.values.len() + usize::from(self.fanout));
+            Vec::with_capacity(row.values.len() + 2 * usize::from(self.fanout));
         if self.fanout {
+            cells.push(agent_name_for(&self.agent_names, agent_fp));
             cells.push(hex_fp(agent_fp));
         }
         cells.extend(row.values.iter().map(value_to_text));
@@ -633,5 +681,15 @@ mod tests {
 
         // Single-agent mode never uses the terminator sentinel.
         assert!(!is_fanout_terminator(false, true, &[], relay, relay));
+    }
+
+    #[test]
+    fn agent_name_resolves_from_manifest_else_question_mark() {
+        let mut names = HashMap::new();
+        names.insert("aa".repeat(32), "web-1".to_string()); // 64-char fp hex
+        // Known fingerprint → operator-assigned name.
+        assert_eq!(agent_name_for(&names, &[0xaau8; 32]), "web-1");
+        // Unknown fingerprint → "?" (the raw fp is still shown alongside).
+        assert_eq!(agent_name_for(&names, &[0xbbu8; 32]), "?");
     }
 }
