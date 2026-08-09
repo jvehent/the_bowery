@@ -337,10 +337,12 @@ max_pinned_peers = 1024
 listen_addr = "0.0.0.0:9901"
 seeds       = ["seed1.internal:9901", "seed2.internal:9901", "seed3.internal:9901"]
 cluster_id  = "prod-us-east"
-# advertise_addr = "10.0.5.7:9901"   # set if listen != dialable
+# advertise_addr = "10.0.5.7:9901"   # gossip addr peers use; set if listen != dialable
 
 [whisper]
 bind_addr = "0.0.0.0:9902"
+# advertise_addr = "10.0.5.7:9902"   # whisper dial addr peers use for fan-out;
+                                     # set when bind_addr is a wildcard (0.0.0.0)
 
 # Phase 5 — neighborhood Q&A
 [whisper.qa]
@@ -508,9 +510,9 @@ bowery exec sql \
 Available tables: `processes`, `mounts`, `kernel_modules`,
 `interfaces`, `listening_ports`, `process_open_sockets`,
 `users`, `logged_in_users`, `last`, `systemd_units`, `crontab`,
-`os_version`, `system_info`, plus four Bowery-internal views
-(`bowery_peers`, `bowery_baseline_binaries`, `bowery_alerts`,
-`bowery_audit`). Plus seven scalar functions for per-path file
+`os_version`, `system_info`, plus five Bowery-internal views
+(`bowery_peers`, `bowery_mesh_peers`, `bowery_baseline_binaries`,
+`bowery_alerts`, `bowery_audit`). Plus seven scalar functions for per-path file
 inspection: `bowery_file_exists`, `_size`, `_mode`,
 `_mtime_unix`, `_owner_uid`, `_owner_gid`, `_sha256_hex`.
 
@@ -533,14 +535,24 @@ bowery exec sql ... --fanout \
     --sql 'SELECT _agent_fp, port FROM listening_ports WHERE port = 22'
 ```
 
+Fan-out relays only to peers that are both **discovered in the
+gossip mesh and pinned** — so the agents must actually form a
+mesh first (seeds + routable advertise addresses + pinning).
+For a standalone deployment over a tailnet, the step-by-step
+bring-up is in [`deploy/remote/MESH.md`](deploy/remote/MESH.md).
+Check what a relay currently sees with the `bowery_mesh_peers`
+view (`pinned = 1` means it will fan out to that peer).
+
 For fan-out to verify peer signatures end-to-end, the operator's
 CLI needs each peer's public key. Maintain that list in
 `~/.bowery/peers.toml`:
 
 ```bash
 bowery peers add --name web-1 \
-    --fp <peer_fp_hex> --pubkey-b64 <peer_pubkey_b64>
+    --fp <peer_fp_hex> --pubkey-b64 <peer_pubkey_b64> \
+    --addr 100.111.5.24:9902          # optional: enables `peers check`
 bowery peers list
+bowery peers check --operator-key ~/.bowery/operator.key   # dial each, report reachability
 bowery peers remove --fp <peer_fp_hex>
 ```
 

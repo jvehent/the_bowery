@@ -118,14 +118,25 @@ robustness without an unroutable advertised address).
 
 ## Step 3 — re-open the TOFU window on each node
 
-Pinning is skipped once a node's window has closed, and the window is
-persisted, so wipe the pin store to start a fresh window at restart:
+Pinning happens only while a node's bootstrap window is open. The
+window is set from `bootstrap_window` at start **and persisted once the
+first peer is pinned** — so behaviour depends on whether the pin store
+already exists:
 
-```bash
-for h in otter1 dartagnan legolas; do
-  ssh "$h" 'sudo rm -f /var/lib/bowery/known_neighbors.json'
-done
-```
+- **File absent** (`/var/lib/bowery/known_neighbors.json` doesn't
+  exist — the common case for nodes that never formed a mesh): the
+  window is recomputed as `now + bootstrap_window` on **every restart**.
+  Nothing to do here; the restart in Step 4 opens a fresh window.
+- **File present**: it pins the persisted (possibly already-closed)
+  window, so wipe it to start fresh:
+  ```bash
+  for h in otter1 dartagnan legolas; do
+    ssh "$h" 'sudo rm -f /var/lib/bowery/known_neighbors.json'
+  done
+  ```
+
+Either way, make sure `bootstrap_window` (Step 2) is long enough that
+all nodes are up together inside it — `30m` is comfortable.
 
 ## Step 4 — restart all three within the window
 

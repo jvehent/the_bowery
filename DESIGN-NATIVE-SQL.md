@@ -32,7 +32,7 @@ multi-agent fan-out model.
   Windows; for now the table substrates assume `/proc`, `/sys`,
   netlink, and systemd D-Bus.
 - **Sprawling table catalogue.** Thirteen host-state tables are
-  in scope (§4) plus four Bowery-internal views. Others arrive
+  in scope (§4) plus five Bowery-internal views. Others arrive
   when an operator workflow demands one.
 - **File integrity monitoring (FIM) / continuous file events.**
   Continuous file change detection requires kernel hookup we
@@ -69,7 +69,7 @@ sole operator-facing entry point.
 
 ## 4. Tables
 
-The 13 host-state tables plus 4 Bowery-internal views, with
+The 13 host-state tables plus 5 Bowery-internal views, with
 implementation substrate per table.
 
 | Table | Substrate | Notes |
@@ -96,6 +96,7 @@ These ride along for free because the vtab interface is generic.
 They expose Bowery's own internal state.
 
 - `bowery_peers` — known_neighbors store: fingerprint, vk_b64, pinned_at, role_vector_hex.
+- `bowery_mesh_peers` — gossip-discovered peers (vs. the pinned `bowery_peers`): fingerprint_hex, whisper_addr, agent_version, pinned, has_role_vector, has_bloom_advert. Added with the Tailscale mesh deploy work.
 - `bowery_baseline_binaries` — baseline DB rows: sha256, first_seen, last_seen, seen_count.
 - `bowery_alerts` — alert inbox: episode_id, suspicion, exe_path, ts.
 - `bowery_audit` — last N audit envelopes: seq, action, outcome, recorded_at.
@@ -463,9 +464,9 @@ through CI; no slice leaves the agent broken.
 - `bowery peers add/list/remove` for operator-side peer
   manifest.
 - `--format=table` table renderer.
-- Bonus tables: `bowery_peers`, `bowery_baseline_binaries`,
-  `bowery_alerts`, `bowery_audit` — Bowery-internal state no
-  third-party SQL surface can reach.
+- Bonus tables: `bowery_peers`, `bowery_mesh_peers`,
+  `bowery_baseline_binaries`, `bowery_alerts`, `bowery_audit` —
+  Bowery-internal state no third-party SQL surface can reach.
 - `bowery doctor` learns to run a smoke query (`SELECT 1`) so
   operators can verify the SQL surface is alive.
 

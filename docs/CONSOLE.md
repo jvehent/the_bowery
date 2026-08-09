@@ -365,9 +365,9 @@ SELECT sha256_hex, seen_count, last_seen_unix
   LIMIT 50;
 ```
 
-Step 2 — when Phase-10 multi-hop ships, `--fanout` the same query
-to ask every reachable peer "have you seen this hash?" and
-correlate.
+Step 2 — `--fanout` the same query to ask every pinned mesh peer
+"have you seen this hash?" and correlate (one hop, works today;
+multi-*hop* relay chains for deeper fan-out are still future).
 
 ### Listening port audit
 

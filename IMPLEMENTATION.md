@@ -2067,6 +2067,26 @@ Per-peer dial / send / receive failures collapse to a synthetic
 relay-signed terminal chunk for that peer, so the operator-side
 decoder always observes EOF for every peer it expected.
 
+**Mesh prerequisites + completion terminator (tailnet deploy
+work).** The relay dispatches only to peers that are *both*
+discovered in the gossip mesh *and* pinned, dialing each peer's
+gossiped `whisper_addr` — so the fleet must actually form a mesh
+with routable advertised addresses first: `[mesh] advertise_addr`,
+`[whisper] advertise_addr` (bind a wildcard for boot robustness,
+advertise the routable `100.x`), and `[mesh] seeds`. The
+step-by-step bring-up is [`deploy/remote/MESH.md`](deploy/remote/MESH.md).
+Because the operator can't know the peer count ahead of time, the
+relay emits an explicit **fan-out completion terminator** once every
+peer has finished (and even with zero peers) — a chunk with an empty
+`agent_fp` and `end = true`, which no real chunk carries — and the
+operator ends its read loop on it. Previously the operator waited for
+the QUIC connection to close, which the relay never did, so every
+fan-out blocked until the client's exchange timeout. Related: the
+operator client binds the *unspecified* address, not `127.0.0.1`, so
+cross-host dials egress the correct interface (a loopback bind reaches
+only locally-deliverable addresses, silently stranding every remote
+agent).
+
 **End-to-end signing (Phase-9 final-1):** the operator signs an
 `OperatorAuthorization` (operator_fp + ts + request_id +
 command_digest) and embeds it in the outbound command's
@@ -2087,14 +2107,21 @@ compromised relay key cannot grant SQL authority over peers.
 
 ### 22.5 Bonus tables (slice 8)
 
-Four agent-state-aware tables plumbed in via
+Five agent-state-aware tables plumbed in via
 `Sql::with_extra_table(Arc<dyn BoweryTable>)`. They live under
 [`crates/bowery-agent/src/sql_tables.rs`](crates/bowery-agent/src/sql_tables.rs)
 because they hold `Arc`s to agent state (`KnownNeighbors`,
-`Baseline`, `AlertInbox`, audit-log path) that `bowery-tables`
-intentionally doesn't depend on:
+`Baseline`, `AlertInbox`, audit-log path, mesh peer watch) that
+`bowery-tables` intentionally doesn't depend on:
 
-- `bowery_peers` — fingerprints in the agent's KnownNeighbors.
+- `bowery_peers` — fingerprints in the agent's KnownNeighbors (the
+  *pinned* set).
+- `bowery_mesh_peers` — peers currently *discovered* over the gossip
+  mesh (fingerprint_hex, whisper_addr, agent_version, pinned,
+  has_role_vector, has_bloom_advert), backed by the mesh peer
+  watch-channel. `pinned = 1` when a discovered peer is also in
+  KnownNeighbors; querying it on agent A confirms A is discovering
+  agent B. Added with the tailnet mesh deploy work.
 - `bowery_baseline_binaries` — every SHA the baseline has seen.
 - `bowery_alerts` — alerts in the in-memory inbox.
 - `bowery_audit` — Phase-7 audit log entries (parsed JSONL).
@@ -2118,11 +2145,17 @@ bowery exec sql ... --format=table --sql 'SELECT * FROM listening_ports'
 # File / hash via scalar functions (final-7) — operator supplies path
 bowery exec sql ... --sql "SELECT bowery_file_sha256_hex('/usr/bin/sshd')"
 
-# Operator peer manifest (final-8) — pre-loaded for fan-out verification
-bowery peers add --name web-1 --fp <hex> --pubkey-b64 <b64>
+# Operator peer manifest (final-8) — pre-loaded for fan-out verification.
+# Optional --addr records a whisper dial address, enabling `peers check`.
+bowery peers add --name web-1 --fp <hex> --pubkey-b64 <b64> --addr 100.111.5.24:9902
 bowery peers list
+bowery peers check --operator-key ~/.bowery/operator.key   # dial each addressed peer, report reachability
 bowery peers remove --fp <hex>
 ```
+
+Forming the mesh that `--fanout` relays across (seeds + routable
+advertise addresses + pinning) is covered in
+[`deploy/remote/MESH.md`](deploy/remote/MESH.md).
 
 `bowery doctor` (slice 8c) runs `SELECT 1` against an in-process
 `bowery-sql` engine, catching build-time SQL surface breakage
