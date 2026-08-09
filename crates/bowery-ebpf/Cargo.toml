@@ -13,15 +13,20 @@ path = "src/main.rs"
 [dependencies]
 aya-ebpf = "0.1"
 
+# NOTE: `debug = 2` is REQUIRED, not optional. bpf-linker generates the
+# object's `.BTF` section from DWARF debug info; with debug off it emits a
+# BTF-less object that the agent's loader (aya: CO-RE relocations + the
+# LSM `bprm_check_security` program) cannot use. This is the aya
+# convention. `scripts/build-ebpf` verifies `.BTF` is present post-build.
 [profile.dev]
 opt-level = 3
-debug = false
+debug = 2
 overflow-checks = false
 panic = "abort"
 
 [profile.release]
 opt-level = 3
-debug = false
+debug = 2
 panic = "abort"
 codegen-units = 1
 lto = true

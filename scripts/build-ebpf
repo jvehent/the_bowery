@@ -32,6 +32,26 @@ if [[ ! -f "$OUT" ]]; then
     exit 1
 fi
 
+# The build can "succeed" yet emit an UNUSABLE object: bpf-linker silently
+# produces a BTF-less object when debug info is missing or when it can't
+# load LLVM (a "dlopen failed" warning above). The agent's loader needs
+# BTF (CO-RE relocations + the LSM program), so reject a BTF-less object
+# here instead of letting it fail cryptically at agent startup.
+if command -v readelf >/dev/null 2>&1; then
+    if ! readelf -S "$OUT" 2>/dev/null | grep -q '\.BTF'; then
+        echo "error: $OUT has no .BTF section — the agent cannot load it." >&2
+        echo "  Likely causes:" >&2
+        echo "   - [profile.release] debug must be >= 1 (this crate pins debug = 2)" >&2
+        echo "   - bpf-linker could not load LLVM: look for 'unable to open LLVM" >&2
+        echo "     shared lib ... dlopen failed' above. The toolchain's" >&2
+        echo "     libLLVM-<ver>.so may be a GNU-ld 'INPUT(...)' stub rather than" >&2
+        echo "     a symlink to the real libLLVM.so.* — recreate it as a symlink." >&2
+        exit 1
+    fi
+else
+    echo "warning: readelf not found; skipping .BTF verification" >&2
+fi
+
 echo
-echo "built $OUT"
+echo "built $OUT (.BTF verified)"
 ls -lh "$OUT"
