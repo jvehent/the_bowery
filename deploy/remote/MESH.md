@@ -6,7 +6,7 @@ one query to any node and have it relay to the others:
 
 ```bash
 bowery exec sql --fanout --sql 'SELECT COUNT(*) FROM processes'
-# → one section of rows per agent, each attributed by fingerprint
+# → one section of rows per agent, attributed by `_agent_name` + `_agent_fp`
 ```
 
 Fan-out relays only to peers that are BOTH discovered in the gossip
@@ -194,7 +194,7 @@ bowery exec sql \
 ```
 
 You should get rows from all three agents, each row tagged with its
-source `_agent_fp`, returning promptly (no 12s hang).
+source `_agent_name` + `_agent_fp`, returning promptly (no 12s hang).
 
 ---
 

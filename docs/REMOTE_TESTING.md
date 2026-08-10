@@ -143,6 +143,7 @@ If any check fails, the doctor prints a remediation hint. See
 | `xtest shell` | interactive SSH session in the workdir |
 | `xtest push-model [NAME]` | rsync `~/.bowery/models/<NAME>.gguf` to the VM |
 | `xtest run-agent ...` | sync + (optional `--push-model`) + build BPF + build agent + run under sudo |
+| `xtest run-console [-- ARGS…]` | sync + build the console with the Gemma 4 chatbot + launch it on the VM |
 | `xtest stop-ssh` | tear down the SSH ControlMaster |
 
 `xtest` keeps an SSH `ControlMaster` socket open for ~10 minutes after

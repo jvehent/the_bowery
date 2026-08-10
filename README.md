@@ -4,14 +4,14 @@
 
 A distributed Linux EDR built around a peer-to-peer **whispering protocol**: agents validate anomalies with their neighbors instead of phoning home to a central backend.
 
-> **Status:** pre-alpha, Phase 0 → 9 of the [implementation plan](DESIGN.md#13-phased-delivery) complete. Native Phase-9 SQL surface ([`bowery-sql` + `bowery-tables`](DESIGN-NATIVE-SQL.md)) ships 13 procfs/sysfs-backed tables plus 5 Bowery-internal views, streamed over the operator wire with one-hop multi-agent fan-out — deployable as a multi-node mesh over a Tailscale tailnet ([deploy/remote/MESH.md](deploy/remote/MESH.md)). Not production-ready, but every layer is end-to-end testable today.
+> **Status:** pre-alpha, Phase 0 → 9 of the [implementation plan](DESIGN.md#13-phased-delivery) complete. Native Phase-9 SQL surface ([`bowery-sql` + `bowery-tables`](DESIGN-NATIVE-SQL.md)) ships 13 procfs/sysfs-backed tables plus 7 Bowery-internal views, streamed over the operator wire with one-hop multi-agent fan-out — deployable as a multi-node mesh over a Tailscale tailnet ([deploy/remote/MESH.md](deploy/remote/MESH.md)). Not production-ready, but every layer is end-to-end testable today.
 
 ## What it is
 
 - A lightweight Rust agent that observes process exec / exit and outgoing TCP connections at the kernel level via eBPF tracepoints, with KRSI (BPF-LSM) hooks for response enforcement.
 - A small embedded LLM (Qwen3-0.6B Q4_K_M via llama.cpp, feature-gated) that turns rule + baseline signal into a refined verdict + rationale.
 - A gossip-based mesh (chitchat) with mTLS-pinned QUIC RPC for direct peer-to-peer whisper Q&A — agents ask role-similar peers "have you seen this fingerprint?" and aggregate the answers as additional context for the LLM.
-- A native, pure-Rust SQL surface (`bowery-sql` + `bowery-tables`) that turns each agent into a queryable host-state engine — 13 procfs/sysfs/etc-backed tables plus 5 Bowery-internal views, streamed back over the operator wire with end-to-end signed multi-agent fan-out.
+- A native, pure-Rust SQL surface (`bowery-sql` + `bowery-tables`) that turns each agent into a queryable host-state engine — 13 procfs/sysfs/etc-backed tables plus 7 Bowery-internal views, streamed back over the operator wire with end-to-end signed multi-agent fan-out.
 - A signed operator CLI that connects to any agent, drains a per-agent alert inbox, prints (or JSON-streams) high-suspicion verdicts, and fans SQL queries across the mesh. There is no backend.
 
 ## Why
@@ -49,9 +49,12 @@ crates/
   bowery-tables/           # Phase-9 default table set (procfs/sysfs/etc-backed)
   bowery-whisper/          # envelope sealing, replay guard, mTLS, QUIC, Q&A,
                            # persistent peer-connection pool, fingerprints
+  bowery-yara/             # YARA rule scanning (feature-gated libyara engine)
 deploy/systemd/            # service unit + slice
 scripts/
   build-console            # console build with llama.cpp + target-cpu=native
+  build-install-operator   # build+install CLI/console/agent (all features) and
+                           # restart the agent on an operator workstation
   build-ebpf               # wraps `cargo +nightly build` for the BPF target
   integration-sql-test.sh  # end-to-end operator → agent SQL CI smoke
   xtest                    # SSH-based remote-VM driver (sync, build, run-agent,
@@ -106,9 +109,11 @@ RUSTFLAGS='-C target-cpu=native' \
 - **Phase 6b** — typed `OperatorCommand` / `OperatorResult` envelopes for operator → agent dispatch.
 - **Phase 7** — response engine with BPF-LSM block-exec hooks, default-deny policy, signed audit log (Phase-8 hash-chain).
 - **Phase 8** — replay guards, per-recipient envelope binding, fuzzing harness.
-- **Phase 9** — native SQL surface: `bowery-sql` engine + `bowery-tables` 13 default + 4 Bowery-internal views + 7 scalar file/hash functions; streamed as chunked `OperatorResult::SqlChunk` envelopes over QUIC; multi-agent fan-out with operator-signed delegation (`OperatorAuthorization`); peers seal chunks **directly for the operator** (relay can drop but cannot forge); SELECT-only authorizer; per-operator rate limit; 16 KiB per-cell cap; SQLite progress-handler cancellation; `bowery peers add/list/remove` operator manifest. Every CRIT/HIGH/MEDIUM finding from [`SECURITY-AUDIT-PHASE9.md`](SECURITY-AUDIT-PHASE9.md) closed.
+- **Phase 9** — native SQL surface: `bowery-sql` engine + `bowery-tables` 13 default + 7 Bowery-internal views + 7 scalar file/hash functions; streamed as chunked `OperatorResult::SqlChunk` envelopes over QUIC; multi-agent fan-out with operator-signed delegation (`OperatorAuthorization`); peers seal chunks **directly for the operator** (relay can drop but cannot forge); SELECT-only authorizer; per-operator rate limit; 16 KiB per-cell cap; SQLite progress-handler cancellation; `bowery peers add/list/remove` operator manifest. Every CRIT/HIGH/MEDIUM finding from [`SECURITY-AUDIT-PHASE9.md`](SECURITY-AUDIT-PHASE9.md) closed.
 - **Phase 10 (slices 1–3)** — persistent peer-connection pool (`bowery_whisper::pool::PeerConnections`): outbound connections cached per fingerprint, lazy + watcher-driven eviction, inbound handler runs on outbound-pooled connections so peers can stream back without their own listener. Whisper Q&A migrated to bidirectional QUIC streams (`request` / `accept_request` / `Reply`) so `ask()` shares the pooled socket with the inbound handler without racing it. Heartbeat + Q&A both reuse the pool; operator transport untouched.
 - **Operator console (`bowery-console`, phases C-1..C-6)** — ratatui workspace built on top of the `bowery-cli` library refactor. Eight panes: Query (SQL REPL), Alerts (live tail), Map (1-hop topology), Audit (snapshot), Peers (manifest), Doctor (local + remote readiness), Chat (Gemma 4 via llama.cpp, drafts SQL — press `x` to run), Help (in-pane operator handbook from [`docs/CONSOLE.md`](docs/CONSOLE.md)). Command palette (`:connect / :peers / :export / :quit`), input history persisted to `~/.bowery/console-history`. Model registry (`bowery model fetch`) gained Gemma-4-E2B-it with pinned SHA-256 verification.
+- **Operator-configurable monitoring** — a `[monitor]` config section defines file watches (userspace inotify; a change to a watched path always alerts) and operator process detections (`exe_prefix` / `comm` / `arg_substr`, layered onto the built-in analyzer rules). Both are queryable fleet-wide via the `bowery_monitor_rules` SQL view.
+- **YARA rule distribution** — `bowery exec yara --rules r.yar --target /tmp --fanout` ships an operator-signed rule to an agent, which stores it (content-addressed), scans the requested paths, alerts on matches, and propagates it across the mesh. Propagation is multi-hop, bounded by a TTL hop counter and a per-agent `(operator_fp, request_id)` seen-set so a cyclic peer graph converges instead of looping. Scanning is a build-time opt-in (`--features yara`, libyara); without it agents still store and forward rules. Stored rules are listed by the `bowery_yara_rules` SQL view.
 - **Remote deployment + mesh over Tailscale** — [`deploy/remote/`](deploy/remote/) is a turnkey installer (static musl agent + bundled CLI, hardened systemd unit) for nodes reached over a tailnet, and [`deploy/remote/MESH.md`](deploy/remote/MESH.md) is a step-by-step multi-node mesh bring-up so `bowery exec sql --fanout` relays a query across the fleet. Supporting pieces: `[whisper] advertise_addr` (bind the wildcard for boot robustness, gossip the routable `100.x`), the fan-out completion terminator (fan-out returns promptly instead of waiting out the timeout), the operator client binding the unspecified address (cross-host dials work, not just loopback), and two operator diagnostics — `bowery peers check` (dials each agent, reports reachability) and the `bowery_mesh_peers` SQL view (gossip-discovered peers vs. the pinned set).
 
 ## What's next

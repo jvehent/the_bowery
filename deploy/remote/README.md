@@ -36,6 +36,12 @@ live over the tailnet. `bowery doctor` on it will report BPF-LSM
   ```bash
   cargo install cross --git https://github.com/cross-rs/cross
   ```
+  `Cross.toml` at the repo root configures that build: it passes
+  `YARA_CRYPTO_LIB` into the container and installs clang there. Note
+  the agent's `yara` feature is **not** enabled for this target —
+  `yara-sys` ships no libyara bindings for `aarch64-unknown-linux-musl`.
+  Pi agents still store and propagate YARA rules; they just don't scan.
+  See the note at the top of `package-agent.sh`.
 
 ## Step 1 — get your operator public key (laptop)
 
@@ -150,12 +156,21 @@ root, but `fchown` isn't in `@system-service`. Both the current fleet
 unit and this kit's drop-in (`10-remote-node.conf`) re-allow the
 `@chown` family. If you're on an older unit without it, add the
 drop-in manually:
+The shipped drop-in carries three directives, not just `@chown` — the
+other two matter on a KRSI host (the eBPF load path calls `bpf(2)` and
+`perf_event_open(2)`, both in the denied `@privileged` group) and for
+`/proc` enrichment of other users' processes:
 ```bash
 sudo mkdir -p /etc/systemd/system/bowery-agent.service.d
-printf '[Service]\nSystemCallFilter=@chown\n' | \
-  sudo tee /etc/systemd/system/bowery-agent.service.d/10-remote-node.conf
+sudo tee /etc/systemd/system/bowery-agent.service.d/10-remote-node.conf <<'EOF'
+[Service]
+SystemCallFilter=@chown
+SystemCallFilter=bpf perf_event_open
+CapabilityBoundingSet=CAP_SYS_PTRACE
+EOF
 sudo systemctl daemon-reload && sudo systemctl restart bowery-agent
 ```
+(Or just install `deploy/remote/10-remote-node.conf` from the kit.)
 Every other sandbox control (ProtectSystem, NoNewPrivileges,
 RestrictAddressFamilies, MemoryDenyWriteExecute, capability bounding)
 stays in force. If a node still SIGSYS-dies on a *different* syscall,

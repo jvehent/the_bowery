@@ -1503,10 +1503,13 @@ Normalising at the BPF side rather than userspace means an attacker
 can't sneak past by appending whitespace to their argv.
 
 Capability-wise: `BpfLsmEngine` startup needs `CAP_BPF` +
-`CAP_SYS_ADMIN` and a kernel built with `CONFIG_BPF_LSM=y` and
+`CAP_MAC_ADMIN` (to attach the LSM program) and a kernel built with
+`CONFIG_BPF_LSM=y` and
 `bpf` listed in the boot cmdline's `lsm=` enumeration. `bowery
 doctor` flags any of those missing — the engine refuses to start
-otherwise rather than silently downgrading.
+otherwise rather than silently downgrading. Note the shipped systemd
+unit does NOT grant `CAP_MAC_ADMIN`; add it to
+`CapabilityBoundingSet` when enabling this engine.
 
 ### 16.4 The response_bpf module
 
@@ -1625,33 +1628,42 @@ everything else:
 # crates/bowery-ebpf/Cargo.toml
 [profile.dev]
 opt-level = 3
-debug = false
+debug = 2          # REQUIRED: bpf-linker derives .BTF from DWARF
 overflow-checks = false
 panic = "abort"
 
 [profile.release]
 opt-level = 3
-debug = false
+debug = 2          # REQUIRED: see above
 panic = "abort"
 codegen-units = 1
 lto = true
 ```
 
-`scripts/build-ebpf` cd's into the directory and runs:
+`scripts/build-ebpf` cd's into the directory and runs a plain:
 
 ```bash
-cargo +nightly build --release \
-    --target bpfel-unknown-none \
-    -Z build-std=core
+cargo build --release
 ```
 
-Three things that make it different from a normal Rust crate:
+There is deliberately no `+nightly` override: the crate pins its
+toolchain in `crates/bowery-ebpf/rust-toolchain.toml`
+(`channel = "nightly-2026-06-01"`), and the target plus `build-std`
+come from `crates/bowery-ebpf/.cargo/config.toml`.
+
+Four things make it different from a normal Rust crate:
 
 1. `bpfel-unknown-none` target — no std, no alloc, no OS.
 2. Nightly `-Z build-std=core` — we compile core for the BPF target
    from source (it's not pre-built).
 3. `bpf-linker` — the LLVM-backed linker that produces BPF bytecode.
-   Installed via `cargo install bpf-linker` during setup.
+   Installed via `cargo install bpf-linker` during setup. **Its LLVM
+   major version must match the pinned nightly's** (bpf-linker 0.10.4
+   ↔ LLVM 22); a floating nightly silently produces a BTF-less object.
+4. `-C link-arg=--btf` — bpf-linker only emits the object's `.BTF`
+   section when explicitly asked. Without BTF the agent's loader (aya
+   CO-RE + the LSM program) cannot use the object, so `build-ebpf`
+   verifies `.BTF` is present after the build and fails loudly if not.
 
 The output is a single ELF file at `target/bpfel-unknown-none/release/bowery-ebpf`
 that the userspace loader mmaps + parses with aya.
@@ -2107,7 +2119,7 @@ compromised relay key cannot grant SQL authority over peers.
 
 ### 22.5 Bonus tables (slice 8)
 
-Five agent-state-aware tables plumbed in via
+Seven agent-state-aware tables plumbed in via
 `Sql::with_extra_table(Arc<dyn BoweryTable>)`. They live under
 [`crates/bowery-agent/src/sql_tables.rs`](crates/bowery-agent/src/sql_tables.rs)
 because they hold `Arc`s to agent state (`KnownNeighbors`,
@@ -2122,6 +2134,10 @@ because they hold `Arc`s to agent state (`KnownNeighbors`,
   watch-channel. `pinned = 1` when a discovered peer is also in
   KnownNeighbors; querying it on agent A confirms A is discovering
   agent B. Added with the tailnet mesh deploy work.
+- `bowery_monitor_rules` — the operator's `[monitor]` file/process watch
+  rules, so "what is this agent watching?" is answerable over SQL.
+- `bowery_yara_rules` — YARA rules distributed to this agent, so "did my
+  rule reach every node?" is answerable with `--fanout`.
 - `bowery_baseline_binaries` — every SHA the baseline has seen.
 - `bowery_alerts` — alerts in the in-memory inbox.
 - `bowery_audit` — Phase-7 audit log entries (parsed JSONL).

@@ -32,14 +32,15 @@ multi-agent fan-out model.
   Windows; for now the table substrates assume `/proc`, `/sys`,
   netlink, and systemd D-Bus.
 - **Sprawling table catalogue.** Thirteen host-state tables are
-  in scope (§4) plus five Bowery-internal views. Others arrive
+  in scope (§4) plus seven Bowery-internal views. Others arrive
   when an operator workflow demands one.
 - **File integrity monitoring (FIM) / continuous file events.**
-  Continuous file change detection requires kernel hookup we
-  don't want to take on yet. Operators get point-in-time
-  scalar lookups via `bowery_file_*` and `bowery_sha256_hex`;
-  continuous file change detection stays a separate eBPF-fed
-  event stream (Phase 11).
+  Out of scope *for the SQL surface* — operators get point-in-time
+  scalar lookups here via `bowery_file_*` and `bowery_sha256_hex`.
+  (Operator-configured FIM has since shipped separately as
+  `[monitor] file_rules`, using userspace inotify rather than the
+  eBPF-fed stream originally sketched; the rules are visible here
+  through the `bowery_monitor_rules` view.)
 - **Operator-defined extensions.** Loadable third-party
   extensions are out of scope. New tables ship as code review
   against this repo.
@@ -58,10 +59,10 @@ bowery-tables                 new
     function. Split from bowery-sql so adding a new table
     doesn't touch SQL plumbing.
 
-bowery-stream                 new
-    Helper for producing chunked OperatorResult streams over a
-    BoweryConnection. Chunk = batch of N rows + an EOF marker.
-    Used by both the local-agent path and the relay path.
+bowery-stream                 NOT BUILT
+    Was scoped as a helper for chunked OperatorResult streams. In
+    the end the chunking lives in bowery-agent alongside the relay,
+    so no separate crate was warranted. See §12.
 ```
 
 The native engine is always wired; `bowery exec sql` is the
@@ -69,7 +70,7 @@ sole operator-facing entry point.
 
 ## 4. Tables
 
-The 13 host-state tables plus 5 Bowery-internal views, with
+The 13 host-state tables plus 7 Bowery-internal views, with
 implementation substrate per table.
 
 | Table | Substrate | Notes |
@@ -96,6 +97,8 @@ These ride along for free because the vtab interface is generic.
 They expose Bowery's own internal state.
 
 - `bowery_peers` — known_neighbors store: fingerprint, vk_b64, pinned_at, role_vector_hex.
+- `bowery_monitor_rules` — operator-configured file/process watches (`[monitor]` config).
+- `bowery_yara_rules` — YARA rules distributed to this agent (`bowery exec yara`).
 - `bowery_mesh_peers` — gossip-discovered peers (vs. the pinned `bowery_peers`): fingerprint_hex, whisper_addr, agent_version, pinned, has_role_vector, has_bloom_advert. Added with the Tailscale mesh deploy work.
 - `bowery_baseline_binaries` — baseline DB rows: sha256, first_seen, last_seen, seen_count.
 - `bowery_alerts` — alert inbox: episode_id, suspicion, exe_path, ts.
@@ -464,8 +467,9 @@ through CI; no slice leaves the agent broken.
 - `bowery peers add/list/remove` for operator-side peer
   manifest.
 - `--format=table` table renderer.
-- Bonus tables: `bowery_peers`, `bowery_mesh_peers`,
-  `bowery_baseline_binaries`, `bowery_alerts`, `bowery_audit` —
+- Bonus tables: `bowery_peers`, `bowery_mesh_peers`, `bowery_monitor_rules`,
+  `bowery_yara_rules`, `bowery_baseline_binaries`, `bowery_alerts`,
+  `bowery_audit` —
   Bowery-internal state no third-party SQL surface can reach.
 - `bowery doctor` learns to run a smoke query (`SELECT 1`) so
   operators can verify the SQL surface is alive.

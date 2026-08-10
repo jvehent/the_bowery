@@ -182,8 +182,8 @@ enum ExecCommand {
         /// Phase-9 slice 7: when set, the dialled agent acts as a
         /// **relay** and dispatches the query to its pinned peers
         /// in parallel. Rows from each agent are tagged with the
-        /// agent's fingerprint (extra `_agent_fp` column in
-        /// output). Without this flag, only the directly-dialled
+        /// agent's name and fingerprint (extra `_agent_name` and
+        /// `_agent_fp` columns in output). Without this flag, only the directly-dialled
         /// agent runs the query.
         ///
         /// Phase-9 final-1: with fanout=true, each peer seals its

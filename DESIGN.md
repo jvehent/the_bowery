@@ -457,8 +457,9 @@ Failure modes covered by tests:
 `bowery exec sql` runs against the native, in-process SQL
 engine: `bowery-sql` (rusqlite + a SELECT-only authorizer) fed
 by `bowery-tables` (13 default procfs/sysfs/etc-backed tables +
-4 Bowery-internal views — peers, baseline binaries, alerts,
-audit — + 7 scalar file/hash functions). Streams chunked
+7 Bowery-internal views — peers, mesh peers, monitor rules, yara
+rules, baseline binaries, alerts, audit — + 7 scalar file/hash
+functions). Streams chunked
 `OperatorResult::SqlChunk` envelopes over QUIC. Multi-agent
 fan-out uses operator-signed delegation: the original
 operator's Ed25519 signature on an `OperatorAuthorization`
@@ -474,9 +475,9 @@ design + slice plan.
 ## 11. Build, packaging, deployment
 
 - `cargo build --release` builds agent and CLI.
-- eBPF crate compiled for `bpfel-unknown-none`, embedded as a static byte slice in the loader binary.
+- eBPF crate compiled for `bpfel-unknown-none`, installed at `/usr/local/lib/bowery/bowery-ebpf` and loaded at runtime after an integrity check.
 - Distribution: `.deb` via `cargo-deb`, `.rpm` via `cargo-generate-rpm`. Static musl build for the CLI.
-- Systemd unit with `CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_NET_ADMIN`, `NoNewPrivileges=yes`, `ProtectSystem=strict`, dedicated `bowery.slice`.
+- Systemd unit with `CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_KILL CAP_SYS_PTRACE` (no `CAP_SYS_ADMIN`, no ambient caps), `NoNewPrivileges=yes`, `ProtectSystem=strict`, dedicated `bowery.slice`.
 - Reproducible builds. Release binaries signed with a separate release key.
 - Model manifest server hosts signed `manifest.json` per model:
 
@@ -521,7 +522,7 @@ For v0.1 the mirror may proxy HuggingFace; the manifest signature is what the ag
 | **8. Hardening** | Fuzzing, adversarial tests, key rotation, neighbor add/remove protocol | (all) |
 | **9. Native SQL surface** | Pure-Rust SQL engine + table set, streaming wire, multi-agent fan-out with operator-signed delegation, scalar file/hash funcs, operator peer manifest CLI, security audit closure | `bowery-sql`, `bowery-tables` |
 
-Phases 0–9 shipped. Estimated 5–6 months for one engineer to defensible v0.1.
+Phases 0–10 shipped, plus the operator console (C-1..C-6), operator-configurable monitoring, and YARA rule distribution. Estimated 5–6 months for one engineer to defensible v0.1.
 
 ---
 

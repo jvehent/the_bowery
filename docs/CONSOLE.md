@@ -502,6 +502,16 @@ Either the binary wasn't built with `--features llm-llama-cpp`, or
 the GGUF at `--chat-model` doesn't exist. Check `bowery model list`
 and `bowery model fetch gemma-4-e2b-it-q4_k_m`.
 
+### Where did my stderr go?
+
+While the TUI owns the screen the console points `stderr` at
+`~/.bowery/console.log`. Anything a dependency writes directly to the
+terminal (llama.cpp/ggml log from C, panic backtraces) would otherwise
+punch straight through the ratatui frame and shred the layout. The path
+is printed on exit if anything was actually written, and the redirect is
+skipped when stderr isn't a terminal, so `bowery-console 2>err.txt` and
+CI runs behave as you'd expect.
+
 ### Doctor pane crashes
 
 Should be fixed in current main. If it ever recurs, `RUST_LOG=debug`

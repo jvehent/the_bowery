@@ -1,13 +1,16 @@
 # Installing The Bowery
 
-> **Status:** Phase 0 → 6a complete (kernel events, baseline, analyzer,
-> LLM, whisper Q&A, operator alert inbox + tail CLI). The agent runs,
-> observes process exec / exit and outgoing TCP connects via eBPF,
-> pins peers over QUIC mTLS, gossips role vectors, asks similar peers
-> for corroboration on suspicious episodes, and surfaces high-suspicion
-> verdicts to roaming operators via a signed `Subscribe` flow. Phase 7
-> (response engine — kill / block) is open; the agent is observe-only
-> today.
+> **Status:** Phase 0 → 10 complete, plus the operator console,
+> operator-configurable monitoring (`[monitor]`), and YARA rule
+> distribution. The agent observes process exec / exit and outgoing TCP
+> connects via eBPF, pins peers over QUIC mTLS, gossips role vectors,
+> corroborates suspicious episodes with similar peers, answers operator
+> SQL (with mesh fan-out), watches operator-specified files, runs
+> distributed YARA rules, and surfaces alerts to roaming operators over
+> a signed `Subscribe` flow. A response engine exists (`block_exec` /
+> `kill_process`); enforcement is opt-in and off by default —
+> `[response] engine = "noop"` ships as the default, so an agent is
+> observe-only until you turn it on.
 
 ---
 
@@ -121,7 +124,7 @@ Run the test suite:
 cargo test --workspace
 ```
 
-~170 tests should pass. The most informative end-to-end tests are:
+~330 tests should pass. The most informative end-to-end tests are:
 - `two_agents_discover_pin_and_heartbeat` — chitchat + TOFU pinning +
   QUIC mTLS + signed envelopes
 - `high_suspicion_exec_triggers_whisper_round_and_aggregates_beta_sighting`
@@ -392,7 +395,7 @@ temperature = 0.2
 # Phase 6a — operator I/O
 [operators]
 # Base64 of each authorised operator's 32-byte verifying key. Get the
-# value from `bowery key generate --out …` or `bowery key fingerprint`.
+# value from `bowery key generate --out …` or `bowery key info`.
 pubkeys_b64 = [
     "8KChxFSe2t0i91xtXDj7swk0QYL1cOCXGea3cx5kaqQ=",
 ]
@@ -558,9 +561,10 @@ bowery exec sql \
 Available tables: `processes`, `mounts`, `kernel_modules`,
 `interfaces`, `listening_ports`, `process_open_sockets`,
 `users`, `logged_in_users`, `last`, `systemd_units`, `crontab`,
-`os_version`, `system_info`, plus five Bowery-internal views
-(`bowery_peers`, `bowery_mesh_peers`, `bowery_baseline_binaries`,
-`bowery_alerts`, `bowery_audit`). Plus seven scalar functions for per-path file
+`os_version`, `system_info`, plus seven Bowery-internal views
+(`bowery_peers`, `bowery_mesh_peers`, `bowery_monitor_rules`,
+`bowery_yara_rules`, `bowery_baseline_binaries`, `bowery_alerts`,
+`bowery_audit`). Plus seven scalar functions for per-path file
 inspection: `bowery_file_exists`, `_size`, `_mode`,
 `_mtime_unix`, `_owner_uid`, `_owner_gid`, `_sha256_hex`.
 
@@ -867,21 +871,22 @@ sudo systemctl daemon-reload
 
 ## 10. What's not yet shipping
 
-Today's binary covers Phase 0 → 6a. **Not** wired up yet (per
-[DESIGN.md §13](DESIGN.md#13-phased-delivery)):
+Phases 0 → 10 are in tree (see [README](README.md#whats-implemented)).
+Known gaps, smallest first:
 
-- **Phase 6b** — operator-issued `OperatorCommand` (e.g. `bowery
-  query 'select * from processes ...'`, `bowery action kill-process
-  ...`). The wire format placeholders exist; the agent's command
-  handler doesn't. OSQuery subprocess integration is in this phase.
-- **Phase 7** — response engine. The agent is observe-only today.
-  When this lands, BPF-LSM hooks will gate `kill_process`,
-  `block_open`, `block_connect`, etc. under standing authorisations
-  recorded in `/etc/bowery/policy.yaml`.
-- **Phase 8** — fuzzing, key rotation ceremony, neighbor add/remove
-  signing, Sybil-resistance hardening, multi-OS.
-
-The whisper context built in Phase 5 (`AgentEvent::WhisperContextReady`)
-is observable via the broadcast channel but not yet fed into the LLM's
-`AnalysisContext.extra` — that's a small follow-up commit, deliberately
-staged separately so the protocol + observability hook landed first.
+- **YARA scanning on the Raspberry Pis.** Rules still distribute and
+  persist there, but `yara-sys` ships no pre-generated libyara bindings
+  for `aarch64-unknown-linux-musl`, so the cross-build can't enable the
+  engine — those agents report `engine not compiled in`. Build natively
+  on the Pi if you need scanning (see `deploy/remote/package-agent.sh`).
+- **Enforcement caveats.** `block_exec` matches on `task->comm`, which
+  an attacker controls, and `kill_process` has a PID-reuse window
+  between the `/proc` check and the signal. Both are documented
+  follow-ups (inode-keyed blocking, `pidfd`).
+- **Mesh trust bootstrap.** Peers are pinned trust-on-first-use during
+  the bootstrap window and there is no revocation path; an
+  operator-signed enrollment + un-pin protocol is still open.
+- **F-7 / F-17** — fan-out EOF accounting (so an operator can prove
+  every expected peer reported) and per-peer relay log rate-limiting.
+- **Phase 11+** — key rotation ceremony, Sybil resistance at fleet
+  scale, multi-OS.
