@@ -87,6 +87,10 @@ fn build_config(
         response: ResponseConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
         monitor: MonitorConfig::default(),
+        eventlog: bowery_agent::config::EventLogConfig {
+            enabled: false,
+            ..Default::default()
+        },
         yara: YaraConfig {
             path: dir.join("yara"),
             ..YaraConfig::default()

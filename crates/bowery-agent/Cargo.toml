@@ -40,6 +40,7 @@ bowery-baseline = { workspace = true }
 bowery-crypto = { workspace = true }
 bowery-ebpf-loader = { workspace = true }
 bowery-events = { workspace = true }
+bowery-eventlog = { workspace = true }
 bowery-llm = { workspace = true }
 bowery-mesh = { workspace = true }
 bowery-proto = { workspace = true }
@@ -74,6 +75,9 @@ tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 bowery-analysis = { workspace = true }
 bowery-llm = { workspace = true }
+bowery-sql = { workspace = true }
+bowery-tables = { workspace = true }
+rusqlite = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }

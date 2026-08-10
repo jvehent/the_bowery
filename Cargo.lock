@@ -275,6 +275,7 @@ dependencies = [
  "bowery-baseline",
  "bowery-crypto",
  "bowery-ebpf-loader",
+ "bowery-eventlog",
  "bowery-events",
  "bowery-llm",
  "bowery-mesh",
@@ -403,6 +404,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "bowery-eventlog"
+version = "0.0.1"
+dependencies = [
+ "bowery-events",
+ "rusqlite",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

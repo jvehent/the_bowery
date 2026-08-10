@@ -107,6 +107,17 @@ They expose Bowery's own internal state.
   round ran for the episode, which is what distinguishes "never asked"
   from "asked and not confirmed".
 - `bowery_audit` — last N audit envelopes: seq, action, outcome, recorded_at.
+- `bowery_events` — the append-only local history: one row per observed
+  host event (`exec`, `exit`, `connect`, `file_open`, `file_change`) in
+  append order. Unlike every other table here it is **not materialised**:
+  the event log is already a `SQLite` file, so it is `ATTACH`ed read-only
+  and exposed as a TEMP view, and queries run against its own indexes.
+  (A view in `main` may not reference an attached database; `temp` is the
+  documented exemption.)
+- `bowery_eventlog_status` — is this host actually recording? `recording`,
+  `queryable`, `rows`, `dropped`, and the oldest/newest timestamps. An
+  empty `bowery_events` is ambiguous — quiet host, or blind host — and
+  this is what disambiguates it, fleet-wide under `--fanout`.
 
 These are what makes the surface worth building — operator
 queries that join host state with the agent's own observation

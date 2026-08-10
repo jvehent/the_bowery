@@ -9,6 +9,7 @@
 pub mod agent;
 mod bloom_publisher;
 pub mod config;
+mod eventlog_writer;
 pub mod inbox;
 pub mod monitor;
 pub mod response_bpf;

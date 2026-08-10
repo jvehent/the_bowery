@@ -376,6 +376,23 @@ interval = "30s"
 [baseline]
 path = "/var/lib/bowery/baseline.db"
 
+# Append-only local history — what the SQL surface queries to answer
+# "what happened on this host between 14:20 and 14:40?".
+[eventlog]
+enabled  = true
+path     = "/var/lib/bowery/events.db"
+retention = "7d"            # age bound; "0s" disables
+max_rows = 500_000          # hard ceiling, oldest-first (~100 MB at
+                            # ~200 B/row). This is the bound that
+                            # actually protects a small disk — an exec
+                            # storm can write more in an hour than a
+                            # quiet week. On an SD-card-backed Pi,
+                            # consider lowering it.
+maintenance_interval = "5m" # retention + WAL checkpoint cadence
+queue_capacity = 4096       # in-flight buffer; when full, events are
+                            # DROPPED rather than stalling the pipeline,
+                            # and counted in bowery_eventlog_status
+
 [role]
 publish_interval = "60s"
 
@@ -567,7 +584,8 @@ Available tables: `processes`, `mounts`, `kernel_modules`,
 `os_version`, `system_info`, plus seven Bowery-internal views
 (`bowery_peers`, `bowery_mesh_peers`, `bowery_monitor_rules`,
 `bowery_yara_rules`, `bowery_baseline_binaries`, `bowery_alerts`,
-`bowery_audit`). Plus seven scalar functions for per-path file
+`bowery_audit`, `bowery_events`, `bowery_eventlog_status`). Plus
+seven scalar functions for per-path file
 inspection: `bowery_file_exists`, `_size`, `_mode`,
 `_mtime_unix`, `_owner_uid`, `_owner_gid`, `_sha256_hex`.
 

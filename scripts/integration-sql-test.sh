@@ -70,6 +70,15 @@ listen_addr = "127.0.0.1:$MESH_PORT"
 bind_addr = "127.0.0.1:$WHISPER_PORT"
 [baseline]
 path = ":memory:"
+
+# Append-only history. A real file (not :memory:) because the SQL
+# surface attaches it read-only — an in-memory log records but no query
+# connection can reach it, which is exactly what the queryable column
+# reports.
+[eventlog]
+path = "$TEST_DIR/state/events.db"
+maintenance_interval = "1h"
+
 [operators]
 pubkeys_b64 = ["$OP_PUBKEY"]
 
@@ -197,6 +206,22 @@ echo "$OUT" | grep -q "netcat-exec" || {
     exit 1
 }
 
+echo "==> event log: the agent's own exec is recorded and queryable"
+# The agent execs nothing by itself, but the file rule below fires a
+# file_change we can look for. First prove the views register.
+OUT=$(run_sql 'SELECT recording, queryable FROM bowery_eventlog_status')
+echo "$OUT"
+[[ "$(echo "$OUT" | sed -n 2p)" == "1	1" ]] || {
+    echo "FAIL: event log should be recording AND queryable; got: $OUT" >&2
+    exit 1
+}
+OUT=$(run_sql 'SELECT COUNT(*) AS n FROM bowery_events')
+echo "$OUT"
+[[ "$(echo "$OUT" | head -1)" == "n" ]] || {
+    echo "FAIL: expected header 'n' from bowery_events" >&2
+    exit 1
+}
+
 echo "==> exercise bowery_yara_rules view (registers + queryable)"
 # No rules pushed in this test, so the view is empty — but it must
 # register and be queryable (a broken register() fails every query).
@@ -221,6 +246,31 @@ done
     exit 1
 }
 echo "watched-file alert observed"
+
+echo "==> event log: that same change is queryable as history"
+# The real end-to-end path: inotify -> pipeline -> bounded writer ->
+# SQLite -> read-only ATTACH behind the SQL surface. Poll, because the
+# writer batches asynchronously.
+RECORDED=0
+for _ in $(seq 1 20); do
+    N=$(run_sql "SELECT COUNT(*) AS n FROM bowery_events WHERE kind = 'file_change' AND path = '$TEST_DIR/watched.conf'" | awk 'NR==2')
+    if [[ "${N:-0}" -ge 1 ]]; then RECORDED=1; break; fi
+    sleep 0.5
+done
+[[ "$RECORDED" == "1" ]] || {
+    echo "FAIL: the file change never landed in bowery_events" >&2
+    run_sql 'SELECT recording, queryable, rows, dropped FROM bowery_eventlog_status' >&2 || true
+    exit 1
+}
+echo "file_change recorded in bowery_events"
+
+# Nothing should have been shed at this trivial event rate; a non-zero
+# count here means the writer is failing to keep up with ~10 events.
+DROPPED=$(run_sql 'SELECT dropped FROM bowery_eventlog_status' | awk 'NR==2')
+[[ "${DROPPED:-0}" == "0" ]] || {
+    echo "FAIL: event log dropped $DROPPED events at idle rate" >&2
+    exit 1
+}
 
 echo "==> fan-out with no peers returns local row promptly (terminator, not a 12s hang)"
 START=$(date +%s)

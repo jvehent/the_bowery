@@ -1260,6 +1260,53 @@ authorization or k-of-n quorum, but the response engine never receives
 a `WhisperContext`. This work makes the signal available and
 operator-visible first.
 
+### 13.7 Append-only event log
+
+[`crates/bowery-eventlog`](crates/bowery-eventlog/src/lib.rs) +
+[`eventlog_writer.rs`](crates/bowery-agent/src/eventlog_writer.rs).
+
+The baseline stores *aggregates* — how many times a sha has been seen,
+which parent spawned which child — which answers "is this normal here?"
+but folds away the individual observations, so it cannot reconstruct a
+timeline. The event log keeps the observations.
+
+**Ordering: record first, analyse second.** `process_event` writes to the
+log before dispatching to the analyzer, because the value of a history is
+that it contains the things nobody thought were interesting at the time.
+It is also the only retention for `ProcessExit` / `NetworkConnect` /
+`FileOpen`, which have no scoring path and were previously produced by
+the eBPF loader and dropped.
+
+**Never block detection.** The handle is a bounded channel written with
+`try_send`. A full queue *drops* — an fsync stall must not become a
+detection stall — but every drop is counted and surfaced via
+`bowery_eventlog_status.dropped`, because a silent gap looks exactly like
+a quiet host. Writes are batched with `recv_many`: a quiet host commits
+one row at a time, a busy one amortises the transaction across hundreds,
+with no timer to tune.
+
+**Retention** applies both an age bound and a hard row ceiling, whichever
+bites first. The row ceiling is the one that protects a small disk — age
+alone is unbounded, since an exec storm can write more in an hour than a
+quiet week. Trimming is by `seq`, not timestamp: `seq` is the true append
+order, and a backwards clock step (NTP, a VM resuming) would make a
+timestamp-ordered trim delete the wrong rows.
+
+**Query path.** Unlike every other Bowery table, `bowery_events` is not
+materialised. `BoweryTable::register` runs *before* the SELECT-only
+authorizer is installed, so it `ATTACH`es the log file `mode=ro` and
+creates a TEMP view over it — queries then use the log's own indexes and
+registration is O(1) rather than O(rows). Two SQLite constraints shape
+this: a view in `main` may not reference an attached database (`temp` is
+the exemption), and the read-only attach is what enforces immutability at
+registration time, before the authorizer exists.
+
+Checkpointing is about bounding WAL growth, **not** visibility: a
+read-only attach does see un-checkpointed rows, because reader and writer
+share the `-shm` index. `crates/bowery-eventlog/tests/attach_probe.rs`
+pins that, since the opposite would silently turn the maintenance
+interval into a query-lag window.
+
 ### 13.6 Bloom advert publisher
 
 [`crates/bowery-agent/src/bloom_publisher.rs`](crates/bowery-agent/src/bloom_publisher.rs).

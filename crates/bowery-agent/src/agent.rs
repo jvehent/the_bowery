@@ -25,6 +25,7 @@ use bowery_response::{
 };
 
 use crate::config::ResponseEngineKind;
+use crate::eventlog_writer::EventLogHandle;
 use bowery_whisper::fingerprint::{TIER1_LEN, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
 use bowery_whisper::pool::PeerConnections;
@@ -188,6 +189,8 @@ pub struct Agent {
     accept_task: JoinHandle<()>,
     heartbeat_task: JoinHandle<()>,
     pipeline_task: JoinHandle<()>,
+    /// `None` when the event log is disabled or failed to open.
+    eventlog_tasks: Option<(JoinHandle<()>, JoinHandle<()>)>,
     /// `None` when no file rules are configured (or inotify is unavailable).
     file_monitor_task: Option<JoinHandle<()>>,
     role_publisher_task: JoinHandle<()>,
@@ -445,6 +448,42 @@ impl Agent {
         // configured ProcessesTable (with optional cmdline) for
         // the default-default-cmdline-off instance, and apply the
         // configured concurrency cap.
+        // Append-only local history. A failure to open it is logged and
+        // degrades to "not recording" rather than refusing to start: an
+        // agent that still detects and alerts is worth far more than one
+        // that refuses to boot because a disk is full.
+        let (eventlog, eventlog_tasks) = if config.eventlog.enabled {
+            match open_event_log(&config.eventlog) {
+                Ok(log) => {
+                    let log = Arc::new(log);
+                    let (handle, writer, maintenance) = crate::eventlog_writer::spawn(
+                        log.clone(),
+                        config.eventlog.queue_capacity,
+                        bowery_eventlog::Retention {
+                            max_age_secs: config.eventlog.retention.as_secs(),
+                            max_rows: config.eventlog.max_rows,
+                        },
+                        config.eventlog.maintenance_interval,
+                        shutdown_rx.clone(),
+                    );
+                    info!(path = %log.path().display(), "event log recording");
+                    (Some((handle, log)), Some((writer, maintenance)))
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %config.eventlog.path.display(),
+                        "event log unavailable; continuing without local history"
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+        let eventlog_handle = eventlog.as_ref().map(|(h, _)| h.clone());
+        let eventlog_store = eventlog.map(|(_, log)| log);
+
         let sql_engine = bowery_sql::Sql::new()
             .with_concurrency_cap(config.sql.max_concurrent_queries)
             .override_default_table("processes")
@@ -472,6 +511,15 @@ impl Agent {
             )))
             .with_extra_table(Arc::new(crate::sql_tables::BoweryYaraRulesTable::new(
                 yara_store.clone(),
+            )))
+            .with_extra_table(Arc::new(crate::sql_tables::BoweryEventsTable::new(
+                eventlog_store.clone(),
+            )))
+            .with_extra_table(Arc::new(crate::sql_tables::BoweryEventLogStatusTable::new(
+                eventlog_store.clone(),
+                eventlog_handle
+                    .as_ref()
+                    .map(EventLogHandle::dropped_counter),
             )));
         let op_router = Arc::new(OperatorCommandRouter {
             sql: Some(Arc::new(sql_engine)),
@@ -634,6 +682,7 @@ impl Agent {
             config.alerts.threshold,
             llm.name().to_string(),
             events_tx.clone(),
+            eventlog_handle.clone(),
             shutdown_rx.clone(),
         );
 
@@ -676,6 +725,7 @@ impl Agent {
             accept_task,
             heartbeat_task,
             pipeline_task,
+            eventlog_tasks,
             file_monitor_task,
             role_publisher_task,
             bloom_publisher_task,
@@ -737,6 +787,12 @@ impl Agent {
         let _ = self.accept_task.await;
         let _ = self.heartbeat_task.await;
         let _ = self.pipeline_task.await;
+        // The writer exits when the pipeline drops the last handle, so
+        // it must be joined after the pipeline, not alongside it.
+        if let Some((writer, maintenance)) = self.eventlog_tasks.take() {
+            let _ = writer.await;
+            let _ = maintenance.await;
+        }
         if let Some(task) = self.file_monitor_task.take() {
             let _ = task.await;
         }
@@ -2670,6 +2726,7 @@ fn spawn_pipeline_task(
     alert_threshold: f32,
     backend_label: String,
     events_tx: broadcast::Sender<AgentEvent>,
+    eventlog: Option<EventLogHandle>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -2700,6 +2757,7 @@ fn spawn_pipeline_task(
                         alert_threshold,
                         &backend_label,
                         &events_tx,
+                        eventlog.as_ref(),
                         event,
                     ).await;
                 }
@@ -2720,6 +2778,7 @@ fn spawn_pipeline_task(
                                 alert_threshold,
                                 &backend_label,
                                 &events_tx,
+                                eventlog.as_ref(),
                                 event,
                             ).await;
                         }
@@ -2746,11 +2805,22 @@ async fn process_event(
     alert_threshold: f32,
     backend_label: &str,
     events_tx: &broadcast::Sender<AgentEvent>,
+    eventlog: Option<&EventLogHandle>,
     event: Event,
 ) {
+    // Record first, analyse second. Every event goes to the log
+    // regardless of whether anything downstream scores it — the whole
+    // value of a history is that it contains the things nobody thought
+    // were interesting at the time. This is also the only consumer of
+    // ProcessExit / NetworkConnect / FileOpen, which the analyzer
+    // pipeline still has no scoring path for.
+    if let Some(log) = eventlog {
+        log.record(event.clone());
+    }
+
     // ProcessExec drives the full analyzer pipeline; FileChange is the
-    // operator-configured file-integrity signal. Other variants are still
-    // silently consumed until later phases wire in network/exit handlers.
+    // operator-configured file-integrity signal. The rest are recorded
+    // above and carry no scoring path yet.
     match event {
         Event::ProcessExec(exec) => {
             process_exec(
@@ -2780,6 +2850,10 @@ async fn process_event(
             )
             .await;
         }
+        // Recorded above; no analyzer path yet. Network connections in
+        // particular are now queryable history even though nothing scores
+        // them — which is what makes retrospective hunting possible
+        // before the detection content exists.
         Event::ProcessExit(_) | Event::FileOpen(_) | Event::NetworkConnect(_) => {}
     }
 }
@@ -3251,6 +3325,19 @@ async fn publish_role_vector(
     }
     debug!(binary_count, "published role vector");
     let _ = events_tx.send(AgentEvent::RoleVectorPublished { binary_count });
+}
+
+/// Open the configured event log, honouring the `:memory:` sentinel the
+/// baseline path uses so tests and ephemeral agents behave the same way
+/// across both stores.
+fn open_event_log(
+    cfg: &crate::config::EventLogConfig,
+) -> Result<bowery_eventlog::EventLog, bowery_eventlog::Error> {
+    if cfg.path.as_os_str() == ":memory:" {
+        bowery_eventlog::EventLog::open_in_memory()
+    } else {
+        bowery_eventlog::EventLog::open(&cfg.path)
+    }
 }
 
 #[cfg(test)]

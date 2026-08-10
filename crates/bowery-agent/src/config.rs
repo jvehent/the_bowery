@@ -64,6 +64,8 @@ pub struct Config {
     pub monitor: MonitorConfig,
     #[serde(default)]
     pub yara: YaraConfig,
+    #[serde(default)]
+    pub eventlog: EventLogConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +269,92 @@ pub struct BaselineConfig {
     /// Path to the `SQLite` baseline database. The literal string `:memory:`
     /// keeps the baseline in RAM (useful for tests and ephemeral agents).
     pub path: PathBuf,
+}
+
+/// `[eventlog]` — the append-only local history the SQL surface queries.
+///
+/// On by default: an event log that ships disabled records nothing on
+/// the day you need it, and the whole point is that history exists
+/// *before* the investigation starts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventLogConfig {
+    /// Record events at all. Turning this off keeps the SQL views
+    /// registered (queries return zero rows) rather than making them
+    /// vanish, so a query written against a recording host doesn't
+    /// error out against a non-recording one.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Path to the `SQLite` event log. `:memory:` keeps it in RAM.
+    #[serde(default = "default_eventlog_path")]
+    pub path: PathBuf,
+    /// Drop rows older than this. `0s` disables the age bound.
+    #[serde(with = "humantime_serde", default = "default_eventlog_retention")]
+    pub retention: Duration,
+    /// Hard row ceiling, oldest-first. This is the bound that actually
+    /// protects a small disk — age alone is unbounded in the bad case,
+    /// since an exec storm can write more in an hour than a quiet week.
+    ///
+    /// At roughly 200 bytes/row, the 500k default is ~100 MB. Raise it
+    /// on a server; on an SD-card-backed Pi, consider lowering it (and
+    /// note that sustained recording is write wear regardless).
+    #[serde(default = "default_eventlog_max_rows")]
+    pub max_rows: u64,
+    /// How often retention + WAL checkpointing run.
+    ///
+    /// This is not a query-lag window: the SQL surface reads
+    /// un-checkpointed rows too, so events are queryable within
+    /// milliseconds of being written. The interval only governs how
+    /// promptly retention reclaims space and how large the WAL is
+    /// allowed to grow.
+    #[serde(with = "humantime_serde", default = "default_eventlog_maintenance")]
+    pub maintenance_interval: Duration,
+    /// In-flight buffer between the event pipeline and the disk writer.
+    ///
+    /// When full, events are *dropped* rather than blocking the
+    /// pipeline — a stalled sensor is worse than a gap, and the drop
+    /// count is exposed via `bowery_eventlog_status` so the gap is
+    /// never silent.
+    #[serde(default = "default_eventlog_queue")]
+    pub queue_capacity: usize,
+}
+
+impl Default for EventLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: default_eventlog_path(),
+            retention: default_eventlog_retention(),
+            max_rows: default_eventlog_max_rows(),
+            maintenance_interval: default_eventlog_maintenance(),
+            queue_capacity: default_eventlog_queue(),
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+fn default_eventlog_path() -> PathBuf {
+    PathBuf::from("/var/lib/bowery/events.db")
+}
+
+const fn default_eventlog_retention() -> Duration {
+    // `from_days` is not const-stable yet; hours is.
+    Duration::from_hours(7 * 24)
+}
+
+const fn default_eventlog_max_rows() -> u64 {
+    500_000
+}
+
+const fn default_eventlog_maintenance() -> Duration {
+    Duration::from_mins(5)
+}
+
+const fn default_eventlog_queue() -> usize {
+    4096
 }
 
 impl Default for BaselineConfig {

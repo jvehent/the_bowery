@@ -80,6 +80,12 @@ fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: St
         sql: bowery_agent::config::SqlConfig::default(),
         monitor: bowery_agent::config::MonitorConfig::default(),
         yara: bowery_agent::config::YaraConfig::default(),
+        // Disabled: these fixtures predate the event log and don't
+        // need a writer task (the default path isn't writable in CI).
+        eventlog: bowery_agent::config::EventLogConfig {
+            enabled: false,
+            ..Default::default()
+        },
     }
 }
 
@@ -436,6 +442,12 @@ async fn fanout_streams_rows_from_relay_and_peer() {
         sql: bowery_agent::config::SqlConfig::default(),
         monitor: bowery_agent::config::MonitorConfig::default(),
         yara: bowery_agent::config::YaraConfig::default(),
+        // Disabled: these fixtures predate the event log and don't
+        // need a writer task (the default path isn't writable in CI).
+        eventlog: bowery_agent::config::EventLogConfig {
+            enabled: false,
+            ..Default::default()
+        },
     };
     let cfg_beta = Config {
         identity: IdentityConfig {
@@ -477,6 +489,12 @@ async fn fanout_streams_rows_from_relay_and_peer() {
         sql: bowery_agent::config::SqlConfig::default(),
         monitor: bowery_agent::config::MonitorConfig::default(),
         yara: bowery_agent::config::YaraConfig::default(),
+        // Disabled: these fixtures predate the event log and don't
+        // need a writer task (the default path isn't writable in CI).
+        eventlog: bowery_agent::config::EventLogConfig {
+            enabled: false,
+            ..Default::default()
+        },
     };
 
     let agent_alpha = Agent::start(cfg_alpha, id_alpha.clone(), Box::new(NoopEventSource))

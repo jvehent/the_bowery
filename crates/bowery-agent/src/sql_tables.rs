@@ -24,6 +24,7 @@ use bowery_tables::{BoweryTable, TableError};
 use bowery_whisper::known_neighbors::KnownNeighbors;
 use rusqlite::{Connection, params};
 use tokio::sync::watch;
+use tracing::warn;
 
 use crate::inbox::AlertInbox;
 use crate::monitor::{MonitorRules, file_op_label, severity_label};
@@ -535,4 +536,207 @@ fn hex_lower(bytes: &[u8]) -> String {
 fn unix_secs(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+// ---------------------------------------------------------------------------
+// bowery_events — the append-only local history.
+// ---------------------------------------------------------------------------
+
+/// `bowery_events` — one row per observed host event, in append order.
+///
+/// This is the table that turns "an alert fired at 14:32" into "here is
+/// what the host was doing at 14:32", and it is the only place
+/// `ProcessExit` / `NetworkConnect` / `FileOpen` are retained at all —
+/// the analyzer has no scoring path for them, so before this they were
+/// collected by the eBPF loader and discarded.
+///
+/// Unlike every other table here, this one does **not** copy its rows
+/// into the query connection. The event log is already a `SQLite` file,
+/// so it is `ATTACH`ed read-only and exposed as a view: queries run
+/// against its real indexes, and a multi-million-row history costs
+/// nothing to register. Materialising it the way `bowery_peers` does
+/// would mean copying the entire log on every query.
+///
+/// The attach is read-only (`mode=ro`) as defence in depth. The
+/// SELECT-only authorizer already rejects writes at query time, but
+/// `register` runs *before* that authorizer is installed, so the file
+/// itself is what enforces it here.
+#[derive(Debug)]
+pub struct BoweryEventsTable {
+    log: Option<Arc<bowery_eventlog::EventLog>>,
+}
+
+/// Columns mirrored from the event log's own schema, so the view is a
+/// straight passthrough and the two can't drift into different names.
+const EVENTS_COLUMNS: &str = "seq, ts_unix_ms, kind, pid, ppid, uid, comm, exe_path, args, \
+                              exit_code, net_family, dst_addr, dst_port, path, file_op, open_flags";
+
+const EVENTS_EMPTY_DDL: &str = "CREATE TABLE IF NOT EXISTS bowery_events (
+    seq          INTEGER,
+    ts_unix_ms   INTEGER,
+    kind         TEXT,
+    pid          INTEGER,
+    ppid         INTEGER,
+    uid          INTEGER,
+    comm         TEXT,
+    exe_path     TEXT,
+    args         TEXT,
+    exit_code    INTEGER,
+    net_family   TEXT,
+    dst_addr     TEXT,
+    dst_port     INTEGER,
+    path         TEXT,
+    file_op      TEXT,
+    open_flags   INTEGER
+);";
+
+impl BoweryEventsTable {
+    pub fn new(log: Option<Arc<bowery_eventlog::EventLog>>) -> Self {
+        Self { log }
+    }
+
+    /// Path to attach, or `None` when there is nothing attachable.
+    ///
+    /// An in-memory log belongs to another connection and cannot be
+    /// reached from here; that is a real limitation of `path =
+    /// ":memory:"`, and `bowery_eventlog_status.queryable` reports it
+    /// rather than leaving an operator to wonder why history is empty.
+    fn attachable_path(&self) -> Option<PathBuf> {
+        let log = self.log.as_ref()?;
+        let path = log.path();
+        if path.as_os_str() == ":memory:" {
+            return None;
+        }
+        path.is_file().then(|| path.to_path_buf())
+    }
+}
+
+impl BoweryTable for BoweryEventsTable {
+    fn name(&self) -> &'static str {
+        "bowery_events"
+    }
+
+    fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        let Some(path) = self.attachable_path() else {
+            // Register the shape even with no data behind it, so a query
+            // written against a recording host doesn't error out against
+            // one that isn't recording — it just returns no rows.
+            conn.execute_batch(EVENTS_EMPTY_DDL)?;
+            return Ok(());
+        };
+        let uri = format!("file:{}?mode=ro", path.display());
+        if let Err(e) = conn.execute("ATTACH DATABASE ?1 AS bowery_eventlog_db", params![uri]) {
+            // Degrade to the empty shape rather than failing the whole
+            // query: one unreadable history file must not take down
+            // every other table in the same statement.
+            warn!(error = %e, path = %path.display(), "event log attach failed; bowery_events will be empty");
+            conn.execute_batch(EVENTS_EMPTY_DDL)?;
+            return Ok(());
+        }
+        // A TEMP view, not a plain one: SQLite refuses to let a view in
+        // `main` reference an attached database ("view ... cannot
+        // reference objects in database ..."), and the `temp` schema is
+        // the documented exemption. It also resolves first for an
+        // unqualified `bowery_events`, which is how operators write it.
+        conn.execute_batch(&format!(
+            "CREATE TEMP VIEW IF NOT EXISTS bowery_events AS
+             SELECT {EVENTS_COLUMNS} FROM bowery_eventlog_db.events;"
+        ))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bowery_eventlog_status — coverage telemetry for the history itself.
+// ---------------------------------------------------------------------------
+
+/// `bowery_eventlog_status` — is this host actually recording?
+///
+/// A silent sensor is the EDR failure that matters most: an empty
+/// `bowery_events` looks identical whether the host was quiet or stopped
+/// recording an hour ago. This table makes the difference queryable, and
+/// fleet-wide with `--fanout`:
+///
+/// ```sql
+/// SELECT _agent_name, recording, queryable, dropped, newest_ts_unix_ms
+/// FROM bowery_eventlog_status
+/// ```
+///
+/// `dropped` is the count of events shed because the writer queue was
+/// full — a non-zero value means the history has holes, and roughly
+/// where.
+#[derive(Debug)]
+pub struct BoweryEventLogStatusTable {
+    log: Option<Arc<bowery_eventlog::EventLog>>,
+    dropped: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl BoweryEventLogStatusTable {
+    pub fn new(
+        log: Option<Arc<bowery_eventlog::EventLog>>,
+        dropped: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Self {
+        Self { log, dropped }
+    }
+}
+
+impl BoweryTable for BoweryEventLogStatusTable {
+    fn name(&self) -> &'static str {
+        "bowery_eventlog_status"
+    }
+
+    fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bowery_eventlog_status (
+                recording          INTEGER,
+                queryable          INTEGER,
+                path               TEXT,
+                rows               INTEGER,
+                oldest_ts_unix_ms  INTEGER,
+                newest_ts_unix_ms  INTEGER,
+                highest_seq        INTEGER,
+                dropped            INTEGER
+            );",
+        )?;
+
+        let dropped = self
+            .dropped
+            .as_ref()
+            .map_or(0, |d| d.load(std::sync::atomic::Ordering::Relaxed));
+
+        let (recording, queryable, path, stats) = match &self.log {
+            Some(log) => {
+                let p = log.path().to_path_buf();
+                // Queryable and recording are genuinely different: an
+                // in-memory log records fine but no query connection can
+                // reach it.
+                let queryable = p.as_os_str() != ":memory:" && p.is_file();
+                (true, queryable, p.display().to_string(), log.stats().ok())
+            }
+            None => (false, false, String::new(), None),
+        };
+        let stats = stats.unwrap_or_default();
+
+        conn.execute(
+            "INSERT INTO bowery_eventlog_status
+                (recording, queryable, path, rows, oldest_ts_unix_ms,
+                 newest_ts_unix_ms, highest_seq, dropped)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                i64::from(recording),
+                i64::from(queryable),
+                path,
+                i64::try_from(stats.rows).unwrap_or(i64::MAX),
+                stats
+                    .oldest_ts_unix_ms
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                stats
+                    .newest_ts_unix_ms
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                i64::try_from(stats.highest_seq).unwrap_or(i64::MAX),
+                i64::try_from(dropped).unwrap_or(i64::MAX),
+            ],
+        )?;
+        Ok(())
+    }
 }

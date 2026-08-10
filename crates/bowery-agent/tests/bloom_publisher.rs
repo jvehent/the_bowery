@@ -71,6 +71,12 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, publish_interval: Duration) -
         sql: bowery_agent::config::SqlConfig::default(),
         monitor: bowery_agent::config::MonitorConfig::default(),
         yara: bowery_agent::config::YaraConfig::default(),
+        // Disabled: these fixtures predate the event log and don't
+        // need a writer task (the default path isn't writable in CI).
+        eventlog: bowery_agent::config::EventLogConfig {
+            enabled: false,
+            ..Default::default()
+        },
     }
 }
 
