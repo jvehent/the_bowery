@@ -177,6 +177,15 @@ On first activation the pane spawns a background poller that calls
 `Subscribe` against the current relay every 5 seconds. New alerts
 appear at the top. The pane keeps the most recent 500 entries.
 
+Columns: `time (UTC)` (RFC3339, millisecond precision), `agent`,
+`susp`, `episode`, `exe`.
+
+The `agent` column resolves the alert's originating fingerprint to the
+name in `~/.bowery/peers.toml`; an agent that isn't in the manifest
+falls back to a short fingerprint, so every row stays attributable.
+Press `r` to re-read the manifest after a `:peers add` without
+restarting the console.
+
 Title bar shows the buffered count and any poll error.
 
 ### 4.3 `[3] Map` — topology

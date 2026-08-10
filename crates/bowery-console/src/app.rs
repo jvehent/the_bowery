@@ -392,6 +392,11 @@ impl App {
 
     fn refresh_current_pane(&mut self) {
         match self.current_pane {
+            PaneId::Alerts => {
+                // Picks up peers added since launch, so a newly-named
+                // agent stops showing as a bare fingerprint.
+                self.alerts_pane.reload_agent_names();
+            }
             PaneId::Audit => {
                 self.audit_pane.refresh(
                     self.relay.clone(),

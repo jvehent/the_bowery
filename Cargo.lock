@@ -367,6 +367,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
