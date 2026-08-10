@@ -268,6 +268,12 @@ pub async fn sql(
                     eprintln!("agent refused query: {} ({})", e.message, e.kind);
                     bail!("sql query failed: {}", e.kind);
                 }
+                Some(OperatorResultBody::YaraReport(_)) => {
+                    // Wrong result type for this request — the agent
+                    // echoed our request_id with a YARA body. Treat as a
+                    // protocol error rather than silently ignoring it.
+                    bail!("agent replied with a YaraReport to a SQL request");
+                }
                 None => bail!("agent returned an OperatorResult with no body"),
             }
         }

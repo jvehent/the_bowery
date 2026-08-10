@@ -62,6 +62,8 @@ pub struct Config {
     pub sql: SqlConfig,
     #[serde(default)]
     pub monitor: MonitorConfig,
+    #[serde(default)]
+    pub yara: YaraConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,6 +493,92 @@ pub struct ProcessRule {
     /// Severity → suspicion weight (high=0.9, medium=0.6, …). Default `high`.
     #[serde(default = "default_monitor_severity")]
     pub severity: RuleSeverity,
+}
+
+/// Operator-distributed YARA rules: where they're stored and the caps that
+/// bound how much an operator (or a compromised relay replaying a push) can
+/// make an agent hold and scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct YaraConfig {
+    /// Directory holding distributed rules + their index. Written 0600.
+    #[serde(default = "default_yara_path")]
+    pub path: PathBuf,
+    /// Maximum rules retained. A push beyond this is refused rather than
+    /// silently evicting detection content an operator is relying on.
+    #[serde(default = "default_yara_max_rules")]
+    pub max_rules: usize,
+    /// Per-rule byte cap. Must stay well under the 64 KiB transport frame
+    /// cap, since the rule travels inside a signed operator command.
+    #[serde(default = "default_yara_max_rule_bytes")]
+    pub max_rule_bytes: usize,
+    /// Hard cap on hops a `fanout` push may traverse, applied even if an
+    /// operator asks for more — the structural bound on mesh amplification.
+    #[serde(default = "default_yara_max_ttl")]
+    pub max_ttl: u32,
+    /// Concurrent scan jobs. Scanning is CPU-heavy and runs on the blocking
+    /// pool; this keeps a fleet-wide push from pinning every core.
+    #[serde(default = "default_yara_max_concurrent_scans")]
+    pub max_concurrent_scans: usize,
+    /// Per-file size cap when scanning; larger files are skipped and noted
+    /// in the report's `errors`.
+    #[serde(default = "default_yara_max_file_bytes")]
+    pub max_file_bytes: u64,
+    /// Maximum files visited per scan target.
+    #[serde(default = "default_yara_max_files_per_scan")]
+    pub max_files_per_scan: usize,
+    /// Maximum directory recursion depth per scan target.
+    #[serde(default = "default_yara_max_depth")]
+    pub max_depth: usize,
+}
+
+impl Default for YaraConfig {
+    fn default() -> Self {
+        Self {
+            path: default_yara_path(),
+            max_rules: default_yara_max_rules(),
+            max_rule_bytes: default_yara_max_rule_bytes(),
+            max_ttl: default_yara_max_ttl(),
+            max_concurrent_scans: default_yara_max_concurrent_scans(),
+            max_file_bytes: default_yara_max_file_bytes(),
+            max_files_per_scan: default_yara_max_files_per_scan(),
+            max_depth: default_yara_max_depth(),
+        }
+    }
+}
+
+fn default_yara_path() -> PathBuf {
+    PathBuf::from("/var/lib/bowery/yara")
+}
+
+fn default_yara_max_rules() -> usize {
+    256
+}
+
+/// 48 KiB — comfortably inside the 64 KiB frame cap once the envelope
+/// signature, operator authorization, and proto framing are accounted for.
+fn default_yara_max_rule_bytes() -> usize {
+    48 * 1024
+}
+
+fn default_yara_max_ttl() -> u32 {
+    8
+}
+
+fn default_yara_max_concurrent_scans() -> usize {
+    2
+}
+
+fn default_yara_max_file_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_yara_max_files_per_scan() -> usize {
+    20_000
+}
+
+fn default_yara_max_depth() -> usize {
+    16
 }
 
 fn default_file_ops() -> Vec<FileOp> {

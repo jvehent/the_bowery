@@ -522,6 +522,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bowery-yara"
+version = "0.0.1"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "yara",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1023,6 +1033,12 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "fs_extra"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "futures"
@@ -3169,6 +3185,28 @@ dependencies = [
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",
+]
+
+[[package]]
+name = "yara"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3caead5c2f89f36a59da301b0ad42e6c096b957db0b4adc60e05aae74c2c3ac"
+dependencies = [
+ "bitflags",
+ "thiserror 1.0.69",
+ "yara-sys",
+]
+
+[[package]]
+name = "yara-sys"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba8598e7b8b80190eddb1e030e87e4051f2fec79df901748a9257a4a59fcc3e5"
+dependencies = [
+ "cc",
+ "fs_extra",
+ "glob",
 ]
 
 [[package]]

@@ -1,0 +1,37 @@
+[package]
+name = "bowery-yara"
+description = "YARA scanning for The Bowery. Stub by default; real libyara engine behind the `engine` feature."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+# Real scanning via libyara (the `yara` crate, `vendored` = builds
+# libyara from source with cc). Deliberately NOT a pure-Rust engine:
+# yara-x compiles rules to WASM and JITs them, which the agent's
+# systemd sandbox forbids (MemoryDenyWriteExecute=yes). libyara is a
+# bytecode interpreter and needs no sandbox change.
+#
+# Without this feature the crate compiles to a stub that reports
+# `EngineUnavailable` — rules are still stored and propagated, they
+# just aren't executed. That keeps the aarch64-musl Pi cross-build free
+# of a C dependency unless it's explicitly wanted.
+engine = ["dep:yara"]
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+yara = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

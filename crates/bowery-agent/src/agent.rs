@@ -38,6 +38,7 @@ use crate::monitor::MonitorRules;
 use crate::whisper_qa::{
     WhisperContext, WhisperQaTrigger, aggregate_local_sighting, spawn_whisper_qa_task,
 };
+use crate::yara_store::YaraStore;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -285,6 +286,21 @@ impl Agent {
             rules,
             bowery_analysis::BinaryScorer::new(baseline.clone()),
         ));
+
+        // Operator-distributed YARA rules survive restarts, so a rule that
+        // reached this agent through the mesh keeps working after a reboot
+        // without the operator re-pushing it.
+        let yara_store = Arc::new(
+            YaraStore::open(
+                &config.yara.path,
+                config.yara.max_rules,
+                config.yara.max_rule_bytes,
+            )
+            .map_err(|e| AgentError::Config(format!("opening yara store: {e}")))?,
+        );
+        if !yara_store.is_empty() {
+            info!(rules = yara_store.len(), "yara rules loaded from store");
+        }
         let inbox = Arc::new(AlertInbox::new(
             config.inbox.capacity,
             config.inbox.retention,
@@ -452,6 +468,9 @@ impl Agent {
             )))
             .with_extra_table(Arc::new(crate::sql_tables::BoweryMonitorRulesTable::new(
                 monitor_rules.clone(),
+            )))
+            .with_extra_table(Arc::new(crate::sql_tables::BoweryYaraRulesTable::new(
+                yara_store.clone(),
             )));
         let op_router = Arc::new(OperatorCommandRouter {
             sql: Some(Arc::new(sql_engine)),
@@ -1258,6 +1277,7 @@ async fn respond_to_operator_command(
     let request_id = cmd.request_id.clone();
     let command_kind = match cmd.command.as_ref() {
         Some(OperatorCommandBody::Sql(_)) => "sql",
+        Some(OperatorCommandBody::YaraPush(_)) => "yara_push",
         None => "<empty>",
     };
 

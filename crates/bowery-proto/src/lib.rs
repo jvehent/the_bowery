@@ -317,9 +317,14 @@ pub struct OperatorCommand {
     /// for sealed `SqlChunk` responses.
     ///
     /// Cycle prevention: when this field is non-empty, the peer
-    /// rejects any inner command with `fanout = true`. Combined
-    /// with the relay always forwarding `fanout = false`, this
-    /// caps fan-out at one hop without trusting the relay.
+    /// rejects any inner **`Sql`** command with `fanout = true`.
+    /// Combined with the relay always forwarding `fanout = false`,
+    /// this caps SQL fan-out at one hop without trusting the relay.
+    ///
+    /// [`YaraPush`] is deliberately exempt: rule distribution is
+    /// meant to reach the whole mesh, so it is bounded by its own
+    /// `ttl` hop counter plus a per-agent `(operator_fp,
+    /// request_id)` seen-set instead of a one-hop cap.
     ///
     /// Backward compat: empty bytes preserve the slice-6 shape;
     /// the receiver uses today's "sender must be in `[operators]`"
@@ -327,7 +332,7 @@ pub struct OperatorCommand {
     #[prost(bytes = "vec", tag = "3")]
     pub forwarded_from_operator: Vec<u8>,
     /// One of the typed command bodies.
-    #[prost(oneof = "OperatorCommandBody", tags = "11")]
+    #[prost(oneof = "OperatorCommandBody", tags = "11, 12")]
     pub command: Option<OperatorCommandBody>,
 }
 
@@ -342,6 +347,12 @@ pub enum OperatorCommandBody {
     /// `recv_envelope` until it sees the terminal frame.
     #[prost(message, tag = "11")]
     Sql(SqlQuery),
+    /// Distribute a YARA rule file to the agent, scan the given
+    /// targets with it, and (when `fanout`) propagate it onward
+    /// through the mesh. The response is a `YaraReport` per
+    /// reporting agent, terminated the same way SQL chunks are.
+    #[prost(message, tag = "12")]
+    YaraPush(YaraPush),
 }
 
 /// Phase-9 final-1: operator-signed delegation that authorises a
@@ -450,6 +461,88 @@ pub struct SqlQuery {
     pub peers: Vec<Vec<u8>>,
 }
 
+/// Distribute + run a YARA rule file. See
+/// [`OperatorCommandBody::YaraPush`].
+///
+/// The rule bytes travel inside the signed `OperatorCommand`, so every
+/// hop re-verifies the *original operator's* signature over the exact
+/// command (see [`OperatorAuthorization`]): a relaying agent can drop a
+/// rule but cannot forge or alter one.
+///
+/// Size: the whole envelope must fit the transport frame cap (64 KiB),
+/// so `rules` is bounded well below that — the agent rejects an
+/// oversized push with a `rule_too_large` error rather than letting the
+/// stream tear down.
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct YaraPush {
+    /// Content address of `rules` (lowercase hex SHA-256). Used as the
+    /// on-disk filename and the `bowery_yara_rules` primary key, so the
+    /// same rule pushed twice doesn't duplicate.
+    #[prost(string, tag = "1")]
+    pub rule_id: String,
+    /// The raw YARA source. Compiled on receipt; a rule that fails to
+    /// compile is rejected and never stored.
+    #[prost(bytes = "vec", tag = "2")]
+    pub rules: Vec<u8>,
+    /// Absolute paths (files or directories) to scan on this agent.
+    /// Empty = store the rule without scanning.
+    #[prost(string, repeated, tag = "3")]
+    pub targets: Vec<String>,
+    /// When true, forward this push to pinned peers (subject to `ttl`).
+    #[prost(bool, tag = "4")]
+    pub fanout: bool,
+    /// Remaining hops. Each forwarding agent decrements it and stops at
+    /// zero — the structural bound on mesh amplification, independent of
+    /// the `(operator_fp, request_id)` seen-set that prevents cycles.
+    #[prost(uint32, tag = "5")]
+    pub ttl: u32,
+}
+
+/// One agent's YARA scan result. See [`OperatorResultBody::YaraReport`].
+///
+/// Framing mirrors `SqlChunk`: one report per contributing agent, and in
+/// fan-out mode the relay emits a final terminator report with an empty
+/// `agent_fp` once every peer has finished.
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct YaraReport {
+    /// Fingerprint of the reporting agent. Operators should prefer the
+    /// authenticated envelope sender for attribution; this field is a
+    /// rendering convenience. Empty + `end = true` is the fan-out
+    /// completion terminator.
+    #[prost(bytes = "vec", tag = "1")]
+    pub agent_fp: Vec<u8>,
+    /// Content address of the rule this report is about.
+    #[prost(string, tag = "2")]
+    pub rule_id: String,
+    /// Every match this agent found.
+    #[prost(message, repeated, tag = "3")]
+    pub matches: Vec<YaraMatch>,
+    /// How many files were scanned (after caps were applied).
+    #[prost(uint32, tag = "4")]
+    pub scanned: u32,
+    /// Non-fatal problems (unreadable paths, per-file timeouts, caps
+    /// hit). A fatal failure is reported as an `Error` body instead.
+    #[prost(string, repeated, tag = "5")]
+    pub errors: Vec<String>,
+    /// Terminator flag for this agent's stream.
+    #[prost(bool, tag = "6")]
+    pub end: bool,
+}
+
+/// A single YARA rule match.
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct YaraMatch {
+    /// The matching rule's identifier from the YARA source.
+    #[prost(string, tag = "1")]
+    pub rule_name: String,
+    /// Path of the file that matched.
+    #[prost(string, tag = "2")]
+    pub path: String,
+    /// Tags declared on the matching rule.
+    #[prost(string, repeated, tag = "3")]
+    pub tags: Vec<String>,
+}
+
 #[derive(Clone, PartialEq, ProstMessage)]
 pub struct OperatorResult {
     /// Echo of [`OperatorCommand::request_id`].
@@ -459,7 +552,7 @@ pub struct OperatorResult {
     /// `error` field so a future "always populated alongside the
     /// concrete result" pattern (e.g. structured warnings) can
     /// extend cleanly.
-    #[prost(oneof = "OperatorResultBody", tags = "11, 12")]
+    #[prost(oneof = "OperatorResultBody", tags = "11, 12, 13")]
     pub result: Option<OperatorResultBody>,
 }
 
@@ -478,6 +571,11 @@ pub enum OperatorResultBody {
     /// final chunk has `end = true` (and may also carry rows).
     #[prost(message, tag = "12")]
     SqlChunk(SqlChunk),
+    /// One agent's YARA scan result. Multiple `YaraReport` envelopes
+    /// share the same `request_id` in fan-out mode (one per agent),
+    /// terminated by a report with an empty `agent_fp` and `end = true`.
+    #[prost(message, tag = "13")]
+    YaraReport(YaraReport),
 }
 
 /// One chunk of a streaming SQL response. See

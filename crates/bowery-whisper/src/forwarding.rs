@@ -109,13 +109,28 @@ pub fn verify_operator_authorization(
 /// hash. `fanout` is fundamentally a dispatch instruction; it
 /// doesn't change *what data the peer returns*, so excluding it
 /// from the integrity binding is correct.
+///
+/// `YaraPush` normalises the same way, and additionally zeroes
+/// `ttl`: every forwarding hop decrements it, so a digest that
+/// covered it would break verification one hop out. What stays
+/// bound is everything security-relevant — the rule id, the rule
+/// bytes, and the scan targets — so a relay can neither swap the
+/// rule nor redirect the scan.
 pub fn command_body_digest(body: &OperatorCommandBody) -> [u8; 32] {
-    let OperatorCommandBody::Sql(q) = body;
-    let normalised = OperatorCommandBody::Sql(bowery_proto::SqlQuery {
-        sql: q.sql.clone(),
-        fanout: false,
-        peers: Vec::new(),
-    });
+    let normalised = match body {
+        OperatorCommandBody::Sql(q) => OperatorCommandBody::Sql(bowery_proto::SqlQuery {
+            sql: q.sql.clone(),
+            fanout: false,
+            peers: Vec::new(),
+        }),
+        OperatorCommandBody::YaraPush(p) => OperatorCommandBody::YaraPush(bowery_proto::YaraPush {
+            rule_id: p.rule_id.clone(),
+            rules: p.rules.clone(),
+            targets: p.targets.clone(),
+            fanout: false,
+            ttl: 0,
+        }),
+    };
     let wrapper = OperatorCommand {
         request_id: String::new(),
         timeout_ms: 0,

@@ -78,6 +78,7 @@ fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: St
         response: ResponseConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
         monitor: bowery_agent::config::MonitorConfig::default(),
+        yara: bowery_agent::config::YaraConfig::default(),
     }
 }
 

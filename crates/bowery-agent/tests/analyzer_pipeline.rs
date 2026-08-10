@@ -67,6 +67,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, role_interval: Duration) -> C
         response: ResponseConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
         monitor: bowery_agent::config::MonitorConfig::default(),
+        yara: bowery_agent::config::YaraConfig::default(),
     }
 }
 

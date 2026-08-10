@@ -16,6 +16,7 @@ members = [
     "crates/bowery-sql",
     "crates/bowery-tables",
     "crates/bowery-whisper",
+    "crates/bowery-yara",
 ]
 # bowery-ebpf is its own workspace (compiles for bpfel-unknown-none).
 # fuzz/ is its own workspace so libfuzzer-sys doesn't infect the main
@@ -47,6 +48,7 @@ bowery-response = { path = "crates/bowery-response", version = "0.0.1" }
 bowery-sql = { path = "crates/bowery-sql", version = "0.0.1" }
 bowery-tables = { path = "crates/bowery-tables", version = "0.0.1" }
 bowery-whisper = { path = "crates/bowery-whisper", version = "0.0.1" }
+bowery-yara = { path = "crates/bowery-yara", version = "0.0.1" }
 
 # Crypto
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8"] }
@@ -116,6 +118,23 @@ libc = "0.2"
 # Linux-only by design; the agent has no macOS/Windows story yet, so
 # this doesn't constrain the platform matrix.
 nix = { version = "0.29", default-features = false, features = ["signal"] }
+
+# Optional YARA engine (compiled only with bowery-yara/engine).
+# `vendored` builds libyara from source via cc — the same shape as
+# rusqlite's `bundled`, which already cross-compiles + statically links
+# under aarch64-unknown-linux-musl in our `cross` setup. Deliberately
+# libyara and not yara-x: yara-x JITs (WASM/Cranelift), which the
+# agent's MemoryDenyWriteExecute=yes sandbox forbids.
+#
+# `vendored` builds libyara from source with cc; `bundled-4_5_5` selects
+# the crate's PRE-GENERATED bindings so we don't pull in bindgen/libclang
+# (that toolchain is what broke the console build once already, and it
+# would be a fresh cross-compile hazard for the Pi target).
+yara = { version = "0.32", default-features = false, features = [
+    "vendored",
+    "bundled-4_5_5",
+    "ndebug",
+] }
 
 # Optional LLM backend (compiled when bowery-llm/llama-cpp is enabled).
 # Builds llama.cpp from C++ at build time; needs cmake + a C++ compiler.

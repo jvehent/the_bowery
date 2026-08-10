@@ -27,6 +27,7 @@ use tokio::sync::watch;
 
 use crate::inbox::AlertInbox;
 use crate::monitor::{MonitorRules, file_op_label, severity_label};
+use crate::yara_store::YaraStore;
 
 // ---------------------------------------------------------------------------
 // bowery_peers — fingerprints currently pinned in KnownNeighbors.
@@ -141,6 +142,61 @@ impl BoweryTable for BoweryMonitorRulesTable {
                 parts.join(" AND "),
                 "",
                 severity_label(r.severity),
+            ])?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bowery_yara_rules — operator-distributed YARA rules this agent holds.
+// ---------------------------------------------------------------------------
+
+/// `bowery_yara_rules` table — one row per YARA rule this agent has
+/// stored, whether pushed directly by an operator or received by mesh
+/// propagation.
+///
+/// Fleet use: `SELECT rule_id FROM bowery_yara_rules` with `--fanout`
+/// answers "did my rule actually reach every agent?" — the practical way
+/// to confirm a distribution converged.
+#[derive(Debug)]
+pub struct BoweryYaraRulesTable {
+    store: Arc<YaraStore>,
+}
+
+impl BoweryYaraRulesTable {
+    pub fn new(store: Arc<YaraStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl BoweryTable for BoweryYaraRulesTable {
+    fn name(&self) -> &'static str {
+        "bowery_yara_rules"
+    }
+
+    fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bowery_yara_rules (
+                rule_id            TEXT,
+                bytes              INTEGER,
+                received_unix      INTEGER,
+                source_operator_fp TEXT,
+                request_id         TEXT
+            );",
+        )?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO bowery_yara_rules
+                (rule_id, bytes, received_unix, source_operator_fp, request_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for r in self.store.list() {
+            stmt.execute(params![
+                r.rule_id,
+                i64::try_from(r.bytes_len).unwrap_or(i64::MAX),
+                i64::try_from(r.received_unix).unwrap_or(i64::MAX),
+                r.source_operator_fp,
+                r.request_id,
             ])?;
         }
         Ok(())

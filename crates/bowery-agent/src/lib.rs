@@ -14,6 +14,7 @@ pub mod monitor;
 pub mod response_bpf;
 pub mod sql_tables;
 pub mod whisper_qa;
+pub mod yara_store;
 
 pub use agent::{Agent, AgentError, AgentEvent};
 pub use config::Config;

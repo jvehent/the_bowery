@@ -66,6 +66,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, monitor: MonitorConfig) -> Co
         response: ResponseConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
         monitor,
+        yara: bowery_agent::config::YaraConfig::default(),
     }
 }
 
