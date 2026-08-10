@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# build-install-operator — build the CLI, console, and agent with every
+# feature enabled, install them on THIS machine, and restart the agent.
+#
+# For an operator workstation that is also a monitored node (the
+# "combined agent + operator" host). Builds natively — this is NOT the
+# path for the Raspberry Pis; those get a cross-compiled, feature-light
+# tarball from deploy/remote/package-agent.sh.
+#
+# What "all features" means here:
+#   bowery-agent    llm-llama-cpp (real Qwen3 inference) + yara (libyara)
+#   bowery-console  llm-llama-cpp (real Gemma 4 chatbot)
+#   bowery          (no optional features)
+#
+# Everything is built with `-C target-cpu=native`, because llama.cpp's
+# CPU dispatch can otherwise select an AVX path the running core doesn't
+# have and die with SIGILL and no Rust error. That makes these binaries
+# NON-PORTABLE: they are tuned for this machine's CPU. Don't copy them
+# to a host with a different processor.
+#
+# Usage:
+#   ./scripts/build-install-operator                 # build + install + restart
+#   ./scripts/build-install-operator --no-console    # skip the slow llama.cpp console
+#   ./scripts/build-install-operator --no-agent      # operator tools only
+#   ./scripts/build-install-operator --no-restart    # install but leave the agent running old code
+#   ./scripts/build-install-operator --skip-unit     # don't refresh the systemd unit/drop-in
+#   ./scripts/build-install-operator --dry-run       # show what would happen
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+BIN_DIR="${BOWERY_BIN_DIR:-/usr/bin}"
+DO_AGENT=1
+DO_CONSOLE=1
+DO_RESTART=1
+DO_UNIT=1
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-agent)   DO_AGENT=0 ;;
+        --no-console) DO_CONSOLE=0 ;;
+        --no-restart) DO_RESTART=0 ;;
+        --skip-unit)  DO_UNIT=0 ;;
+        --dry-run)    DRY_RUN=1 ;;
+        -h|--help)    sed -n '2,30p' "$0"; exit 0 ;;
+        *) echo "error: unknown option $1 (try --help)" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+run() {
+    if [[ "$DRY_RUN" == 1 ]]; then
+        echo "  [dry-run] $*"
+    else
+        "$@"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Toolchain pre-checks. Both LLM features compile llama.cpp (cmake) and
+# run bindgen (libclang); libyara needs a C compiler. Missing pieces
+# surface as a deep, confusing panic (e.g. `'stdbool.h' file not found`),
+# so fail early with the exact fix.
+# ---------------------------------------------------------------------------
+missing=()
+need_tools=(cc)
+if [[ "$DO_CONSOLE" == 1 || "$DO_AGENT" == 1 ]]; then
+    need_tools+=(cmake clang)
+fi
+for tool in "${need_tools[@]}"; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+done
+if [[ "$DO_CONSOLE" == 1 || "$DO_AGENT" == 1 ]]; then
+    # libclang.so is a library, not a command — probe common locations.
+    ls /usr/lib*/libclang*.so* /usr/lib/*/libclang*.so* >/dev/null 2>&1 || missing+=("libclang")
+fi
+if [[ ${#missing[@]} -gt 0 ]]; then
+    cat >&2 <<EOF
+error: the LLM (llama.cpp) and YARA features need a C/C++/clang toolchain
+       that isn't fully installed. Missing: ${missing[*]}
+
+  Debian/Ubuntu:  sudo apt install -y cmake clang libclang-dev build-essential
+  Fedora/RHEL:    sudo dnf install -y cmake clang clang-devel gcc-c++
+EOF
+    exit 1
+fi
+
+command -v cargo >/dev/null 2>&1 || {
+    echo "error: cargo not on PATH (source \$HOME/.cargo/env?)" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Build. `-C target-cpu=native` for every binary so the llama.cpp-linked
+# ones can't SIGILL on a CPU-dispatch mismatch.
+# ---------------------------------------------------------------------------
+export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"
+
+echo "==> building bowery CLI (release)"
+run cargo build --release -p bowery-cli
+
+if [[ "$DO_AGENT" == 1 ]]; then
+    echo "==> building bowery-agent (release, llm-llama-cpp + yara)"
+    echo "    note: first build compiles llama.cpp and libyara — several minutes"
+    run cargo build --release -p bowery-agent --features llm-llama-cpp,yara
+fi
+
+if [[ "$DO_CONSOLE" == 1 ]]; then
+    echo "==> building bowery-console (release, llm-llama-cpp)"
+    run cargo build --release -p bowery-console --features llm-llama-cpp
+fi
+
+# Smoke-test each binary before it replaces a working one. A binary that
+# won't even run (bad CPU flags, missing shared lib) must not be
+# installed over the one currently keeping the host monitored.
+smoke() {
+    local bin="$1"
+    if [[ "$DRY_RUN" == 1 ]]; then return 0; fi
+    if ! "$bin" --version >/dev/null 2>&1 && ! "$bin" --help >/dev/null 2>&1; then
+        echo "error: $bin was built but won't run — refusing to install it" >&2
+        exit 1
+    fi
+}
+smoke target/release/bowery
+if [[ "$DO_AGENT" == 1 ]]; then smoke target/release/bowery-agent; fi
+if [[ "$DO_CONSOLE" == 1 ]]; then smoke target/release/bowery-console; fi
+
+# ---------------------------------------------------------------------------
+# Install.
+# ---------------------------------------------------------------------------
+echo
+echo "==> installing into $BIN_DIR (sudo)"
+run sudo install -m0755 target/release/bowery "$BIN_DIR/bowery"
+if [[ "$DO_CONSOLE" == 1 ]]; then
+    run sudo install -m0755 target/release/bowery-console "$BIN_DIR/bowery-console"
+fi
+if [[ "$DO_AGENT" == 1 ]]; then
+    run sudo install -m0755 target/release/bowery-agent "$BIN_DIR/bowery-agent"
+fi
+
+# Refresh the systemd unit + remote drop-in. This is what makes
+# capability/seccomp changes (CAP_SYS_PTRACE for /proc enrichment,
+# bpf+perf_event_open for the eBPF load path) actually take effect — a
+# new binary alone won't pick them up.
+if [[ "$DO_AGENT" == 1 && "$DO_UNIT" == 1 ]]; then
+    echo "==> refreshing systemd unit + drop-in"
+    run sudo install -m0644 deploy/systemd/bowery-agent.service \
+        /lib/systemd/system/bowery-agent.service
+    if [[ -f deploy/systemd/bowery.slice ]]; then
+        run sudo install -m0644 deploy/systemd/bowery.slice /lib/systemd/system/bowery.slice
+    fi
+    run sudo install -d -m0755 /etc/systemd/system/bowery-agent.service.d
+    run sudo install -m0644 deploy/remote/10-remote-node.conf \
+        /etc/systemd/system/bowery-agent.service.d/10-remote-node.conf
+    run sudo systemctl daemon-reload
+fi
+
+# ---------------------------------------------------------------------------
+# Restart + verify. A silent restart isn't good enough: the agent can
+# come back up "active" while its eBPF source failed to attach, so print
+# the lines that actually prove it.
+# ---------------------------------------------------------------------------
+if [[ "$DO_AGENT" == 1 && "$DO_RESTART" == 1 ]]; then
+    echo "==> restarting bowery-agent"
+    run sudo systemctl restart bowery-agent
+    if [[ "$DRY_RUN" == 0 ]]; then
+        sleep 2
+        if ! systemctl is-active --quiet bowery-agent; then
+            echo "error: bowery-agent did not come back up. Recent log:" >&2
+            journalctl -u bowery-agent -n 30 --no-pager >&2
+            exit 1
+        fi
+        echo
+        echo "==> agent status"
+        journalctl -u bowery-agent -b --no-pager -n 200 \
+            | grep -iE 'agent ready|attached BPF|attached tracepoint|BPF source exited|unavailable|monitoring rules|yara rules|SIGSYS|status=31' \
+            | tail -12 || true
+    fi
+fi
+
+echo
+echo "installed:"
+echo "  $BIN_DIR/bowery"
+if [[ "$DO_CONSOLE" == 1 ]]; then echo "  $BIN_DIR/bowery-console"; fi
+if [[ "$DO_AGENT" == 1 ]]; then echo "  $BIN_DIR/bowery-agent   (llm-llama-cpp + yara)"; fi
+cat <<'EOF'
+
+notes:
+  - These binaries are built for THIS machine's CPU (-C target-cpu=native).
+    Don't copy them to another host; use deploy/remote/package-agent.sh for
+    the Raspberry Pis (cross-compiled, static musl, features off).
+  - The agent's llm-llama-cpp feature only enables the code path. Real
+    inference also needs a GGUF plus an [llm.llama_cpp] block in
+    /etc/bowery/agent.toml; without it the agent stays on the mock backend.
+  - libyara here is built with crypto disabled, so YARA rules cannot use the
+    `hash` module. Use the bowery_file_sha256_hex SQL function instead.
+EOF

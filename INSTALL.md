@@ -711,6 +711,40 @@ sudo install -m755 target/release/bowery-console /usr/bin/
 > llama.cpp's dispatch picks an instruction the running core lacks;
 > the resulting native binary is not portable to a different CPU.
 
+### One-shot rebuild + install on an operator host
+
+When the operator workstation is also a monitored node, this builds all
+three binaries with every feature on, installs them, refreshes the
+systemd unit, restarts the agent, and prints the lines that prove it
+actually came back healthy:
+
+```bash
+./scripts/build-install-operator
+```
+
+| Binary | Features enabled |
+|---|---|
+| `bowery-agent` | `llm-llama-cpp` + `yara` |
+| `bowery-console` | `llm-llama-cpp` |
+| `bowery` | (none optional) |
+
+Useful flags: `--no-console` (skip the slow llama.cpp console build),
+`--no-agent` (operator tools only), `--no-restart`, `--skip-unit`,
+`--dry-run`.
+
+It refreshes `bowery-agent.service` + the `10-remote-node.conf` drop-in
+because capability and seccomp changes (`CAP_SYS_PTRACE` for `/proc`
+enrichment, `bpf`/`perf_event_open` for the eBPF load path) don't take
+effect from a new binary alone. Each binary is smoke-tested before it
+replaces the running one, so a build that won't execute can't take your
+monitoring down.
+
+> **Native build only.** Everything is compiled with
+> `-C target-cpu=native`, so these binaries are tuned to this machine's
+> CPU — don't copy them to another host. The Raspberry Pis take the
+> cross-compiled static musl tarball from
+> `deploy/remote/package-agent.sh` instead.
+
 It pulls in eight panes — Query (SQL REPL), Alerts (live tail),
 Map (1-hop topology), Audit, Peers (manifest CRUD), Doctor (local
 + remote readiness), Chat (Gemma 4 chatbot that drafts SQL —
