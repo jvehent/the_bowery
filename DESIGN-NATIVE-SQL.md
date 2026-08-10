@@ -101,7 +101,11 @@ They expose Bowery's own internal state.
 - `bowery_yara_rules` — YARA rules distributed to this agent (`bowery exec yara`).
 - `bowery_mesh_peers` — gossip-discovered peers (vs. the pinned `bowery_peers`): fingerprint_hex, whisper_addr, agent_version, pinned, has_role_vector, has_bloom_advert. Added with the Tailscale mesh deploy work.
 - `bowery_baseline_binaries` — baseline DB rows: sha256, first_seen, last_seen, seen_count.
-- `bowery_alerts` — alert inbox: episode_id, suspicion, exe_path, ts.
+- `bowery_alerts` — alert inbox: episode_id, suspicion, exe_path, ts,
+  plus the neighbourhood verdict (`confirmed`, `peers_asked`,
+  `peers_unseen`, `peers_seen`). Those four are NULL when no whisper
+  round ran for the episode, which is what distinguishes "never asked"
+  from "asked and not confirmed".
 - `bowery_audit` — last N audit envelopes: seq, action, outcome, recorded_at.
 
 These are what makes the surface worth building — operator

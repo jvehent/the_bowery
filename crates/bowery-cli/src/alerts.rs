@@ -213,6 +213,22 @@ fn print_human(alert: &Alert) {
     if !alert.suggested_actions.is_empty() {
         println!("    sug : {}", alert.suggested_actions.join(", "));
     }
+    if let Some(c) = alert.confirmation {
+        let verdict = if c.confirmed {
+            "CONFIRMED"
+        } else {
+            "not confirmed"
+        };
+        println!(
+            "    mesh: {verdict} — {unseen}/{asked} peers never saw this \
+             (quorum {q}; {seen} have seen it, {nr} did not reply)",
+            unseen = c.peers_unseen,
+            asked = c.peers_asked,
+            q = c.quorum,
+            seen = c.peers_seen,
+            nr = c.peers_no_reply,
+        );
+    }
 }
 
 fn alert_to_json(alert: &Alert) -> String {
@@ -234,7 +250,8 @@ fn alert_to_json(alert: &Alert) -> String {
     format!(
         "{{\"ts_unix_ms\":{ts},\"originator_fp\":\"{fp}\",\"episode_id\":\"{ep}\",\
          \"exe_sha256_hex\":\"{sha}\",\"exe_path\":\"{exe}\",\"suspicion\":{sus},\
-         \"rationale\":\"{rat}\",\"suggested_actions\":[{act}],\"backend\":\"{be}\"}}",
+         \"rationale\":\"{rat}\",\"suggested_actions\":[{act}],\"backend\":\"{be}\",\
+         \"confirmation\":{conf}}}",
         ts = alert.ts_unix_ms,
         fp = originator_hex,
         ep = json_escape(&alert.episode_id),
@@ -244,7 +261,27 @@ fn alert_to_json(alert: &Alert) -> String {
         rat = json_escape(&alert.rationale),
         act = actions,
         be = json_escape(&alert.backend),
+        conf = confirmation_to_json(alert.confirmation.as_ref()),
     )
+}
+
+/// Confirmation as a nested JSON object, or `null` when no whisper round
+/// ran for this alert. `null` rather than a zeroed object so downstream
+/// tooling can tell "not asked" from "asked and nobody agreed".
+fn confirmation_to_json(c: Option<&bowery_proto::AlertConfirmation>) -> String {
+    match c {
+        None => "null".to_string(),
+        Some(c) => format!(
+            "{{\"confirmed\":{conf},\"quorum\":{q},\"peers_asked\":{asked},\
+             \"peers_unseen\":{unseen},\"peers_seen\":{seen},\"peers_no_reply\":{nr}}}",
+            conf = c.confirmed,
+            q = c.quorum,
+            asked = c.peers_asked,
+            unseen = c.peers_unseen,
+            seen = c.peers_seen,
+            nr = c.peers_no_reply,
+        ),
+    }
 }
 
 fn json_escape(s: &str) -> String {
@@ -264,4 +301,55 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod json_tests {
+    use super::*;
+
+    fn base() -> Alert {
+        Alert {
+            originator_fp: vec![0xab; 32],
+            episode_id: "ep-1".into(),
+            exe_sha256_hex: "cd".repeat(32),
+            exe_path: "/tmp/pay\"load".into(), // embedded quote — escaping must hold
+            suspicion: 0.875,
+            rationale: "line1\nline2".into(),
+            suggested_actions: vec!["kill_process".into()],
+            ts_unix_ms: 1_786_622_341_123,
+            backend: "llama-cpp/qwen3".into(),
+            confirmation: None,
+        }
+    }
+
+    /// The JSON here is built by `format!`, not serde, so a missing comma
+    /// or brace would ship as malformed output that only breaks in the
+    /// operator's `jq` pipeline. Parse it back to prove the shape.
+    #[test]
+    fn alert_json_is_parseable_with_and_without_confirmation() {
+        let unconfirmed: serde_json::Value =
+            serde_json::from_str(&alert_to_json(&base())).expect("unconfirmed alert must be JSON");
+        assert!(
+            unconfirmed["confirmation"].is_null(),
+            "no whisper round must serialise as null, not a zeroed object"
+        );
+        assert_eq!(unconfirmed["exe_path"], "/tmp/pay\"load");
+        assert_eq!(unconfirmed["rationale"], "line1\nline2");
+
+        let mut a = base();
+        a.confirmation = Some(bowery_proto::AlertConfirmation {
+            peers_asked: 5,
+            peers_unseen: 4,
+            peers_seen: 1,
+            peers_no_reply: 0,
+            quorum: 2,
+            confirmed: true,
+        });
+        let v: serde_json::Value =
+            serde_json::from_str(&alert_to_json(&a)).expect("confirmed alert must be JSON");
+        assert_eq!(v["confirmation"]["confirmed"], true);
+        assert_eq!(v["confirmation"]["peers_unseen"], 4);
+        assert_eq!(v["confirmation"]["peers_seen"], 1);
+        assert_eq!(v["confirmation"]["quorum"], 2);
+    }
 }

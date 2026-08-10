@@ -52,6 +52,14 @@ pub(crate) fn hint() -> Style {
         .add_modifier(Modifier::ITALIC)
 }
 
+/// A quorum-confirmed alert — the neighbourhood corroborated it, so it
+/// deserves to be found by scanning rather than by reading. Red + bold
+/// rather than a background fill so it survives `selected_row`'s
+/// REVERSED modifier without the two cancelling each other out.
+pub(crate) fn confirmed_alert() -> Style {
+    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+}
+
 pub(crate) fn header_row() -> Style {
     Style::default()
         .fg(Color::Black)

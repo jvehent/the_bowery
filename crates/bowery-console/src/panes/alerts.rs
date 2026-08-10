@@ -114,6 +114,7 @@ impl AlertsPane {
         let header = TableRow::new([
             Cell::from("time (UTC)"),
             Cell::from("agent"),
+            Cell::from("conf"),
             Cell::from("susp"),
             Cell::from("episode"),
             Cell::from("exe"),
@@ -136,19 +137,26 @@ impl AlertsPane {
                 } else {
                     a.exe_path.clone()
                 };
-                TableRow::new([
+                let row = TableRow::new([
                     Cell::from(ts),
                     Cell::from(truncate(&agent, 16)),
+                    Cell::from(confirmation_badge(a.confirmation.as_ref())),
                     Cell::from(sus),
                     Cell::from(truncate(&ep, 16)),
                     Cell::from(truncate(&exe, 60)),
-                ])
+                ]);
+                if a.confirmation.is_some_and(|c| c.confirmed) {
+                    row.style(theme::confirmed_alert())
+                } else {
+                    row
+                }
             })
             .collect();
 
         let widths = [
             Constraint::Length(25),
             Constraint::Length(17),
+            Constraint::Length(7),
             Constraint::Length(6),
             Constraint::Length(18),
             Constraint::Min(20),
@@ -200,6 +208,31 @@ impl AlertsPane {
         ];
         if !alert.suggested_actions.is_empty() {
             lines.push(kv("suggested", alert.suggested_actions.join(", ")));
+        }
+        if let Some(c) = alert.confirmation {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                if c.confirmed {
+                    "neighbourhood: CONFIRMED"
+                } else {
+                    "neighbourhood: not confirmed"
+                },
+                if c.confirmed {
+                    theme::confirmed_alert()
+                } else {
+                    theme::detail_label()
+                },
+            )));
+            // Both sides of the evidence: peers that have never seen the
+            // binary are what confirms (it's anomalous here), peers that
+            // have argue it's a normal fleet artifact.
+            lines.push(kv(
+                "  never seen",
+                format!("{} (quorum {})", c.peers_unseen, c.quorum),
+            ));
+            lines.push(kv("  have seen", c.peers_seen.to_string()));
+            lines.push(kv("  no reply", c.peers_no_reply.to_string()));
+            lines.push(kv("  asked", c.peers_asked.to_string()));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("rationale", theme::detail_label())));
@@ -277,8 +310,35 @@ impl AlertsPane {
         if cursor_unix_ms > self.cursor_unix_ms {
             self.cursor_unix_ms = cursor_unix_ms;
         }
+        // Dedup by episode_id: an episode can produce several alerts —
+        // the initial one, an LLM-refined one, and a quorum-confirmed
+        // one — and the later ones supersede rather than accompany the
+        // first. Without this the same finding renders two or three
+        // times, which is exactly the noise an operator doesn't need.
+        //
+        // Batches arrive oldest-first, so a later entry always supersedes
+        // an earlier one for the same episode. Collapse within the batch
+        // first: a single batch routinely carries both the original and
+        // its superseding alert, and prepending them one at a time would
+        // let the *older* one land on top.
+        //
+        // An empty episode_id is not an identity — those never dedup,
+        // or every one of them would collapse into a single row.
+        let mut batch: Vec<Alert> = Vec::with_capacity(items.len());
+        for a in items {
+            match batch
+                .iter_mut()
+                .find(|e| !a.episode_id.is_empty() && e.episode_id == a.episode_id)
+            {
+                Some(slot) => *slot = a,
+                None => batch.push(a),
+            }
+        }
         // Newest at the top; slide the window.
-        for a in items.into_iter().rev() {
+        for a in batch.into_iter().rev() {
+            if !a.episode_id.is_empty() {
+                self.alerts.retain(|e| e.episode_id != a.episode_id);
+            }
             self.alerts.insert(0, a);
         }
         if self.alerts.len() > MAX_ALERTS {
@@ -289,6 +349,18 @@ impl AlertsPane {
 
     pub(crate) fn on_error(&mut self, message: String) {
         self.last_error = Some(message);
+    }
+}
+
+/// Compact confirmation badge for the list column.
+///
+/// Blank when no whisper round ran, so the column reads as "nothing to
+/// say" rather than implying a negative result.
+fn confirmation_badge(c: Option<&bowery_proto::AlertConfirmation>) -> String {
+    match c {
+        None => String::new(),
+        Some(c) if c.confirmed => format!("✓{}/{}", c.peers_unseen, c.peers_asked),
+        Some(c) => format!(" {}/{}", c.peers_unseen, c.peers_asked),
     }
 }
 
@@ -377,8 +449,24 @@ mod render_tests {
                 suggested_actions: vec!["kill_process".into()],
                 ts_unix_ms: 1_786_622_341_123 + i as u64,
                 backend: "llama-cpp/qwen3-0.6b".into(),
+                confirmation: None,
             })
             .collect()
+    }
+
+    fn confirmed(ep: &str, unseen: u32, asked: u32, confirmed: bool) -> Alert {
+        Alert {
+            episode_id: ep.into(),
+            confirmation: Some(bowery_proto::AlertConfirmation {
+                peers_asked: asked,
+                peers_unseen: unseen,
+                peers_seen: asked - unseen,
+                peers_no_reply: 0,
+                quorum: 2,
+                confirmed,
+            }),
+            ..sample(1).remove(0)
+        }
     }
 
     fn draw(pane: &mut AlertsPane, detail: bool) -> String {
@@ -437,6 +525,66 @@ mod render_tests {
         assert!(out.contains(&"ab".repeat(8)), "exe sha256 missing");
         // Rationale is only a fallback in the table; here it's always shown.
         assert!(out.contains("world-writable"), "rationale missing");
+    }
+
+    #[test]
+    fn superseding_alert_replaces_its_episode_instead_of_duplicating() {
+        let mut pane = AlertsPane::default();
+        // The original and its confirmation arrive in one drained batch,
+        // oldest first — the case that made the naive prepend keep the
+        // *older* row.
+        pane.on_batch(vec![sample(1).remove(0), confirmed("ep-0", 4, 5, true)], 1);
+        assert_eq!(pane.alerts.len(), 1, "one episode must be one row");
+        assert!(
+            pane.alerts[0].confirmation.is_some(),
+            "the superseding alert must win, not the original"
+        );
+
+        // ... and again when they arrive in separate polls.
+        let mut pane = AlertsPane::default();
+        pane.on_batch(vec![sample(1).remove(0)], 1);
+        pane.on_batch(vec![confirmed("ep-0", 4, 5, true)], 2);
+        assert_eq!(pane.alerts.len(), 1);
+        assert!(pane.alerts[0].confirmation.is_some());
+    }
+
+    #[test]
+    fn empty_episode_ids_never_collapse_together() {
+        let mut pane = AlertsPane::default();
+        let mut a = sample(1).remove(0);
+        let mut b = sample(1).remove(0);
+        a.episode_id = String::new();
+        b.episode_id = String::new();
+        pane.on_batch(vec![a, b], 1);
+        assert_eq!(
+            pane.alerts.len(),
+            2,
+            "an empty episode_id is not an identity"
+        );
+    }
+
+    #[test]
+    fn confirmation_is_visible_in_both_list_and_detail() {
+        let mut pane = AlertsPane {
+            alerts: vec![confirmed("ep-0", 4, 5, true)],
+            ..AlertsPane::default()
+        };
+        let list = draw(&mut pane, false);
+        assert!(list.contains("✓4/5"), "confirmed badge missing: {list}");
+
+        pane.browser_mut().home();
+        let detail = draw(&mut pane, true);
+        assert!(detail.contains("CONFIRMED"), "verdict missing: {detail}");
+        assert!(detail.contains("never seen"), "evidence missing: {detail}");
+
+        // Not-confirmed must not wear a checkmark — the badge is the
+        // whole signal an operator scans for.
+        let mut pane = AlertsPane {
+            alerts: vec![confirmed("ep-0", 1, 5, false)],
+            ..AlertsPane::default()
+        };
+        let list = draw(&mut pane, false);
+        assert!(!list.contains("✓"), "unconfirmed row wears a check: {list}");
     }
 
     #[test]

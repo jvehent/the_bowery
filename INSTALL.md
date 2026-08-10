@@ -366,6 +366,9 @@ threshold      = 0.6        # suspicion at which we ask peers
 fanout         = 5          # number of role-similar peers per round
 timeout        = "5s"
 min_similarity = 0.0        # cosine cutoff; raise for stricter neighborhoods
+quorum         = 2          # peers that must report NEVER SEEN to confirm
+                            # an alert (0 disables confirmation)
+max_concurrent_rounds = 4   # Q&A rounds in flight; extras are shed
 
 [heartbeat]
 interval = "30s"

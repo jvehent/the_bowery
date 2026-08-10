@@ -16,6 +16,7 @@
 //! - Peer ranking (see `bowery_analysis::peer_select`)
 //! - Mesh peer discovery (see `bowery_mesh::Mesh`)
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -26,7 +27,7 @@ use bowery_baseline::Baseline;
 use bowery_crypto::Fingerprint;
 use bowery_llm::{AnalysisContext, Submitter};
 use bowery_mesh::{Mesh, PeerInfo};
-use bowery_proto::BloomAdvert;
+use bowery_proto::{Alert, AlertConfirmation, BloomAdvert};
 use bowery_whisper::fingerprint::{BloomFilter, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::KnownNeighbors;
 use bowery_whisper::pool::PeerConnections;
@@ -41,9 +42,23 @@ use tracing::{debug, info, warn};
 
 use crate::agent::{AgentEvent, LlmShedReason};
 use crate::config::WhisperQaConfig;
+use crate::inbox::AlertInbox;
 
 // ---------------------------------------------------------------------------
 // Pipeline → Q&A trigger channel.
+/// Everything `finish_round` needs to raise a confirmed alert, grouped
+/// so the round plumbing doesn't grow another six parameters.
+#[derive(Clone)]
+pub(crate) struct ConfirmSink {
+    pub inbox: Arc<AlertInbox>,
+    pub originator_fp: Fingerprint,
+    pub alert_threshold: f32,
+    pub backend_label: String,
+    /// Peers that must report *never seen it*. Zero disables
+    /// confirmation.
+    pub quorum: usize,
+}
+
 // ---------------------------------------------------------------------------
 
 /// Trigger emitted by the pipeline when a verdict crosses the Q&A
@@ -154,13 +169,27 @@ pub(crate) fn spawn_whisper_qa_task(
     llm_submitter: Submitter,
     llm_threshold: f32,
     events_tx: broadcast::Sender<AgentEvent>,
+    confirm: ConfirmSink,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
+    // Shed-not-queue: a full semaphore drops the round rather than
+    // parking the trigger, so a burst can't build a backlog that keeps
+    // dialling peers long after the exec storm that caused it is over.
+    let round_permits = Arc::new(tokio::sync::Semaphore::new(
+        qa_cfg.max_concurrent_rounds.max(1),
+    ));
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 trigger = triggers.recv() => {
                     let Some(trigger) = trigger else { break };
+                    let Ok(permit) = round_permits.clone().try_acquire_owned() else {
+                        warn!(
+                            max = qa_cfg.max_concurrent_rounds,
+                            "whisper Q&A rounds at capacity; shedding trigger"
+                        );
+                        continue;
+                    };
                     let pool = pool.clone();
                     let kn = kn.clone();
                     let sealer = sealer.clone();
@@ -169,6 +198,7 @@ pub(crate) fn spawn_whisper_qa_task(
                     let qa_cfg = qa_cfg.clone();
                     let llm_submitter = llm_submitter.clone();
                     let events_tx = events_tx.clone();
+                    let confirm = confirm.clone();
                     // Each round runs in its own task so a slow peer
                     // can't block the next trigger.
                     tokio::spawn(async move {
@@ -183,8 +213,10 @@ pub(crate) fn spawn_whisper_qa_task(
                             llm_submitter,
                             llm_threshold,
                             events_tx,
+                            confirm,
                         )
                         .await;
+                        drop(permit);
                     });
                 }
                 _ = shutdown_rx.changed() => break,
@@ -205,6 +237,7 @@ async fn run_round(
     llm_submitter: Submitter,
     llm_threshold: f32,
     events_tx: broadcast::Sender<AgentEvent>,
+    confirm: ConfirmSink,
 ) {
     let tier1 = Tier1Fingerprint::derive(&trigger.sha);
     let pre_suspicion = trigger.ctx.pre_verdict.suspicion;
@@ -266,6 +299,7 @@ async fn run_round(
             &llm_submitter,
             llm_threshold,
             &events_tx,
+            &confirm,
         );
         return;
     }
@@ -282,23 +316,44 @@ async fn run_round(
     // artifact (modulo bloom collisions, which are vanishingly rare in
     // the *negative* direction — bloom filters never produce false
     // negatives). Skipping these saves a QUIC dial per peer.
+    //
+    // It stands down when confirmation is enabled, and that is not an
+    // oversight — it is the whole reason this branch exists:
+    //
+    //   1. It would skip exactly the peers a quorum needs. Confirmation
+    //      counts peers that have NEVER seen the binary, and this filter
+    //      removes precisely those from the round. Left on, `peers_unseen`
+    //      would sit at ~0 forever and nothing would ever confirm.
+    //   2. Its input is unauthenticated. Bloom adverts ride plain
+    //      chitchat KV gossip — no envelope, no signature. As a dial-
+    //      avoidance hint a forged advert costs one skipped query; as
+    //      quorum evidence it would let anyone who can reach the mesh
+    //      manufacture CONFIRMED alerts. Confirmation is only ever built
+    //      from signed `Answer` envelopes.
+    //
+    // The cost is a few extra RPCs over already-pooled connections,
+    // bounded by `fanout`.
     let mut peers_skipped_by_bloom = 0usize;
-    let ranked: Vec<_> = ranked
-        .into_iter()
-        .filter(|(peer, _)| {
-            if bloom_says_definitely_no(peer, tier1) {
-                peers_skipped_by_bloom += 1;
-                debug!(
-                    episode = %trigger.episode_id,
-                    peer = %peer.fingerprint,
-                    "skipping dial — peer advert excludes this tier1"
-                );
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
+    let ranked: Vec<_> = if qa_cfg.quorum > 0 {
+        ranked
+    } else {
+        ranked
+            .into_iter()
+            .filter(|(peer, _)| {
+                if bloom_says_definitely_no(peer, tier1) {
+                    peers_skipped_by_bloom += 1;
+                    debug!(
+                        episode = %trigger.episode_id,
+                        peer = %peer.fingerprint,
+                        "skipping dial — peer advert excludes this tier1"
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect()
+    };
 
     let envelope_verifier = Arc::new(Verifier::new(kn.clone(), local_fp));
 
@@ -388,6 +443,7 @@ async fn run_round(
         &llm_submitter,
         llm_threshold,
         &events_tx,
+        &confirm,
     );
 }
 
@@ -396,6 +452,61 @@ async fn run_round(
 /// and submit to the LLM if the verdict still clears the LLM
 /// threshold. Pulled out of `run_round` so both the empty-candidates
 /// fast path and the normal path share a single decision point.
+/// Turn a round's per-peer answers into a confirmation verdict.
+///
+/// **Polarity is the whole point and is easy to invert.** A peer that
+/// answers `seen_count > 0` is saying "I have this binary too", which
+/// argues it's a normal fleet artifact — evidence *against* the alert.
+/// Confirmation therefore counts peers that have **never** seen it:
+/// a binary none of your role-similar neighbours has is anomalous for
+/// this fleet. Both counts are reported so an operator can tell
+/// "nobody has this" from "everybody has this" rather than reading one
+/// opaque number.
+///
+/// Non-responders are counted separately and never satisfy a quorum:
+/// a peer that timed out told us nothing, and treating silence as
+/// agreement would let an offline neighbourhood manufacture
+/// confirmations.
+pub fn quorum_verdict(peers: &[PeerSighting], quorum: usize) -> AlertConfirmation {
+    let mut unseen = 0u32;
+    let mut seen = 0u32;
+    let mut no_reply = 0u32;
+    for p in peers {
+        match &p.sighting {
+            Some(s) if s.seen_count > 0 => seen += 1,
+            Some(_) => unseen += 1,
+            None => no_reply += 1,
+        }
+    }
+    let quorum_u32 = u32::try_from(quorum).unwrap_or(u32::MAX);
+    AlertConfirmation {
+        peers_asked: u32::try_from(peers.len()).unwrap_or(u32::MAX),
+        peers_unseen: unseen,
+        peers_seen: seen,
+        peers_no_reply: no_reply,
+        quorum: quorum_u32,
+        // quorum == 0 disables confirmation outright rather than
+        // confirming everything, which is what `>=` alone would do.
+        confirmed: quorum > 0 && unseen >= quorum_u32,
+    }
+}
+
+/// Human-readable evidence for the confirmed alert's rationale.
+fn confirmation_rationale(c: &AlertConfirmation) -> String {
+    let mut s = format!(
+        "confirmed by the neighbourhood: {}/{} role-similar peers have never seen this binary",
+        c.peers_unseen, c.peers_asked
+    );
+    if c.peers_seen > 0 {
+        let _ = write!(s, " ({} have seen it)", c.peers_seen);
+    }
+    if c.peers_no_reply > 0 {
+        let _ = write!(s, ", {} did not reply", c.peers_no_reply);
+    }
+    s
+}
+
+#[allow(clippy::too_many_arguments)]
 fn finish_round(
     trigger: WhisperQaTrigger,
     context: WhisperContext,
@@ -403,9 +514,50 @@ fn finish_round(
     llm_submitter: &Submitter,
     llm_threshold: f32,
     events_tx: &broadcast::Sender<AgentEvent>,
+    confirm: &ConfirmSink,
 ) {
     let mut ctx = trigger.ctx;
     inject_whisper_context(&mut ctx, &context);
+
+    // Emit a superseding alert when the neighbourhood confirms.
+    //
+    // It has to be a *second* alert rather than an edit: the original is
+    // appended before this round even starts, the inbox has no update
+    // path, and operators drain it with a monotonic cursor — mutating an
+    // already-delivered alert would be invisible to anyone who had
+    // already read past it. The LLM refinement path establishes the same
+    // supersede-by-episode_id pattern.
+    let verdict = quorum_verdict(&context.peers, confirm.quorum);
+    if verdict.confirmed && pre_suspicion >= confirm.alert_threshold {
+        let alert = Alert {
+            originator_fp: confirm.originator_fp.as_bytes().to_vec(),
+            episode_id: context.episode_id.clone(),
+            exe_sha256_hex: ctx.exe_sha256_hex.clone().unwrap_or_default(),
+            exe_path: ctx
+                .exe_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            suspicion: pre_suspicion,
+            rationale: confirmation_rationale(&verdict),
+            suggested_actions: Vec::new(),
+            ts_unix_ms: crate::inbox::current_unix_ms(),
+            backend: confirm.backend_label.clone(),
+            confirmation: Some(verdict),
+        };
+        info!(
+            episode = %context.episode_id,
+            unseen = verdict.peers_unseen,
+            seen = verdict.peers_seen,
+            quorum = verdict.quorum,
+            "alert confirmed by neighbourhood quorum"
+        );
+        confirm.inbox.append(alert);
+        let _ = events_tx.send(AgentEvent::AlertEmitted {
+            episode_id: context.episode_id.clone(),
+            suspicion: pre_suspicion,
+        });
+    }
 
     // Broadcast the round result for observers (tests, dashboards). We
     // emit *before* the LLM submission so subscribers see the round
@@ -748,5 +900,118 @@ mod tests {
         // Only the corroborating peer (seen_count > 0) shows up.
         assert_eq!(peer_keys.len(), 1);
         assert!(peer_keys[0].starts_with(&corroborating.to_string()[..16]));
+    }
+}
+
+#[cfg(test)]
+mod quorum_tests {
+    use super::*;
+
+    fn fp(b: u8) -> Fingerprint {
+        Fingerprint::from_bytes([b; 32])
+    }
+
+    /// A peer that replied "never seen it" — the evidence that confirms.
+    fn unseen(b: u8) -> PeerSighting {
+        PeerSighting {
+            peer: fp(b),
+            similarity: 0.9,
+            sighting: Some(LocalSighting::default()),
+            note: String::new(),
+        }
+    }
+
+    /// A peer that replied "I have it too" — argues the binary is common.
+    fn seen(b: u8, count: u64) -> PeerSighting {
+        PeerSighting {
+            peer: fp(b),
+            similarity: 0.9,
+            sighting: Some(LocalSighting {
+                seen_count: count,
+                first_seen_unix_ms: 1,
+                last_seen_unix_ms: 2,
+            }),
+            note: String::new(),
+        }
+    }
+
+    /// Timed out / failed to dial.
+    fn silent(b: u8) -> PeerSighting {
+        PeerSighting {
+            peer: fp(b),
+            similarity: 0.9,
+            sighting: None,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn confirms_when_enough_peers_have_never_seen_it() {
+        let peers = vec![unseen(1), unseen(2), seen(3, 12)];
+        let v = quorum_verdict(&peers, 2);
+        assert!(v.confirmed, "2 unseen meets a quorum of 2");
+        assert_eq!(v.peers_unseen, 2);
+        assert_eq!(v.peers_seen, 1);
+        assert_eq!(v.peers_no_reply, 0);
+        assert_eq!(v.peers_asked, 3);
+        assert_eq!(v.quorum, 2);
+    }
+
+    #[test]
+    fn a_prevalent_binary_is_not_confirmed() {
+        // Everyone has it: a normal fleet artifact. This is the case the
+        // old `corroborating_peers` count would have called "corroborated",
+        // which is exactly backwards for alert confirmation.
+        let peers = vec![seen(1, 40), seen(2, 12), seen(3, 7)];
+        let v = quorum_verdict(&peers, 2);
+        assert!(!v.confirmed, "prevalence must not confirm an alert");
+        assert_eq!(v.peers_seen, 3);
+        assert_eq!(v.peers_unseen, 0);
+    }
+
+    #[test]
+    fn silence_never_satisfies_a_quorum() {
+        // An offline neighbourhood must not manufacture confirmations.
+        let peers = vec![silent(1), silent(2), silent(3), unseen(4)];
+        let v = quorum_verdict(&peers, 2);
+        assert!(!v.confirmed, "non-responders are not evidence");
+        assert_eq!(v.peers_no_reply, 3);
+        assert_eq!(v.peers_unseen, 1);
+    }
+
+    #[test]
+    fn exactly_at_threshold_confirms() {
+        let peers = vec![unseen(1), unseen(2)];
+        assert!(quorum_verdict(&peers, 2).confirmed);
+        assert!(
+            !quorum_verdict(&peers, 3).confirmed,
+            "one short must not confirm"
+        );
+    }
+
+    #[test]
+    fn quorum_zero_disables_confirmation() {
+        // `unseen >= 0` is trivially true, so a naive `>=` would confirm
+        // everything — including a round that asked nobody.
+        let peers = vec![unseen(1)];
+        assert!(!quorum_verdict(&peers, 0).confirmed);
+        assert!(!quorum_verdict(&[], 0).confirmed);
+    }
+
+    #[test]
+    fn empty_round_is_not_confirmed() {
+        // No pinned role-similar peers: nothing corroborated anything.
+        let v = quorum_verdict(&[], 2);
+        assert!(!v.confirmed);
+        assert_eq!(v.peers_asked, 0);
+    }
+
+    #[test]
+    fn rationale_states_the_evidence() {
+        let v = quorum_verdict(&[unseen(1), unseen(2), seen(3, 5), silent(4)], 2);
+        let text = confirmation_rationale(&v);
+        assert!(text.contains("2/4"), "{text}");
+        assert!(text.contains("1 have seen it"), "{text}");
+        assert!(text.contains("1 did not reply"), "{text}");
     }
 }

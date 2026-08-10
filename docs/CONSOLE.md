@@ -178,7 +178,22 @@ On first activation the pane spawns a background poller that calls
 appear at the top. The pane keeps the most recent 500 entries.
 
 Columns: `time (UTC)` (RFC3339, millisecond precision), `agent`,
-`susp`, `episode`, `exe`.
+`conf`, `susp`, `episode`, `exe`.
+
+`conf` is the neighbourhood verdict: `✓4/5` means four of the five
+peers asked have **never seen** this binary — the rarity signal that
+confirms an alert — and a confirmed row is drawn red + bold so it is
+found by scanning rather than by reading. A blank cell means no
+whisper round ran; a check-less `1/5` means the round ran and did not
+reach quorum. The detail overlay breaks out all four counts, including
+peers that *have* seen the binary (which argues it's a normal fleet
+artifact) and peers that never replied (which count for nothing —
+silence isn't evidence).
+
+An episode that produces several alerts — the original, an LLM-refined
+one, a quorum-confirmed one — collapses to a single row showing the
+newest, since the later ones supersede rather than accompany the
+first.
 
 The `agent` column resolves the alert's originating fingerprint to the
 name in `~/.bowery/peers.toml`; an agent that isn't in the manifest

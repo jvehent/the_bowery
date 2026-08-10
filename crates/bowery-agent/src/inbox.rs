@@ -159,6 +159,7 @@ mod tests {
             suggested_actions: vec![],
             ts_unix_ms: ts_ms,
             backend: "test".into(),
+            confirmation: None,
         }
     }
 

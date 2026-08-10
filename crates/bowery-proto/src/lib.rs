@@ -241,6 +241,49 @@ pub struct Alert {
     /// LLM backends.
     #[prost(string, tag = "9")]
     pub backend: String,
+
+    /// Neighbourhood corroboration for this episode, when a whisper Q&A
+    /// round ran. `None` on alerts that never whisper (file-watch hits,
+    /// YARA matches) and on the first alert for an episode — the round
+    /// starts *after* the initial alert is emitted, so confirmation
+    /// arrives as a second, superseding alert for the same `episode_id`.
+    #[prost(message, optional, tag = "10")]
+    pub confirmation: Option<AlertConfirmation>,
+}
+
+/// Outcome of asking role-similar peers about an episode's binary.
+///
+/// Polarity matters and is easy to get backwards: a peer answering
+/// `seen_count > 0` means "I have this binary in my baseline too", which
+/// argues the binary is a normal fleet artifact — *less* suspicious. So
+/// confirmation is driven by `peers_unseen`: a quorum of neighbours that
+/// have **never** seen it makes the binary anomalous for this fleet.
+/// `peers_seen` is reported alongside rather than folded in, so an
+/// operator can tell "nobody has this" from "everybody has this" instead
+/// of being handed a single opaque number.
+#[derive(Clone, Copy, PartialEq, Eq, ProstMessage)]
+pub struct AlertConfirmation {
+    /// Peers actually dialled this round (after role-similarity ranking
+    /// and the bloom pre-filter).
+    #[prost(uint32, tag = "1")]
+    pub peers_asked: u32,
+    /// Replied "never seen it" — the evidence that confirms.
+    #[prost(uint32, tag = "2")]
+    pub peers_unseen: u32,
+    /// Replied "seen it", with a count. Argues the binary is common.
+    #[prost(uint32, tag = "3")]
+    pub peers_seen: u32,
+    /// Timed out or failed to dial. Never counts toward a quorum —
+    /// silence is not evidence.
+    #[prost(uint32, tag = "4")]
+    pub peers_no_reply: u32,
+    /// The threshold in force when this verdict was computed, so an
+    /// operator reading an old alert knows what "confirmed" meant then.
+    #[prost(uint32, tag = "5")]
+    pub quorum: u32,
+    /// `peers_unseen >= quorum`.
+    #[prost(bool, tag = "6")]
+    pub confirmed: bool,
 }
 
 /// Operator-issued request to drain the agent's local inbox. Sent on a
@@ -820,6 +863,14 @@ mod tests {
             suggested_actions: vec!["alert".into(), "kill_process".into()],
             ts_unix_ms: 1_730_000_000_000,
             backend: "mock/echo".into(),
+            confirmation: Some(AlertConfirmation {
+                peers_asked: 5,
+                peers_unseen: 4,
+                peers_seen: 1,
+                peers_no_reply: 0,
+                quorum: 2,
+                confirmed: true,
+            }),
         };
         let original = WhisperPayload::alert(alert.clone());
         let bytes = original.encode_to_vec();
@@ -828,6 +879,38 @@ mod tests {
             Some(Body::Alert(got)) => assert_eq!(got, alert),
             other => panic!("unexpected body: {other:?}"),
         }
+    }
+
+    /// An agent still running the previous build emits alerts with no
+    /// field 10. Decoding one must yield `confirmation: None` rather than
+    /// failing — a mixed-version fleet is the normal state during a
+    /// rollout, and a decode error would drop that agent's alerts
+    /// entirely.
+    #[test]
+    fn alert_without_confirmation_field_still_decodes() {
+        let mut legacy = Alert {
+            originator_fp: vec![0xbb; 32],
+            episode_id: "ep-legacy".into(),
+            exe_sha256_hex: "ab".repeat(32),
+            exe_path: "/usr/bin/legacy".into(),
+            suspicion: 0.7,
+            rationale: "old agent".into(),
+            suggested_actions: vec!["alert".into()],
+            ts_unix_ms: 1_730_000_000_001,
+            backend: "old/backend".into(),
+            confirmation: None,
+        };
+        // `None` encodes to no tag-10 bytes at all, which is exactly the
+        // wire image an older agent produces.
+        let bytes = legacy.encode_to_vec();
+        assert!(
+            !bytes.windows(1).any(|w| w == [0x52]),
+            "tag 10 (LEN) must be absent from the legacy wire image"
+        );
+        let decoded = Alert::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.confirmation, None);
+        legacy.confirmation = None;
+        assert_eq!(decoded, legacy);
     }
 
     #[test]
@@ -853,6 +936,7 @@ mod tests {
                 suggested_actions: vec![],
                 ts_unix_ms: 7,
                 backend: "test".into(),
+                confirmation: None,
             }],
             cursor_unix_ms: 8,
             end: true,

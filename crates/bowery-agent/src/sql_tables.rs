@@ -366,14 +366,19 @@ impl BoweryTable for BoweryAlertsTable {
                 suspicion         REAL,
                 rationale         TEXT,
                 ts_unix_ms        INTEGER,
-                backend           TEXT
+                backend           TEXT,
+                confirmed         INTEGER,
+                peers_asked       INTEGER,
+                peers_unseen      INTEGER,
+                peers_seen        INTEGER
             );",
         )?;
         let (alerts, _) = self.inbox.read_since(0, usize::MAX);
         let mut stmt = conn.prepare(
             "INSERT INTO bowery_alerts (originator_fp_hex, episode_id, exe_sha256_hex,
-                                         exe_path, suspicion, rationale, ts_unix_ms, backend)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                         exe_path, suspicion, rationale, ts_unix_ms, backend,
+                                         confirmed, peers_asked, peers_unseen, peers_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )?;
         for a in alerts {
             let originator_hex = hex_lower(&a.originator_fp);
@@ -387,6 +392,13 @@ impl BoweryTable for BoweryAlertsTable {
                 a.rationale,
                 ts,
                 a.backend,
+                // Absent confirmation renders as NULL rather than 0 so
+                // "no whisper round ran" is distinguishable from "the
+                // round ran and did not confirm".
+                a.confirmation.map(|c| i64::from(c.confirmed)),
+                a.confirmation.map(|c| i64::from(c.peers_asked)),
+                a.confirmation.map(|c| i64::from(c.peers_unseen)),
+                a.confirmation.map(|c| i64::from(c.peers_seen)),
             ])?;
         }
         Ok(())

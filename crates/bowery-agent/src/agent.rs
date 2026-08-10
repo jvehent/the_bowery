@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -476,7 +476,7 @@ impl Agent {
         let op_router = Arc::new(OperatorCommandRouter {
             sql: Some(Arc::new(sql_engine)),
             relay: Some(relay_ctx),
-            fanout_rate_limit: Arc::new(FanoutRateLimit::new()),
+            fanout_rate_limit: Arc::new(RateLimit::fanout()),
             max_timeout: config.sql.max_timeout,
             yara: Some(Arc::new(YaraContext {
                 store: yara_store.clone(),
@@ -491,6 +491,12 @@ impl Agent {
                 originator_fp: fingerprint,
             })),
         });
+
+        // One bucket-set per agent, shared by both inbound paths (the
+        // listener and streams opened back through pooled outbound
+        // connections) — otherwise a peer gets a fresh budget simply by
+        // choosing the other route in.
+        let qa_rate_limit = Arc::new(RateLimit::whisper_qa());
 
         // Persistent outbound-connection pool — Phase-10 slices 1+2.
         // Heartbeat (and, in later slices, Q&A and operator fanout)
@@ -507,6 +513,7 @@ impl Agent {
             let inbox_for_handler = inbox.clone();
             let op_router_for_handler = op_router.clone();
             let events_for_handler = events_tx.clone();
+            let qa_limit_for_handler = qa_rate_limit.clone();
             let handler: bowery_whisper::pool::InboundHandler = Arc::new(move |peer_fp, conn| {
                 let verifier = envelope_verifier.clone();
                 let operators = operators_for_handler.clone();
@@ -515,13 +522,22 @@ impl Agent {
                 let inbox = inbox_for_handler.clone();
                 let op_router = op_router_for_handler.clone();
                 let events = events_for_handler.clone();
+                let qa_rate_limit = qa_limit_for_handler.clone();
                 debug!(
                     peer = %peer_fp,
                     conn_id = conn.stable_id(),
                     "spawning inbound handler on outbound-pooled connection"
                 );
                 tokio::spawn(handle_connection(
-                    conn, verifier, operators, sealer, baseline, inbox, op_router, events,
+                    conn,
+                    verifier,
+                    operators,
+                    sealer,
+                    baseline,
+                    inbox,
+                    op_router,
+                    events,
+                    qa_rate_limit,
                 ));
             });
             PeerConnections::with_handler(endpoint.clone(), handler)
@@ -536,6 +552,7 @@ impl Agent {
             inbox.clone(),
             op_router,
             events_tx.clone(),
+            qa_rate_limit.clone(),
             shutdown_rx.clone(),
         );
 
@@ -582,6 +599,13 @@ impl Agent {
             llm_submitter.clone(),
             config.llm.invocation_threshold,
             events_tx.clone(),
+            crate::whisper_qa::ConfirmSink {
+                inbox: inbox.clone(),
+                originator_fp: fingerprint,
+                alert_threshold: config.alerts.threshold,
+                backend_label: llm.name().to_string(),
+                quorum: config.whisper.qa.quorum,
+            },
             shutdown_rx.clone(),
         );
 
@@ -837,7 +861,7 @@ pub(crate) struct OperatorCommandRouter {
     /// fan-out queries. Enforces F-4 from the security audit.
     /// Operator-direct queries aren't throttled — the blast radius
     /// is one host and `max_timeout` already caps per-query work.
-    pub fanout_rate_limit: Arc<FanoutRateLimit>,
+    pub fanout_rate_limit: Arc<RateLimit>,
     /// Hard ceiling on per-query wall-clock timeout.
     pub max_timeout: Duration,
     /// Operator-distributed YARA rules: the persistent store, the
@@ -861,45 +885,71 @@ pub(crate) struct YaraContext {
     pub originator_fp: Fingerprint,
 }
 
-/// Token-bucket rate limiter keyed on operator fingerprint. Each
-/// fan-out query consumes one token; tokens refill at
-/// `REFILL_PER_SEC`. A first-time operator gets `BURST` tokens
-/// immediately. Defends against a compromised operator key
-/// driving the relay into sustained mesh-amplified work.
+/// Token-bucket rate limiter keyed on peer fingerprint. Each request
+/// consumes one token; tokens refill at `refill_per_sec` and a
+/// first-time key starts with a full `burst`.
 ///
-/// Sized for the realistic operator workflow: one fan-out every
-/// 5 seconds for interactive triage, bursts up to 6 queries.
-#[derive(Debug, Default)]
-pub(crate) struct FanoutRateLimit {
-    inner: std::sync::Mutex<std::collections::HashMap<Fingerprint, FanoutBucket>>,
+/// Keyed on an *authenticated* fingerprint in both of its uses, so the
+/// map is bounded by the number of enrolled operators / pinned peers
+/// rather than by anything an unauthenticated attacker controls.
+#[derive(Debug)]
+pub(crate) struct RateLimit {
+    inner: std::sync::Mutex<std::collections::HashMap<Fingerprint, Bucket>>,
+    refill_per_sec: f64,
+    burst: f64,
 }
 
 #[derive(Debug)]
-struct FanoutBucket {
+struct Bucket {
     tokens: f64,
     last_refill: std::time::Instant,
 }
 
-impl FanoutRateLimit {
-    const REFILL_PER_SEC: f64 = 0.2; // 1 token / 5 s
-    const BURST: f64 = 6.0;
+impl Default for RateLimit {
+    /// The struct is reachable through `OperatorCommandRouter`'s derived
+    /// `Default`, where the field is the fan-out limiter.
+    fn default() -> Self {
+        Self::fanout()
+    }
+}
 
-    pub(crate) fn new() -> Self {
-        Self::default()
+impl RateLimit {
+    fn new(refill_per_sec: f64, burst: f64) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            refill_per_sec,
+            burst,
+        }
     }
 
-    /// Try to consume one token for `operator`. Returns `true` if
-    /// a token was available; `false` if the operator should be
-    /// deferred.
-    pub(crate) fn try_acquire(&self, operator: &Fingerprint) -> bool {
+    /// Defends against a compromised operator key driving the relay into
+    /// sustained mesh-amplified work. Sized for the realistic operator
+    /// workflow: one fan-out every 5 seconds for interactive triage,
+    /// bursts up to 6 queries.
+    pub(crate) fn fanout() -> Self {
+        Self::new(0.2, 6.0)
+    }
+
+    /// Bounds inbound whisper questions from a single peer. Each one
+    /// costs an O(baseline) scan, so an otherwise-legitimate pinned peer
+    /// that has been compromised could pin a core just by asking. A
+    /// burst of 10 covers a genuine exec storm on the asking host;
+    /// 1/sec sustained is far above any honest steady-state rate.
+    pub(crate) fn whisper_qa() -> Self {
+        Self::new(1.0, 10.0)
+    }
+
+    /// Try to consume one token for `key`. Returns `true` if a token was
+    /// available; `false` if the caller should be shed.
+    pub(crate) fn try_acquire(&self, key: &Fingerprint) -> bool {
         let now = std::time::Instant::now();
-        let mut map = self.inner.lock().expect("fanout rate-limit mutex poisoned");
-        let bucket = map.entry(*operator).or_insert(FanoutBucket {
-            tokens: Self::BURST,
+        let mut map = self.inner.lock().expect("rate-limit mutex poisoned");
+        let bucket = map.entry(*key).or_insert(Bucket {
+            tokens: self.burst,
             last_refill: now,
         });
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * Self::REFILL_PER_SEC).min(Self::BURST);
+        bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec).min(self.burst);
         bucket.last_refill = now;
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
@@ -939,6 +989,7 @@ fn spawn_accept_task(
     inbox: Arc<AlertInbox>,
     op_router: Arc<OperatorCommandRouter>,
     events_tx: broadcast::Sender<AgentEvent>,
+    qa_rate_limit: Arc<RateLimit>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -957,8 +1008,10 @@ fn spawn_accept_task(
                             let inbox = inbox.clone();
                             let op_router = op_router.clone();
                             let events = events_tx.clone();
+                            let qa_rate_limit = qa_rate_limit.clone();
                             tokio::spawn(handle_connection(
-                                conn, verifier, operators, sealer, baseline, inbox, op_router, events,
+                                conn, verifier, operators, sealer, baseline, inbox, op_router,
+                                events, qa_rate_limit,
                             ));
                         }
                         Err(e) => warn!(error = %e, "accept failed"),
@@ -991,6 +1044,7 @@ async fn handle_connection(
     inbox: Arc<AlertInbox>,
     op_router: Arc<OperatorCommandRouter>,
     events_tx: broadcast::Sender<AgentEvent>,
+    qa_rate_limit: Arc<RateLimit>,
 ) {
     let uni = tokio::spawn(handle_uni_stream_loop(
         conn.clone(),
@@ -1002,7 +1056,12 @@ async fn handle_connection(
         events_tx.clone(),
     ));
     let bi = tokio::spawn(handle_bi_stream_loop(
-        conn, verifier, sealer, baseline, events_tx,
+        conn,
+        verifier,
+        sealer,
+        baseline,
+        events_tx,
+        qa_rate_limit,
     ));
     let _ = tokio::join!(uni, bi);
 }
@@ -1091,6 +1150,7 @@ async fn handle_bi_stream_loop(
     sealer: Arc<Sealer>,
     baseline: Arc<Baseline>,
     events_tx: broadcast::Sender<AgentEvent>,
+    qa_rate_limit: Arc<RateLimit>,
 ) {
     loop {
         let Ok((bytes, reply)) = conn.accept_request().await else {
@@ -1110,6 +1170,11 @@ async fn handle_bi_stream_loop(
         });
         match env.payload.body {
             Some(Body::Question(q)) => {
+                // Check the budget before the O(baseline) scan, not after.
+                if !qa_rate_limit.try_acquire(&env.sender) {
+                    warn!(sender = %env.sender, "whisper Q&A rate limit exceeded; shedding");
+                    continue;
+                }
                 if let Err(e) = respond_to_question(reply, &sealer, &baseline, env.sender, q).await
                 {
                     warn!(sender = %env.sender, error = %e, "whisper Q&A response failed");
@@ -1156,6 +1221,26 @@ async fn respond_to_question(
         // the asker observes a transport error / timeout.
         return Ok(());
     }
+    // `ttl_ms` is an absolute deadline (see `qa::ttl_deadline_ms`). An
+    // expired question is work whose answer nobody is still waiting for
+    // — the other responder path (`qa.rs`) already drops these, and not
+    // doing so here left a free way to buy baseline scans with stale
+    // replayed-shaped traffic.
+    let now_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(u64::MAX);
+    if now_ms > question.ttl_ms {
+        debug!(
+            sender = %asker,
+            now_ms,
+            ttl_ms = question.ttl_ms,
+            "dropping expired whisper question"
+        );
+        return Ok(());
+    }
+
     let mut fp_bytes = [0u8; TIER1_LEN];
     fp_bytes.copy_from_slice(&question.tier1_fp);
     let target = Tier1Fingerprint::from_bytes(fp_bytes);
@@ -1831,6 +1916,9 @@ async fn handle_yara_push(
             suggested_actions: Vec::new(),
             ts_unix_ms: current_unix_ms(),
             backend: "yara".to_string(),
+            // A YARA hit is a direct content match; there is nothing for
+            // the neighbourhood to corroborate.
+            confirmation: None,
         };
         let episode_id = alert.episode_id.clone();
         warn!(rule = %m.rule_name, path = %m.path, "YARA MATCH");
@@ -2750,6 +2838,10 @@ async fn process_file_change(
         suggested_actions: Vec::new(),
         ts_unix_ms: current_unix_ms(),
         backend: backend_label.to_string(),
+        // File watches don't whisper: a deleted file has no hash to ask
+        // the neighbourhood about, and the operator asked to be told
+        // regardless of what peers think.
+        confirmation: None,
     };
     let episode_id = alert.episode_id.clone();
     info!(rule = %rule.id, path = %change.path.display(), op, "file monitor alert");
@@ -2893,6 +2985,9 @@ async fn process_exec(
             suggested_actions: Vec::new(), // populated by the LLM enrichment, later phase
             ts_unix_ms: current_unix_ms(),
             backend: backend_label.to_string(),
+            // First alert for this episode. A whisper round may follow and
+            // append a confirmed, superseding alert.
+            confirmation: None,
         };
         let episode_id = alert.episode_id.clone();
         let suspicion = alert.suspicion;
@@ -3005,6 +3100,10 @@ fn handle_llm_outcome(
                     suggested_actions: verdict.suggested_actions.clone(),
                     ts_unix_ms: current_unix_ms(),
                     backend: backend_label.to_string(),
+                    // The LLM refinement path doesn't carry the whisper
+                    // round's outcome; confirmation arrives on its own
+                    // superseding alert from `finish_round`.
+                    confirmation: None,
                 };
                 inbox.append(alert);
                 let _ = events_tx.send(AgentEvent::AlertEmitted {
@@ -3169,6 +3268,7 @@ mod alert_chunk_tests {
             suggested_actions: vec![],
             ts_unix_ms: i,
             backend: "test".to_string(),
+            confirmation: None,
         }
     }
 

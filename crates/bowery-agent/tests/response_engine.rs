@@ -85,6 +85,8 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, response: ResponseConfig) -> 
                 fanout: 1,
                 timeout: Duration::from_secs(1),
                 min_similarity: 0.0,
+                quorum: 2,
+                max_concurrent_rounds: 4,
             },
             bind_addr: loopback_ephemeral(),
         },

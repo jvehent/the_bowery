@@ -1111,7 +1111,7 @@ bit_count` for `i ∈ 0..k`. This avoids extra hashing per insert; with
 default `k=6` and `bit_count=2^16` it gives ~1% FP rate at ~6800
 inserted items.
 
-The advert *is* on the wire (Phase 5 polish, see §13.5):
+The advert *is* on the wire (Phase 5 polish, see §13.6):
 [`bloom_publisher.rs`](crates/bowery-agent/src/bloom_publisher.rs)
 periodically rebuilds a filter over the local baseline's tier-1
 fingerprints and publishes it to mesh KV. Askers consult that filter
@@ -1178,18 +1178,28 @@ receives them on an mpsc, and for each:
    per-peer timeout.
 7. Aggregate replies into a `WhisperContext { tier1_fp, peers,
    total_seen_count, corroborating_peers }`.
-8. Emit `AgentEvent::WhisperContextReady`.
-9. Stash the context against `episode_id` so the LLM analyzer can
-   pick it up when it dequeues that episode.
+8. Compute the quorum verdict and, when confirmed, append a
+   superseding alert (§13.5).
+9. Emit `AgentEvent::WhisperContextReady`.
+10. Stash the context against `episode_id` so the LLM analyzer can
+    pick it up when it dequeues that episode.
 
 Each round runs in its own `tokio::spawn` so a slow peer can't block
-the next trigger. The aggregator is liberal on errors — a peer that
+the next trigger, bounded by a `whisper.qa.max_concurrent_rounds`
+semaphore. A full semaphore *sheds* the trigger rather than queueing
+it: a late confirmation is worth less than a responsive agent, and
+the underlying alert has already been delivered either way. The aggregator is liberal on errors — a peer that
 times out or fails the dial just gets `sighting: None` in the result;
 the rest of the round proceeds.
 
 The responder side lives in [`crates/bowery-agent/src/agent.rs::handle_connection`](crates/bowery-agent/src/agent.rs):
 when an inbound envelope's body is `Question`, we run a baseline scan
 in `spawn_blocking` and reply. Same connection, same envelope crypto.
+
+Inbound questions are rate-limited per authenticated sender
+(`RateLimit::whisper_qa`, 1/s sustained, burst 10) because each one
+costs an O(baseline) scan, and expired questions — `ttl_ms` is an
+absolute deadline — are dropped before that scan runs.
 
 The asker pre-flight (Phase 5 polish): before each dial, look up the
 peer's published bloom advert in mesh KV and check if our tier-1 hits
@@ -1199,7 +1209,58 @@ shortcuts a network round-trip on a probabilistic structure; the
 correctness argument is one-sided (no false negatives) so worst-case
 we lose a single peer's `total_seen_count` contribution.
 
-### 13.5 Bloom advert publisher
+**The pre-flight stands down when `whisper.qa.quorum > 0`**, for two
+reasons that both matter:
+
+- It would skip exactly the peers a quorum needs. Confirmation counts
+  peers that have *never* seen the binary, and the filter removes
+  precisely those from the round — left enabled, `peers_unseen` would
+  sit at ~0 and nothing could ever confirm.
+- Bloom adverts ride plain chitchat KV gossip with no envelope and no
+  signature. As a dial-avoidance hint a forged advert costs one
+  skipped query; as quorum evidence it would let anyone who can reach
+  the mesh manufacture CONFIRMED alerts. Confirmation is built only
+  from signed `Answer` envelopes.
+
+### 13.5 Quorum-confirmed alerts
+
+A peer answering `seen_count > 0` means *"I have this binary too"* —
+that is **prevalence**, and prevalence argues the binary is a normal
+fleet artifact, i.e. more benign. So confirmation is driven by the
+opposite signal: peers that report **never seen it**. Of the peers
+actually asked:
+
+| bucket | meaning | counts toward quorum |
+| --- | --- | --- |
+| `peers_unseen` | replied, `seen_count == 0` | **yes** |
+| `peers_seen` | replied, `seen_count > 0` | no (argues benign) |
+| `peers_no_reply` | timeout / dial failure | no — silence isn't evidence |
+
+Confirmed when `peers_unseen >= whisper.qa.quorum`. Both signals are
+reported so an operator can tell "nobody has this" from "everybody
+has this" rather than being handed a single number.
+
+Confirmation arrives as a **second, superseding alert** for the same
+`episode_id`, not an edit of the first. The original alert is appended
+before the round starts, the inbox has no update path, and operators
+drain it with a monotonic cursor — mutating an already-delivered alert
+would be invisible to anyone who had read past it. The LLM refinement
+path establishes the same supersede-by-`episode_id` pattern, and
+consumers (console, CLI) dedup on that key.
+
+Operator surface: `confirmed` / `peers_asked` / `peers_unseen` /
+`peers_seen` columns on `bowery_alerts` (NULL when no round ran), a
+`conf` badge column plus red-bold row highlight in the console alerts
+pane with the full breakdown in the detail overlay, and a `mesh:` line
+in `bowery alerts` human output / a `confirmation` object in its JSON.
+
+Out of scope for now, and deliberately: gating *enforcement* on
+quorum. `DESIGN.md` specifies hard actions requiring standing operator
+authorization or k-of-n quorum, but the response engine never receives
+a `WhisperContext`. This work makes the signal available and
+operator-visible first.
+
+### 13.6 Bloom advert publisher
 
 [`crates/bowery-agent/src/bloom_publisher.rs`](crates/bowery-agent/src/bloom_publisher.rs).
 

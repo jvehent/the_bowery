@@ -30,7 +30,7 @@ fn reserve_udp_port() -> SocketAddr {
     socket.local_addr().expect("local_addr")
 }
 
-fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>) -> Config {
+fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>, quorum: usize) -> Config {
     Config {
         identity: IdentityConfig {
             path: dir.join("identity.key"),
@@ -53,6 +53,8 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>) -> Config
                 fanout: 4,
                 timeout: Duration::from_secs(3),
                 min_similarity: -1.0, // accept anything; tiny test fleet
+                quorum,
+                max_concurrent_rounds: 4,
             },
             bind_addr: loopback_ephemeral(),
         },
@@ -92,7 +94,9 @@ fn make_exec(pid: u32, exe_path: std::path::PathBuf) -> Event {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one linear scenario; splitting hides the ordering
 async fn high_suspicion_exec_triggers_whisper_round_and_aggregates_beta_sighting() {
+    const QUORUM: usize = 2;
     let workdir_alpha = TempDir::new().unwrap();
     let workdir_beta = TempDir::new().unwrap();
 
@@ -112,11 +116,13 @@ async fn high_suspicion_exec_triggers_whisper_round_and_aggregates_beta_sighting
         workdir_alpha.path(),
         mesh_addr_alpha,
         vec![mesh_addr_beta.to_string()],
+        QUORUM,
     );
     let cfg_beta = build_config(
         workdir_beta.path(),
         mesh_addr_beta,
         vec![mesh_addr_alpha.to_string()],
+        QUORUM,
     );
 
     // Alpha: send the exec event after a delay long enough for mesh
@@ -188,6 +194,16 @@ async fn high_suspicion_exec_triggers_whisper_round_and_aggregates_beta_sighting
     assert_eq!(context.corroborating_peers, 1);
     assert_eq!(context.total_seen_count, 2);
 
+    // Beta HAS the binary, which argues it's a normal fleet artifact —
+    // the opposite of what confirms. No confirmed alert may exist.
+    let (alerts, _) = agent_alpha.inbox().read_since(0, 100);
+    assert!(
+        !alerts
+            .iter()
+            .any(|a| a.confirmation.is_some_and(|c| c.confirmed)),
+        "a binary every peer already has must never be quorum-confirmed"
+    );
+
     // After the whisper round, the agent should have submitted the
     // verdict to the LLM with the neighborhood sightings folded into
     // ctx.extra. We assert by waiting for LlmVerdict — its presence
@@ -241,10 +257,15 @@ async fn whisper_round_skips_peers_whose_bloom_advert_excludes_tier1() {
     // Configure both with a fast bloom publish_interval so beta has
     // time to gossip its (empty) advert before alpha's exec event
     // fires.
+    // quorum 0 — the bloom skip is a pure dial-avoidance optimization
+    // and deliberately stands down when confirmation is enabled, since
+    // it would filter out exactly the never-seen-it peers a quorum
+    // counts (see `run_round`).
     let mut cfg_alpha = build_config(
         workdir_alpha.path(),
         mesh_addr_alpha,
         vec![mesh_addr_beta.to_string()],
+        0,
     );
     cfg_alpha.bloom.publish_interval = Duration::from_millis(200);
 
@@ -252,6 +273,7 @@ async fn whisper_round_skips_peers_whose_bloom_advert_excludes_tier1() {
         workdir_beta.path(),
         mesh_addr_beta,
         vec![mesh_addr_alpha.to_string()],
+        0,
     );
     cfg_beta.bloom.publish_interval = Duration::from_millis(200);
 
@@ -304,6 +326,118 @@ async fn whisper_round_skips_peers_whose_bloom_advert_excludes_tier1() {
     );
     assert_eq!(context.corroborating_peers, 0);
     assert_eq!(context.total_seen_count, 0);
+
+    agent_alpha.shutdown().await.expect("shutdown alpha");
+    agent_beta.shutdown().await.expect("shutdown beta");
+}
+
+/// Quorum confirmation, end to end over a real two-agent whisper round.
+///
+/// Beta has *never* seen the payload, so its signed `Answer` carries
+/// `seen_count == 0` — the rarity signal confirmation is built from. With
+/// `quorum: 1` that single never-seen-it vote is enough, and alpha must
+/// append a superseding alert marked confirmed.
+///
+/// Note the polarity, which is the easiest thing to get backwards here:
+/// a peer that HAS the binary argues it is a normal fleet artifact, so it
+/// counts *against* confirmation. `high_suspicion_exec_..._beta_sighting`
+/// covers that direction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn neighbourhood_quorum_confirms_an_alert_nobody_else_has_seen() {
+    let workdir_alpha = TempDir::new().unwrap();
+    let workdir_beta = TempDir::new().unwrap();
+
+    let payload_path = workdir_alpha.path().join("payload");
+    // Unique bytes so beta's baseline cannot coincidentally hold it.
+    std::fs::write(&payload_path, b"quorum-confirm-never-seen-anywhere-else").unwrap();
+
+    let mesh_addr_alpha = reserve_udp_port();
+    let mesh_addr_beta = reserve_udp_port();
+
+    let cfg_alpha = build_config(
+        workdir_alpha.path(),
+        mesh_addr_alpha,
+        vec![mesh_addr_beta.to_string()],
+        1,
+    );
+    let cfg_beta = build_config(
+        workdir_beta.path(),
+        mesh_addr_beta,
+        vec![mesh_addr_alpha.to_string()],
+        1,
+    );
+
+    let alpha_source = Box::new(
+        MockEventSource::new(vec![make_exec(4242, payload_path)])
+            .with_delay(Duration::from_secs(2)),
+    );
+
+    let agent_alpha = Agent::start(cfg_alpha, Arc::new(Identity::generate()), alpha_source)
+        .await
+        .expect("start alpha");
+    let agent_beta = Agent::start(
+        cfg_beta,
+        Arc::new(Identity::generate()),
+        Box::new(NoopEventSource),
+    )
+    .await
+    .expect("start beta");
+
+    // Beta's baseline is deliberately left empty for this sha.
+    let mut events = agent_alpha.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let context = loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !timeout.is_zero(),
+            "timed out waiting for WhisperContextReady"
+        );
+        match tokio::time::timeout(timeout, events.recv()).await {
+            Ok(Ok(AgentEvent::WhisperContextReady(ctx))) => break ctx,
+            Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
+            Ok(Err(RecvError::Closed)) => panic!("event channel closed early"),
+            Err(tokio::time::error::Elapsed { .. }) => {
+                panic!("timed out waiting for WhisperContextReady")
+            }
+        }
+    };
+
+    // Beta must actually have been dialled: with confirmation enabled the
+    // bloom filter stands down precisely so never-seen-it peers are asked
+    // rather than skipped.
+    assert_eq!(
+        context.peers_skipped_by_bloom, 0,
+        "bloom skip must stand down when quorum > 0, or nothing can ever confirm"
+    );
+    assert_eq!(context.peers.len(), 1, "expected beta in the round");
+    let sighting = context.peers[0]
+        .sighting
+        .expect("beta should have replied rather than timing out");
+    assert_eq!(sighting.seen_count, 0, "beta has never seen this payload");
+    assert_eq!(context.corroborating_peers, 0);
+
+    // The superseding alert is appended before WhisperContextReady is
+    // broadcast, so it is already readable.
+    let (alerts, _) = agent_alpha.inbox().read_since(0, 100);
+    let confirmed: Vec<_> = alerts
+        .iter()
+        .filter(|a| a.episode_id == context.episode_id)
+        .filter_map(|a| a.confirmation)
+        .collect();
+    assert_eq!(
+        confirmed.len(),
+        1,
+        "expected exactly one confirmed alert for the episode, got {} of {} alerts",
+        confirmed.len(),
+        alerts.len()
+    );
+    let c = confirmed[0];
+    assert!(c.confirmed, "quorum of 1 never-seen-it vote must confirm");
+    assert_eq!(c.peers_unseen, 1);
+    assert_eq!(c.peers_seen, 0);
+    assert_eq!(c.peers_no_reply, 0);
+    assert_eq!(c.peers_asked, 1);
+    assert_eq!(c.quorum, 1);
 
     agent_alpha.shutdown().await.expect("shutdown alpha");
     agent_beta.shutdown().await.expect("shutdown beta");

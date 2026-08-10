@@ -205,6 +205,24 @@ pub struct WhisperQaConfig {
     /// neighborhood scoping.
     #[serde(default = "default_whisper_qa_min_similarity")]
     pub min_similarity: f32,
+    /// How many peers must report **never seen it** for an alert to be
+    /// confirmed by the neighbourhood.
+    ///
+    /// Polarity is deliberate and easy to get backwards: a peer that
+    /// *has* seen the binary argues it's a normal fleet artifact, so
+    /// confirmation is driven by peers that have NOT. Non-responders
+    /// never count — silence isn't evidence. Set to 0 to disable
+    /// confirmation entirely.
+    #[serde(default = "default_whisper_qa_quorum")]
+    pub quorum: usize,
+    /// Ceiling on Q&A rounds in flight at once. Each round dials up to
+    /// `fanout` peers, so an exec storm on a busy host would otherwise
+    /// spawn unbounded concurrent rounds and turn one noisy machine into
+    /// a mesh-wide amplifier. Rounds over the ceiling are shed, not
+    /// queued — a late confirmation is worth less than a responsive
+    /// agent, and the underlying alert is already delivered either way.
+    #[serde(default = "default_whisper_qa_max_concurrent_rounds")]
+    pub max_concurrent_rounds: usize,
 }
 
 impl Default for WhisperQaConfig {
@@ -214,6 +232,8 @@ impl Default for WhisperQaConfig {
             fanout: default_whisper_qa_fanout(),
             timeout: default_whisper_qa_timeout(),
             min_similarity: default_whisper_qa_min_similarity(),
+            quorum: default_whisper_qa_quorum(),
+            max_concurrent_rounds: default_whisper_qa_max_concurrent_rounds(),
         }
     }
 }
@@ -229,6 +249,16 @@ fn default_whisper_qa_timeout() -> Duration {
 }
 fn default_whisper_qa_min_similarity() -> f32 {
     0.0
+}
+/// Two independent neighbours that have never seen the binary. One is
+/// too easy to satisfy on a small mesh; the default `fanout` of 5 makes
+/// two reachable without demanding a large fleet.
+const fn default_whisper_qa_max_concurrent_rounds() -> usize {
+    4
+}
+
+fn default_whisper_qa_quorum() -> usize {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
