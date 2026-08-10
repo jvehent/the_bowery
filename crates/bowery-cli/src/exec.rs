@@ -645,6 +645,201 @@ fn escape_json_string(s: &str) -> String {
     out
 }
 
+/// Push a YARA rule to an agent, scan the given targets, and print each
+/// reporting agent's results.
+///
+/// Mirrors [`sql`]'s dial → seal → send → read-until-terminator shape,
+/// including the same two integrity rules learned there: attribute a
+/// report by the **authenticated envelope sender** (never a self-declared
+/// field), and honor the fan-out terminator only from the relay we
+/// dialled — otherwise one compromised peer could truncate the fleet's
+/// results or impersonate another host.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn yara(
+    operator_key: PathBuf,
+    target_addr: SocketAddr,
+    target_fp_hex: String,
+    target_pubkey_b64: String,
+    peer_pubkeys_b64: Vec<String>,
+    rules_path: PathBuf,
+    targets: Vec<String>,
+    timeout: Duration,
+    fanout: bool,
+    ttl: u32,
+) -> Result<()> {
+    use bowery_proto::YaraPush;
+    // Fail here with a clear message rather than letting an oversized
+    // envelope tear down the QUIC stream with no explanation.
+    const MAX_RULE_BYTES: usize = 48 * 1024;
+
+    let rules = std::fs::read(&rules_path)
+        .with_context(|| format!("reading rule file {}", rules_path.display()))?;
+    if rules.len() > MAX_RULE_BYTES {
+        bail!(
+            "rule file is {} bytes; the transport frame cap allows about {} \
+             (split the rules across several pushes)",
+            rules.len(),
+            MAX_RULE_BYTES
+        );
+    }
+    let rule_id = sha256_hex(&rules);
+
+    let identity = Arc::new(
+        Identity::load(&operator_key)
+            .with_context(|| format!("loading operator key from {}", operator_key.display()))?,
+    );
+    let target_fp = parse_fingerprint(&target_fp_hex)?;
+    let target_vk = parse_verifying_key(&target_pubkey_b64)?;
+    let mut resolver = StaticResolver::new();
+    let inserted_fp = resolver.insert(target_vk);
+    if inserted_fp != target_fp {
+        bail!("target_pubkey_b64 fingerprint {inserted_fp} doesn't match --agent-fp {target_fp}");
+    }
+    // Propagating agents seal their reports for us directly, so we need
+    // their pubkeys to verify — same manifest the SQL fan-out uses.
+    let mut agent_names: HashMap<String, String> = HashMap::new();
+    if let Ok(manifest_path) = crate::peers::default_path()
+        && let Ok(manifest) = crate::peers::Manifest::load(&manifest_path)
+    {
+        for peer in &manifest.peers {
+            if let Ok(vk) = parse_verifying_key(&peer.pubkey_b64) {
+                resolver.insert(vk);
+                agent_names.insert(peer.fp.to_ascii_lowercase(), peer.name.clone());
+            }
+        }
+    }
+    for b64 in &peer_pubkeys_b64 {
+        let vk = parse_verifying_key(b64)
+            .with_context(|| format!("parsing --peer-pubkey-b64 {b64:?}"))?;
+        resolver.insert(vk);
+    }
+    let resolver = Arc::new(resolver);
+
+    let bind_addr: SocketAddr = if target_addr.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
+    let endpoint = BoweryEndpoint::bind(identity.clone(), accept_verifier, bind_addr)
+        .context("binding operator-side endpoint")?;
+    let operator_fp = identity.fingerprint();
+    let sealer = Sealer::new(identity.clone());
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), target_fp));
+    let conn = endpoint
+        .dial(dial_verifier, target_addr)
+        .await
+        .with_context(|| format!("dialing agent at {target_addr}"))?;
+
+    let request_id = format!("op-{}", current_unix_ms());
+    let target_count = targets.len();
+    let body = OperatorCommandBody::YaraPush(YaraPush {
+        rule_id: rule_id.clone(),
+        rules,
+        targets,
+        fanout,
+        ttl,
+    });
+    // Always sign an authorization: unlike SQL, a YARA push can travel
+    // several hops, and every agent it reaches verifies this signature.
+    let auth =
+        bowery_whisper::forwarding::sign_operator_authorization(&identity, &request_id, &body);
+    let cmd = OperatorCommand {
+        forwarded_from_operator: prost::Message::encode_to_vec(&auth),
+        request_id: request_id.clone(),
+        timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+        command: Some(body),
+    };
+    let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
+
+    println!("pushing rule {} ({target_count} target(s))", &rule_id[..16]);
+    let exchange_timeout = timeout + Duration::from_secs(2);
+    let exchange = async {
+        conn.send_envelope(&outbound)
+            .await
+            .context("sending YaraPush")?;
+        let mut reporting = 0usize;
+        let mut total_matches = 0usize;
+        loop {
+            let bytes = match conn.recv_envelope().await {
+                Ok(b) => b,
+                Err(e) => {
+                    if fanout {
+                        break; // connection closed ends a fan-out stream
+                    }
+                    return Err(anyhow::Error::from(e).context("awaiting YaraReport"));
+                }
+            };
+            let opened = envelope_verifier
+                .open(&bytes)
+                .context("verifying YaraReport envelope")?;
+            let sender = opened.sender;
+            let result = match opened.payload.body {
+                Some(Body::OperatorResult(r)) => r,
+                other => bail!("agent replied with unexpected body: {other:?}"),
+            };
+            if result.request_id != request_id {
+                bail!("agent echoed request_id {:?}", result.request_id);
+            }
+            match result.result {
+                Some(OperatorResultBody::YaraReport(rep)) => {
+                    // Fan-out terminator, honored only from the relay.
+                    if fanout && rep.end && rep.agent_fp.is_empty() && sender == target_fp {
+                        break;
+                    }
+                    let name = agent_name_for(&agent_names, sender.as_bytes());
+                    reporting += 1;
+                    total_matches += rep.matches.len();
+                    println!(
+                        "{name} ({}): {} match(es), {} file(s) scanned",
+                        &sender.to_string()[..16],
+                        rep.matches.len(),
+                        rep.scanned
+                    );
+                    for m in &rep.matches {
+                        println!("    MATCH {} :: {}", m.rule_name, m.path);
+                    }
+                    for e in &rep.errors {
+                        println!("    note: {e}");
+                    }
+                    if rep.end && !fanout {
+                        break;
+                    }
+                }
+                Some(OperatorResultBody::Error(e)) => {
+                    eprintln!("agent refused push: {} ({})", e.message, e.kind);
+                    bail!("yara push failed: {}", e.kind);
+                }
+                Some(OperatorResultBody::SqlChunk(_)) => {
+                    bail!("agent replied with a SqlChunk to a YARA request");
+                }
+                None => bail!("agent returned an OperatorResult with no body"),
+            }
+        }
+        println!("{reporting} agent(s) reported, {total_matches} total match(es)");
+        Ok::<(), anyhow::Error>(())
+    };
+    let outcome = tokio::time::timeout(exchange_timeout, exchange).await;
+    drop(conn);
+    endpoint.close().await;
+    match outcome {
+        Ok(r) => r,
+        Err(_) => bail!("yara push timed out after {exchange_timeout:?}"),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Whether a received chunk is the fan-out completion terminator — an
 /// empty declared `agent_fp` with `end = true`, which the relay sends to
 /// signal "all peers done". Honored ONLY when it comes from the relay we

@@ -197,6 +197,16 @@ echo "$OUT" | grep -q "netcat-exec" || {
     exit 1
 }
 
+echo "==> exercise bowery_yara_rules view (registers + queryable)"
+# No rules pushed in this test, so the view is empty — but it must
+# register and be queryable (a broken register() fails every query).
+OUT=$(run_sql 'SELECT COUNT(*) AS n FROM bowery_yara_rules')
+echo "$OUT"
+[[ "$(echo "$OUT" | head -1)" == "n" ]] || {
+    echo "FAIL: expected header 'n' from bowery_yara_rules" >&2
+    exit 1
+}
+
 echo "==> file monitor: changing a watched file raises an alert"
 # inotify IN_CLOSE_WRITE on the watched path -> Event::FileChange -> alert.
 printf 'tampered\n' > "$TEST_DIR/watched.conf"

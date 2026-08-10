@@ -210,6 +210,54 @@ enum ExecCommand {
         #[arg(long, default_value_t = SqlFormat::Tsv)]
         format: SqlFormat,
     },
+    /// Distribute a YARA rule file to an agent, scan the given targets
+    /// with it, and optionally propagate it across the whisper mesh.
+    ///
+    /// The rule travels inside the operator-signed command, so every
+    /// agent it reaches verifies *your* signature over the exact rule
+    /// bytes and targets — a relaying agent can drop a rule but cannot
+    /// forge or alter one.
+    Yara {
+        /// Path to the operator's identity key file.
+        #[arg(long)]
+        operator_key: PathBuf,
+        /// Agent's whisper bind address (e.g. `127.0.0.1:9902`).
+        #[arg(long)]
+        agent_addr: SocketAddr,
+        /// Hex-encoded fingerprint of the agent's identity key.
+        #[arg(long)]
+        agent_fp: String,
+        /// Base64-encoded Ed25519 verifying key of the agent.
+        #[arg(long)]
+        agent_pubkey_b64: String,
+        /// Path to the `.yar` rule file to distribute.
+        #[arg(long)]
+        rules: PathBuf,
+        /// Absolute path (file or directory) for the agents to scan.
+        /// Repeat for several. Omit to store + propagate without
+        /// scanning.
+        #[arg(long = "target")]
+        targets: Vec<String>,
+        /// Wall-clock deadline for the agent-side scan.
+        #[arg(long, default_value = "30s", value_parser = parse_duration)]
+        timeout: Duration,
+        /// Propagate the rule through the mesh: each agent forwards it
+        /// to its pinned peers until the hop budget (`--ttl`) runs out.
+        /// Agents drop pushes they've already handled, so a cyclic mesh
+        /// terminates instead of looping.
+        #[arg(long)]
+        fanout: bool,
+        /// Hop budget for `--fanout`. Each agent decrements it before
+        /// forwarding; agents also clamp it to their own configured
+        /// maximum.
+        #[arg(long, default_value_t = 4)]
+        ttl: u32,
+        /// Base64-encoded Ed25519 verifying key of a peer that may
+        /// report back. Repeat per peer. `~/.bowery/peers.toml` is
+        /// loaded automatically; this extends it for one-off pushes.
+        #[arg(long = "peer-pubkey-b64")]
+        peer_pubkeys_b64: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -453,6 +501,47 @@ impl Cli {
                     timeout,
                     fanout,
                     sink.as_mut(),
+                ))?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::Exec {
+                sub:
+                    ExecCommand::Yara {
+                        operator_key,
+                        agent_addr,
+                        agent_fp,
+                        agent_pubkey_b64,
+                        rules,
+                        targets,
+                        timeout,
+                        fanout,
+                        ttl,
+                        peer_pubkeys_b64,
+                    },
+            } => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                    )
+                    .with_target(false)
+                    .with_writer(std::io::stderr)
+                    .init();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building tokio runtime")?;
+                runtime.block_on(exec::yara(
+                    operator_key,
+                    agent_addr,
+                    agent_fp,
+                    agent_pubkey_b64,
+                    peer_pubkeys_b64,
+                    rules,
+                    targets,
+                    timeout,
+                    fanout,
+                    ttl,
                 ))?;
                 Ok(ExitCode::SUCCESS)
             }

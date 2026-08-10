@@ -294,13 +294,14 @@ return to the previous pane.
 `processes.cmdline` is empty unless `[sql] expose_cmdline = true` is
 set in the agent config.
 
-### 5.2 Bowery-internal views (6)
+### 5.2 Bowery-internal views (7)
 
 | Table | Columns |
 |---|---|
 | `bowery_peers` | fingerprint_hex |
 | `bowery_mesh_peers` | fingerprint_hex, whisper_addr, agent_version, pinned, has_role_vector, has_bloom_advert |
 | `bowery_monitor_rules` | kind, rule_id, pattern, ops, severity |
+| `bowery_yara_rules` | rule_id, bytes, received_unix, source_operator_fp, request_id |
 | `bowery_baseline_binaries` | sha256_hex, first_seen_unix, last_seen_unix, seen_count |
 | `bowery_alerts` | episode_id, suspicion, exe_path, ts_unix_ms |
 | `bowery_audit` | seq, ts_unix_ms, episode_id, action_id, outcome_kind |

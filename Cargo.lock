@@ -283,6 +283,7 @@ dependencies = [
  "bowery-sql",
  "bowery-tables",
  "bowery-whisper",
+ "bowery-yara",
  "clap",
  "ed25519-dalek",
  "futures",

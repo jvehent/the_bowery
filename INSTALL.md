@@ -623,6 +623,52 @@ operator — the relay does **not** need to be in any peer's
 `[operators]` list — so a compromised relay key cannot grant
 SQL authority over peers.
 
+### YARA rule distribution
+
+Push a YARA rule to an agent, scan paths with it, and (optionally)
+propagate it across the whisper mesh so every agent stores and runs it:
+
+```bash
+# scan one agent
+bowery exec yara --operator-key ~/.bowery/operator.key \
+    --agent-addr 100.105.157.53:9902 --agent-fp <hex> --agent-pubkey-b64 <b64> \
+    --rules ./webshell.yar --target /var/www --target /tmp
+
+# distribute across the whole mesh (each hop decrements --ttl)
+bowery exec yara ... --rules ./webshell.yar --target /tmp --fanout --ttl 4
+```
+
+Matches become alerts (visible via `bowery alerts tail`), and each agent
+reports its own results back. Confirm distribution landed everywhere:
+
+```bash
+bowery exec sql ... --fanout --sql 'SELECT rule_id FROM bowery_yara_rules'
+```
+
+How it's bounded and secured:
+
+- **The rule is operator-signed.** Every agent it reaches verifies *your*
+  signature over the exact rule bytes and targets, so a relaying agent
+  can drop a rule but cannot forge, alter, or redirect one.
+- **Loops terminate.** Each agent remembers `(operator_fp, request_id)`
+  and drops a push it has already handled, so a cyclic peer graph
+  converges instead of flooding forever. `--ttl` is an independent
+  structural bound; agents clamp it to their own `[yara] max_ttl`.
+- **Rules are content-addressed** by SHA-256, so the same rule arriving
+  by several mesh paths stores once.
+- **Caps** live in `[yara]`: `max_rules`, `max_rule_bytes` (48 KiB
+  default — the transport frame cap makes larger pushes impossible),
+  `max_concurrent_scans`, `max_file_bytes`, `max_files_per_scan`,
+  `max_depth`.
+
+> **The scanning engine is opt-in at build time.** Build the agent with
+> `--features yara` to link libyara. Without it agents still accept,
+> store, and propagate rules — they just report `engine not compiled in`
+> instead of scanning. It's off by default so the static aarch64-musl Pi
+> build doesn't take on a C dependency. Note libyara here is built with
+> crypto disabled, so rules cannot use the `hash` module; use the
+> `bowery_file_sha256_hex` SQL function for hashing instead.
+
 ### Models
 
 The agent expects an already-on-disk GGUF. Fetch one:

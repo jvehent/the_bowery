@@ -2,6 +2,7 @@
 //! pin-task + accept-task + heartbeat-task, with watch-channel-driven
 //! shutdown.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,7 +39,7 @@ use crate::monitor::MonitorRules;
 use crate::whisper_qa::{
     WhisperContext, WhisperQaTrigger, aggregate_local_sighting, spawn_whisper_qa_task,
 };
-use crate::yara_store::YaraStore;
+use crate::yara_store::{YaraSeen, YaraStore};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -477,6 +478,18 @@ impl Agent {
             relay: Some(relay_ctx),
             fanout_rate_limit: Arc::new(FanoutRateLimit::new()),
             max_timeout: config.sql.max_timeout,
+            yara: Some(Arc::new(YaraContext {
+                store: yara_store.clone(),
+                // Remembering a push for 30 minutes is far longer than any
+                // flood takes to settle, so a rule can't lap the mesh.
+                seen: Arc::new(YaraSeen::new(Duration::from_mins(30), 4096)),
+                inbox: inbox.clone(),
+                scan_permits: Arc::new(tokio::sync::Semaphore::new(
+                    config.yara.max_concurrent_scans.max(1),
+                )),
+                config: config.yara.clone(),
+                originator_fp: fingerprint,
+            })),
         });
 
         // Persistent outbound-connection pool — Phase-10 slices 1+2.
@@ -827,6 +840,25 @@ pub(crate) struct OperatorCommandRouter {
     pub fanout_rate_limit: Arc<FanoutRateLimit>,
     /// Hard ceiling on per-query wall-clock timeout.
     pub max_timeout: Duration,
+    /// Operator-distributed YARA rules: the persistent store, the
+    /// propagation seen-set (loop prevention), the alert inbox to raise
+    /// matches into, and the caps that bound scan work. `None` rejects
+    /// `YaraPush` with `policy_denied`, per this struct's convention.
+    pub yara: Option<Arc<YaraContext>>,
+}
+
+/// Everything the YARA push handler needs, grouped so the router stays
+/// readable.
+pub(crate) struct YaraContext {
+    pub store: Arc<YaraStore>,
+    pub seen: Arc<YaraSeen>,
+    pub inbox: Arc<AlertInbox>,
+    /// Bounds concurrent scans: a fleet-wide push otherwise pins every
+    /// core on every agent at once.
+    pub scan_permits: Arc<tokio::sync::Semaphore>,
+    pub config: crate::config::YaraConfig,
+    /// This agent's own fingerprint, stamped on emitted alerts.
+    pub originator_fp: Fingerprint,
 }
 
 /// Token-bucket rate limiter keyed on operator fingerprint. Each
@@ -1357,6 +1389,66 @@ async fn respond_to_operator_command(
         "operator command received"
     );
 
+    // YARA rule distribution. Like SQL it streams its own responses;
+    // unlike SQL it may propagate multiple hops (bounded by ttl + the
+    // seen-set) because a detection rule is meant to reach the fleet.
+    if let Some(OperatorCommandBody::YaraPush(p)) = &cmd.command {
+        let Some(yara_ctx) = op_router.yara.clone() else {
+            return send_sql_error(
+                conn,
+                &sealer,
+                &operator,
+                &request_id,
+                "policy_denied",
+                "yara rule distribution is not enabled on this agent",
+            )
+            .await;
+        };
+        // Rate-limit the entry-point push the same way as fan-out SQL:
+        // one operator shouldn't be able to flood the mesh with pushes.
+        if p.fanout && is_direct_operator && !op_router.fanout_rate_limit.try_acquire(&operator) {
+            warn!(
+                operator = %operator,
+                request_id = %request_id,
+                "rate-limiting yara push: operator bucket empty"
+            );
+            return send_sql_error(
+                conn,
+                &sealer,
+                &operator,
+                &request_id,
+                "rate_limited",
+                "fan-out bucket empty for this operator; back off and retry",
+            )
+            .await;
+        }
+        // Clamp the operator's requested TTL to this agent's cap, so a
+        // single push can't be given an unbounded hop budget.
+        let capped = bowery_proto::YaraPush {
+            ttl: p.ttl.min(yara_ctx.config.max_ttl),
+            ..p.clone()
+        };
+        let outcome = handle_yara_push(
+            conn,
+            &sealer,
+            operator,
+            &request_id,
+            &capped,
+            &cmd.forwarded_from_operator,
+            &yara_ctx,
+            op_router.relay.as_ref(),
+            effective_timeout,
+            events_tx,
+        )
+        .await;
+        let _ = events_tx.send(AgentEvent::OperatorCommandHandled {
+            operator,
+            request_id,
+            kind: command_kind,
+        });
+        return outcome;
+    }
+
     // SQL is special-cased: it streams multiple chunked envelopes
     // back over the same connection. Other variants build a single
     // OperatorResultBody and fall through to the unified send below.
@@ -1582,6 +1674,384 @@ async fn stream_sql_response(
         send_chunk(conn, sealer, &operator, request_id, terminator).await?;
     }
     Ok(())
+}
+
+/// Handle an operator `YaraPush`: store the rule, scan the requested
+/// targets, alert on matches, report back, and (when asked) propagate the
+/// push onward through the mesh.
+///
+/// Ordering matters. The seen-set is consulted **first** so a push that
+/// has already been handled is dropped whole — no re-store, no re-scan,
+/// and crucially no re-forward. That's what terminates propagation in a
+/// cyclic pinned-peer graph; the `ttl` hop counter is the independent
+/// structural backstop.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn handle_yara_push(
+    conn: &BoweryConnection,
+    sealer: &Arc<Sealer>,
+    operator: Fingerprint,
+    request_id: &str,
+    push: &bowery_proto::YaraPush,
+    forwarded_authorization: &[u8],
+    yara: &Arc<YaraContext>,
+    relay: Option<&Arc<RelayContext>>,
+    timeout: Duration,
+    events_tx: &broadcast::Sender<AgentEvent>,
+) -> Result<(), bowery_whisper::transport::Error> {
+    let self_fp = sealer.fingerprint();
+    let operator_hex = operator.to_string();
+
+    // --- Loop prevention. Must come before any work or forwarding. ---
+    if !yara.seen.check_and_record(&operator_hex, request_id) {
+        debug!(
+            operator = %operator,
+            request_id,
+            rule = %push.rule_id,
+            "dropping already-seen yara push (propagation loop cut)"
+        );
+        // Still terminate the operator's stream cleanly.
+        return send_yara_report(
+            conn,
+            sealer,
+            &operator,
+            request_id,
+            bowery_proto::YaraReport {
+                agent_fp: self_fp.as_bytes().to_vec(),
+                rule_id: push.rule_id.clone(),
+                matches: Vec::new(),
+                scanned: 0,
+                errors: vec!["already handled (duplicate push)".to_string()],
+                end: true,
+            },
+        )
+        .await;
+    }
+
+    // --- Store. Idempotent + content-verified. ---
+    let mut errors: Vec<String> = Vec::new();
+    if push.rules.len() > yara.config.max_rule_bytes {
+        return send_sql_error(
+            conn,
+            sealer,
+            &operator,
+            request_id,
+            "rule_too_large",
+            &format!(
+                "rule is {} bytes; this agent's cap is {}",
+                push.rules.len(),
+                yara.config.max_rule_bytes
+            ),
+        )
+        .await;
+    }
+    match yara.store.store(
+        &push.rule_id,
+        &push.rules,
+        &operator_hex,
+        request_id,
+        current_unix_ms() / 1000,
+    ) {
+        Ok(true) => info!(rule = %push.rule_id, operator = %operator, "yara rule stored"),
+        Ok(false) => debug!(rule = %push.rule_id, "yara rule already stored"),
+        Err(e) => {
+            return send_sql_error(
+                conn,
+                sealer,
+                &operator,
+                request_id,
+                "rule_rejected",
+                &e.to_string(),
+            )
+            .await;
+        }
+    }
+
+    // --- Scan. CPU-heavy: bounded by a semaphore, run off the async
+    // runtime, and capped by config. ---
+    let mut matches: Vec<bowery_proto::YaraMatch> = Vec::new();
+    let mut scanned: u32 = 0;
+    if push.targets.is_empty() {
+        debug!(rule = %push.rule_id, "no scan targets; stored only");
+    } else {
+        let permit = yara.scan_permits.clone().acquire_owned().await;
+        if permit.is_err() {
+            errors.push("scan semaphore closed".to_string());
+        } else {
+            let source = String::from_utf8_lossy(&push.rules).into_owned();
+            let targets: Vec<PathBuf> = push.targets.iter().map(PathBuf::from).collect();
+            let limits = bowery_yara::ScanLimits {
+                max_file_bytes: yara.config.max_file_bytes,
+                max_files: yara.config.max_files_per_scan,
+                max_depth: yara.config.max_depth,
+            };
+            let secs = i32::try_from(timeout.as_secs()).unwrap_or(i32::MAX).max(1);
+            let scan = tokio::task::spawn_blocking(move || {
+                let rules = bowery_yara::Rules::compile(&source)?;
+                let mut agg = bowery_yara::ScanOutcome::default();
+                for t in targets {
+                    let out = rules.scan_path(&t, limits, secs);
+                    agg.matches.extend(out.matches);
+                    agg.scanned += out.scanned;
+                    agg.errors.extend(out.errors);
+                }
+                Ok::<_, bowery_yara::YaraError>(agg)
+            })
+            .await;
+            match scan {
+                Ok(Ok(out)) => {
+                    scanned = out.scanned;
+                    errors.extend(out.errors);
+                    for m in out.matches {
+                        matches.push(bowery_proto::YaraMatch {
+                            rule_name: m.rule_name,
+                            path: m.path.display().to_string(),
+                            tags: m.tags,
+                        });
+                    }
+                }
+                // A rule that won't compile, or an engine-less build, is
+                // reported rather than failing the whole push — the rule
+                // is still stored and propagated.
+                Ok(Err(e)) => errors.push(e.to_string()),
+                Err(e) => errors.push(format!("scan task failed: {e}")),
+            }
+        }
+    }
+
+    // --- Alert on every match, so a hit reaches the operator's inbox
+    // even if they aren't watching this command's response. ---
+    for m in &matches {
+        let alert = Alert {
+            originator_fp: yara.originator_fp.as_bytes().to_vec(),
+            episode_id: format!("yara-{}-{}", push.rule_id, current_unix_ms()),
+            exe_sha256_hex: String::new(),
+            exe_path: m.path.clone(),
+            suspicion: 1.0,
+            rationale: format!("yara rule `{}` matched {}", m.rule_name, m.path),
+            suggested_actions: Vec::new(),
+            ts_unix_ms: current_unix_ms(),
+            backend: "yara".to_string(),
+        };
+        let episode_id = alert.episode_id.clone();
+        warn!(rule = %m.rule_name, path = %m.path, "YARA MATCH");
+        yara.inbox.append(alert);
+        let _ = events_tx.send(AgentEvent::AlertEmitted {
+            episode_id,
+            suspicion: 1.0,
+        });
+    }
+
+    // --- Report this agent's own result. ---
+    send_yara_report(
+        conn,
+        sealer,
+        &operator,
+        request_id,
+        bowery_proto::YaraReport {
+            agent_fp: self_fp.as_bytes().to_vec(),
+            rule_id: push.rule_id.clone(),
+            matches,
+            scanned,
+            errors,
+            end: true,
+        },
+    )
+    .await?;
+
+    // --- Propagate. Unlike SQL fan-out (one hop), a rule is meant to
+    // reach the whole mesh, so forwarding is bounded by ttl rather than
+    // by "have I been forwarded already". ---
+    if push.fanout
+        && push.ttl > 0
+        && let Some(relay) = relay
+    {
+        relay_yara_push(
+            conn,
+            sealer,
+            operator,
+            request_id,
+            push,
+            forwarded_authorization,
+            relay,
+            timeout,
+        )
+        .await?;
+    }
+
+    // Fan-out completion terminator (empty agent_fp), mirroring the SQL
+    // path so the operator's read loop ends promptly rather than waiting
+    // out its timeout.
+    if push.fanout {
+        send_yara_report(
+            conn,
+            sealer,
+            &operator,
+            request_id,
+            bowery_proto::YaraReport {
+                agent_fp: Vec::new(),
+                rule_id: push.rule_id.clone(),
+                matches: Vec::new(),
+                scanned: 0,
+                errors: Vec::new(),
+                end: true,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Forward a YARA push to every pinned peer, decrementing `ttl`, and pipe
+/// each peer's sealed reports back to the operator verbatim.
+///
+/// Peers seal their reports for the *operator*, not for us, so a relaying
+/// agent can drop a report but cannot forge or read one.
+#[allow(clippy::too_many_arguments)]
+async fn relay_yara_push(
+    conn: &BoweryConnection,
+    sealer: &Arc<Sealer>,
+    operator: Fingerprint,
+    request_id: &str,
+    push: &bowery_proto::YaraPush,
+    forwarded_authorization: &[u8],
+    relay: &Arc<RelayContext>,
+    timeout: Duration,
+) -> Result<(), bowery_whisper::transport::Error> {
+    let peers: Vec<PeerInfo> = relay
+        .peers_watcher
+        .borrow()
+        .clone()
+        .into_iter()
+        .filter(|p| relay.known_neighbors.resolve(&p.fingerprint).is_some())
+        .filter(|p| p.fingerprint != sealer.fingerprint())
+        .collect();
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    let (bytes_tx, mut bytes_rx) = mpsc::channel::<Vec<u8>>(64);
+    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // Each hop sees one less TTL; the push that reaches ttl == 0 stops.
+    let onward = bowery_proto::YaraPush {
+        rule_id: push.rule_id.clone(),
+        rules: push.rules.clone(),
+        targets: push.targets.clone(),
+        fanout: true,
+        ttl: push.ttl.saturating_sub(1),
+    };
+
+    for peer in peers {
+        let bytes_tx = bytes_tx.clone();
+        let endpoint = relay.endpoint.clone();
+        let kn = relay.known_neighbors.clone();
+        let sealer_clone = sealer.clone();
+        let request_id = request_id.to_string();
+        let auth = forwarded_authorization.to_vec();
+        let onward = onward.clone();
+        join_set.spawn(async move {
+            run_peer_yara_push(
+                endpoint,
+                kn,
+                &sealer_clone,
+                peer,
+                auth,
+                onward,
+                &request_id,
+                timeout,
+                bytes_tx,
+            )
+            .await;
+        });
+    }
+    drop(bytes_tx);
+
+    let drain: Result<(), bowery_whisper::transport::Error> = async {
+        while let Some(bytes) = bytes_rx.recv().await {
+            conn.send_envelope(&bytes).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    join_set.abort_all();
+    while join_set.join_next().await.is_some() {}
+    let _ = operator; // attribution is carried by each peer's own sealing
+    drain
+}
+
+/// Push a rule to one peer and stream its sealed reports back.
+#[allow(clippy::too_many_arguments)]
+async fn run_peer_yara_push(
+    endpoint: BoweryEndpoint,
+    kn: Arc<KnownNeighbors>,
+    sealer: &Arc<Sealer>,
+    peer: PeerInfo,
+    forwarded_authorization: Vec<u8>,
+    push: bowery_proto::YaraPush,
+    request_id: &str,
+    timeout: Duration,
+    bytes_tx: mpsc::Sender<Vec<u8>>,
+) {
+    use bowery_proto::{OperatorCommand, OperatorCommandBody, WhisperEnvelope};
+    use prost::Message as _;
+
+    let peer_fp = peer.fingerprint;
+    let cmd = OperatorCommand {
+        request_id: request_id.to_string(),
+        timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+        forwarded_from_operator: forwarded_authorization,
+        command: Some(OperatorCommandBody::YaraPush(push)),
+    };
+    let outbound = sealer.seal_for(&peer_fp, &WhisperPayload::operator_command(cmd));
+
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(kn, peer_fp));
+    let Ok(conn) = endpoint.dial(dial_verifier, peer.whisper_addr).await else {
+        warn!(peer = %peer_fp, "yara propagation dial failed");
+        return;
+    };
+    if conn.send_envelope(&outbound).await.is_err() {
+        warn!(peer = %peer_fp, "yara propagation send failed");
+        return;
+    }
+
+    // Relay whatever the peer sends back, until it closes or we time out.
+    // Reports are sealed for the operator, so we only peek at the sender
+    // claim for sanity — verification is the operator's job.
+    let pump = async {
+        loop {
+            let Ok(bytes) = conn.recv_envelope().await else {
+                return;
+            };
+            let Ok(env) = WhisperEnvelope::decode(bytes.as_slice()) else {
+                return;
+            };
+            if env.sender_fingerprint.as_slice() != peer_fp.as_bytes().as_slice() {
+                warn!(peer = %peer_fp, "yara propagation sender mismatch");
+                return;
+            }
+            if bytes_tx.send(bytes).await.is_err() {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(timeout, pump).await;
+}
+
+/// Helper to seal + send one `YaraReport` envelope.
+async fn send_yara_report(
+    conn: &BoweryConnection,
+    sealer: &Sealer,
+    operator: &Fingerprint,
+    request_id: &str,
+    report: bowery_proto::YaraReport,
+) -> Result<(), bowery_whisper::transport::Error> {
+    use bowery_proto::{OperatorResult, OperatorResultBody};
+    let response = OperatorResult {
+        request_id: request_id.to_string(),
+        result: Some(OperatorResultBody::YaraReport(report)),
+    };
+    let outbound = sealer.seal_for(operator, &WhisperPayload::operator_result(response));
+    conn.send_envelope(&outbound).await
 }
 
 /// Helper to seal + send one `SqlChunk` envelope.

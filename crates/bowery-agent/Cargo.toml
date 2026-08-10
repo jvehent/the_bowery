@@ -23,6 +23,12 @@ default = []
 # build dep (cmake + clang). Without this feature the agent only has
 # the mock LLM backend.
 llm-llama-cpp = ["bowery-llm/llama-cpp"]
+# Enable real YARA scanning (libyara, built from source via cc). Without
+# it the agent still accepts, stores, and propagates operator-pushed
+# rules across the mesh — it just reports `engine not compiled in`
+# instead of scanning. Kept off by default so the static aarch64-musl Pi
+# cross-build doesn't take on a C dependency it may not need.
+yara = ["bowery-yara/engine"]
 
 [dependencies]
 bowery-analysis = { workspace = true }
@@ -37,6 +43,7 @@ bowery-response = { workspace = true }
 bowery-sql = { workspace = true }
 bowery-tables = { workspace = true }
 bowery-whisper = { workspace = true }
+bowery-yara = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
