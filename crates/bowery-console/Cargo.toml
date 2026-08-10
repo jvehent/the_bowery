@@ -33,6 +33,8 @@ clap = { workspace = true }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 humantime = "2"
+# Used only to park stderr in a log file while the TUI owns the screen.
+libc = { workspace = true }
 ratatui = "0.29"
 serde = { workspace = true }
 serde_json = { workspace = true }

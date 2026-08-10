@@ -105,6 +105,15 @@ fn main() -> Result<()> {
         chat_backend,
     };
 
+    // Park stderr in a log file before taking the alternate screen.
+    // Anything that writes to the terminal behind ratatui's back tears
+    // the layout apart, and we don't control every writer: llama.cpp and
+    // ggml log to stderr from C (the chat backend voids those, but its
+    // backend init can emit before the callback is installed), and any
+    // dependency can print on a panic path. Redirecting keeps the screen
+    // intact without throwing the output away.
+    let stderr_log = redirect_stderr_to_log();
+
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("enter alt screen")?;
@@ -120,7 +129,50 @@ fn main() -> Result<()> {
     let mut stdout = io::stdout();
     execute!(stdout, LeaveAlternateScreen).ok();
 
+    // Tell the operator where the noise went, but only if something
+    // actually wrote there — otherwise it's just clutter on every exit.
+    if let Some(path) = stderr_log
+        && std::fs::metadata(&path).is_ok_and(|m| m.len() > 0)
+    {
+        eprintln!("(console stderr was logged to {})", path.display());
+    }
+
     result
+}
+
+/// Point fd 2 at `~/.bowery/console.log` for the lifetime of the TUI.
+///
+/// Returns the path when the redirect happened. Skipped when stderr
+/// isn't a terminal — if the operator already piped stderr somewhere
+/// (`2>err.txt`, a systemd unit, CI) that's a deliberate choice and
+/// there's no screen to protect.
+///
+/// The workspace denies `unsafe_code`; this is the only place the
+/// console needs it, and it's two libc calls (`isatty`, `dup2`) that
+/// have no safe equivalent in std. Scoped to this function rather than
+/// exempting the whole crate.
+#[allow(unsafe_code)]
+fn redirect_stderr_to_log() -> Option<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: isatty just interrogates a file descriptor.
+    if unsafe { libc::isatty(libc::STDERR_FILENO) } != 1 {
+        return None;
+    }
+    let dir = PathBuf::from(std::env::var_os("HOME")?).join(".bowery");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("console.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    // SAFETY: both descriptors are valid; dup2 duplicates `file` onto fd
+    // 2, so dropping `file` afterwards leaves stderr pointing at the log.
+    if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } == -1 {
+        return None;
+    }
+    Some(path)
 }
 
 fn default_chat_model_path() -> Option<PathBuf> {

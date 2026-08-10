@@ -363,6 +363,7 @@ dependencies = [
  "crossterm",
  "futures",
  "humantime",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

@@ -178,7 +178,17 @@ struct Worker {
 
 impl Worker {
     fn new(config: &LlamaCppChatConfig) -> Result<Self, LlmError> {
-        let backend = LlamaBackend::init().map_err(|e| LlmError::ModelNotLoaded(e.to_string()))?;
+        let mut backend =
+            LlamaBackend::init().map_err(|e| LlmError::ModelNotLoaded(e.to_string()))?;
+        // llama.cpp and ggml log to stderr by default, and they are
+        // chatty — model metadata on load, then per-inference lines.
+        // This backend is only ever driven by the ncurses console, which
+        // renders on an alternate screen: raw writes to the terminal
+        // punch straight through the TUI and shred the layout. Void them
+        // at the source (llama_log_set also covers ggml). Errors still
+        // surface as `LlmError`s, which the console shows in its own
+        // chrome.
+        backend.void_logs();
         let model_params = LlamaModelParams::default().with_n_gpu_layers(config.n_gpu_layers);
         let model = LlamaModel::load_from_file(&backend, &config.model_path, &model_params)
             .map_err(|e| LlmError::ModelNotLoaded(e.to_string()))?;
