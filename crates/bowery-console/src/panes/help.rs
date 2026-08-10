@@ -12,14 +12,17 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use crate::browse::Scroll;
 use crate::theme;
 
 const HANDBOOK_MD: &str = include_str!("../../../../docs/CONSOLE.md");
 
 #[derive(Debug, Default)]
 pub(crate) struct HelpPane {
-    /// Vertical scroll offset (lines).
-    pub(crate) scroll: u16,
+    /// Vertical scroll, clamped to the handbook's length. The previous
+    /// ad-hoc offset had no upper bound, so `PgDn` walked off the end into
+    /// blank space with no indication you'd left the document.
+    scroll: Scroll,
 }
 
 impl HelpPane {
@@ -28,18 +31,22 @@ impl HelpPane {
     }
 
     pub(crate) fn scroll_down(&mut self, by: u16) {
-        self.scroll = self.scroll.saturating_add(by);
+        self.scroll.down(by);
     }
 
     pub(crate) fn scroll_up(&mut self, by: u16) {
-        self.scroll = self.scroll.saturating_sub(by);
+        self.scroll.up(by);
     }
 
     pub(crate) fn home(&mut self) {
-        self.scroll = 0;
+        self.scroll.home();
     }
 
-    pub(crate) fn render(&self, f: &mut Frame<'_>, area: Rect) {
+    pub(crate) fn end(&mut self) {
+        self.scroll.end();
+    }
+
+    pub(crate) fn render(&mut self, f: &mut Frame<'_>, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title("Help (↑↓/PgUp/PgDn scroll · Home jumps to top)");
@@ -47,9 +54,10 @@ impl HelpPane {
         f.render_widget(block, area);
 
         let lines: Vec<Line<'static>> = HANDBOOK_MD.lines().map(render_md_line).collect();
+        self.scroll.set_bounds(lines.len(), inner.height as usize);
         f.render_widget(
             Paragraph::new(lines)
-                .scroll((self.scroll, 0))
+                .scroll((self.scroll.offset(), 0))
                 .wrap(Wrap { trim: false }),
             inner,
         );

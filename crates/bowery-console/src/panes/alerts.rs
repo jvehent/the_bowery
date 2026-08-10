@@ -12,13 +12,16 @@ use bowery_cli::alerts;
 use bowery_proto::Alert;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
-use ratatui::widgets::{Block, Borders, Cell, Row as TableRow, Table};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row as TableRow, Table, TableState};
 use time::OffsetDateTime;
 use time::format_description::BorrowedFormatItem;
 use time::macros::format_description;
 use tokio::sync::mpsc;
 
 use crate::app::{EngineEvent, Relay};
+use crate::browse::Browser;
+use crate::panes::{hex_lower, kv, split_hint};
 use crate::theme;
 
 const MAX_ALERTS: usize = 500;
@@ -43,6 +46,8 @@ pub(crate) struct AlertsPane {
     /// `~/.bowery/peers.toml`. Lets the pane show "web-1" instead of a
     /// 64-hex fingerprint for the agent that raised each alert.
     agent_names: HashMap<String, String>,
+    /// Cursor + viewport over `alerts`.
+    browser: Browser,
 }
 
 impl AlertsPane {
@@ -82,7 +87,7 @@ impl AlertsPane {
             .unwrap_or_else(|| truncate(&hex, 12))
     }
 
-    pub(crate) fn render(&self, f: &mut Frame<'_>, area: Rect) {
+    pub(crate) fn render(&mut self, f: &mut Frame<'_>, area: Rect) {
         let title = if let Some(e) = &self.last_error {
             format!("Alerts (poll error: {})", truncate(e, 40))
         } else {
@@ -91,6 +96,7 @@ impl AlertsPane {
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
+        self.browser.set_len(self.alerts.len());
 
         if self.alerts.is_empty() {
             let body = if self.poller_started {
@@ -114,8 +120,11 @@ impl AlertsPane {
         ])
         .style(theme::header_row());
 
-        let rows: Vec<TableRow> = self
-            .alerts
+        // Header takes one line, the hint another; the rest is rows.
+        let visible = self
+            .browser
+            .visible_range(inner.height.saturating_sub(2) as usize);
+        let rows: Vec<TableRow> = self.alerts[visible]
             .iter()
             .map(|a| {
                 let ts = format_ts_utc(a.ts_unix_ms);
@@ -144,8 +153,82 @@ impl AlertsPane {
             Constraint::Length(18),
             Constraint::Min(20),
         ];
-        let table = Table::new(rows, widths).header(header);
-        f.render_widget(table, inner);
+        // Reserve the last line for the key legend so the operator can
+        // discover drill-down without reading the handbook.
+        let (list_area, hint_area) = split_hint(inner);
+        let table = Table::new(rows, widths)
+            .header(header)
+            .row_highlight_style(theme::selected_row())
+            .highlight_symbol("▸ ");
+        let mut state = TableState::default().with_selected(self.browser.selected_in_view());
+        f.render_stateful_widget(table, list_area, &mut state);
+        f.render_widget(
+            Paragraph::new("↑↓ move  ⏎ detail  r refresh").style(theme::hint()),
+            hint_area,
+        );
+    }
+
+    /// Full-screen detail for the selected alert.
+    ///
+    /// The table can only show five truncated columns; every `Alert`
+    /// field is already in memory, so this is pure rendering — no
+    /// refetch, and it works even if the agent is now unreachable.
+    pub(crate) fn render_detail(&mut self, f: &mut Frame<'_>, area: Rect) {
+        // Sync the cursor bound here too: the overlay must not depend on
+        // the list having been rendered first, and the poller can change
+        // the list length while the overlay is open.
+        self.browser.set_len(self.alerts.len());
+        let Some(alert) = self.selected_alert() else {
+            return;
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Alert detail — Esc back");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let fp_hex = hex_lower(&alert.originator_fp);
+        let agent = self.agent_label(&alert.originator_fp);
+        let mut lines: Vec<Line<'static>> = vec![
+            kv("time", format_ts_utc(alert.ts_unix_ms)),
+            kv("agent", format!("{agent}  ({fp_hex})")),
+            kv("suspicion", format!("{:.2}", alert.suspicion)),
+            kv("episode", alert.episode_id.clone()),
+            kv("backend", alert.backend.clone()),
+            kv("exe path", alert.exe_path.clone()),
+            kv("exe sha256", alert.exe_sha256_hex.clone()),
+        ];
+        if !alert.suggested_actions.is_empty() {
+            lines.push(kv("suggested", alert.suggested_actions.join(", ")));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("rationale", theme::detail_label())));
+        // Unwrapped and untruncated — the rationale is the analyst's
+        // primary evidence and the table only ever showed it as a
+        // fallback when exe_path happened to be empty.
+        for chunk in alert.rationale.lines() {
+            lines.push(Line::from(format!("  {chunk}")));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "pivots:  a audit for episode   b baseline for sha256   \
+             p processes by path   f file on disk",
+            theme::hint(),
+        )));
+
+        f.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
+    }
+
+    /// The alert under the cursor, if any.
+    pub(crate) fn selected_alert(&self) -> Option<&Alert> {
+        self.browser.selected().and_then(|i| self.alerts.get(i))
+    }
+
+    pub(crate) fn browser_mut(&mut self) -> &mut Browser {
+        &mut self.browser
     }
 
     /// Spawn the polling task on first activation. Subsequent calls
@@ -201,6 +284,7 @@ impl AlertsPane {
         if self.alerts.len() > MAX_ALERTS {
             self.alerts.truncate(MAX_ALERTS);
         }
+        self.browser.set_len(self.alerts.len());
     }
 
     pub(crate) fn on_error(&mut self, message: String) {
@@ -229,14 +313,6 @@ fn format_ts_utc(ts_unix_ms: u64) -> String {
         .ok()
         .and_then(|dt| dt.format(&TS_FORMAT).ok())
         .unwrap_or_else(|| ts_unix_ms.to_string())
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut acc, b| {
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
 }
 
 #[cfg(test)]
@@ -280,5 +356,93 @@ mod tests {
         assert!(unknown.chars().count() <= 12, "got {unknown}");
         // Missing originator → placeholder rather than an empty cell.
         assert_eq!(pane.agent_label(&[]), "-");
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn sample(n: usize) -> Vec<Alert> {
+        (0..n)
+            .map(|i| Alert {
+                originator_fp: vec![0xaa; 32],
+                episode_id: format!("ep-{i}"),
+                exe_sha256_hex: "ab".repeat(32),
+                exe_path: format!("/tmp/payload-{i}"),
+                suspicion: 0.9,
+                rationale: "exec from world-writable path /tmp/".into(),
+                suggested_actions: vec!["kill_process".into()],
+                ts_unix_ms: 1_786_622_341_123 + i as u64,
+                backend: "llama-cpp/qwen3-0.6b".into(),
+            })
+            .collect()
+    }
+
+    fn draw(pane: &mut AlertsPane, detail: bool) -> String {
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| {
+            if detail {
+                pane.render_detail(f, f.area());
+            } else {
+                pane.render(f, f.area());
+            }
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>()
+    }
+
+    #[test]
+    fn list_renders_and_tracks_selection_beyond_the_viewport() {
+        let mut pane = AlertsPane {
+            alerts: sample(200),
+            ..AlertsPane::default()
+        };
+
+        let first = draw(&mut pane, false);
+        assert!(first.contains("ep-0"), "first page shows the top row");
+
+        // Jump to the end: the viewport must follow, which is exactly
+        // what was impossible before (only page one was reachable).
+        pane.browser_mut().end();
+        let last = draw(&mut pane, false);
+        assert!(
+            last.contains("ep-199"),
+            "end of a 200-row list is reachable"
+        );
+        assert!(
+            !last.contains("ep-0 "),
+            "viewport scrolled off the first row"
+        );
+    }
+
+    #[test]
+    fn detail_shows_fields_the_table_cannot() {
+        let mut pane = AlertsPane {
+            alerts: sample(1),
+            ..AlertsPane::default()
+        };
+        pane.browser_mut().home();
+
+        let out = draw(&mut pane, true);
+        // These three are absent from the table entirely.
+        assert!(out.contains("llama-cpp"), "backend missing: {out}");
+        assert!(out.contains("kill_process"), "suggested actions missing");
+        assert!(out.contains(&"ab".repeat(8)), "exe sha256 missing");
+        // Rationale is only a fallback in the table; here it's always shown.
+        assert!(out.contains("world-writable"), "rationale missing");
+    }
+
+    #[test]
+    fn detail_on_empty_list_is_a_noop() {
+        let mut pane = AlertsPane::default();
+        // Must not panic when nothing is selected.
+        let _ = draw(&mut pane, true);
     }
 }

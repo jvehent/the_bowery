@@ -89,7 +89,7 @@ impl AuditPane {
         }
     }
 
-    pub(crate) fn render(&self, f: &mut Frame<'_>, area: Rect) {
+    pub(crate) fn render(&mut self, f: &mut Frame<'_>, area: Rect) {
         let title = match (&self.error, &self.snapshot) {
             (Some(_), _) => "Audit (error — press r to retry)".to_string(),
             (None, Some(s)) => format!("Audit ({} entries · r refreshes)", s.rows.len()),

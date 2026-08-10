@@ -33,6 +33,25 @@ pub(crate) fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+/// The selected row in a browsable table. Reversed rather than a fixed
+/// background so it stays visible under any terminal colour scheme —
+/// including the low-contrast ones this console is meant to survive.
+pub(crate) fn selected_row() -> Style {
+    Style::default().add_modifier(Modifier::REVERSED)
+}
+
+/// Label column inside a detail overlay.
+pub(crate) fn detail_label() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
+/// Footer hint line (key legends).
+pub(crate) fn hint() -> Style {
+    Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC)
+}
+
 pub(crate) fn header_row() -> Style {
     Style::default()
         .fg(Color::Black)

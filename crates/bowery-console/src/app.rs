@@ -18,6 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc;
 
+use crate::browse::Browser;
 use crate::input::{InputAction, InputState};
 use crate::palette::PaletteCommand;
 use crate::panes::PaneId;
@@ -56,6 +57,10 @@ pub(crate) enum InputMode {
     Pane,
     /// `:command` palette modal.
     Palette,
+    /// Full-screen detail overlay for the selected row. The list's
+    /// selection is preserved underneath, so Esc returns you exactly
+    /// where you were.
+    Detail,
 }
 
 /// Events the engine pushes to the UI loop.
@@ -216,6 +221,10 @@ impl App {
             _ => {}
         }
 
+        if self.handle_browse_keys(key, pane_mode, input_empty) {
+            return true;
+        }
+
         if pane_mode && self.current_pane == PaneId::Help {
             match (key.code, key.modifiers) {
                 (KeyCode::PageDown, _) => {
@@ -238,6 +247,81 @@ impl App {
                     self.help_pane.home();
                     return true;
                 }
+                (KeyCode::End, _) if input_empty => {
+                    self.help_pane.end();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Detail-overlay and row-navigation keys. Split out of
+    /// `handle_global_hotkey` to keep that function readable.
+    fn handle_browse_keys(&mut self, key: KeyEvent, pane_mode: bool, input_empty: bool) -> bool {
+        // Detail overlay owns the keyboard while it's up.
+        if matches!(self.input_mode, InputMode::Detail) {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.input_mode = InputMode::Pane;
+                    return true;
+                }
+                _ => {
+                    if self.handle_detail_key(key) {
+                        return true;
+                    }
+                    // Swallow everything else: a stray keystroke must not
+                    // leak into the pane prompt behind the overlay.
+                    return true;
+                }
+            }
+        }
+
+        // Row navigation for browsable panes. This has to be claimed here,
+        // before InputState, because the editor consumes Up/Down for history
+        // unconditionally (input.rs) — the same reason the Help block below
+        // exists.
+        if pane_mode && input_empty && self.current_pane.is_browsable() {
+            let page = 10;
+            match (key.code, key.modifiers) {
+                (KeyCode::Down, KeyModifiers::NONE) => {
+                    if let Some(b) = self.browser_mut() {
+                        b.next();
+                    }
+                    return true;
+                }
+                (KeyCode::Up, KeyModifiers::NONE) => {
+                    if let Some(b) = self.browser_mut() {
+                        b.prev();
+                    }
+                    return true;
+                }
+                (KeyCode::PageDown, _) => {
+                    if let Some(b) = self.browser_mut() {
+                        b.page_down(page);
+                    }
+                    return true;
+                }
+                (KeyCode::PageUp, _) => {
+                    if let Some(b) = self.browser_mut() {
+                        b.page_up(page);
+                    }
+                    return true;
+                }
+                (KeyCode::Home, _) => {
+                    if let Some(b) = self.browser_mut() {
+                        b.home();
+                    }
+                    return true;
+                }
+                (KeyCode::End, _) => {
+                    if let Some(b) = self.browser_mut() {
+                        b.end();
+                    }
+                    return true;
+                }
+                (KeyCode::Enter, _) if self.open_detail() => return true,
                 _ => {}
             }
         }
@@ -253,6 +337,10 @@ impl App {
             InputAction::Submit(line) => match self.input_mode {
                 InputMode::Pane => self.dispatch_pane_submit(&line),
                 InputMode::Palette => self.dispatch_palette(&line),
+                // Unreachable: the overlay swallows every key before the
+                // editor sees it. Fail closed rather than submitting a
+                // stale line into whichever pane is behind the overlay.
+                InputMode::Detail => {}
             },
             InputAction::Cancel => {
                 self.input.clear();
@@ -390,6 +478,38 @@ impl App {
         }
     }
 
+    /// The active pane's cursor, when it has one.
+    fn browser_mut(&mut self) -> Option<&mut Browser> {
+        match self.current_pane {
+            PaneId::Alerts => Some(self.alerts_pane.browser_mut()),
+            _ => None,
+        }
+    }
+
+    /// Open the detail overlay for the active pane's selection.
+    /// Returns false when there's nothing selected, so the key falls
+    /// through instead of opening an empty overlay.
+    fn open_detail(&mut self) -> bool {
+        let has_selection = match self.current_pane {
+            PaneId::Alerts => self.alerts_pane.selected_alert().is_some(),
+            _ => false,
+        };
+        if has_selection {
+            self.input_mode = InputMode::Detail;
+        }
+        has_selection
+    }
+
+    /// Keys handled while a detail overlay is open (pivots). Returns
+    /// true if the key did something.
+    /// Keys handled while a detail overlay is open. Pivots land here in
+    /// a later slice; today the overlay is read-only and only Esc/q
+    /// (handled by the caller) exits.
+    #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
+    fn handle_detail_key(&mut self, _key: KeyEvent) -> bool {
+        false
+    }
+
     fn refresh_current_pane(&mut self) {
         match self.current_pane {
             PaneId::Alerts => {
@@ -445,7 +565,7 @@ impl App {
         }
     }
 
-    fn render(&self, f: &mut Frame<'_>) {
+    fn render(&mut self, f: &mut Frame<'_>) {
         let area = f.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -493,7 +613,11 @@ impl App {
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    fn render_pane(&self, f: &mut Frame<'_>, area: Rect) {
+    fn render_pane(&mut self, f: &mut Frame<'_>, area: Rect) {
+        if matches!(self.input_mode, InputMode::Detail) && self.current_pane == PaneId::Alerts {
+            self.alerts_pane.render_detail(f, area);
+            return;
+        }
         match self.current_pane {
             PaneId::Query => self.query_pane.render(f, area),
             PaneId::Alerts => self.alerts_pane.render(f, area),
@@ -510,6 +634,7 @@ impl App {
         let prompt = match self.input_mode {
             InputMode::Pane => format!("{} > ", self.current_pane.label().to_lowercase()),
             InputMode::Palette => ": ".to_string(),
+            InputMode::Detail => "detail (Esc back) > ".to_string(),
         };
         let block = Block::default().borders(Borders::ALL);
         let inner = block.inner(area);

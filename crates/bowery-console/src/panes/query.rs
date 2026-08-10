@@ -59,7 +59,7 @@ impl QueryPane {
         }
     }
 
-    pub(crate) fn render(&self, f: &mut Frame<'_>, area: Rect) {
+    pub(crate) fn render(&mut self, f: &mut Frame<'_>, area: Rect) {
         let block = Block::default().borders(Borders::ALL).title("Query");
         let inner = block.inner(area);
         f.render_widget(block, area);

@@ -149,7 +149,7 @@ impl ChatPane {
         self.draft_sql.take()
     }
 
-    pub(crate) fn render(&self, f: &mut Frame<'_>, area: Rect) {
+    pub(crate) fn render(&mut self, f: &mut Frame<'_>, area: Rect) {
         let title = if self.in_flight {
             format!("Chat ({} · thinking…)", self.backend.name())
         } else if self.draft_sql.is_some() {

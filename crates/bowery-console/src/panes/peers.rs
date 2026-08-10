@@ -47,7 +47,7 @@ impl PeersPane {
         }
     }
 
-    pub(crate) fn render(&self, f: &mut Frame<'_>, area: Rect) {
+    pub(crate) fn render(&mut self, f: &mut Frame<'_>, area: Rect) {
         let title = match &self.loaded_path {
             Some(p) => format!("Peers ({} entries · {})", self.entries.len(), p.display()),
             None => "Peers (not loaded)".to_string(),

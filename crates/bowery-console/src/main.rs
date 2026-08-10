@@ -22,6 +22,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 mod app;
+mod browse;
 mod input;
 mod palette;
 mod panes;
