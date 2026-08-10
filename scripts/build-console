@@ -29,10 +29,42 @@ cd "$REPO_ROOT"
 # The llm-llama-cpp feature compiles llama.cpp (cmake) and runs bindgen
 # (libclang). Missing pieces surface as a deep panic like
 # `'stdbool.h' file not found` — pre-check and give the exact fix.
+# Locating libclang is fiddly: distros scatter it across
+# /usr/lib/<triplet>/, /usr/lib/llvm-<ver>/lib/, /usr/lib64/, and a bare
+# glob of /usr/lib misses the LLVM-versioned directory Ubuntu uses. Probe
+# the way bindgen itself resolves it, most authoritative first, so an
+# installed toolchain is never reported missing.
+have_libclang() {
+    if [[ -n "${LIBCLANG_PATH:-}" ]] && compgen -G "${LIBCLANG_PATH}/libclang*.so*" >/dev/null; then
+        return 0
+    fi
+    if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q 'libclang[.-]'; then
+        return 0
+    fi
+    local lc d
+    for lc in llvm-config llvm-config-20 llvm-config-19 llvm-config-18 \
+              llvm-config-17 llvm-config-16 llvm-config-15 llvm-config-14; do
+        if command -v "$lc" >/dev/null 2>&1; then
+            d="$("$lc" --libdir 2>/dev/null || true)"
+            if [[ -n "$d" ]] && compgen -G "$d/libclang*.so*" >/dev/null; then
+                return 0
+            fi
+        fi
+    done
+    local g
+    for g in /usr/lib/libclang*.so* /usr/lib64/libclang*.so* \
+             /usr/lib/*/libclang*.so* /usr/lib/llvm-*/lib/libclang*.so* \
+             /usr/lib64/llvm-*/lib/libclang*.so* /usr/local/lib/libclang*.so*; do
+        if compgen -G "$g" >/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 missing=()
 for tool in cmake clang cc; do command -v "$tool" >/dev/null 2>&1 || missing+=("$tool"); done
-# libclang.so is a library, not a command — probe common locations.
-if ! ls /usr/lib*/libclang*.so* /usr/lib/*/libclang*.so* >/dev/null 2>&1; then
+if ! have_libclang; then
     missing+=("libclang")
 fi
 if [[ ${#missing[@]} -gt 0 ]]; then
