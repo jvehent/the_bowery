@@ -142,6 +142,15 @@ command -v cargo >/dev/null 2>&1 || {
 # ---------------------------------------------------------------------------
 export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"
 
+# libyara links OpenSSL by default (for its `hash` module and PE
+# signature checks). We disable crypto rather than take on an OpenSSL
+# build dependency. Set here rather than in .cargo/config.toml: a
+# workspace [env] block silently breaks `cross`'s metadata call, which
+# sends the Pi cross-build to the host toolchain instead of the
+# container. Consequence: YARA rules can't use the `hash` module — use
+# the bowery_file_sha256_hex SQL function instead.
+export YARA_CRYPTO_LIB="${YARA_CRYPTO_LIB:-disable}"
+
 echo "==> building bowery CLI (release)"
 run cargo build --release -p bowery-cli
 

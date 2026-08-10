@@ -17,6 +17,20 @@
 #   cargo install cross --git https://github.com/cross-rs/cross
 # Docker or Podman must be running.
 #
+# NOTE ON YARA: the agent's `yara` feature is deliberately NOT enabled
+# for this cross-build. The `yara-sys` crate ships no pre-generated
+# libyara bindings for aarch64-unknown-linux-musl, and its bindgen
+# fallback doesn't engage for that target, so the build fails in the
+# build script. libyara itself cross-compiles fine — it's the bindings
+# that are missing. Options if you want scanning on a Pi:
+#   1. Build natively ON the Pi (slow but works; needs clang):
+#        sudo apt install -y clang libclang-dev build-essential
+#        YARA_CRYPTO_LIB=disable cargo build --release -p bowery-agent \
+#            --features yara
+#   2. Leave it off. The agent still stores and PROPAGATES rules across
+#      the mesh; it just reports `engine not compiled in` instead of
+#      scanning, so distribution to the Pis still works.
+#
 # Output: deploy/remote/dist/bowery-agent-<target>.tar.gz
 # The tarball extracts to a directory containing the binaries, the
 # systemd unit + slice, the config template, and install-agent.sh.

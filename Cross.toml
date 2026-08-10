@@ -1,0 +1,17 @@
+# `cross` configuration for the Raspberry-Pi / aarch64-musl builds.
+#
+# Environment variables do NOT reach the build container unless they are
+# listed here. libyara (agent `yara` feature) reads YARA_CRYPTO_LIB at
+# build time; without the passthrough it defaults to OpenSSL and the
+# cross-build dies on a missing <openssl/crypto.h>, since the cross image
+# has no aarch64-musl OpenSSL.
+[build.env]
+passthrough = ["YARA_CRYPTO_LIB"]
+
+# aarch64-musl has no pre-generated libyara bindings in the `yara` crate,
+# so that target must build them with bindgen — which needs clang and
+# libclang inside the container image.
+[target.aarch64-unknown-linux-musl]
+pre-build = [
+    "apt-get update && apt-get install --assume-yes clang libclang-dev",
+]

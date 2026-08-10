@@ -29,6 +29,10 @@ llm-llama-cpp = ["bowery-llm/llama-cpp"]
 # instead of scanning. Kept off by default so the static aarch64-musl Pi
 # cross-build doesn't take on a C dependency it may not need.
 yara = ["bowery-yara/engine"]
+# YARA for targets with no pre-generated libyara bindings (aarch64-musl
+# / the Pis). Same engine; bindings are generated with bindgen, so the
+# build environment needs clang + libclang.
+yara-bindgen = ["bowery-yara/engine-bindgen"]
 
 [dependencies]
 bowery-analysis = { workspace = true }

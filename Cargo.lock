@@ -3205,6 +3205,7 @@ version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba8598e7b8b80190eddb1e030e87e4051f2fec79df901748a9257a4a59fcc3e5"
 dependencies = [
+ "bindgen",
  "cc",
  "fs_extra",
  "glob",

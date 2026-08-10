@@ -23,6 +23,11 @@ default = []
 # just aren't executed. That keeps the aarch64-musl Pi cross-build free
 # of a C dependency unless it's explicitly wanted.
 engine = ["dep:yara"]
+# Same engine, but generate the libyara bindings with bindgen instead of
+# using the crate's pre-generated ones. Required on targets the `yara`
+# crate ships no bindings for — notably aarch64-unknown-linux-musl (the
+# Raspberry Pi build). Needs clang/libclang in the build environment.
+engine-bindgen = ["engine", "yara/bindgen"]
 
 [dependencies]
 thiserror = { workspace = true }
