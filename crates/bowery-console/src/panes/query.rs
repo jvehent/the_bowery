@@ -11,13 +11,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bowery_cli::exec::{self, CollectSink, CollectedRow};
+use bowery_cli::exec::{self, CollectSink};
 use bowery_proto::SqlValueKind;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row as TableRow, Table};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::Mutex;
+
+use crate::browse::Browser;
 use tokio::sync::mpsc;
 
 use crate::app::Relay;
@@ -45,6 +46,8 @@ pub(crate) enum QueryStatus {
 #[derive(Debug)]
 pub(crate) struct QueryPane {
     pub(crate) status: QueryStatus,
+    /// Cursor + viewport over the current result's rows.
+    browser: Browser,
     /// Held while a query is in flight so concurrent submits are
     /// rejected loudly. Same lock the engine task takes when it
     /// publishes the result.
@@ -55,6 +58,7 @@ impl QueryPane {
     pub(crate) fn new() -> Self {
         Self {
             status: QueryStatus::Idle,
+            browser: Browser::default(),
             in_flight: Arc::new(Mutex::new(())),
         }
     }
@@ -100,7 +104,13 @@ impl QueryPane {
         f.render_widget(status_widget, chunks[0]);
 
         match &self.status {
-            QueryStatus::Rendered { result, .. } => render_table(f, chunks[1], result),
+            QueryStatus::Rendered { result, .. } => crate::panes::render_sink_table(
+                f,
+                chunks[1],
+                result,
+                &mut self.browser,
+                "↑↓ move  ⏎ row detail",
+            ),
             QueryStatus::Error { message, .. } => {
                 f.render_widget(
                     Paragraph::new(message.clone()).style(theme::error()),
@@ -123,6 +133,41 @@ impl QueryPane {
                 );
             }
         }
+    }
+
+    /// Full-screen detail for the selected result row.
+    pub(crate) fn render_detail(&mut self, f: &mut Frame<'_>, area: Rect) {
+        let QueryStatus::Rendered { result, .. } = &self.status else {
+            return;
+        };
+        crate::panes::render_sink_detail(f, area, result, &mut self.browser, "Query row", "");
+    }
+
+    pub(crate) fn browser_mut(&mut self) -> &mut Browser {
+        &mut self.browser
+    }
+
+    /// The selected row's `(column, value)` pairs, for the detail
+    /// overlay's pivots. `None` when there is no rendered result.
+    pub(crate) fn selected_row(&self) -> Option<Vec<(String, String)>> {
+        let QueryStatus::Rendered { result, .. } = &self.status else {
+            return None;
+        };
+        let row = result.rows.get(self.browser.selected()?)?;
+        Some(
+            result
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let v = row
+                        .values
+                        .get(i)
+                        .map_or_else(|| "NULL".to_string(), render_value);
+                    (c.clone(), v)
+                })
+                .collect(),
+        )
     }
 
     /// Submit the SQL on the input bar. Returns immediately;
@@ -188,6 +233,7 @@ impl QueryPane {
         result: Result<CollectSink, String>,
         latency: Duration,
     ) {
+        self.browser.home();
         self.status = match result {
             Ok(result) => QueryStatus::Rendered {
                 sql,
@@ -197,39 +243,6 @@ impl QueryPane {
             Err(message) => QueryStatus::Error { sql, message },
         };
     }
-}
-
-fn render_table(f: &mut Frame<'_>, area: Rect, sink: &CollectSink) {
-    if sink.columns.is_empty() {
-        f.render_widget(Paragraph::new("(no rows)").style(theme::dim()), area);
-        return;
-    }
-    let header = TableRow::new(
-        sink.columns
-            .iter()
-            .map(|c| Cell::from(c.clone()))
-            .collect::<Vec<_>>(),
-    )
-    .style(theme::header_row());
-
-    let rows: Vec<TableRow> = sink
-        .rows
-        .iter()
-        .map(|r: &CollectedRow| {
-            let cells = r
-                .values
-                .iter()
-                .map(|v| Cell::from(render_value(v)))
-                .collect::<Vec<_>>();
-            TableRow::new(cells)
-        })
-        .collect();
-
-    let widths: Vec<Constraint> = sink.columns.iter().map(|_| Constraint::Min(8)).collect();
-    let table = Table::new(rows, widths)
-        .header(header)
-        .style(Style::default());
-    f.render_widget(table, area);
 }
 
 pub(crate) fn render_value(v: &bowery_proto::SqlValue) -> String {

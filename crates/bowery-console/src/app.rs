@@ -480,9 +480,17 @@ impl App {
 
     /// The active pane's cursor, when it has one.
     fn browser_mut(&mut self) -> Option<&mut Browser> {
+        // Every arm of `PaneId::is_browsable` must appear here. A pane
+        // that claims to be browsable without a browser has its arrow
+        // keys *consumed* by `handle_browse_keys` and dropped on the
+        // floor — worse than not claiming browsability at all.
         match self.current_pane {
             PaneId::Alerts => Some(self.alerts_pane.browser_mut()),
-            _ => None,
+            PaneId::Query => Some(self.query_pane.browser_mut()),
+            PaneId::Audit => Some(self.audit_pane.browser_mut()),
+            PaneId::Peers => Some(self.peers_pane.browser_mut()),
+            PaneId::Map => Some(self.map_pane.browser_mut()),
+            PaneId::Doctor | PaneId::Chat | PaneId::Help => None,
         }
     }
 
@@ -492,7 +500,11 @@ impl App {
     fn open_detail(&mut self) -> bool {
         let has_selection = match self.current_pane {
             PaneId::Alerts => self.alerts_pane.selected_alert().is_some(),
-            _ => false,
+            PaneId::Query => self.query_pane.selected_row().is_some(),
+            PaneId::Audit => self.audit_pane.has_rows(),
+            PaneId::Peers => self.peers_pane.selected_peer().is_some(),
+            PaneId::Map => self.map_pane.has_rows(),
+            PaneId::Doctor | PaneId::Chat | PaneId::Help => false,
         };
         if has_selection {
             self.input_mode = InputMode::Detail;
@@ -506,8 +518,83 @@ impl App {
     /// a later slice; today the overlay is read-only and only Esc/q
     /// (handled by the caller) exits.
     #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
-    fn handle_detail_key(&mut self, _key: KeyEvent) -> bool {
-        false
+    /// Cross-pane pivots from inside a detail overlay: turn the record
+    /// under the cursor into the query you'd otherwise have to type by
+    /// hand, and jump to the Query pane with it already running.
+    ///
+    /// This is the investigative core of the redesign — a detail view
+    /// that can only be read is a dead end.
+    fn handle_detail_key(&mut self, key: KeyEvent) -> bool {
+        let KeyCode::Char(c) = key.code else {
+            return false;
+        };
+        let Some(sql) = self.pivot_sql(c) else {
+            return false;
+        };
+        self.run_pivot(&sql);
+        true
+    }
+
+    /// The query a pivot key maps to for the current pane's selection,
+    /// or `None` when the key isn't a pivot or the record lacks the
+    /// field it needs (an alert with no `exe_path` has nothing to stat).
+    fn pivot_sql(&self, c: char) -> Option<String> {
+        match self.current_pane {
+            PaneId::Alerts => {
+                let alert = self.alerts_pane.selected_alert()?.clone();
+                let exe = alert.exe_path.clone();
+                match c {
+                    'a' => Some(format!(
+                        "SELECT seq, ts_unix_ms, action_id, outcome_kind FROM bowery_audit \
+                         WHERE episode_id = {}",
+                        sql_literal(&alert.episode_id)
+                    )),
+                    'b' if !alert.exe_sha256_hex.is_empty() => Some(format!(
+                        "SELECT sha256_hex, first_seen_unix, last_seen_unix, seen_count \
+                         FROM bowery_baseline_binaries WHERE sha256_hex = {}",
+                        sql_literal(&alert.exe_sha256_hex)
+                    )),
+                    'p' if !exe.is_empty() => Some(format!(
+                        "SELECT pid, ppid, uid, name, exe_path, cmdline FROM processes \
+                         WHERE exe_path = {}",
+                        sql_literal(&exe)
+                    )),
+                    'f' if !exe.is_empty() => Some(format!(
+                        "SELECT bowery_file_exists({p}) AS exists_now, \
+                                bowery_file_size({p}) AS size, \
+                                bowery_file_mode({p}) AS mode, \
+                                bowery_file_owner_uid({p}) AS uid, \
+                                bowery_file_mtime_unix({p}) AS mtime, \
+                                bowery_file_sha256_hex({p}) AS sha256",
+                        p = sql_literal(&exe)
+                    )),
+                    _ => None,
+                }
+            }
+            PaneId::Peers => {
+                let fp = self.peers_pane.selected_peer()?.fp.clone();
+                pivot_by_fingerprint(c, &fp)
+            }
+            PaneId::Map => {
+                let fp = self.map_pane.selected_fingerprint()?;
+                pivot_by_fingerprint(c, &fp)
+            }
+            PaneId::Query | PaneId::Audit | PaneId::Doctor | PaneId::Chat | PaneId::Help => None,
+        }
+    }
+
+    /// Leave the overlay, switch to Query, and run `sql` there.
+    fn run_pivot(&mut self, sql: &str) {
+        self.input_mode = InputMode::Pane;
+        self.current_pane = PaneId::Query;
+        self.query_pane.submit(
+            sql,
+            self.relay.clone(),
+            self.operator_key.clone(),
+            self.default_timeout,
+            self.engine_tx.clone(),
+        );
+        self.status_message = Some(format!("pivot: {}", truncate_status(sql)));
     }
 
     fn refresh_current_pane(&mut self) {
@@ -614,9 +701,32 @@ impl App {
     }
 
     fn render_pane(&mut self, f: &mut Frame<'_>, area: Rect) {
-        if matches!(self.input_mode, InputMode::Detail) && self.current_pane == PaneId::Alerts {
-            self.alerts_pane.render_detail(f, area);
-            return;
+        if matches!(self.input_mode, InputMode::Detail) {
+            match self.current_pane {
+                PaneId::Alerts => {
+                    self.alerts_pane.render_detail(f, area);
+                    return;
+                }
+                PaneId::Query => {
+                    self.query_pane.render_detail(f, area);
+                    return;
+                }
+                PaneId::Audit => {
+                    self.audit_pane.render_detail(f, area);
+                    return;
+                }
+                PaneId::Peers => {
+                    self.peers_pane.render_detail(f, area);
+                    return;
+                }
+                PaneId::Map => {
+                    self.map_pane.render_detail(f, area);
+                    return;
+                }
+                // Not browsable, so `open_detail` never sets Detail mode
+                // for these; fall through to the normal render.
+                PaneId::Doctor | PaneId::Chat | PaneId::Help => {}
+            }
         }
         match self.current_pane {
             PaneId::Query => self.query_pane.render(f, area),
@@ -764,4 +874,91 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Quote a value as a SQL string literal.
+///
+/// Every pivot interpolates values that came off the wire from an agent
+/// — an exe path, a rationale, a fingerprint. An embedded single quote
+/// would otherwise terminate the literal early and change the statement,
+/// so double it, per the SQL standard. The surface is read-only, but a
+/// broken query is still a broken pivot.
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Pivots available from any pane whose selection is a peer fingerprint
+/// (Peers, Map), so the two stay in step by construction.
+fn pivot_by_fingerprint(key: char, fp: &str) -> Option<String> {
+    match key {
+        'n' => Some(format!(
+            "SELECT episode_id, ts_unix_ms, suspicion, exe_path, confirmed \
+             FROM bowery_alerts WHERE originator_fp_hex = {}",
+            sql_literal(fp)
+        )),
+        'm' => Some(format!(
+            "SELECT fingerprint_hex, whisper_addr, agent_version, pinned, \
+                    has_role_vector, has_bloom_advert \
+             FROM bowery_mesh_peers WHERE fingerprint_hex = {}",
+            sql_literal(fp)
+        )),
+        _ => None,
+    }
+}
+
+fn truncate_status(s: &str) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 60 {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(59).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod pivot_tests {
+    use super::*;
+
+    #[test]
+    fn sql_literal_escapes_embedded_quotes() {
+        assert_eq!(sql_literal("/tmp/x"), "'/tmp/x'");
+        // Pivots interpolate agent-supplied paths. Without doubling, the
+        // literal would terminate early and the rest would be parsed as
+        // SQL.
+        assert_eq!(sql_literal("/tmp/it's"), "'/tmp/it''s'");
+        assert_eq!(
+            sql_literal("' OR 1=1 --"),
+            "''' OR 1=1 --'",
+            "a quote-led payload must stay inside the literal"
+        );
+        assert_eq!(sql_literal(""), "''");
+    }
+
+    #[test]
+    fn fingerprint_pivots_cover_the_advertised_keys_and_nothing_else() {
+        let fp = "ab".repeat(32);
+        for key in ['n', 'm'] {
+            let sql = pivot_by_fingerprint(key, &fp)
+                .unwrap_or_else(|| panic!("advertised key {key} produced no query"));
+            assert!(sql.contains(&format!("'{fp}'")), "fp must be bound: {sql}");
+        }
+        // Keys the hint line does not advertise must not silently do
+        // something — that asymmetry is what made the first slice
+        // confusing.
+        for key in ['a', 'b', 'q', 'z'] {
+            assert!(pivot_by_fingerprint(key, &fp).is_none(), "key {key} leaked");
+        }
+    }
+
+    #[test]
+    fn truncate_status_flattens_and_bounds() {
+        let long = format!("SELECT {}", "x".repeat(200));
+        let out = truncate_status(&long);
+        assert!(out.chars().count() <= 60, "status line stayed long: {out}");
+        assert_eq!(
+            truncate_status("SELECT a\n  FROM b"),
+            "SELECT a FROM b",
+            "multi-line SQL must flatten; a newline would break the bar"
+        );
+    }
 }

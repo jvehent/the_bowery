@@ -243,9 +243,19 @@ impl AlertsPane {
             lines.push(Line::from(format!("  {chunk}")));
         }
         lines.push(Line::from(""));
+        // Only advertise pivots that will actually fire: a file alert
+        // has no sha256, a process alert may have no path, and a hint
+        // for a key that does nothing is worse than no hint.
+        let mut pivots = vec!["a audit for episode"];
+        if !alert.exe_sha256_hex.is_empty() {
+            pivots.push("b baseline for sha256");
+        }
+        if !alert.exe_path.is_empty() {
+            pivots.push("p processes by path");
+            pivots.push("f file on disk");
+        }
         lines.push(Line::from(Span::styled(
-            "pivots:  a audit for episode   b baseline for sha256   \
-             p processes by path   f file on disk",
+            format!("pivots:  {}", pivots.join("   ")),
             theme::hint(),
         )));
 

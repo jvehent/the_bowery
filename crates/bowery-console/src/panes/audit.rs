@@ -9,11 +9,12 @@ use std::time::Duration;
 
 use bowery_cli::exec::{self, CollectSink};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Rect};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row as TableRow, Table};
+use ratatui::layout::Rect;
+use ratatui::widgets::{Block, Borders, Paragraph};
 use tokio::sync::mpsc;
 
 use crate::app::{EngineEvent, Relay};
+use crate::browse::Browser;
 use crate::theme;
 
 const SNAPSHOT_SQL: &str = "SELECT seq, ts_unix_ms, episode_id, action_id, outcome_kind \
@@ -22,6 +23,8 @@ const SNAPSHOT_SQL: &str = "SELECT seq, ts_unix_ms, episode_id, action_id, outco
 #[derive(Debug, Default)]
 pub(crate) struct AuditPane {
     pub(crate) snapshot: Option<CollectSink>,
+    /// Cursor + viewport over `snapshot.rows`.
+    browser: Browser,
     pub(crate) loading: bool,
     pub(crate) error: Option<String>,
     pub(crate) loaded_once: bool,
@@ -77,6 +80,22 @@ impl AuditPane {
         });
     }
 
+    /// Full-screen detail for the selected audit entry.
+    pub(crate) fn render_detail(&mut self, f: &mut Frame<'_>, area: Rect) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        crate::panes::render_sink_detail(f, area, snapshot, &mut self.browser, "Audit entry", "");
+    }
+
+    pub(crate) fn browser_mut(&mut self) -> &mut Browser {
+        &mut self.browser
+    }
+
+    pub(crate) fn has_rows(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|s| !s.rows.is_empty())
+    }
+
     pub(crate) fn on_done(&mut self, result: Result<CollectSink, String>) {
         self.loading = false;
         self.loaded_once = true;
@@ -119,32 +138,12 @@ impl AuditPane {
             return;
         }
 
-        let header = TableRow::new(
-            snapshot
-                .columns
-                .iter()
-                .map(|c| Cell::from(c.clone()))
-                .collect::<Vec<_>>(),
-        )
-        .style(theme::header_row());
-
-        let rows: Vec<TableRow> = snapshot
-            .rows
-            .iter()
-            .map(|r| {
-                let cells = r
-                    .values
-                    .iter()
-                    .map(|v| Cell::from(crate::panes::query::render_value(v)))
-                    .collect::<Vec<_>>();
-                TableRow::new(cells)
-            })
-            .collect();
-        let widths: Vec<Constraint> = snapshot
-            .columns
-            .iter()
-            .map(|_| Constraint::Min(8))
-            .collect();
-        f.render_widget(Table::new(rows, widths).header(header), inner);
+        crate::panes::render_sink_table(
+            f,
+            inner,
+            snapshot,
+            &mut self.browser,
+            "↑↓ move  ⏎ entry detail  r refresh",
+        );
     }
 }

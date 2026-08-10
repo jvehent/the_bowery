@@ -131,6 +131,11 @@ prompt you for the Gemma download on first run.
 | Key   | Action                                                 |
 |-------|--------------------------------------------------------|
 | 1–8   | Switch to that pane                                    |
+| ↑ ↓   | Move the row cursor (browsable panes — see §4.0)       |
+| PgUp/PgDn | Page the row cursor                                |
+| Home/End | Jump to the first / last row                        |
+| Enter | Open the detail overlay for the selected row            |
+| Esc / `q` | Close the detail overlay                            |
 | `r`   | Refresh the current pane (re-poll / re-query)          |
 | `x`   | Run the chat pane's draft SQL against the current relay |
 | `:`   | Open the command palette (see §6)                       |
@@ -138,17 +143,51 @@ prompt you for the Gemma download on first run.
 | Ctrl-C | Quit                                                   |
 
 History (Up/Down) is remembered per-session and persisted to
-`~/.bowery/console-history` between runs.
+`~/.bowery/console-history` between runs. On a browsable pane the arrow
+keys drive the row cursor while the input is empty, and revert to
+history as soon as you start typing.
 
 ---
 
 ## 4. Panes
 
+### 4.0 Browsing and drill-down
+
+Query, Alerts, Map, Audit and Peers are **browsable**: with the input
+prompt empty, `↑`/`↓` move the cursor, `PgUp`/`PgDn` page, `Home`/`End`
+jump to the ends, and `Enter` opens a full-screen **detail overlay** for
+the selected record. `Esc` (or `q`) closes it.
+
+The overlay exists because a table cell clips exactly the values that
+matter most — a sha256, a full argv, an alert rationale, a peer's
+public key. It shows every field of the record untruncated.
+
+Chat, Help and Doctor are prose panes and keep those keys for their own
+use (message editing, scrolling).
+
+**Pivots.** A detail overlay is not a dead end: single keys turn the
+record under the cursor into the query you'd otherwise type by hand,
+switch to the Query pane, and run it there. Each overlay lists the
+pivots it actually offers on its last line — a pivot is only advertised
+when the record carries the field it needs, so a key shown is a key that
+works.
+
+| pane | key | pivots to |
+| --- | --- | --- |
+| Alerts | `a` | audit entries for the alert's episode |
+| Alerts | `b` | the baseline row for its sha256 |
+| Alerts | `p` | running processes with that `exe_path` |
+| Alerts | `f` | the file on disk now (exists/size/mode/uid/mtime/sha256) |
+| Peers, Map | `n` | alerts raised by that peer |
+| Peers, Map | `m` | that peer's `bowery_mesh_peers` row |
+
 ### 4.1 `[1] Query` — SQL REPL
 
 Type a `SELECT` statement at the prompt and press Enter. Result
-renders as an aligned table. Latency + row count appear above the
-table.
+renders as an aligned, browsable table. Latency + row count appear
+above it. `Enter` on a row opens the detail overlay with every column
+on its own line — the way to read a `cmdline` or a hash that the table
+clips. The cursor resets to the top when a new result arrives.
 
 The agent's SQL surface is read-only (`set_authorizer` rejects
 everything but `SELECT`). The **schema** is in §5.
@@ -205,14 +244,28 @@ Title bar shows the buffered count and any poll error.
 
 ### 4.3 `[3] Map` — topology
 
-Renders the relay's 1-hop neighborhood as an ASCII tree:
+Renders the relay's 1-hop neighborhood as an ASCII tree, backed by
+`bowery_mesh_peers` — the *discovery* view, i.e. every peer the relay
+currently sees gossiping, whether or not it has been pinned:
 
 ```
 ◆ relay  25781c94907396bd…  10.11.178.126:9902
-├── ◆ 9e511c8a3b3c2f00…
-├── ◆ 4290a9c29f8e36c7…
-└── ◆ a3f201bb35a84e36…
+├── ◆ 9e511c8a3b3c2f00…  100.83.4.12:9902  v0.0.1
+├── ◆ 4290a9c29f8e36c7…  100.83.4.19:9902  v0.0.1
+└── ◇ a3f201bb35a84e36…  100.83.4.31:9902  v0.0.1  (unpinned)
+
+3 peer(s) discovered, 2 pinned  ·  ◆ pinned  ◇ unpinned
 ```
+
+`◇ (unpinned)` is the one worth watching: a peer can gossip all day
+and still answer nothing, because only pinned peers are dialed. The
+inverse — pinned but no longer gossiping — shows up as a peer missing
+from this list that `SELECT * FROM bowery_peers` still returns.
+
+Rows are selectable; `Enter` shows the peer's full fingerprint plus its
+`whisper_addr`, `agent_version`, and whether it has published a role
+vector and bloom advert. A peer with no role vector is never picked for
+a whisper round at all, which is otherwise invisible.
 
 Press `r` to refresh. Phase-10 multi-hop fan-out, when it lands,
 populates deeper levels in the same pane.
@@ -220,14 +273,17 @@ populates deeper levels in the same pane.
 ### 4.4 `[4] Audit` — Phase-7 enforcement log snapshot
 
 Runs `SELECT seq, ts_unix_ms, episode_id, action_id, outcome_kind
-FROM bowery_audit ORDER BY seq DESC LIMIT 200`. Press `r` to
-refresh.
+FROM bowery_audit ORDER BY seq DESC LIMIT 200`. Browsable; `Enter`
+opens the full entry. Press `r` to refresh.
 
 ### 4.5 `[5] Peers` — operator-side manifest
 
-Reads `~/.bowery/peers.toml` and renders it as a table. The same
-file `bowery peers add/list/remove` writes. Press `r` to reload
-after manual edits, or use the palette (`:peers add/remove/reload`).
+Reads `~/.bowery/peers.toml` and renders it as a browsable table. The
+same file `bowery peers add/list/remove` writes. `Enter` shows the
+peer's full fingerprint and public key — the table truncates both, and
+both are needed in full to enroll the peer elsewhere. Press `r` to
+reload after manual edits, or use the palette
+(`:peers add/remove/reload`).
 
 ### 4.6 `[6] Doctor` — local + remote readiness
 
