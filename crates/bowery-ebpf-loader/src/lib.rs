@@ -48,7 +48,9 @@ use aya::maps::{HashMap as AyaHashMap, MapData};
 use aya::programs::{Lsm, TracePoint};
 use aya::{Btf, BtfError};
 use bowery_events::source::{DEFAULT_CHANNEL_CAPACITY, EventSource};
-use bowery_events::{Event, NetFamily, NetworkConnect, ProcessExec, ProcessExit, enrich};
+use bowery_events::{
+    Event, NetDirection, NetFamily, NetworkConnect, ProcessExec, ProcessExit, enrich,
+};
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
@@ -80,10 +82,17 @@ struct RawConnectEvent {
     family: u16,
     /// Network byte order — converted in user space.
     dport: u16,
+    /// Network byte order — converted in user space.
+    sport: u16,
+    /// Mirrors `bowery_ebpf::DIRECTION_OUT` / `DIRECTION_IN`.
+    direction: u8,
+    _pad: u8,
     daddr_v4: [u8; 4],
     daddr_v6: [u8; 16],
     comm: [u8; 16],
 }
+
+const DIRECTION_IN: u8 = 1;
 
 const RAW_EXEC_SIZE: usize = std::mem::size_of::<RawExecEvent>();
 const RAW_EXIT_SIZE: usize = std::mem::size_of::<RawExitEvent>();
@@ -427,11 +436,19 @@ fn parse_connect(bytes: &[u8]) -> Option<Event> {
         }
     };
 
+    let direction = if raw.direction == DIRECTION_IN {
+        NetDirection::Inbound
+    } else {
+        NetDirection::Outbound
+    };
+
     Some(Event::NetworkConnect(NetworkConnect {
         pid: raw.pid,
         family,
         daddr,
         dport: u16::from_be(raw.dport),
+        local_port: u16::from_be(raw.sport),
+        direction,
         ts: std::time::SystemTime::now(),
     }))
 }
@@ -668,6 +685,9 @@ mod tests {
     fn parse_connect_v4_decodes_ipv4_and_dport() {
         let event_raw = RawConnectEvent {
             pid: 1234,
+            sport: 54321u16.to_be(),
+            direction: 0,
+            _pad: 0,
             family: AF_INET,
             // 443 in network byte order
             dport: 443u16.to_be(),
@@ -694,6 +714,9 @@ mod tests {
         v6[15] = 1;
         let event_raw = RawConnectEvent {
             pid: 99,
+            sport: 54321u16.to_be(),
+            direction: 0,
+            _pad: 0,
             family: AF_INET6,
             dport: 80u16.to_be(),
             daddr_v4: [0; 4],
@@ -716,6 +739,9 @@ mod tests {
     fn parse_connect_drops_unknown_family() {
         let event_raw = RawConnectEvent {
             pid: 1,
+            sport: 54321u16.to_be(),
+            direction: 0,
+            _pad: 0,
             family: 17, // AF_NETLINK — not something we care about
             dport: 0,
             daddr_v4: [0; 4],
@@ -744,5 +770,58 @@ mod tests {
         // Last byte must be 0 (kernel invariant).
         assert_eq!(key[15], 0);
         assert_eq!(&key[..15], b"a-very-long-com");
+    }
+}
+
+#[cfg(test)]
+mod inbound_tests {
+    use super::*;
+
+    fn as_bytes<T>(v: &T) -> &[u8] {
+        // SAFETY: same justification as the sibling parse tests.
+        unsafe { std::slice::from_raw_parts(std::ptr::from_ref(v).cast::<u8>(), size_of::<T>()) }
+    }
+
+    /// The accept-side record. `daddr`/`dport` describe the *client*,
+    /// and `local_port` is the service it reached — the field that says
+    /// what was actually touched.
+    #[test]
+    fn parse_connect_decodes_an_inbound_record() {
+        let raw = RawConnectEvent {
+            pid: 0,
+            family: AF_INET,
+            dport: 54321u16.to_be(), // client's ephemeral port
+            sport: 22u16.to_be(),    // our listening port
+            direction: DIRECTION_IN,
+            _pad: 0,
+            daddr_v4: [10, 0, 0, 42],
+            daddr_v6: [0; 16],
+            comm: [0; 16],
+        };
+        match parse_connect(as_bytes(&raw)).expect("parses") {
+            Event::NetworkConnect(c) => {
+                assert_eq!(c.direction, NetDirection::Inbound);
+                assert_eq!(c.daddr.to_string(), "10.0.0.42", "remote is the client");
+                assert_eq!(c.dport, 54321);
+                assert_eq!(c.local_port, 22, "local side is the service reached");
+                assert_eq!(
+                    c.pid, 0,
+                    "the accept-side transition runs in softirq context; a pid here \
+                     would be whatever task was interrupted"
+                );
+            }
+            other => panic!("expected NetworkConnect, got {other:?}"),
+        }
+    }
+
+    /// Layout is shared with the kernel-side struct by hand, so a size
+    /// change on either side must fail loudly here rather than silently
+    /// misparse every field after the drift.
+    #[test]
+    fn raw_connect_layout_is_pinned() {
+        assert_eq!(
+            RAW_CONNECT_SIZE, 48,
+            "ConnectEvent layout changed; update crates/bowery-ebpf/src/main.rs to match"
+        );
     }
 }

@@ -59,13 +59,53 @@ pub struct FileOpen {
     pub ts: SystemTime,
 }
 
+/// A TCP connection setup observed on this host.
+///
+/// `daddr`/`dport` always describe the **remote** end: the destination
+/// we dialled for [`NetDirection::Outbound`], and the client that dialled
+/// *us* for [`NetDirection::Inbound`]. `local_port` is our side — the
+/// ephemeral source port outbound, and the listening port inbound, which
+/// is the one that says which service was reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkConnect {
+    /// Connecting process. **Always 0 for inbound**: the kernel's
+    /// accept-side state transition runs in softirq context, where the
+    /// current task is whatever was interrupted. The process that owns
+    /// an inbound connection is knowable only on the host that made it —
+    /// which is precisely why the two hosts have to compare notes.
     pub pid: u32,
     pub family: NetFamily,
+    /// Remote peer address.
     pub daddr: IpAddr,
+    /// Remote peer port.
     pub dport: u16,
+    /// Our own port.
+    pub local_port: u16,
+    pub direction: NetDirection,
     pub ts: SystemTime,
+}
+
+/// Which side initiated a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetDirection {
+    /// This host dialled out.
+    Outbound,
+    /// This host accepted. The other half of this connection was
+    /// recorded as `Outbound` on some other machine — with the process
+    /// attribution this side can never see.
+    Inbound,
+}
+
+impl NetDirection {
+    /// Stable operator-facing label, used in the `bowery_events`
+    /// `direction` column.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Outbound => "out",
+            Self::Inbound => "in",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

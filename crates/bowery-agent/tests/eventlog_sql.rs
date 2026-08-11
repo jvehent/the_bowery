@@ -125,6 +125,8 @@ async fn pipeline_events_become_queryable_history() {
             family: NetFamily::V4,
             daddr: "203.0.113.9".parse().unwrap(),
             dport: 4444,
+            local_port: 51000,
+            direction: bowery_events::NetDirection::Outbound,
             ts: SystemTime::now(),
         }),
     ]));
@@ -267,6 +269,8 @@ async fn history_is_readable_through_the_real_authorized_engine() {
                 family: NetFamily::V4,
                 daddr: "198.51.100.4".parse().unwrap(),
                 dport: 443,
+                local_port: 51000,
+                direction: bowery_events::NetDirection::Outbound,
                 ts: SystemTime::now(),
             }),
         ])
@@ -329,6 +333,8 @@ async fn outbound_connections_become_a_queryable_destination_graph() {
             family: NetFamily::V4,
             daddr: "198.51.100.22".parse().unwrap(),
             dport: 22,
+            local_port: 51000,
+            direction: bowery_events::NetDirection::Outbound,
             ts: SystemTime::now(),
         }),
         // Same endpoint twice: the count must reflect repetition, since
@@ -339,6 +345,8 @@ async fn outbound_connections_become_a_queryable_destination_graph() {
             family: NetFamily::V4,
             daddr: "198.51.100.22".parse().unwrap(),
             dport: 22,
+            local_port: 51000,
+            direction: bowery_events::NetDirection::Outbound,
             ts: SystemTime::now(),
         }),
     ]));

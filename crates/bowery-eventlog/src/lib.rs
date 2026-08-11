@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS events (
     net_family   TEXT,
     dst_addr     TEXT,
     dst_port     INTEGER,
+    local_port   INTEGER,
+    direction    TEXT,
     path         TEXT,
     file_op      TEXT,
     open_flags   INTEGER
@@ -205,8 +207,10 @@ impl EventLog {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO events
                     (ts_unix_ms, kind, pid, ppid, uid, comm, exe_path, args,
-                     exit_code, net_family, dst_addr, dst_port, path, file_op, open_flags)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                     exit_code, net_family, dst_addr, dst_port, local_port, direction,
+                     path, file_op, open_flags)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                         ?15, ?16, ?17)",
             )?;
             for event in events {
                 let r = Row::from_event(event);
@@ -223,6 +227,8 @@ impl EventLog {
                     r.net_family,
                     r.dst_addr,
                     r.dst_port,
+                    r.local_port,
+                    r.direction,
                     r.path,
                     r.file_op,
                     r.open_flags,
@@ -332,6 +338,8 @@ struct Row {
     net_family: Option<&'static str>,
     dst_addr: Option<String>,
     dst_port: Option<i64>,
+    local_port: Option<i64>,
+    direction: Option<&'static str>,
     path: Option<String>,
     file_op: Option<&'static str>,
     open_flags: Option<i64>,
@@ -353,6 +361,8 @@ impl Row {
             net_family: None,
             dst_addr: None,
             dst_port: None,
+            local_port: None,
+            direction: None,
             path: None,
             file_op: None,
             open_flags: None,
@@ -384,6 +394,8 @@ impl Row {
                 });
                 r.dst_addr = Some(e.daddr.to_string());
                 r.dst_port = Some(i64::from(e.dport));
+                r.local_port = Some(i64::from(e.local_port));
+                r.direction = Some(e.direction.label());
             }
             Event::FileOpen(e) => {
                 r.kind = KIND_FILE_OPEN;
@@ -461,6 +473,8 @@ mod tests {
                     family: NetFamily::V4,
                     daddr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
                     dport: 4444,
+                    local_port: 51000,
+                    direction: bowery_events::NetDirection::Outbound,
                     ts: now,
                 }),
                 Event::FileChange(FileChange {

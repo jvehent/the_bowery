@@ -3137,6 +3137,17 @@ async fn process_event(
 /// host in the fleet* has ever contacted is the shape of C2, exfil, or
 /// lateral movement to somewhere new.
 async fn process_network_connect(baseline: &Arc<Baseline>, conn: &bowery_events::NetworkConnect) {
+    // Only outbound connections are destinations *this host chose*. An
+    // inbound peer is somebody else's choice, and folding it in here
+    // would corrupt the rarity signal: a host that gets scanned would
+    // accumulate hundreds of "destinations" it never contacted, and
+    // every one of them would then look normal fleet-wide.
+    //
+    // The inbound record still reaches the event log, which is where the
+    // correlating question gets answered from.
+    if conn.direction != bowery_events::NetDirection::Outbound {
+        return;
+    }
     let baseline = baseline.clone();
     let addr = conn.daddr.to_string();
     let port = conn.dport;
