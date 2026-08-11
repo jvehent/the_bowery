@@ -35,6 +35,27 @@ CREATE TABLE IF NOT EXISTS process_lineage (
 );
 
 CREATE INDEX IF NOT EXISTS idx_lineage_child ON process_lineage(child_sha);
+
+-- Network destinations this host has ever contacted.
+--
+-- The peer analogue of `binaries`: the question 'has this host talked to
+-- this endpoint before?' is answered the same way as 'has this host run
+-- this binary before?', and -- asked across the mesh -- becomes 'has ANY
+-- host in the fleet ever talked to it?'. A destination nobody has
+-- contacted is the shape of C2 or exfil; an intra-fleet destination
+-- nobody has contacted is the shape of lateral movement.
+--
+-- Keyed on the canonical addr:port text rather than a parsed tuple so
+-- v4 and v6 share one table and the key is directly greppable by an
+-- operator reading the SQL surface.
+CREATE TABLE IF NOT EXISTS net_destinations (
+    dst_key    TEXT PRIMARY KEY,
+    addr       TEXT NOT NULL,
+    port       INTEGER NOT NULL,
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL,
+    seen_count INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 #[derive(Debug, Error)]
@@ -66,6 +87,27 @@ pub struct BinaryRecord {
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
     pub seen_count: u64,
+}
+
+/// One endpoint this host has contacted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetDestinationRecord {
+    /// Canonical `addr:port`, and the key peers fingerprint for whisper
+    /// rounds.
+    pub dst_key: String,
+    pub addr: String,
+    pub port: u16,
+    pub first_seen: SystemTime,
+    pub last_seen: SystemTime,
+    pub seen_count: u64,
+}
+
+/// Canonical text form of a destination. Single source of truth: the
+/// asker's fingerprint and the responder's scan must agree byte for
+/// byte or a whisper round silently matches nothing.
+#[must_use]
+pub fn destination_key(addr: &str, port: u16) -> String {
+    format!("{addr}:{port}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +243,87 @@ impl Baseline {
     /// connection elsewhere) should use [`Self::snapshot_binaries`]
     /// instead, which collects into a Vec under the lock and
     /// releases the mutex before the caller iterates.
+    /// Record an observation of an outbound connection to `addr:port`.
+    ///
+    /// Mirrors [`Self::upsert_binary`]: `Inserted` means this host has
+    /// never contacted this endpoint before, which is the local half of
+    /// the rarity signal.
+    pub fn upsert_net_destination(&self, addr: &str, port: u16) -> Result<UpsertOutcome> {
+        let key = destination_key(addr, port);
+        let now = system_time_to_secs(SystemTime::now());
+        let conn = self.inner.lock().expect("baseline mutex poisoned");
+        let tx = conn.unchecked_transaction()?;
+
+        let existing: Option<u64> = tx
+            .query_row(
+                "SELECT seen_count FROM net_destinations WHERE dst_key = ?1",
+                params![&key],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let outcome = if let Some(prev) = existing {
+            tx.execute(
+                "UPDATE net_destinations SET last_seen = ?2, seen_count = seen_count + 1
+                 WHERE dst_key = ?1",
+                params![&key, now],
+            )?;
+            UpsertOutcome::Updated {
+                seen_count: prev.saturating_add(1),
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO net_destinations
+                    (dst_key, addr, port, first_seen, last_seen, seen_count)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 1)",
+                params![&key, addr, i64::from(port), now],
+            )?;
+            UpsertOutcome::Inserted
+        };
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// Collect every recorded destination into a Vec.
+    ///
+    /// Preferred over [`Self::for_each_net_destination`] wherever the
+    /// caller does real work per row: the visitor variant holds the
+    /// baseline mutex for the whole walk, which is the shape of
+    /// SECURITY-AUDIT-PHASE9 F-9 (the SQL view must not hold it across
+    /// its own INSERTs).
+    pub fn snapshot_net_destinations(&self) -> Result<Vec<NetDestinationRecord>> {
+        let mut out = Vec::new();
+        self.for_each_net_destination(|r| out.push(r.clone()))?;
+        Ok(out)
+    }
+
+    /// Visit every recorded destination. Used by the whisper responder,
+    /// which derives a tier-1 fingerprint per row and does no I/O.
+    pub fn for_each_net_destination<F>(&self, mut visit: F) -> Result<()>
+    where
+        F: FnMut(&NetDestinationRecord),
+    {
+        let conn = self.inner.lock().expect("baseline mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT dst_key, addr, port, first_seen, last_seen, seen_count
+             FROM net_destinations",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(NetDestinationRecord {
+                dst_key: row.get(0)?,
+                addr: row.get(1)?,
+                port: u16::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                first_seen: secs_to_system_time(row.get(3)?),
+                last_seen: secs_to_system_time(row.get(4)?),
+                seen_count: row.get(5)?,
+            })
+        })?;
+        for row in rows {
+            visit(&row?);
+        }
+        Ok(())
+    }
+
     pub fn for_each_binary<F>(&self, mut visit: F) -> Result<()>
     where
         F: FnMut(&BinaryRecord),
@@ -354,6 +477,85 @@ fn secs_to_system_time(secs: i64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or(0))
     } else {
         UNIX_EPOCH
+    }
+}
+
+#[cfg(test)]
+mod net_destination_tests {
+    use super::*;
+
+    #[test]
+    fn first_contact_is_inserted_and_repeats_increment() {
+        let b = Baseline::open_in_memory().unwrap();
+        assert_eq!(
+            b.upsert_net_destination("203.0.113.9", 443).unwrap(),
+            UpsertOutcome::Inserted,
+            "first contact is the local half of the rarity signal"
+        );
+        assert_eq!(
+            b.upsert_net_destination("203.0.113.9", 443).unwrap(),
+            UpsertOutcome::Updated { seen_count: 2 }
+        );
+
+        let mut rows = Vec::new();
+        b.for_each_net_destination(|r| rows.push(r.clone()))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].dst_key, "203.0.113.9:443");
+        assert_eq!(rows[0].addr, "203.0.113.9");
+        assert_eq!(rows[0].port, 443);
+        assert_eq!(rows[0].seen_count, 2);
+    }
+
+    /// Port is part of the identity: SSH to a host you already talk to
+    /// on 443 is a different fact, and collapsing them would hide
+    /// exactly the lateral-movement case this exists for.
+    #[test]
+    fn the_same_address_on_a_different_port_is_a_different_destination() {
+        let b = Baseline::open_in_memory().unwrap();
+        b.upsert_net_destination("10.0.0.5", 443).unwrap();
+        assert_eq!(
+            b.upsert_net_destination("10.0.0.5", 22).unwrap(),
+            UpsertOutcome::Inserted
+        );
+        let mut n = 0;
+        b.for_each_net_destination(|_| n += 1).unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// v6 addresses contain colons, so the canonical key must stay
+    /// round-trippable through the fields it was built from — the
+    /// asker fingerprints this string and the responder rebuilds it.
+    #[test]
+    fn v6_destinations_keep_address_and_port_separable() {
+        let b = Baseline::open_in_memory().unwrap();
+        b.upsert_net_destination("2001:db8::1", 8443).unwrap();
+        let mut rows = Vec::new();
+        b.for_each_net_destination(|r| rows.push(r.clone()))
+            .unwrap();
+        assert_eq!(rows[0].addr, "2001:db8::1");
+        assert_eq!(rows[0].port, 8443);
+        assert_eq!(
+            rows[0].dst_key,
+            destination_key("2001:db8::1", 8443),
+            "the stored key must equal what an asker would fingerprint"
+        );
+    }
+
+    #[test]
+    fn destinations_survive_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("baseline.db");
+        {
+            let b = Baseline::open(&path).unwrap();
+            b.upsert_net_destination("198.51.100.7", 53).unwrap();
+        }
+        let b = Baseline::open(&path).unwrap();
+        assert_eq!(
+            b.upsert_net_destination("198.51.100.7", 53).unwrap(),
+            UpsertOutcome::Updated { seen_count: 2 },
+            "a restart must not make every destination look new again"
+        );
     }
 }
 

@@ -599,7 +599,8 @@ Available tables: `processes`, `mounts`, `kernel_modules`,
 (`bowery_peers`, `bowery_mesh_peers`, `bowery_monitor_rules`,
 `bowery_yara_rules`, `bowery_baseline_binaries`, `bowery_alerts`,
 `bowery_audit`, `bowery_events`, `bowery_eventlog_status`,
-`bowery_revocations`). Plus seven scalar functions for per-path file
+`bowery_revocations`, `bowery_net_destinations`). Plus seven scalar
+functions for per-path file
 inspection: `bowery_file_exists`, `_size`, `_mode`,
 `_mtime_unix`, `_owner_uid`, `_owner_gid`, `_sha256_hex`.
 
@@ -609,6 +610,37 @@ column-name array; `--format=tsv` (default) streams one
 tab-separated line per row. See
 [`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md) for the full
 schema and security model.
+
+### The fleet connection graph
+
+Every outbound connection is folded into a per-host destination
+baseline, exposed as `bowery_net_destinations`. Under `--fanout` that
+becomes the fleet-wide connection graph, which is what makes lateral
+movement legible: the two halves of a hop live on different hosts and
+neither is remarkable alone.
+
+```bash
+# Which hosts have ever contacted this endpoint?
+bowery exec sql --fanout --sql \
+  "SELECT _agent_name, seen_count, first_seen_unix
+   FROM bowery_net_destinations WHERE dst_key = '10.0.0.5:22'"
+
+# Endpoints exactly one host in the fleet has ever contacted.
+bowery exec sql --fanout --sql \
+  "SELECT dst_key, COUNT(*) AS hosts FROM bowery_net_destinations
+   GROUP BY dst_key HAVING hosts = 1"
+```
+
+That second query is the useful one for hunting: an endpoint a single
+host has ever talked to is the shape of C2, exfil, or a first hop.
+Cross-reference it against `bowery_events` on that host to get the
+process that made the connection:
+
+```bash
+bowery exec sql --sql \
+  "SELECT ts_unix_ms, pid, comm, exe_path FROM bowery_events
+   WHERE kind = 'connect' AND dst_addr = '10.0.0.5' AND dst_port = 22"
+```
 
 ### Mesh trust: signed enrollment and revocation
 

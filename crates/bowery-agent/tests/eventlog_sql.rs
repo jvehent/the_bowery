@@ -312,3 +312,76 @@ async fn history_is_readable_through_the_real_authorized_engine() {
         .await;
     assert!(write.is_err(), "SELECT-only authorizer must reject writes");
 }
+
+/// The fleet connection graph: an outbound connection must land in the
+/// destination baseline and be queryable, because that view under
+/// `--fanout` is what makes lateral movement visible at all — the two
+/// halves of a hop live on different hosts and neither is remarkable
+/// alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbound_connections_become_a_queryable_destination_graph() {
+    let workdir = TempDir::new().unwrap();
+    let log_path = workdir.path().join("events.db");
+
+    let source = Box::new(MockEventSource::new(vec![
+        Event::NetworkConnect(NetworkConnect {
+            pid: 900,
+            family: NetFamily::V4,
+            daddr: "198.51.100.22".parse().unwrap(),
+            dport: 22,
+            ts: SystemTime::now(),
+        }),
+        // Same endpoint twice: the count must reflect repetition, since
+        // "contacted once, ever" is the signal and "contacted daily" is
+        // not.
+        Event::NetworkConnect(NetworkConnect {
+            pid: 901,
+            family: NetFamily::V4,
+            daddr: "198.51.100.22".parse().unwrap(),
+            dport: 22,
+            ts: SystemTime::now(),
+        }),
+    ]));
+
+    let mut cfg = build_config(workdir.path(), log_path);
+    // A real baseline file so the destination table survives the query.
+    cfg.baseline.path = workdir.path().join("baseline.db");
+    let agent = Agent::start(cfg, Arc::new(Identity::generate()), source)
+        .await
+        .expect("start agent");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the destination to be recorded"
+        );
+        let count = agent
+            .baseline()
+            .snapshot_net_destinations()
+            .unwrap()
+            .iter()
+            .find(|d| d.dst_key == "198.51.100.22:22")
+            .map_or(0, |d| d.seen_count);
+        if count >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // And it must be visible through the SQL surface an operator uses.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let table = bowery_agent::sql_tables::BoweryNetDestinationsTable::new(agent.baseline().clone());
+    bowery_tables::BoweryTable::register(&table, &conn).unwrap();
+    let (addr, port, count): (String, i64, i64) = conn
+        .query_row(
+            "SELECT addr, port, seen_count FROM bowery_net_destinations \
+             WHERE dst_key = '198.51.100.22:22'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((addr.as_str(), port, count), ("198.51.100.22", 22, 2));
+
+    agent.shutdown().await.expect("shutdown");
+}

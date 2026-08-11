@@ -580,6 +580,9 @@ impl Agent {
                     operators: operators.clone(),
                 }),
             ))
+            .with_extra_table(Arc::new(
+                crate::sql_tables::BoweryNetDestinationsTable::new(baseline.clone()),
+            ))
             .with_extra_table(Arc::new(crate::sql_tables::BoweryRevocationsTable::new(
                 revocations.clone(),
             )))
@@ -3117,11 +3120,37 @@ async fn process_event(
             )
             .await;
         }
-        // Recorded above; no analyzer path yet. Network connections in
-        // particular are now queryable history even though nothing scores
-        // them — which is what makes retrospective hunting possible
-        // before the detection content exists.
-        Event::ProcessExit(_) | Event::FileOpen(_) | Event::NetworkConnect(_) => {}
+        Event::NetworkConnect(conn) => {
+            process_network_connect(baseline, &conn).await;
+        }
+        // Recorded to the event log above; no analyzer path yet.
+        Event::ProcessExit(_) | Event::FileOpen(_) => {}
+    }
+}
+
+/// Fold an outbound connection into the host's destination baseline.
+///
+/// This is the local half of a fleet-wide rarity signal. On its own,
+/// "this host has never contacted this endpoint" is weak — every
+/// legitimate first connection looks the same. It becomes strong when
+/// the same question is asked across the mesh, because an endpoint *no
+/// host in the fleet* has ever contacted is the shape of C2, exfil, or
+/// lateral movement to somewhere new.
+async fn process_network_connect(baseline: &Arc<Baseline>, conn: &bowery_events::NetworkConnect) {
+    let baseline = baseline.clone();
+    let addr = conn.daddr.to_string();
+    let port = conn.dport;
+    // spawn_blocking: SQLite is synchronous, and connect events arrive
+    // at a much higher rate than execs on a busy host.
+    let outcome =
+        tokio::task::spawn_blocking(move || baseline.upsert_net_destination(&addr, port)).await;
+    match outcome {
+        Ok(Ok(bowery_baseline::UpsertOutcome::Inserted)) => {
+            debug!(dst = %conn.daddr, port = conn.dport, "first contact with destination");
+        }
+        Ok(Ok(bowery_baseline::UpsertOutcome::Updated { .. })) => {}
+        Ok(Err(e)) => warn!(error = %e, "recording network destination failed"),
+        Err(e) => warn!(error = %e, "destination upsert task panicked"),
     }
 }
 

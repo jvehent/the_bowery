@@ -601,6 +601,80 @@ pub struct GrantCheck {
 }
 
 // ---------------------------------------------------------------------------
+// bowery_net_destinations — every endpoint this host has contacted.
+// ---------------------------------------------------------------------------
+
+/// `bowery_net_destinations` — one row per endpoint this agent has ever
+/// made an outbound connection to, with a count and first/last seen.
+///
+/// Under `--fanout` this is the **fleet-wide connection graph**, which
+/// is what makes lateral movement visible at all: the two halves of a
+/// hop live on different hosts, and neither is remarkable alone.
+///
+/// ```sql
+/// -- who in the fleet has ever talked to this endpoint?
+/// SELECT _agent_name, seen_count, first_seen_unix
+/// FROM bowery_net_destinations WHERE dst_key = '10.0.0.5:22';
+///
+/// -- endpoints exactly one host has ever contacted
+/// SELECT dst_key, COUNT(*) AS hosts FROM bowery_net_destinations
+/// GROUP BY dst_key HAVING hosts = 1;
+/// ```
+#[derive(Debug)]
+pub struct BoweryNetDestinationsTable {
+    baseline: Arc<Baseline>,
+}
+
+impl BoweryNetDestinationsTable {
+    pub fn new(baseline: Arc<Baseline>) -> Self {
+        Self { baseline }
+    }
+}
+
+impl BoweryTable for BoweryNetDestinationsTable {
+    fn name(&self) -> &'static str {
+        "bowery_net_destinations"
+    }
+
+    fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bowery_net_destinations (
+                dst_key         TEXT,
+                addr            TEXT,
+                port            INTEGER,
+                first_seen_unix INTEGER,
+                last_seen_unix  INTEGER,
+                seen_count      INTEGER
+            );",
+        )?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO bowery_net_destinations
+                (dst_key, addr, port, first_seen_unix, last_seen_unix, seen_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        // Snapshot first so the baseline mutex isn't held across our
+        // INSERTs (SECURITY-AUDIT-PHASE9 F-9); a snapshot error falls
+        // back to no rows, the same best-effort policy as every other
+        // table here.
+        let snapshot = self
+            .baseline
+            .snapshot_net_destinations()
+            .unwrap_or_default();
+        for r in &snapshot {
+            let _ = stmt.execute(params![
+                r.dst_key,
+                r.addr,
+                i64::from(r.port),
+                unix_secs(r.first_seen),
+                unix_secs(r.last_seen),
+                i64::try_from(r.seen_count).unwrap_or(i64::MAX),
+            ]);
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bowery_revocations — identities an operator has ejected from the mesh.
 // ---------------------------------------------------------------------------
 
