@@ -182,6 +182,7 @@ impl EventLog {
         // Pi is the difference between usable and not.
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         conn.execute_batch(SCHEMA_V1)?;
+        Self::migrate(&conn)?;
         Ok(Self {
             inner: Mutex::new(conn),
             path,
@@ -190,6 +191,40 @@ impl EventLog {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Add columns introduced after a log file was first created.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so
+    /// adding a column to `SCHEMA_V1` alone silently leaves every
+    /// already-deployed agent on the old shape — and then every INSERT
+    /// naming the new column fails, which stops history recording dead
+    /// on exactly the hosts that have the most of it. That is not
+    /// hypothetical: it happened.
+    ///
+    /// `ALTER TABLE ... ADD COLUMN` is metadata-only in `SQLite` for a
+    /// nullable column with no default, so this is O(1) regardless of
+    /// how many rows the log holds.
+    fn migrate(conn: &Connection) -> Result<()> {
+        // Columns added after the initial schema. Append here — never
+        // reorder or remove, since the point is to reconcile with files
+        // written by older builds.
+        const ADDED: &[(&str, &str)] = &[("local_port", "INTEGER"), ("direction", "TEXT")];
+
+        let mut present = std::collections::HashSet::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(events)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            for name in rows {
+                present.insert(name?);
+            }
+        }
+        for (name, ty) in ADDED {
+            if !present.contains(*name) {
+                conn.execute_batch(&format!("ALTER TABLE events ADD COLUMN {name} {ty};"))?;
+            }
+        }
+        Ok(())
     }
 
     /// Append a batch of events in one transaction.
@@ -653,5 +688,110 @@ mod tests {
             1,
             "history must survive a restart"
         );
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    use bowery_events::{Event, NetDirection, NetFamily, NetworkConnect, ProcessExec};
+    use rusqlite::Connection;
+
+    use super::*;
+
+    /// The pre-migration schema, verbatim: no `local_port`, no
+    /// `direction`.
+    const SCHEMA_BEFORE: &str = "
+    CREATE TABLE IF NOT EXISTS events (
+        seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_unix_ms   INTEGER NOT NULL,
+        kind         TEXT    NOT NULL,
+        pid          INTEGER,
+        ppid         INTEGER,
+        uid          INTEGER,
+        comm         TEXT,
+        exe_path     TEXT,
+        args         TEXT,
+        exit_code    INTEGER,
+        net_family   TEXT,
+        dst_addr     TEXT,
+        dst_port     INTEGER,
+        path         TEXT,
+        file_op      TEXT,
+        open_flags   INTEGER
+    );";
+
+    /// Regression for a bug that reached a live host: adding a column to
+    /// `SCHEMA_V1` does nothing to an existing file, because
+    /// `CREATE TABLE IF NOT EXISTS` is a no-op there. Every subsequent
+    /// INSERT then failed, and the agent with the longest history was
+    /// the one that stopped recording.
+    #[test]
+    fn an_old_schema_log_migrates_and_keeps_accepting_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("events.db");
+
+        // A log written by the previous build, with a row already in it.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_BEFORE).unwrap();
+            conn.execute(
+                "INSERT INTO events (ts_unix_ms, kind, pid, comm) VALUES (1, 'exec', 7, 'old')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let log = EventLog::open(&path).expect("opening an old-schema log must succeed");
+
+        // The write that used to fail.
+        log.append_batch(&[Event::NetworkConnect(NetworkConnect {
+            pid: 0,
+            family: NetFamily::V4,
+            daddr: "10.0.0.42".parse().unwrap(),
+            dport: 54321,
+            local_port: 22,
+            direction: NetDirection::Inbound,
+            ts: SystemTime::now(),
+        })])
+        .expect("a migrated log must accept rows using the new columns");
+
+        // Pre-existing history survives the migration.
+        assert_eq!(log.stats().unwrap().rows, 2, "the old row must not be lost");
+
+        let conn = log.inner.lock().unwrap();
+        let (dir_label, lport): (String, i64) = conn
+            .query_row(
+                "SELECT direction, local_port FROM events WHERE kind = 'connect'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((dir_label.as_str(), lport), ("in", 22));
+    }
+
+    /// Migration runs on every open, so it must be a no-op the second
+    /// time — `ALTER TABLE ADD COLUMN` errors on a duplicate.
+    #[test]
+    fn migration_is_idempotent_across_reopens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("events.db");
+        for _ in 0..3 {
+            let log = EventLog::open(&path).expect("reopen must not fail");
+            log.append_batch(&[Event::ProcessExec(ProcessExec {
+                pid: 1,
+                ppid: 1,
+                uid: 0,
+                comm: "t".into(),
+                exe_path: Some(PathBuf::from("/bin/t")),
+                args: vec![],
+                ts: SystemTime::now(),
+            })])
+            .unwrap();
+        }
+        let log = EventLog::open(&path).unwrap();
+        assert_eq!(log.stats().unwrap().rows, 3);
     }
 }
