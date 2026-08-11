@@ -36,6 +36,14 @@ pub const KEY_ROLE_VECTOR: &str = "role_vec";
 /// summary). Receivers compare epochs per peer and keep only the
 /// highest one they've seen.
 pub const KEY_BLOOM_ADVERT: &str = "bloom_advert";
+/// Key under which each node publishes its base64-encoded
+/// `bowery_proto::MembershipGrant` — the operator-signed statement that
+/// it belongs in this cluster (Phase-3 mesh trust).
+///
+/// Published in the clear on purpose: a grant is bound to one agent
+/// fingerprint and one cluster, so it is useless to anyone else, and
+/// gossiping it means enrollment needs no extra round trip.
+pub const KEY_MEMBERSHIP_GRANT: &str = "membership_grant";
 pub const DEFAULT_CLUSTER_ID: &str = "bowery";
 
 #[derive(Debug, Error)]
@@ -63,6 +71,10 @@ pub struct PeerInfo {
     /// if any. Decode by base64'ing then `prost::Message::decode`'ing
     /// into `bowery_proto::BloomAdvert`. Phase 5.
     pub bloom_advert: Option<String>,
+    /// Base64-encoded `bowery_proto::MembershipGrant` published by the
+    /// peer, if any. Phase-3 mesh trust: under the `grant` enrollment
+    /// policy a peer without a valid one is never pinned.
+    pub membership_grant: Option<String>,
 }
 
 #[derive(Debug)]
@@ -245,6 +257,7 @@ fn build_peer_infos(
             }
             let role_vector = state.get(KEY_ROLE_VECTOR).map(str::to_string);
             let bloom_advert = state.get(KEY_BLOOM_ADVERT).map(str::to_string);
+            let membership_grant = state.get(KEY_MEMBERSHIP_GRANT).map(str::to_string);
             Some(PeerInfo {
                 fingerprint: fp,
                 verifying_key: vk,
@@ -252,6 +265,7 @@ fn build_peer_infos(
                 agent_version,
                 role_vector,
                 bloom_advert,
+                membership_grant,
             })
         })
         .collect()

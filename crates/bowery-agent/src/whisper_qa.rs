@@ -788,6 +788,7 @@ mod tests {
             agent_version: "0.0.1".into(),
             role_vector: None,
             bloom_advert: Some(b64),
+            membership_grant: None,
         }
     }
 

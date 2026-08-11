@@ -21,5 +21,6 @@ pub mod alerts;
 pub mod audit;
 pub mod doctor;
 pub mod exec;
+pub mod mesh_trust;
 pub mod model;
 pub mod peers;

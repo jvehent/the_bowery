@@ -44,6 +44,10 @@ fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: St
             path: dir.join("known_neighbors.json"),
             bootstrap_window: Duration::from_hours(1),
             max_pinned_peers: 1024,
+            // Phase-3 defaults: unchanged TOFU behaviour.
+            enrollment: bowery_agent::config::EnrollmentPolicy::Tofu,
+            grant_path: None,
+            revocations_path: dir.join("revocations.json"),
         },
         mesh: MeshConfig {
             listen_addr: mesh_addr,

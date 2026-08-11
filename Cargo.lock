@@ -273,6 +273,7 @@ dependencies = [
  "base64",
  "bowery-analysis",
  "bowery-baseline",
+ "bowery-cli",
  "bowery-crypto",
  "bowery-ebpf-loader",
  "bowery-eventlog",

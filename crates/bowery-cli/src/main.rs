@@ -16,7 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_crypto::Identity;
 use clap::{Parser, Subcommand};
 
-use bowery_cli::{alerts, audit, doctor, exec, model, peers};
+use bowery_cli::{alerts, audit, doctor, exec, mesh_trust, model, peers};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -99,6 +99,62 @@ enum Command {
     Peers {
         #[command(subcommand)]
         sub: PeersCommand,
+    },
+
+    /// Mesh trust (Phase 3): admit agents to the mesh with signed
+    /// membership grants, and eject compromised ones with signed
+    /// revocations.
+    ///
+    /// Both are offline signing operations — nothing here talks to the
+    /// network, so they work from an air-gapped key holder.
+    #[command(subcommand)]
+    Trust(TrustCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum TrustCommand {
+    /// Mint an operator-signed membership grant admitting one agent to
+    /// one cluster.
+    ///
+    /// Copy the output to the agent and point `[known_neighbors]
+    /// grant_path` at it. The agent gossips it so peers running
+    /// `enrollment = "grant"` can verify and pin it.
+    Grant {
+        /// Path to the operator's identity key file.
+        #[arg(long)]
+        operator_key: PathBuf,
+        /// Hex-encoded fingerprint of the agent being admitted.
+        #[arg(long)]
+        agent_fp: String,
+        /// Mesh cluster id. Must match the agent's `[mesh] cluster_id`.
+        #[arg(long, default_value = "bowery")]
+        cluster_id: String,
+        /// Validity window (`30d`, `1y`). Omit for a grant that never
+        /// expires.
+        #[arg(long, value_parser = parse_duration)]
+        valid_for: Option<Duration>,
+        /// Write here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Mint an operator-signed revocation ejecting one agent from the
+    /// mesh, permanently.
+    ///
+    /// There is no un-revoke: re-admitting a rebuilt host means giving
+    /// it a new identity key.
+    Revoke {
+        #[arg(long)]
+        operator_key: PathBuf,
+        /// Hex-encoded fingerprint of the agent being ejected.
+        #[arg(long)]
+        agent_fp: String,
+        #[arg(long, default_value = "bowery")]
+        cluster_id: String,
+        /// Operator note, carried in the revocation for the audit trail.
+        #[arg(long, default_value = "revoked by operator")]
+        reason: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -399,6 +455,26 @@ impl Cli {
             }
             Command::Key(KeyCommand::Info { path }) => {
                 key_info(&path)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::Trust(TrustCommand::Grant {
+                operator_key,
+                agent_fp,
+                cluster_id,
+                valid_for,
+                out,
+            }) => {
+                mesh_trust::mint_grant(&operator_key, &agent_fp, &cluster_id, valid_for, out)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::Trust(TrustCommand::Revoke {
+                operator_key,
+                agent_fp,
+                cluster_id,
+                reason,
+                out,
+            }) => {
+                mesh_trust::mint_revocation(&operator_key, &agent_fp, &cluster_id, &reason, out)?;
                 Ok(ExitCode::SUCCESS)
             }
             Command::Doctor { json } => doctor_cmd(json),

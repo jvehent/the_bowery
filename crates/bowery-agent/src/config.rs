@@ -97,6 +97,51 @@ pub struct KnownNeighborsConfig {
     /// identities during the bootstrap window. Default 1024.
     #[serde(default = "default_max_pinned_peers")]
     pub max_pinned_peers: usize,
+    /// How a peer earns a pin. See [`EnrollmentPolicy`].
+    #[serde(default)]
+    pub enrollment: EnrollmentPolicy,
+    /// Path to this agent's own operator-signed membership grant
+    /// (`bowery enroll grant` writes one). Published into the mesh KV so
+    /// peers can verify it. Absent under `tofu`; required under `grant`
+    /// or no peer will pin this agent.
+    #[serde(default)]
+    pub grant_path: Option<PathBuf>,
+    /// File of operator-signed revocations — one base64 `Revocation`
+    /// per line, exactly as `bowery trust revoke` emits. Every line is
+    /// re-verified against the configured operator keys on load, so the
+    /// file carries no authority of its own: editing it can remove a
+    /// revocation but cannot manufacture one. Consulted on every pin,
+    /// and revoked peers are evicted at startup.
+    #[serde(default = "default_revocations_path")]
+    pub revocations_path: PathBuf,
+}
+
+/// How a peer earns a pin.
+///
+/// `Tofu` is the historical behaviour and remains the default so that
+/// upgrading an existing fleet doesn't partition it — but it is the
+/// weaker mode, and deliberately so named that it reads as a choice
+/// rather than an absence of one. Gossip is unauthenticated UDP, so
+/// under `Tofu` "can reach port 9901 during the bootstrap window" *is*
+/// the admission control.
+///
+/// `Grant` requires an operator-signed [`bowery_proto::MembershipGrant`]
+/// naming the peer's own fingerprint and this cluster. Migration is
+/// gradual: issue grants to every agent first, confirm via
+/// `SELECT fingerprint_hex, grant_state FROM bowery_mesh_peers`, then
+/// flip the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnrollmentPolicy {
+    /// Pin any peer seen gossiping during the bootstrap window.
+    #[default]
+    Tofu,
+    /// Pin only peers presenting a valid operator-signed grant.
+    Grant,
+}
+
+fn default_revocations_path() -> PathBuf {
+    PathBuf::from("/var/lib/bowery/revocations.b64")
 }
 
 impl Default for KnownNeighborsConfig {
@@ -105,6 +150,9 @@ impl Default for KnownNeighborsConfig {
             path: PathBuf::from(DEFAULT_KNOWN_NEIGHBORS_PATH),
             bootstrap_window: default_bootstrap_window(),
             max_pinned_peers: default_max_pinned_peers(),
+            enrollment: EnrollmentPolicy::default(),
+            grant_path: None,
+            revocations_path: default_revocations_path(),
         }
     }
 }

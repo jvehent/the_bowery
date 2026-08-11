@@ -373,6 +373,20 @@ max_concurrent_rounds = 4   # Q&A rounds in flight; extras are shed
 [heartbeat]
 interval = "30s"
 
+# Mesh trust (Phase 3). `enrollment` decides how a peer earns a pin.
+#   tofu  — pin anything seen gossiping during the bootstrap window.
+#           Gossip is unauthenticated UDP, so under tofu "can reach
+#           port 9901 during the window" IS the admission control.
+#   grant — pin only peers presenting an operator-signed membership
+#           grant naming their own fingerprint and this cluster.
+# Default is tofu so upgrading an existing fleet doesn't partition it.
+# See "Migrating to signed enrollment" below before flipping it.
+[known_neighbors]
+path       = "/var/lib/bowery/known_neighbors.json"
+enrollment = "tofu"
+# grant_path = "/var/lib/bowery/grant.b64"   # required under "grant"
+revocations_path = "/var/lib/bowery/revocations.b64"
+
 [baseline]
 path = "/var/lib/bowery/baseline.db"
 
@@ -584,8 +598,8 @@ Available tables: `processes`, `mounts`, `kernel_modules`,
 `os_version`, `system_info`, plus seven Bowery-internal views
 (`bowery_peers`, `bowery_mesh_peers`, `bowery_monitor_rules`,
 `bowery_yara_rules`, `bowery_baseline_binaries`, `bowery_alerts`,
-`bowery_audit`, `bowery_events`, `bowery_eventlog_status`). Plus
-seven scalar functions for per-path file
+`bowery_audit`, `bowery_events`, `bowery_eventlog_status`,
+`bowery_revocations`). Plus seven scalar functions for per-path file
 inspection: `bowery_file_exists`, `_size`, `_mode`,
 `_mtime_unix`, `_owner_uid`, `_owner_gid`, `_sha256_hex`.
 
@@ -595,6 +609,63 @@ column-name array; `--format=tsv` (default) streams one
 tab-separated line per row. See
 [`DESIGN-NATIVE-SQL.md`](DESIGN-NATIVE-SQL.md) for the full
 schema and security model.
+
+### Mesh trust: signed enrollment and revocation
+
+Under the default `enrollment = "tofu"`, any host that can send UDP to
+the gossip port during an agent's bootstrap window becomes a permanently
+trusted mesh member. Signed enrollment replaces that with an
+operator-signed grant.
+
+**Issue a grant per agent** (offline; needs only the operator key):
+
+```bash
+bowery trust grant \
+  --operator-key ~/.bowery/operator.key \
+  --agent-fp <agent fingerprint hex> \
+  --cluster-id bowery-tailnet \
+  --out grant.b64
+```
+
+Copy `grant.b64` to the agent and point `[known_neighbors] grant_path`
+at it, then restart. The agent gossips the grant so peers can verify it.
+
+**Migrating to signed enrollment.** Flipping `enrollment` to `grant`
+while any peer lacks a valid grant partitions the mesh — those peers
+stop being pinnable. Issue grants to every agent first, then confirm
+fleet-wide before flipping:
+
+```bash
+bowery exec sql --fanout --sql \
+  "SELECT fingerprint_hex, grant_state FROM bowery_mesh_peers"
+```
+
+Every row must read `grant_state = valid`. `absent` means that agent has
+no grant yet; `invalid: …` names the failing check.
+
+**Revoking a compromised agent:**
+
+```bash
+bowery trust revoke \
+  --operator-key ~/.bowery/operator.key \
+  --agent-fp <fingerprint> --cluster-id bowery-tailnet \
+  --reason "compromised" --out revocation.b64
+```
+
+Append the base64 line to each agent's `revocations_path` (the file is
+one signed revocation per line, and every line is re-verified against
+the configured operator keys on load — so a hand-edited or forged entry
+is skipped, not trusted). On start, and on the next gossip tick, the
+agent evicts the revoked peer from its pin set and refuses to re-pin it.
+Confirm delivery:
+
+```bash
+bowery exec sql --fanout --sql "SELECT fingerprint_hex FROM bowery_revocations"
+```
+
+A revocation only binds agents that have received it — an agent missing
+it still trusts the revoked peer. There is no un-revoke: re-admitting a
+rebuilt host means giving it a new identity key.
 
 ### Multi-agent fan-out
 

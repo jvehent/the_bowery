@@ -26,6 +26,9 @@ use rusqlite::{Connection, params};
 use tokio::sync::watch;
 use tracing::warn;
 
+use base64::prelude::Engine as _;
+use bowery_whisper::FingerprintResolver as _;
+
 use crate::inbox::AlertInbox;
 use crate::monitor::{MonitorRules, file_op_label, severity_label};
 use crate::yara_store::YaraStore;
@@ -226,11 +229,25 @@ impl BoweryTable for BoweryYaraRulesTable {
 pub struct BoweryMeshPeersTable {
     peers_rx: watch::Receiver<Vec<PeerInfo>>,
     kn: Arc<KnownNeighbors>,
+    /// `None` leaves `grant_state` as `unchecked` — used by callers that
+    /// have no operator key set to verify against.
+    enrollment: Option<GrantCheck>,
 }
 
 impl BoweryMeshPeersTable {
     pub fn new(peers_rx: watch::Receiver<Vec<PeerInfo>>, kn: Arc<KnownNeighbors>) -> Self {
-        Self { peers_rx, kn }
+        Self {
+            peers_rx,
+            kn,
+            enrollment: None,
+        }
+    }
+
+    /// Enable grant evaluation for the `grant_state` column.
+    #[must_use]
+    pub fn with_enrollment(mut self, check: GrantCheck) -> Self {
+        self.enrollment = Some(check);
+        self
     }
 }
 
@@ -247,7 +264,8 @@ impl BoweryTable for BoweryMeshPeersTable {
                 agent_version     TEXT,
                 pinned            INTEGER,
                 has_role_vector   INTEGER,
-                has_bloom_advert  INTEGER
+                has_bloom_advert  INTEGER,
+                grant_state       TEXT
             );",
         )?;
         // Snapshot the pinned set once so we don't re-lock KnownNeighbors
@@ -256,8 +274,8 @@ impl BoweryTable for BoweryMeshPeersTable {
         let mut stmt = conn.prepare(
             "INSERT INTO bowery_mesh_peers
                 (fingerprint_hex, whisper_addr, agent_version, pinned,
-                 has_role_vector, has_bloom_advert)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 has_role_vector, has_bloom_advert, grant_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for peer in self.peers_rx.borrow().iter() {
             let is_pinned = i64::from(pinned.contains(&peer.fingerprint));
@@ -270,6 +288,7 @@ impl BoweryTable for BoweryMeshPeersTable {
                 is_pinned,
                 has_role,
                 has_bloom,
+                grant_state(peer, self.enrollment.as_ref()),
             ])?;
         }
         Ok(())
@@ -536,6 +555,101 @@ fn hex_lower(bytes: &[u8]) -> String {
 fn unix_secs(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// How this agent would judge a peer's membership grant *right now*.
+///
+/// This is the pre-flight for switching `enrollment` from `tofu` to
+/// `grant`: flipping the policy while any peer reads anything other than
+/// `valid` partitions the mesh, because those peers stop being pinnable.
+/// Reported as text rather than a boolean so the reason is actionable —
+/// `absent` means the peer hasn't been issued a grant, while
+/// `invalid: …` means it has one that this agent rejects.
+fn grant_state(peer: &PeerInfo, enrollment: Option<&GrantCheck>) -> String {
+    let Some(check) = enrollment else {
+        return "unchecked".to_string();
+    };
+    let Some(encoded) = peer.membership_grant.as_deref() else {
+        return "absent".to_string();
+    };
+    let Ok(raw) = base64::prelude::BASE64_STANDARD.decode(encoded.as_bytes()) else {
+        return "invalid: not base64".to_string();
+    };
+    let Ok(grant) = <bowery_proto::MembershipGrant as prost::Message>::decode(raw.as_slice())
+    else {
+        return "invalid: undecodable".to_string();
+    };
+    let operators = check.operators.clone();
+    let resolve = move |fp: &bowery_crypto::Fingerprint| operators.resolve(fp);
+    match bowery_whisper::mesh_trust::verify_grant(
+        &grant,
+        &peer.fingerprint,
+        &check.cluster_id,
+        &resolve,
+        SystemTime::now(),
+    ) {
+        Ok(()) => "valid".to_string(),
+        Err(e) => format!("invalid: {e}"),
+    }
+}
+
+/// The subset of enrollment state the SQL view needs to judge a grant.
+#[derive(Debug)]
+pub struct GrantCheck {
+    pub cluster_id: String,
+    pub operators: Arc<bowery_whisper::StaticResolver>,
+}
+
+// ---------------------------------------------------------------------------
+// bowery_revocations — identities an operator has ejected from the mesh.
+// ---------------------------------------------------------------------------
+
+/// `bowery_revocations` — one row per revoked agent identity.
+///
+/// Fleet-wide with `--fanout`, this answers the question that actually
+/// matters after ejecting a compromised host: *did the revocation
+/// reach everyone?* An agent that never received it still trusts the
+/// revoked peer.
+#[derive(Debug)]
+pub struct BoweryRevocationsTable {
+    store: Arc<bowery_whisper::mesh_trust::RevocationStore>,
+}
+
+impl BoweryRevocationsTable {
+    pub fn new(store: Arc<bowery_whisper::mesh_trust::RevocationStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl BoweryTable for BoweryRevocationsTable {
+    fn name(&self) -> &'static str {
+        "bowery_revocations"
+    }
+
+    fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bowery_revocations (
+                fingerprint_hex   TEXT,
+                issued_unix_ms    INTEGER,
+                reason            TEXT,
+                operator_fp_hex   TEXT
+            );",
+        )?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO bowery_revocations
+                (fingerprint_hex, issued_unix_ms, reason, operator_fp_hex)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for e in self.store.entries() {
+            stmt.execute(params![
+                e.fingerprint,
+                i64::try_from(e.issued_unix_ms).unwrap_or(i64::MAX),
+                e.reason,
+                e.operator_fp,
+            ])?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

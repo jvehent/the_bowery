@@ -114,6 +114,13 @@ They expose Bowery's own internal state.
   and exposed as a TEMP view, and queries run against its own indexes.
   (A view in `main` may not reference an attached database; `temp` is the
   documented exemption.)
+- `bowery_revocations` — agent identities an operator has ejected from
+  the mesh. Fleet-wide with `--fanout` this answers the question that
+  matters after ejecting a compromised host: *did the revocation reach
+  everyone?*
+- `bowery_mesh_peers.grant_state` — how this agent judges each peer's
+  membership grant right now (`valid` / `absent` / `invalid: …` /
+  `unchecked`). The pre-flight for switching `enrollment` to `grant`.
 - `bowery_eventlog_status` — is this host actually recording? `recording`,
   `queryable`, `rows`, `dropped`, and the oldest/newest timestamps. An
   empty `bowery_events` is ambiguous — quiet host, or blind host — and

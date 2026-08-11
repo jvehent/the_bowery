@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine;
@@ -61,6 +61,9 @@ pub enum PinOutcome {
     /// Pin store is at its maximum capacity. Defends against a
     /// chitchat-mesh flood pinning unbounded synthetic identities.
     AtCapacity,
+    /// An operator has revoked this identity. Terminal: unlike
+    /// `BootstrapClosed`, no later window or policy change re-admits it.
+    Revoked,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +91,11 @@ pub struct KnownNeighbors {
     state: RwLock<HashMap<Fingerprint, Peer>>,
     bootstrap_until: SystemTime,
     max_pinned: usize,
+    /// Consulted on every pin. Held here rather than only at the call
+    /// sites so that *no* path — pin task, test, future operator
+    /// add-neighbor command — can admit a revoked identity by
+    /// forgetting to check.
+    revocations: Option<Arc<crate::mesh_trust::RevocationStore>>,
 }
 
 impl KnownNeighbors {
@@ -104,6 +112,7 @@ impl KnownNeighbors {
                 state: RwLock::new(HashMap::new()),
                 bootstrap_until: SystemTime::now() + bootstrap_window,
                 max_pinned: DEFAULT_MAX_PINNED_PEERS,
+                revocations: None,
             });
         }
 
@@ -153,6 +162,7 @@ impl KnownNeighbors {
             state: RwLock::new(state),
             bootstrap_until,
             max_pinned: DEFAULT_MAX_PINNED_PEERS,
+            revocations: None,
         })
     }
 
@@ -180,6 +190,12 @@ impl KnownNeighbors {
     /// - If unknown and outside the window, returns `BootstrapClosed`.
     pub fn try_pin(&self, vk: &VerifyingKey) -> Result<PinOutcome> {
         let fp = Fingerprint::from_verifying_key(vk);
+
+        // Revocation outranks everything, including an existing pin: a
+        // peer revoked after it was pinned must not stay trusted.
+        if self.revocations.as_ref().is_some_and(|r| r.is_revoked(&fp)) {
+            return Ok(PinOutcome::Revoked);
+        }
 
         if self
             .state
@@ -214,6 +230,33 @@ impl KnownNeighbors {
         }
         self.save()?;
         Ok(PinOutcome::NewlyPinned)
+    }
+
+    /// Attach a revocation store. Every pin attempt then consults it,
+    /// and [`Self::unpin`] can evict peers revoked after pinning.
+    #[must_use]
+    pub fn with_revocations(mut self, store: Arc<crate::mesh_trust::RevocationStore>) -> Self {
+        self.revocations = Some(store);
+        self
+    }
+
+    /// Remove a peer from the pin set, persisting the change.
+    ///
+    /// Returns `true` if it had been pinned. This is what makes a
+    /// revocation take effect immediately rather than at next restart —
+    /// a compromised peer that stays pinned keeps answering whisper
+    /// questions and receiving distributed rules.
+    pub fn unpin(&self, fp: &Fingerprint) -> Result<bool> {
+        let removed = self
+            .state
+            .write()
+            .expect("known_neighbors poisoned")
+            .remove(fp)
+            .is_some();
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
     }
 
     /// Override the default `max_pinned` cap. Operators tune this via
@@ -368,6 +411,61 @@ mod tests {
 
     fn store_path(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("known_neighbors.json")
+    }
+
+    /// Revocation must outrank an existing pin. A peer revoked after it
+    /// was pinned that stayed pinned would keep answering whisper
+    /// questions and receiving distributed rules — i.e. containment
+    /// would not have contained anything.
+    #[test]
+    fn a_revoked_identity_cannot_be_pinned_and_can_be_evicted() {
+        use bowery_proto::Revocation;
+
+        use crate::mesh_trust::RevocationStore;
+
+        let operator = bowery_crypto::Identity::generate();
+        let target = bowery_crypto::Identity::generate();
+        let target_fp = target.fingerprint();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(RevocationStore::in_memory());
+        let kn = KnownNeighbors::open(store_path(&dir), Duration::from_hours(1))
+            .unwrap()
+            .with_revocations(store.clone());
+
+        // Pinned first, revoked second — the ordering that matters.
+        assert_eq!(
+            kn.try_pin(&target.verifying_key()).unwrap(),
+            PinOutcome::NewlyPinned
+        );
+        assert_eq!(kn.count(), 1);
+
+        let issued = 1_700_000_000_000;
+        let reason = "compromised".to_string();
+        let input = Revocation::signing_input(
+            target_fp.as_bytes(),
+            "prod",
+            issued,
+            &reason,
+            operator.fingerprint().as_bytes(),
+        );
+        let rev = Revocation {
+            agent_fp: target_fp.as_bytes().to_vec(),
+            cluster_id: "prod".into(),
+            issued_unix_ms: issued,
+            reason,
+            operator_fp: operator.fingerprint().as_bytes().to_vec(),
+            sig: operator.sign(&input).to_bytes().to_vec(),
+        };
+        store.insert(target_fp, &rev).unwrap();
+
+        assert!(kn.unpin(&target_fp).unwrap(), "revocation must evict");
+        assert_eq!(kn.count(), 0);
+        assert_eq!(
+            kn.try_pin(&target.verifying_key()).unwrap(),
+            PinOutcome::Revoked,
+            "and must not be re-pinnable afterwards"
+        );
     }
 
     #[test]

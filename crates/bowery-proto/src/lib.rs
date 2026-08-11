@@ -799,6 +799,168 @@ impl WhisperPayload {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase-3 mesh trust: membership grants and revocations.
+// ---------------------------------------------------------------------------
+
+/// Domain separator for [`MembershipGrant`] signatures. Distinct from
+/// every other signing domain so a signature minted for one purpose can
+/// never be replayed as another.
+pub const MEMBERSHIP_GRANT_DOMAIN: &[u8] = b"bowery/mesh/membership-grant/v1";
+
+/// Domain separator for [`Revocation`] signatures.
+pub const REVOCATION_DOMAIN: &[u8] = b"bowery/mesh/revocation/v1";
+
+/// An operator's signed statement that a given agent belongs in a given
+/// mesh cluster.
+///
+/// This is what replaces trust-on-first-use. Under TOFU any host that
+/// can reach the gossip port during the bootstrap window becomes a
+/// permanently trusted mesh member — and gossip is plain unauthenticated
+/// UDP, so "can reach the port" is the entire admission control. A grant
+/// moves that decision to a key the agent already trusts: agents are
+/// configured with operator public keys (`[operators] pubkeys_b64`), so
+/// a grant is verifiable offline by every agent with no new trust root
+/// and no enrollment round trip.
+///
+/// **`agent_fp` binds the grant to one identity.** Without it a grant
+/// harvested off the wire (it is published in plaintext gossip KV, and
+/// is meant to be) could be replayed by any key at all. Verification
+/// must check it against the fingerprint of the peer actually gossiping.
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct MembershipGrant {
+    /// Fingerprint of the agent identity this grant admits.
+    #[prost(bytes = "vec", tag = "1")]
+    pub agent_fp: Vec<u8>,
+    /// Mesh cluster this grant is valid for. Checked against the
+    /// agent's own `[mesh] cluster_id`, so a grant for a staging fleet
+    /// can't admit a peer into production.
+    #[prost(string, tag = "2")]
+    pub cluster_id: String,
+    #[prost(uint64, tag = "3")]
+    pub issued_unix_ms: u64,
+    /// Expiry. `0` means no expiry — appropriate for long-lived
+    /// infrastructure, but an expiring grant limits the blast radius of
+    /// a leaked operator key.
+    #[prost(uint64, tag = "4")]
+    pub expires_unix_ms: u64,
+    /// Fingerprint of the operator key that signed this grant. Selects
+    /// which configured operator key to verify against.
+    #[prost(bytes = "vec", tag = "5")]
+    pub operator_fp: Vec<u8>,
+    /// Ed25519 signature over [`MembershipGrant::signing_input`].
+    #[prost(bytes = "vec", tag = "6")]
+    pub sig: Vec<u8>,
+}
+
+impl MembershipGrant {
+    /// Bytes an operator signs. Length-prefixes `cluster_id` so a grant
+    /// for cluster `"ab"` can't be reinterpreted as one for `"a"` with
+    /// different trailing fields.
+    #[must_use]
+    pub fn signing_input(
+        agent_fp: &[u8; 32],
+        cluster_id: &str,
+        issued_unix_ms: u64,
+        expires_unix_ms: u64,
+        operator_fp: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            MEMBERSHIP_GRANT_DOMAIN.len() + 32 + 4 + cluster_id.len() + 8 + 8 + 32,
+        );
+        buf.extend_from_slice(MEMBERSHIP_GRANT_DOMAIN);
+        buf.extend_from_slice(agent_fp);
+        let len = u32::try_from(cluster_id.len()).unwrap_or(u32::MAX);
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(cluster_id.as_bytes());
+        buf.extend_from_slice(&issued_unix_ms.to_be_bytes());
+        buf.extend_from_slice(&expires_unix_ms.to_be_bytes());
+        buf.extend_from_slice(operator_fp);
+        buf
+    }
+
+    /// This grant's own signing input.
+    #[must_use]
+    pub fn to_signing_input(&self) -> Option<Vec<u8>> {
+        let agent: [u8; 32] = self.agent_fp.as_slice().try_into().ok()?;
+        let operator: [u8; 32] = self.operator_fp.as_slice().try_into().ok()?;
+        Some(Self::signing_input(
+            &agent,
+            &self.cluster_id,
+            self.issued_unix_ms,
+            self.expires_unix_ms,
+            &operator,
+        ))
+    }
+}
+
+/// An operator's signed statement that an agent is no longer trusted.
+///
+/// TOFU has no exit: once pinned, a peer stays a full mesh member for
+/// the life of the pin store, so a compromised host keeps answering
+/// whisper questions and receiving distributed rules forever. A
+/// revocation is the exit.
+///
+/// Revocations are deliberately *unconditional and permanent* once seen:
+/// there is no un-revoke, because an attacker who can make an agent
+/// forget a revocation has undone the containment. Re-admitting a
+/// rebuilt host means giving it a new identity key.
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct Revocation {
+    #[prost(bytes = "vec", tag = "1")]
+    pub agent_fp: Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub cluster_id: String,
+    #[prost(uint64, tag = "3")]
+    pub issued_unix_ms: u64,
+    /// Free-text operator note, carried for the audit trail.
+    #[prost(string, tag = "4")]
+    pub reason: String,
+    #[prost(bytes = "vec", tag = "5")]
+    pub operator_fp: Vec<u8>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub sig: Vec<u8>,
+}
+
+impl Revocation {
+    #[must_use]
+    pub fn signing_input(
+        agent_fp: &[u8; 32],
+        cluster_id: &str,
+        issued_unix_ms: u64,
+        reason: &str,
+        operator_fp: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            REVOCATION_DOMAIN.len() + 32 + 4 + cluster_id.len() + 8 + 4 + reason.len() + 32,
+        );
+        buf.extend_from_slice(REVOCATION_DOMAIN);
+        buf.extend_from_slice(agent_fp);
+        let len = u32::try_from(cluster_id.len()).unwrap_or(u32::MAX);
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(cluster_id.as_bytes());
+        buf.extend_from_slice(&issued_unix_ms.to_be_bytes());
+        let rlen = u32::try_from(reason.len()).unwrap_or(u32::MAX);
+        buf.extend_from_slice(&rlen.to_be_bytes());
+        buf.extend_from_slice(reason.as_bytes());
+        buf.extend_from_slice(operator_fp);
+        buf
+    }
+
+    #[must_use]
+    pub fn to_signing_input(&self) -> Option<Vec<u8>> {
+        let agent: [u8; 32] = self.agent_fp.as_slice().try_into().ok()?;
+        let operator: [u8; 32] = self.operator_fp.as_slice().try_into().ok()?;
+        Some(Self::signing_input(
+            &agent,
+            &self.cluster_id,
+            self.issued_unix_ms,
+            &self.reason,
+            &operator,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

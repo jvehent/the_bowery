@@ -28,6 +28,7 @@ use crate::config::ResponseEngineKind;
 use crate::eventlog_writer::EventLogHandle;
 use bowery_whisper::fingerprint::{TIER1_LEN, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
+use bowery_whisper::mesh_trust::RevocationStore;
 use bowery_whisper::pool::PeerConnections;
 use bowery_whisper::tls::PinnedCertVerifier;
 use bowery_whisper::transport::{BoweryConnection, BoweryEndpoint};
@@ -240,15 +241,40 @@ impl Agent {
         let fingerprint = identity.fingerprint();
         info!(fingerprint = %fingerprint, "starting agent");
 
+        let operators = Arc::new(load_operators(&config.operators.pubkeys_b64)?);
+
+        let cluster_id_for_trust = config
+            .mesh
+            .cluster_id
+            .clone()
+            .unwrap_or_else(|| bowery_mesh::DEFAULT_CLUSTER_ID.to_string());
+        // Revocations load before KnownNeighbors so the pin store can
+        // consult them on every pin attempt — no code path should be
+        // able to admit a revoked identity by forgetting to check. They
+        // are re-verified against the operator keys on every load, so
+        // the file itself carries no authority.
+        let revocations = {
+            let ops = operators.clone();
+            let resolve = move |fp: &Fingerprint| ops.resolve(fp);
+            Arc::new(RevocationStore::load_signed(
+                &config.known_neighbors.revocations_path,
+                &cluster_id_for_trust,
+                &resolve,
+            )?)
+        };
+        if !revocations.is_empty() {
+            info!(count = revocations.len(), "loaded revocation list");
+        }
+
         let known_neighbors = Arc::new(
             KnownNeighbors::open(
                 &config.known_neighbors.path,
                 config.known_neighbors.bootstrap_window,
             )?
-            .with_max_pinned(config.known_neighbors.max_pinned_peers),
+            .with_max_pinned(config.known_neighbors.max_pinned_peers)
+            .with_revocations(revocations.clone()),
         );
 
-        let operators = Arc::new(load_operators(&config.operators.pubkeys_b64)?);
         // Composite resolver: pinned peer agents AND configured
         // operators. Both can dial us — peers for heartbeats / Q&A,
         // operators for `Subscribe` against the alert inbox.
@@ -425,12 +451,58 @@ impl Agent {
         }
         let mesh = Arc::new(Mesh::start(mesh_cfg).await?);
 
+        // Publish our own grant so peers running `enrollment = "grant"`
+        // can pin us. Set once rather than on a timer: chitchat KV is
+        // replicated state, not a heartbeat, and a grant doesn't change.
+        if let Some(path) = &config.known_neighbors.grant_path {
+            match load_grant_b64(path) {
+                Ok(encoded) => {
+                    if let Err(e) = mesh
+                        .set_state(bowery_mesh::KEY_MEMBERSHIP_GRANT, encoded)
+                        .await
+                    {
+                        warn!(error = %e, "failed to publish membership grant");
+                    } else {
+                        info!(path = %path.display(), "published membership grant");
+                    }
+                }
+                // Non-fatal: an agent with an unreadable grant still runs
+                // and still detects. It just won't be pinned by peers
+                // enforcing `grant`, which `bowery peers check` surfaces.
+                Err(e) => warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not load membership grant; peers enforcing enrollment=grant will not pin this agent"
+                ),
+            }
+        }
+
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
+        let enrollment = Arc::new(EnrollmentContext {
+            policy: config.known_neighbors.enrollment,
+            cluster_id: config
+                .mesh
+                .cluster_id
+                .clone()
+                .unwrap_or_else(|| bowery_mesh::DEFAULT_CLUSTER_ID.to_string()),
+            operators: operators.clone(),
+            revocations: revocations.clone(),
+        });
+        // Evict anything revoked while this agent was down: a revocation
+        // that only applied to peers we meet *after* a restart would let
+        // containment lapse across a reboot.
+        for fp in known_neighbors.fingerprints() {
+            if revocations.is_revoked(&fp) && known_neighbors.unpin(&fp).unwrap_or(false) {
+                warn!(peer = %fp, "evicted revoked peer at startup");
+            }
+        }
 
         let pin_task = spawn_pin_task(
             mesh.peers_watcher(),
             known_neighbors.clone(),
+            enrollment,
             events_tx.clone(),
             shutdown_rx.clone(),
         );
@@ -493,9 +565,22 @@ impl Agent {
             .with_extra_table(Arc::new(crate::sql_tables::BoweryPeersTable::new(
                 known_neighbors.clone(),
             )))
-            .with_extra_table(Arc::new(crate::sql_tables::BoweryMeshPeersTable::new(
-                mesh.peers_watcher(),
-                known_neighbors.clone(),
+            .with_extra_table(Arc::new(
+                crate::sql_tables::BoweryMeshPeersTable::new(
+                    mesh.peers_watcher(),
+                    known_neighbors.clone(),
+                )
+                .with_enrollment(crate::sql_tables::GrantCheck {
+                    cluster_id: config
+                        .mesh
+                        .cluster_id
+                        .clone()
+                        .unwrap_or_else(|| bowery_mesh::DEFAULT_CLUSTER_ID.to_string()),
+                    operators: operators.clone(),
+                }),
+            ))
+            .with_extra_table(Arc::new(crate::sql_tables::BoweryRevocationsTable::new(
+                revocations.clone(),
             )))
             .with_extra_table(Arc::new(
                 crate::sql_tables::BoweryBaselineBinariesTable::new(baseline.clone()),
@@ -851,9 +936,64 @@ fn load_operators(pubkeys_b64: &[String]) -> Result<StaticResolver, AgentError> 
 // Background tasks
 // ---------------------------------------------------------------------------
 
+/// Everything the pin task needs to decide whether a gossiping peer is
+/// allowed to become a trusted neighbour.
+pub(crate) struct EnrollmentContext {
+    pub policy: crate::config::EnrollmentPolicy,
+    pub cluster_id: String,
+    /// Operator keys this agent trusts — the same set that authorises
+    /// commands. A grant is only as good as the key that signed it.
+    pub operators: Arc<StaticResolver>,
+    pub revocations: Arc<RevocationStore>,
+}
+
+impl EnrollmentContext {
+    /// Under `grant`, a peer must present a valid operator-signed grant
+    /// naming its own fingerprint and this cluster. Under `tofu`, any
+    /// peer passes and the grant (if any) is ignored.
+    fn admits(&self, peer: &PeerInfo) -> bool {
+        if self.policy == crate::config::EnrollmentPolicy::Tofu {
+            return true;
+        }
+        let Some(grant) = decode_grant(peer.membership_grant.as_deref()) else {
+            debug!(
+                peer = %peer.fingerprint,
+                "refusing pin: enrollment=grant but peer published no usable grant"
+            );
+            return false;
+        };
+        let operators = self.operators.clone();
+        let resolve = move |fp: &Fingerprint| operators.resolve(fp);
+        match bowery_whisper::mesh_trust::verify_grant(
+            &grant,
+            &peer.fingerprint,
+            &self.cluster_id,
+            &resolve,
+            SystemTime::now(),
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(peer = %peer.fingerprint, error = %e, "refusing pin: invalid membership grant");
+                false
+            }
+        }
+    }
+}
+
+/// Decode a base64 gossip-KV grant. Any malformation is simply "no
+/// grant" — a peer cannot gain anything by publishing garbage.
+fn decode_grant(encoded: Option<&str>) -> Option<bowery_proto::MembershipGrant> {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(encoded?.as_bytes())
+        .ok()?;
+    <bowery_proto::MembershipGrant as prost::Message>::decode(raw.as_slice()).ok()
+}
+
 fn spawn_pin_task(
     mut peers_watcher: watch::Receiver<Vec<PeerInfo>>,
     kn: Arc<KnownNeighbors>,
+    enrollment: Arc<EnrollmentContext>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -861,6 +1001,23 @@ fn spawn_pin_task(
         loop {
             let snapshot: Vec<PeerInfo> = peers_watcher.borrow().clone();
             for peer in snapshot {
+                // A peer revoked while already pinned must lose the pin,
+                // not merely fail to gain one — otherwise containment
+                // only applies to hosts we hadn't met yet.
+                if enrollment.revocations.is_revoked(&peer.fingerprint) {
+                    match kn.unpin(&peer.fingerprint) {
+                        Ok(true) => warn!(
+                            peer = %peer.fingerprint,
+                            "evicted revoked peer from the pin set"
+                        ),
+                        Ok(false) => {}
+                        Err(e) => warn!(error = %e, "failed to evict revoked peer"),
+                    }
+                    continue;
+                }
+                if !enrollment.admits(&peer) {
+                    continue;
+                }
                 match kn.try_pin(&peer.verifying_key) {
                     Ok(PinOutcome::NewlyPinned) => {
                         info!(peer = %peer.fingerprint, "pinned new neighbor");
@@ -875,6 +1032,9 @@ fn spawn_pin_task(
                             peer = %peer.fingerprint,
                             "pin store at capacity; ignoring new neighbor (possible mesh flood)"
                         );
+                    }
+                    Ok(PinOutcome::Revoked) => {
+                        warn!(peer = %peer.fingerprint, "refusing pin: identity is revoked");
                     }
                     Err(e) => warn!(error = %e, "pin failed"),
                 }
@@ -3338,6 +3498,37 @@ fn open_event_log(
     } else {
         bowery_eventlog::EventLog::open(&cfg.path)
     }
+}
+
+/// Read a membership grant from disk and return it base64-encoded for
+/// the gossip KV.
+///
+/// The grant is validated as decodable here so a corrupt file is caught
+/// at startup with a clear message, rather than silently gossiping
+/// garbage that every peer rejects.
+fn load_grant_b64(path: &std::path::Path) -> Result<String, AgentError> {
+    use base64::Engine as _;
+    let raw = std::fs::read(path).map_err(|e| {
+        AgentError::Config(format!("reading membership grant {}: {e}", path.display()))
+    })?;
+    // Accept either raw protobuf or a base64 text file, since the CLI
+    // writes base64 and operators may paste either.
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(raw.trim_ascii()) {
+        Ok(decoded)
+            if <bowery_proto::MembershipGrant as prost::Message>::decode(decoded.as_slice())
+                .is_ok() =>
+        {
+            decoded
+        }
+        _ => raw.clone(),
+    };
+    <bowery_proto::MembershipGrant as prost::Message>::decode(bytes.as_slice()).map_err(|e| {
+        AgentError::Config(format!(
+            "membership grant {} is not a valid MembershipGrant: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
 }
 
 #[cfg(test)]

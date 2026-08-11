@@ -74,6 +74,7 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 bowery-analysis = { workspace = true }
+bowery-cli = { workspace = true }
 bowery-llm = { workspace = true }
 bowery-sql = { workspace = true }
 bowery-tables = { workspace = true }
