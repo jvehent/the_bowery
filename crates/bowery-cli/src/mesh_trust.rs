@@ -100,7 +100,8 @@ pub fn mint_revocation(
     cluster_id: &str,
     reason: &str,
     out: Option<PathBuf>,
-) -> Result<()> {
+    print_manual_install_note: bool,
+) -> Result<String> {
     let operator = Identity::load(operator_key)
         .with_context(|| format!("loading operator key {}", operator_key.display()))?;
     let agent_fp =
@@ -132,15 +133,19 @@ pub fn mint_revocation(
                 .with_context(|| format!("writing revocation to {}", path.display()))?;
             println!("wrote revocation to {}", path.display());
         }
-        None => println!("{encoded}"),
+        None if print_manual_install_note => println!("{encoded}"),
+        None => {}
     }
-    eprintln!(
-        "\nNOTE: a revocation only binds agents that receive it. Install it in each\n\
-         agent's [known_neighbors] revocations_path, then confirm fleet-wide with:\n  \
-         bowery exec sql --fanout --sql \\\n    \
-         \"SELECT fingerprint_hex FROM bowery_revocations WHERE fingerprint_hex = '{agent_fp}'\""
-    );
-    Ok(())
+    if print_manual_install_note {
+        eprintln!(
+            "\nNOTE: a revocation only binds agents that receive it. Either push it\n\
+             (--agent-addr / --relay-fp / --relay-pubkey-b64 [--fanout]) or append it\n\
+             to each agent's [known_neighbors] revocations_path. Confirm with:\n  \
+             bowery exec sql --fanout --sql \\\n    \
+             \"SELECT fingerprint_hex FROM bowery_revocations WHERE fingerprint_hex = '{agent_fp}'\""
+        );
+    }
+    Ok(encoded)
 }
 
 fn now_unix_ms() -> u64 {
@@ -248,6 +253,7 @@ mod tests {
             "prod",
             "compromised via CVE-2026-1234",
             Some(out.clone()),
+            true,
         )
         .unwrap();
         let raw = BASE64

@@ -375,7 +375,7 @@ pub struct OperatorCommand {
     #[prost(bytes = "vec", tag = "3")]
     pub forwarded_from_operator: Vec<u8>,
     /// One of the typed command bodies.
-    #[prost(oneof = "OperatorCommandBody", tags = "11, 12")]
+    #[prost(oneof = "OperatorCommandBody", tags = "11, 12, 13")]
     pub command: Option<OperatorCommandBody>,
 }
 
@@ -396,6 +396,62 @@ pub enum OperatorCommandBody {
     /// reporting agent, terminated the same way SQL chunks are.
     #[prost(message, tag = "12")]
     YaraPush(YaraPush),
+    /// Deliver an operator-signed [`Revocation`] to the agent and, when
+    /// `fanout`, propagate it onward through the mesh.
+    ///
+    /// Unlike every other command body, the payload here is
+    /// *self-authenticating*: the revocation carries its own operator
+    /// signature, so a receiving agent verifies it directly instead of
+    /// trusting the delegation chain that carried it. A relaying peer
+    /// can therefore drop a revocation but cannot forge one.
+    #[prost(message, tag = "13")]
+    RevokePush(RevokePush),
+}
+
+/// See [`OperatorCommandBody::RevokePush`].
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct RevokePush {
+    /// Prost-encoded [`Revocation`].
+    #[prost(bytes = "vec", tag = "1")]
+    pub revocation: Vec<u8>,
+    /// When true, forward to pinned peers (subject to `ttl`).
+    #[prost(bool, tag = "2")]
+    pub fanout: bool,
+    /// Remaining hops. Each forwarding agent decrements it and stops at
+    /// zero — a structural bound on amplification, independent of the
+    /// natural termination that comes from the revocation store (a
+    /// re-seen revocation is not new, so it is not forwarded).
+    #[prost(uint32, tag = "3")]
+    pub ttl: u32,
+}
+
+/// One agent's response to a [`RevokePush`].
+///
+/// The flags are deliberately not collapsed into an enum: they are
+/// independent facts an operator needs separately — a report can be
+/// `accepted` *and* `already_known` (converged) or `accepted` and
+/// `evicted` (it was actively trusted here until now).
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct RevokeReport {
+    /// Reporting agent. Empty on the fan-out completion terminator.
+    #[prost(bytes = "vec", tag = "1")]
+    pub agent_fp: Vec<u8>,
+    /// The revocation verified and is now in force on this agent.
+    #[prost(bool, tag = "2")]
+    pub accepted: bool,
+    /// Already held — reported separately from `accepted` because it is
+    /// what tells an operator the fleet has converged rather than that
+    /// the push is still spreading.
+    #[prost(bool, tag = "3")]
+    pub already_known: bool,
+    /// Whether the target was pinned here and has now been evicted.
+    #[prost(bool, tag = "4")]
+    pub evicted: bool,
+    #[prost(string, tag = "5")]
+    pub error: String,
+    #[prost(bool, tag = "6")]
+    pub end: bool,
 }
 
 /// Phase-9 final-1: operator-signed delegation that authorises a
@@ -595,7 +651,7 @@ pub struct OperatorResult {
     /// `error` field so a future "always populated alongside the
     /// concrete result" pattern (e.g. structured warnings) can
     /// extend cleanly.
-    #[prost(oneof = "OperatorResultBody", tags = "11, 12, 13")]
+    #[prost(oneof = "OperatorResultBody", tags = "11, 12, 13, 14")]
     pub result: Option<OperatorResultBody>,
 }
 
@@ -619,6 +675,9 @@ pub enum OperatorResultBody {
     /// terminated by a report with an empty `agent_fp` and `end = true`.
     #[prost(message, tag = "13")]
     YaraReport(YaraReport),
+    /// One agent's response to a `RevokePush`, framed like `YaraReport`.
+    #[prost(message, tag = "14")]
+    RevokeReport(RevokeReport),
 }
 
 /// One chunk of a streaming SQL response. See

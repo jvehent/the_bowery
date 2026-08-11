@@ -1307,6 +1307,29 @@ share the `-shm` index. `crates/bowery-eventlog/tests/attach_probe.rs`
 pins that, since the opposite would silently turn the maintenance
 interval into a query-lag window.
 
+### 13.8 Revocation propagation
+
+`RevokePush` mirrors `YaraPush`'s transport (operator command, TTL,
+per-peer relay piping sealed reports back), with one structural
+difference that simplifies the security argument: **the payload
+authorises itself.** A `Revocation` carries an operator signature over
+its own fields, so every agent it reaches verifies it directly rather
+than trusting the chain of peers that relayed it. A compromised relay
+can therefore *drop* a revocation — it cannot forge one, and cannot use
+the relay path to eject healthy agents. Dropping is the residual risk,
+which is why `bowery_revocations` is queryable fleet-wide: convergence
+is checked, not assumed.
+
+Propagation terminates on the revocation store rather than a separate
+seen-set. Revocations are permanent, so `insert` returns "new" exactly
+once per identity, and an agent forwards only what was new — a flood
+over a cyclic peer graph converges instead of echoing. `ttl` (clamped to
+`MAX_REVOKE_TTL = 8`) remains as an independent structural bound.
+
+Eviction happens inline on receipt rather than waiting for the next
+gossip tick, so the window between "this peer is known compromised" and
+"we stop trusting it" is as close to zero as the code allows.
+
 ### 13.6 Bloom advert publisher
 
 [`crates/bowery-agent/src/bloom_publisher.rs`](crates/bowery-agent/src/bloom_publisher.rs).

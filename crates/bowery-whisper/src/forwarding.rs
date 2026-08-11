@@ -130,6 +130,16 @@ pub fn command_body_digest(body: &OperatorCommandBody) -> [u8; 32] {
             fanout: false,
             ttl: 0,
         }),
+        // Same normalisation rationale as YaraPush: `fanout` and `ttl`
+        // change on every hop, so excluding them is what lets a
+        // forwarded command still match the operator's signed digest.
+        OperatorCommandBody::RevokePush(p) => {
+            OperatorCommandBody::RevokePush(bowery_proto::RevokePush {
+                revocation: p.revocation.clone(),
+                fanout: false,
+                ttl: 0,
+            })
+        }
     };
     let wrapper = OperatorCommand {
         request_id: String::new(),

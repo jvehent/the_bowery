@@ -261,3 +261,128 @@ async fn tofu_policy_still_pins_a_peer_with_no_grant() {
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");
 }
+
+/// A revocation pushed to one agent must reach its peers and take effect
+/// there — the gap that made revocation nearly useless when delivery was
+/// manual per-agent.
+///
+/// Also pins the convergence property: a re-delivered revocation reports
+/// `already_known` and is not forwarded again, which is what stops a
+/// flood from echoing around a cyclic peer graph. The store is the
+/// seen-set, because revocations are permanent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pushed_revocation_propagates_to_peers_and_converges() {
+    let operator = Identity::generate();
+    let operator_pubkey_b64 = BASE64.encode(operator.verifying_key().to_bytes());
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let addr_a = reserve_udp_port();
+    let addr_b = reserve_udp_port();
+    let op_key = dir_a.path().join("operator.key");
+    operator.save(&op_key).unwrap();
+
+    let id_a = Arc::new(Identity::generate());
+    let id_b = Arc::new(Identity::generate());
+
+    let mut cfg_a = build_config(
+        dir_a.path(),
+        addr_a,
+        vec![addr_b.to_string()],
+        operator_pubkey_b64.clone(),
+        EnrollmentPolicy::Tofu,
+        None,
+    );
+    // A fixed whisper port so the operator can dial `a` deterministically.
+    let whisper_a = reserve_udp_port();
+    cfg_a.whisper.bind_addr = whisper_a;
+    let cfg_b = build_config(
+        dir_b.path(),
+        addr_b,
+        vec![addr_a.to_string()],
+        operator_pubkey_b64,
+        EnrollmentPolicy::Tofu,
+        None,
+    );
+
+    let a = Agent::start(cfg_a, id_a.clone(), Box::new(NoopEventSource))
+        .await
+        .expect("start a");
+    let b = Agent::start(cfg_b, id_b.clone(), Box::new(NoopEventSource))
+        .await
+        .expect("start b");
+
+    // Let them find and pin each other, so `a` has somewhere to forward.
+    assert!(
+        wait_for_pins(&a, 1, Duration::from_secs(20)).await,
+        "a never pinned b"
+    );
+    assert!(
+        wait_for_pins(&b, 1, Duration::from_secs(20)).await,
+        "b never pinned a"
+    );
+
+    // Revoke a third identity neither agent has met, so the assertion is
+    // strictly about the revocation propagating, not about eviction.
+    let victim = Identity::generate();
+    let rev_b64 = bowery_cli::mesh_trust::mint_revocation(
+        &op_key,
+        &victim.fingerprint().to_hex(),
+        CLUSTER,
+        "propagation test",
+        None,
+        false,
+    )
+    .unwrap();
+
+    let a_pub = BASE64.encode(id_a.verifying_key().to_bytes());
+    // b seals its report for the operator directly, so the operator must
+    // hold b's key to verify it.
+    let b_pub = BASE64.encode(id_b.verifying_key().to_bytes());
+    bowery_cli::exec::revoke_push(
+        op_key.clone(),
+        whisper_a,
+        id_a.fingerprint().to_hex(),
+        a_pub.clone(),
+        vec![b_pub.clone()],
+        rev_b64.clone(),
+        Duration::from_secs(10),
+        true,
+        4,
+    )
+    .await
+    .expect("push revocation");
+
+    // Both the dialled agent and its peer must now hold it.
+    assert!(
+        a.revocations().is_revoked(&victim.fingerprint()),
+        "the dialled agent must apply the revocation"
+    );
+    assert!(
+        b.revocations().is_revoked(&victim.fingerprint()),
+        "the revocation must reach the peer — manual per-agent delivery is what this replaces"
+    );
+
+    // Re-push: converges rather than re-flooding.
+    bowery_cli::exec::revoke_push(
+        op_key,
+        whisper_a,
+        id_a.fingerprint().to_hex(),
+        a_pub,
+        vec![b_pub],
+        rev_b64,
+        Duration::from_secs(10),
+        true,
+        4,
+    )
+    .await
+    .expect("re-push revocation");
+    assert_eq!(
+        a.revocations().len(),
+        1,
+        "a re-delivered revocation must not duplicate"
+    );
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}

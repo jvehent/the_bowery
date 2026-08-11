@@ -192,6 +192,7 @@ pub struct Agent {
     pipeline_task: JoinHandle<()>,
     /// `None` when the event log is disabled or failed to open.
     eventlog_tasks: Option<(JoinHandle<()>, JoinHandle<()>)>,
+    revocations: Arc<RevocationStore>,
     /// `None` when no file rules are configured (or inotify is unavailable).
     file_monitor_task: Option<JoinHandle<()>>,
     role_publisher_task: JoinHandle<()>,
@@ -611,6 +612,12 @@ impl Agent {
             relay: Some(relay_ctx),
             fanout_rate_limit: Arc::new(RateLimit::fanout()),
             max_timeout: config.sql.max_timeout,
+            revocation: Some(Arc::new(RevocationContext {
+                store: revocations.clone(),
+                known_neighbors: known_neighbors.clone(),
+                cluster_id: cluster_id_for_trust.clone(),
+                operators: operators.clone(),
+            })),
             yara: Some(Arc::new(YaraContext {
                 store: yara_store.clone(),
                 // Remembering a push for 30 minutes is far longer than any
@@ -811,6 +818,7 @@ impl Agent {
             heartbeat_task,
             pipeline_task,
             eventlog_tasks,
+            revocations,
             file_monitor_task,
             role_publisher_task,
             bloom_publisher_task,
@@ -861,6 +869,11 @@ impl Agent {
 
     /// Pin store accessor — used by integration tests to seed peers
     /// without going through the chitchat-bootstrap path.
+    /// The verified revocation set, for tests and diagnostics.
+    pub fn revocations(&self) -> &Arc<RevocationStore> {
+        &self.revocations
+    }
+
     pub fn known_neighbors(&self) -> &Arc<KnownNeighbors> {
         &self.known_neighbors
     }
@@ -1085,7 +1098,15 @@ pub(crate) struct OperatorCommandRouter {
     /// matches into, and the caps that bound scan work. `None` rejects
     /// `YaraPush` with `policy_denied`, per this struct's convention.
     pub yara: Option<Arc<YaraContext>>,
+    /// Revocation store + pin store, for `RevokePush`. `None` rejects
+    /// the command with `policy_denied`.
+    pub revocation: Option<Arc<RevocationContext>>,
 }
+
+/// Hop budget ceiling for revocation propagation. Small on purpose: a
+/// mesh deep enough to need more hops than this has bigger problems, and
+/// the store-based termination already stops echoes.
+const MAX_REVOKE_TTL: u32 = 8;
 
 /// Everything the YARA push handler needs, grouped so the router stays
 /// readable.
@@ -1611,6 +1632,7 @@ async fn respond_to_operator_command(
     let command_kind = match cmd.command.as_ref() {
         Some(OperatorCommandBody::Sql(_)) => "sql",
         Some(OperatorCommandBody::YaraPush(_)) => "yara_push",
+        Some(OperatorCommandBody::RevokePush(_)) => "revoke_push",
         None => "<empty>",
     };
 
@@ -1689,6 +1711,59 @@ async fn respond_to_operator_command(
         effective_ms = u64::try_from(effective_timeout.as_millis()).unwrap_or(u64::MAX),
         "operator command received"
     );
+
+    // Revocation delivery + propagation. Placed before the other
+    // bodies because it is the only command whose payload authorises
+    // itself: the revocation carries an operator signature over its own
+    // fields, so a relaying peer can drop it but cannot forge one.
+    if let Some(OperatorCommandBody::RevokePush(p)) = &cmd.command {
+        let Some(rev_ctx) = op_router.revocation.clone() else {
+            return send_sql_error(
+                conn,
+                &sealer,
+                &operator,
+                &request_id,
+                "policy_denied",
+                "revocation handling is not enabled on this agent",
+            )
+            .await;
+        };
+        if p.fanout && is_direct_operator && !op_router.fanout_rate_limit.try_acquire(&operator) {
+            return send_sql_error(
+                conn,
+                &sealer,
+                &operator,
+                &request_id,
+                "rate_limited",
+                "fan-out bucket empty for this operator; back off and retry",
+            )
+            .await;
+        }
+        // Clamp the hop budget so one push can't be handed an unbounded
+        // one, same as YARA.
+        let capped = bowery_proto::RevokePush {
+            ttl: p.ttl.min(MAX_REVOKE_TTL),
+            ..p.clone()
+        };
+        let outcome = handle_revoke_push(
+            conn,
+            &sealer,
+            operator,
+            &request_id,
+            &capped,
+            &cmd.forwarded_from_operator,
+            &rev_ctx,
+            op_router.relay.as_ref(),
+            effective_timeout,
+        )
+        .await;
+        let _ = events_tx.send(AgentEvent::OperatorCommandHandled {
+            operator,
+            request_id,
+            kind: command_kind,
+        });
+        return outcome;
+    }
 
     // YARA rule distribution. Like SQL it streams its own responses;
     // unlike SQL it may propagate multiple hops (bounded by ttl + the
@@ -3529,6 +3604,272 @@ fn load_grant_b64(path: &std::path::Path) -> Result<String, AgentError> {
         ))
     })?;
     Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
+// ---------------------------------------------------------------------------
+// Revocation propagation
+// ---------------------------------------------------------------------------
+
+/// Everything the `RevokePush` handler needs.
+pub(crate) struct RevocationContext {
+    pub store: Arc<RevocationStore>,
+    pub known_neighbors: Arc<KnownNeighbors>,
+    pub cluster_id: String,
+    pub operators: Arc<StaticResolver>,
+}
+
+/// Apply an operator-signed revocation and, when asked, spread it.
+///
+/// The security argument here is different from every other command, and
+/// simpler: the payload is **self-authenticating**. A `Revocation`
+/// carries its own operator signature over its own fields, so this agent
+/// verifies it directly rather than trusting whoever relayed it. A
+/// compromised peer can therefore *drop* a revocation in transit — it
+/// cannot forge one, and cannot use the relay path to eject healthy
+/// agents. Dropping is the residual risk, which is why
+/// `bowery_revocations` is queryable fleet-wide: convergence is checked,
+/// not assumed.
+///
+/// Propagation terminates on the store rather than on a separate
+/// seen-set: revocations are permanent, so a re-received one is not new
+/// and is not forwarded. `ttl` remains as an independent structural
+/// bound.
+#[allow(clippy::too_many_arguments)]
+async fn handle_revoke_push(
+    conn: &BoweryConnection,
+    sealer: &Arc<Sealer>,
+    operator: Fingerprint,
+    request_id: &str,
+    push: &bowery_proto::RevokePush,
+    forwarded_authorization: &[u8],
+    ctx: &Arc<RevocationContext>,
+    relay: Option<&Arc<RelayContext>>,
+    timeout: Duration,
+) -> Result<(), bowery_whisper::transport::Error> {
+    let self_fp = sealer.fingerprint();
+    let mut report = bowery_proto::RevokeReport {
+        agent_fp: self_fp.as_bytes().to_vec(),
+        end: true,
+        ..Default::default()
+    };
+
+    let decoded = <bowery_proto::Revocation as prost::Message>::decode(push.revocation.as_slice());
+    let mut is_new = false;
+    match decoded {
+        Err(e) => report.error = format!("undecodable revocation: {e}"),
+        Ok(revocation) => {
+            let ops = ctx.operators.clone();
+            let resolve = move |fp: &Fingerprint| ops.resolve(fp);
+            match bowery_whisper::mesh_trust::verify_revocation(
+                &revocation,
+                &ctx.cluster_id,
+                &resolve,
+            ) {
+                Err(e) => {
+                    warn!(sender = %operator, error = %e, "rejecting unverifiable revocation");
+                    report.error = e.to_string();
+                }
+                Ok(target) => match ctx.store.insert(target, &revocation) {
+                    Err(e) => report.error = format!("persisting revocation: {e}"),
+                    Ok(new) => {
+                        is_new = new;
+                        report.accepted = true;
+                        report.already_known = !new;
+                        // Evict immediately rather than waiting for the
+                        // next gossip tick: the window between "we know
+                        // this peer is compromised" and "we stop
+                        // trusting it" should be as close to zero as the
+                        // code can make it.
+                        report.evicted = ctx.known_neighbors.unpin(&target).unwrap_or(false);
+                        if new {
+                            warn!(
+                                target = %target,
+                                reason = %revocation.reason,
+                                evicted = report.evicted,
+                                "revocation applied"
+                            );
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    send_revoke_report(conn, sealer, &operator, request_id, report).await?;
+
+    // Forward only what we hadn't already seen — that is what makes a
+    // flood converge instead of echoing around the mesh forever.
+    if push.fanout
+        && push.ttl > 0
+        && is_new
+        && let Some(relay) = relay
+    {
+        relay_revoke_push(
+            conn,
+            sealer,
+            request_id,
+            push,
+            forwarded_authorization,
+            relay,
+            timeout,
+        )
+        .await?;
+    }
+
+    if push.fanout {
+        send_revoke_report(
+            conn,
+            sealer,
+            &operator,
+            request_id,
+            bowery_proto::RevokeReport {
+                agent_fp: Vec::new(),
+                end: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn send_revoke_report(
+    conn: &BoweryConnection,
+    sealer: &Sealer,
+    operator: &Fingerprint,
+    request_id: &str,
+    report: bowery_proto::RevokeReport,
+) -> Result<(), bowery_whisper::transport::Error> {
+    use bowery_proto::{OperatorResult, OperatorResultBody};
+    let response = OperatorResult {
+        request_id: request_id.to_string(),
+        result: Some(OperatorResultBody::RevokeReport(report)),
+    };
+    let outbound = sealer.seal_for(operator, &WhisperPayload::operator_result(response));
+    conn.send_envelope(&outbound).await
+}
+
+/// Forward a revocation to every pinned peer with `ttl` decremented,
+/// piping their sealed reports back to the operator verbatim.
+async fn relay_revoke_push(
+    conn: &BoweryConnection,
+    sealer: &Arc<Sealer>,
+    request_id: &str,
+    push: &bowery_proto::RevokePush,
+    forwarded_authorization: &[u8],
+    relay: &Arc<RelayContext>,
+    timeout: Duration,
+) -> Result<(), bowery_whisper::transport::Error> {
+    let peers: Vec<PeerInfo> = relay
+        .peers_watcher
+        .borrow()
+        .clone()
+        .into_iter()
+        .filter(|p| relay.known_neighbors.resolve(&p.fingerprint).is_some())
+        .filter(|p| p.fingerprint != sealer.fingerprint())
+        .collect();
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    let (bytes_tx, mut bytes_rx) = mpsc::channel::<Vec<u8>>(64);
+    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let onward = bowery_proto::RevokePush {
+        revocation: push.revocation.clone(),
+        fanout: true,
+        ttl: push.ttl.saturating_sub(1),
+    };
+
+    for peer in peers {
+        let bytes_tx = bytes_tx.clone();
+        let endpoint = relay.endpoint.clone();
+        let kn = relay.known_neighbors.clone();
+        let sealer_clone = sealer.clone();
+        let request_id = request_id.to_string();
+        let auth = forwarded_authorization.to_vec();
+        let onward = onward.clone();
+        join_set.spawn(async move {
+            run_peer_revoke_push(
+                endpoint,
+                kn,
+                &sealer_clone,
+                peer,
+                auth,
+                onward,
+                &request_id,
+                timeout,
+                bytes_tx,
+            )
+            .await;
+        });
+    }
+    drop(bytes_tx);
+
+    let drain: Result<(), bowery_whisper::transport::Error> = async {
+        while let Some(bytes) = bytes_rx.recv().await {
+            conn.send_envelope(&bytes).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    join_set.abort_all();
+    while join_set.join_next().await.is_some() {}
+    drain
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_peer_revoke_push(
+    endpoint: BoweryEndpoint,
+    kn: Arc<KnownNeighbors>,
+    sealer: &Arc<Sealer>,
+    peer: PeerInfo,
+    forwarded_authorization: Vec<u8>,
+    push: bowery_proto::RevokePush,
+    request_id: &str,
+    timeout: Duration,
+    bytes_tx: mpsc::Sender<Vec<u8>>,
+) {
+    use bowery_proto::{OperatorCommand, OperatorCommandBody, WhisperEnvelope};
+    use prost::Message as _;
+
+    let peer_fp = peer.fingerprint;
+    let cmd = OperatorCommand {
+        request_id: request_id.to_string(),
+        timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+        forwarded_from_operator: forwarded_authorization,
+        command: Some(OperatorCommandBody::RevokePush(push)),
+    };
+    let outbound = sealer.seal_for(&peer_fp, &WhisperPayload::operator_command(cmd));
+
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(kn, peer_fp));
+    let Ok(conn) = endpoint.dial(dial_verifier, peer.whisper_addr).await else {
+        warn!(peer = %peer_fp, "revocation propagation dial failed");
+        return;
+    };
+    if conn.send_envelope(&outbound).await.is_err() {
+        warn!(peer = %peer_fp, "revocation propagation send failed");
+        return;
+    }
+
+    let pump = async {
+        loop {
+            let Ok(bytes) = conn.recv_envelope().await else {
+                return;
+            };
+            let Ok(env) = WhisperEnvelope::decode(bytes.as_slice()) else {
+                return;
+            };
+            if env.sender_fingerprint.as_slice() != peer_fp.as_bytes().as_slice() {
+                warn!(peer = %peer_fp, "revocation propagation sender mismatch");
+                return;
+            }
+            if bytes_tx.send(bytes).await.is_err() {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(timeout, pump).await;
 }
 
 #[cfg(test)]

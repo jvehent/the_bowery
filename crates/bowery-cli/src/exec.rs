@@ -268,6 +268,9 @@ pub async fn sql(
                     eprintln!("agent refused query: {} ({})", e.message, e.kind);
                     bail!("sql query failed: {}", e.kind);
                 }
+                Some(OperatorResultBody::RevokeReport(_)) => {
+                    bail!("agent replied with a RevokeReport to a SQL request");
+                }
                 Some(OperatorResultBody::YaraReport(_)) => {
                     // Wrong result type for this request — the agent
                     // echoed our request_id with a YARA body. Treat as a
@@ -811,8 +814,8 @@ pub async fn yara(
                     eprintln!("agent refused push: {} ({})", e.message, e.kind);
                     bail!("yara push failed: {}", e.kind);
                 }
-                Some(OperatorResultBody::SqlChunk(_)) => {
-                    bail!("agent replied with a SqlChunk to a YARA request");
+                Some(OperatorResultBody::SqlChunk(_) | OperatorResultBody::RevokeReport(_)) => {
+                    bail!("agent replied with an unexpected body to a YARA request");
                 }
                 None => bail!("agent returned an OperatorResult with no body"),
             }
@@ -856,6 +859,193 @@ fn is_fanout_terminator(
     target_fp: Fingerprint,
 ) -> bool {
     fanout && end && declared_fp.is_empty() && sender == target_fp
+}
+
+/// Push an operator-signed revocation to an agent and, with `fanout`,
+/// through the mesh.
+///
+/// Mirrors [`yara`]'s transport exactly. The difference is what carries
+/// the authority: the revocation is signed over its own fields, so every
+/// agent it reaches verifies it directly rather than trusting the chain
+/// of peers that relayed it. The `OperatorAuthorization` here only
+/// authorises the *relaying*, not the revocation's contents.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one linear exchange, mirrors `yara`
+pub async fn revoke_push(
+    operator_key: PathBuf,
+    target_addr: SocketAddr,
+    target_fp_hex: String,
+    target_pubkey_b64: String,
+    peer_pubkeys_b64: Vec<String>,
+    revocation_b64: String,
+    timeout: Duration,
+    fanout: bool,
+    ttl: u32,
+) -> Result<()> {
+    use base64::Engine as _;
+    use bowery_proto::RevokePush;
+
+    let revocation = base64::prelude::BASE64_STANDARD
+        .decode(revocation_b64.trim())
+        .context("decoding revocation (expected base64 from `bowery trust revoke`)")?;
+    // Decode locally so an operator typo fails here with a clear message
+    // rather than as a rejection from every agent in the fleet.
+    let decoded = <bowery_proto::Revocation as prost::Message>::decode(revocation.as_slice())
+        .context("revocation is not a valid Revocation message")?;
+    let target_agent = hex_lower(&decoded.agent_fp);
+
+    let identity = Arc::new(
+        Identity::load(&operator_key)
+            .with_context(|| format!("loading operator key from {}", operator_key.display()))?,
+    );
+    let target_fp = parse_fingerprint(&target_fp_hex)?;
+    let target_vk = parse_verifying_key(&target_pubkey_b64)?;
+    let mut resolver = StaticResolver::new();
+    let inserted_fp = resolver.insert(target_vk);
+    if inserted_fp != target_fp {
+        bail!("target_pubkey_b64 fingerprint {inserted_fp} doesn't match --agent-fp {target_fp}");
+    }
+    let mut agent_names: HashMap<String, String> = HashMap::new();
+    if let Ok(manifest_path) = crate::peers::default_path()
+        && let Ok(manifest) = crate::peers::Manifest::load(&manifest_path)
+    {
+        for peer in &manifest.peers {
+            if let Ok(vk) = parse_verifying_key(&peer.pubkey_b64) {
+                resolver.insert(vk);
+                agent_names.insert(peer.fp.to_ascii_lowercase(), peer.name.clone());
+            }
+        }
+    }
+    // Propagating agents seal their reports for us directly, so we need
+    // their pubkeys to verify — same manifest the SQL fan-out uses.
+    for b64 in &peer_pubkeys_b64 {
+        let vk = parse_verifying_key(b64)
+            .with_context(|| format!("parsing --peer-pubkey-b64 {b64:?}"))?;
+        resolver.insert(vk);
+    }
+    let resolver = Arc::new(resolver);
+
+    let bind_addr: SocketAddr = if target_addr.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
+    let endpoint = BoweryEndpoint::bind(identity.clone(), accept_verifier, bind_addr)
+        .context("binding operator-side endpoint")?;
+    let operator_fp = identity.fingerprint();
+    let sealer = Sealer::new(identity.clone());
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), target_fp));
+    let conn = endpoint
+        .dial(dial_verifier, target_addr)
+        .await
+        .with_context(|| format!("dialing agent at {target_addr}"))?;
+
+    let request_id = format!("op-{}", current_unix_ms());
+    let body = OperatorCommandBody::RevokePush(RevokePush {
+        revocation,
+        fanout,
+        ttl,
+    });
+    let auth =
+        bowery_whisper::forwarding::sign_operator_authorization(&identity, &request_id, &body);
+    let cmd = OperatorCommand {
+        forwarded_from_operator: prost::Message::encode_to_vec(&auth),
+        request_id: request_id.clone(),
+        timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+        command: Some(body),
+    };
+    let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
+
+    println!(
+        "revoking {} (reason: {})",
+        &target_agent[..16],
+        decoded.reason
+    );
+    let exchange_timeout = timeout + Duration::from_secs(2);
+    let exchange = async {
+        conn.send_envelope(&outbound)
+            .await
+            .context("sending RevokePush")?;
+        let mut applied = 0usize;
+        let mut already = 0usize;
+        loop {
+            let bytes = match conn.recv_envelope().await {
+                Ok(b) => b,
+                Err(e) => {
+                    if fanout {
+                        break;
+                    }
+                    return Err(anyhow::Error::from(e).context("awaiting RevokeReport"));
+                }
+            };
+            let opened = envelope_verifier
+                .open(&bytes)
+                .context("verifying RevokeReport envelope")?;
+            let sender = opened.sender;
+            let result = match opened.payload.body {
+                Some(Body::OperatorResult(r)) => r,
+                other => bail!("agent replied with unexpected body: {other:?}"),
+            };
+            if result.request_id != request_id {
+                bail!("agent echoed request_id {:?}", result.request_id);
+            }
+            match result.result {
+                Some(OperatorResultBody::RevokeReport(rep)) => {
+                    // Terminator honoured only from the dialled relay,
+                    // so a peer can't truncate the fleet's replies.
+                    if fanout && rep.end && rep.agent_fp.is_empty() && sender == target_fp {
+                        break;
+                    }
+                    let name = agent_name_for(&agent_names, sender.as_bytes());
+                    let short = &sender.to_string()[..16];
+                    if rep.error.is_empty() {
+                        if rep.already_known {
+                            already += 1;
+                        } else {
+                            applied += 1;
+                        }
+                        println!(
+                            "{name} ({short}): {}{}",
+                            if rep.already_known {
+                                "already held"
+                            } else {
+                                "APPLIED"
+                            },
+                            if rep.evicted { ", peer evicted" } else { "" }
+                        );
+                    } else {
+                        println!("{name} ({short}): REFUSED — {}", rep.error);
+                    }
+                    if rep.end && !fanout {
+                        break;
+                    }
+                }
+                Some(OperatorResultBody::Error(e)) => {
+                    eprintln!("agent refused push: {} ({})", e.message, e.kind);
+                    bail!("revoke push failed: {}", e.kind);
+                }
+                other => bail!("agent replied with an unexpected result body: {other:?}"),
+            }
+        }
+        println!("{applied} agent(s) newly applied, {already} already held");
+        Ok::<(), anyhow::Error>(())
+    };
+    let outcome = tokio::time::timeout(exchange_timeout, exchange).await;
+    drop(conn);
+    endpoint.close().await;
+    match outcome {
+        Ok(r) => r,
+        Err(_) => bail!("revoke push timed out after {exchange_timeout:?}"),
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut acc, b| {
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
 }
 
 #[cfg(test)]

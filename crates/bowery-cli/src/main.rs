@@ -155,6 +155,31 @@ enum TrustCommand {
         reason: String,
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Also deliver it: dial this agent and push the revocation.
+        /// Requires --agent-fp-target and --agent-pubkey-b64.
+        #[arg(long)]
+        agent_addr: Option<SocketAddr>,
+        /// Fingerprint of the agent to dial (NOT the one being revoked).
+        #[arg(long)]
+        relay_fp: Option<String>,
+        /// Base64 verifying key of the agent being dialled.
+        #[arg(long)]
+        relay_pubkey_b64: Option<String>,
+        /// Verifying keys of peers that may report back under --fanout.
+        /// `~/.bowery/peers.toml` entries are loaded automatically; use
+        /// this for agents not in the manifest.
+        #[arg(long = "peer-pubkey-b64")]
+        peer_pubkeys_b64: Vec<String>,
+        /// Propagate onward through the mesh from the dialled agent.
+        /// Each hop applies the revocation and forwards it only if it
+        /// was new, so a flood converges instead of echoing.
+        #[arg(long)]
+        fanout: bool,
+        /// Hop budget for propagation (clamped to 8 by the agent).
+        #[arg(long, default_value_t = 4)]
+        ttl: u32,
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        timeout: Duration,
     },
 }
 
@@ -473,8 +498,46 @@ impl Cli {
                 cluster_id,
                 reason,
                 out,
+                agent_addr,
+                relay_fp,
+                relay_pubkey_b64,
+                peer_pubkeys_b64,
+                fanout,
+                ttl,
+                timeout,
             }) => {
-                mesh_trust::mint_revocation(&operator_key, &agent_fp, &cluster_id, &reason, out)?;
+                let encoded = mesh_trust::mint_revocation(
+                    &operator_key,
+                    &agent_fp,
+                    &cluster_id,
+                    &reason,
+                    out,
+                    agent_addr.is_none(),
+                )?;
+                let Some(addr) = agent_addr else {
+                    return Ok(ExitCode::SUCCESS);
+                };
+                let (Some(fp), Some(pubkey)) = (relay_fp, relay_pubkey_b64) else {
+                    anyhow::bail!(
+                        "--agent-addr also needs --relay-fp and --relay-pubkey-b64 \
+                         (the agent being DIALLED, not the one being revoked)"
+                    );
+                };
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building tokio runtime")?;
+                runtime.block_on(exec::revoke_push(
+                    operator_key,
+                    addr,
+                    fp,
+                    pubkey,
+                    peer_pubkeys_b64,
+                    encoded,
+                    timeout,
+                    fanout,
+                    ttl,
+                ))?;
                 Ok(ExitCode::SUCCESS)
             }
             Command::Doctor { json } => doctor_cmd(json),

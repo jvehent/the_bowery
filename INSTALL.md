@@ -652,12 +652,38 @@ bowery trust revoke \
   --reason "compromised" --out revocation.b64
 ```
 
-Append the base64 line to each agent's `revocations_path` (the file is
-one signed revocation per line, and every line is re-verified against
-the configured operator keys on load — so a hand-edited or forged entry
-is skipped, not trusted). On start, and on the next gossip tick, the
-agent evicts the revoked peer from its pin set and refuses to re-pin it.
-Confirm delivery:
+**Push it to the fleet** in the same command — the revocation spreads
+peer-to-peer from the agent you dial:
+
+```bash
+bowery trust revoke \
+  --operator-key ~/.bowery/operator.key \
+  --agent-fp <fingerprint being revoked> --cluster-id bowery-tailnet \
+  --reason "compromised" \
+  --agent-addr 100.64.0.5:9902 \
+  --relay-fp <fingerprint of the agent you're dialling> \
+  --relay-pubkey-b64 <its pubkey> \
+  --fanout
+```
+
+Each agent verifies the revocation itself — it carries an operator
+signature over its own fields, so a relaying peer can *drop* it but
+cannot forge one, and cannot use the relay path to eject healthy agents.
+Each hop applies it and forwards only if it was new, so a flood
+converges instead of echoing around a cyclic peer graph; `--ttl`
+(clamped to 8) is a second, structural bound.
+
+Because a peer can drop rather than relay, delivery is confirmed, not
+assumed — see the query below.
+
+Alternatively, append the base64 line to each agent's
+`revocations_path` by hand. The file is one signed revocation per line
+and every line is re-verified against the configured operator keys on
+load, so a hand-edited or forged entry is skipped, not trusted. On
+start, and on the next gossip tick, the agent evicts the revoked peer
+from its pin set and refuses to re-pin it.
+
+Confirm delivery either way:
 
 ```bash
 bowery exec sql --fanout --sql "SELECT fingerprint_hex FROM bowery_revocations"
