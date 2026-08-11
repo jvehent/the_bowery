@@ -630,6 +630,16 @@ bowery trust grant \
 Copy `grant.b64` to the agent and point `[known_neighbors] grant_path`
 at it, then restart. The agent gossips the grant so peers can verify it.
 
+A valid grant **bypasses the bootstrap window**. That window exists to
+bound TOFU — when "showed up on the gossip port" is the only admission
+evidence, it has to expire — but an operator signature is stronger
+evidence and doesn't. Without this, a granted agent could never join a
+fleet that had been running longer than its window, which is the exact
+friction grants remove. Revocation and the pin-count cap still apply.
+
+Grants are honoured even by agents still running `enrollment = "tofu"`,
+which is what makes the migration below incremental.
+
 **Migrating to signed enrollment.** Flipping `enrollment` to `grant`
 while any peer lacks a valid grant partitions the mesh — those peers
 stop being pinnable. Issue grants to every agent first, then confirm
@@ -641,7 +651,17 @@ bowery exec sql --fanout --sql \
 ```
 
 Every row must read `grant_state = valid`. `absent` means that agent has
-no grant yet; `invalid: …` names the failing check.
+no grant yet; `invalid: …` names the failing check — most often
+`ClusterMismatch`, because the grant's `--cluster-id` must match the
+agent's `[mesh] cluster_id` exactly (the remote installer defaults to
+`bowery-tailnet`, while `bowery trust grant` defaults to `bowery`).
+
+Note that flipping `enrollment` to `grant` does **not** unpin peers that
+were already TOFU-pinned — it only governs *new* pins, so the switch
+can't partition a running mesh. The corollary is that flipping alone
+does not retroactively close the TOFU hole: to require proof from every
+peer, stop the agent, delete `known_neighbors.json`, and restart, at
+which point it re-pins only peers presenting valid grants.
 
 **Revoking a compromised agent:**
 

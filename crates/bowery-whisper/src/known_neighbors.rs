@@ -189,6 +189,10 @@ impl KnownNeighbors {
     /// - If unknown and within bootstrap window, pins and writes to disk.
     /// - If unknown and outside the window, returns `BootstrapClosed`.
     pub fn try_pin(&self, vk: &VerifyingKey) -> Result<PinOutcome> {
+        self.pin_inner(vk, false)
+    }
+
+    fn pin_inner(&self, vk: &VerifyingKey, bypass_bootstrap: bool) -> Result<PinOutcome> {
         let fp = Fingerprint::from_verifying_key(vk);
 
         // Revocation outranks everything, including an existing pin: a
@@ -205,7 +209,7 @@ impl KnownNeighbors {
         {
             return Ok(PinOutcome::AlreadyPinned);
         }
-        if !self.bootstrap_active() {
+        if !bypass_bootstrap && !self.bootstrap_active() {
             return Ok(PinOutcome::BootstrapClosed);
         }
 
@@ -230,6 +234,24 @@ impl KnownNeighbors {
         }
         self.save()?;
         Ok(PinOutcome::NewlyPinned)
+    }
+
+    /// Pin a peer whose admission has been authorised out-of-band —
+    /// in practice, one presenting a valid operator-signed
+    /// `MembershipGrant`.
+    ///
+    /// Identical to [`Self::try_pin`] except that it does **not**
+    /// consult the bootstrap window. That window exists to bound TOFU:
+    /// when "showed up on the gossip port" is the only admission
+    /// evidence, it must expire. An operator signature is strictly
+    /// stronger evidence and does not, so gating it on the window would
+    /// mean a granted agent could not join an established fleet — which
+    /// is precisely the friction grants exist to remove.
+    ///
+    /// Revocation and the capacity cap still apply: neither is about how
+    /// admission was proven.
+    pub fn pin_authorized(&self, vk: &VerifyingKey) -> Result<PinOutcome> {
+        self.pin_inner(vk, true)
     }
 
     /// Attach a revocation store. Every pin attempt then consults it,

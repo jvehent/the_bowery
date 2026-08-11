@@ -960,20 +960,42 @@ pub(crate) struct EnrollmentContext {
     pub revocations: Arc<RevocationStore>,
 }
 
+/// How a peer qualified for a pin. The distinction matters because only
+/// a verified grant justifies bypassing the bootstrap window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// A valid operator-signed grant. Admission is proven, so the
+    /// bootstrap window — which exists to bound *unproven* TOFU
+    /// admission — does not apply.
+    Granted,
+    /// No grant, but policy is `tofu`, so the bootstrap window is the
+    /// admission control and must still gate the pin.
+    Tofu,
+    Refused,
+}
+
 impl EnrollmentContext {
-    /// Under `grant`, a peer must present a valid operator-signed grant
-    /// naming its own fingerprint and this cluster. Under `tofu`, any
-    /// peer passes and the grant (if any) is ignored.
-    fn admits(&self, peer: &PeerInfo) -> bool {
-        if self.policy == crate::config::EnrollmentPolicy::Tofu {
-            return true;
-        }
+    /// Decide whether, and on what basis, a gossiping peer may be pinned.
+    ///
+    /// A grant is verified whenever one is present, regardless of policy:
+    /// it is operator-signed evidence and is no less valid because this
+    /// agent happens to be running in `tofu` mode. That also smooths
+    /// migration — agents not yet flipped still honour grants, so a newly
+    /// provisioned host joins even after their bootstrap windows closed.
+    fn admits(&self, peer: &PeerInfo) -> Admission {
+        let tofu = self.policy == crate::config::EnrollmentPolicy::Tofu;
         let Some(grant) = decode_grant(peer.membership_grant.as_deref()) else {
-            debug!(
-                peer = %peer.fingerprint,
-                "refusing pin: enrollment=grant but peer published no usable grant"
-            );
-            return false;
+            if !tofu {
+                debug!(
+                    peer = %peer.fingerprint,
+                    "refusing pin: enrollment=grant but peer published no usable grant"
+                );
+            }
+            return if tofu {
+                Admission::Tofu
+            } else {
+                Admission::Refused
+            };
         };
         let operators = self.operators.clone();
         let resolve = move |fp: &Fingerprint| operators.resolve(fp);
@@ -984,10 +1006,18 @@ impl EnrollmentContext {
             &resolve,
             SystemTime::now(),
         ) {
-            Ok(()) => true,
+            Ok(()) => Admission::Granted,
             Err(e) => {
-                warn!(peer = %peer.fingerprint, error = %e, "refusing pin: invalid membership grant");
-                false
+                warn!(peer = %peer.fingerprint, error = %e, "membership grant rejected");
+                // A bad grant under tofu is not itself disqualifying —
+                // tofu admits ungranted peers anyway, and treating a
+                // malformed grant as worse than none would let any peer
+                // lock itself out by publishing garbage.
+                if tofu {
+                    Admission::Tofu
+                } else {
+                    Admission::Refused
+                }
             }
         }
     }
@@ -1028,10 +1058,12 @@ fn spawn_pin_task(
                     }
                     continue;
                 }
-                if !enrollment.admits(&peer) {
-                    continue;
-                }
-                match kn.try_pin(&peer.verifying_key) {
+                let outcome = match enrollment.admits(&peer) {
+                    Admission::Refused => continue,
+                    Admission::Granted => kn.pin_authorized(&peer.verifying_key),
+                    Admission::Tofu => kn.try_pin(&peer.verifying_key),
+                };
+                match outcome {
                     Ok(PinOutcome::NewlyPinned) => {
                         info!(peer = %peer.fingerprint, "pinned new neighbor");
                         let _ = events_tx.send(AgentEvent::PeerPinned(peer.fingerprint));

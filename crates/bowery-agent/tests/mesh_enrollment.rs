@@ -211,6 +211,93 @@ async fn grant_policy_admits_the_granted_peer_and_refuses_the_ungranted_one() {
     ungranted.shutdown().await.expect("shutdown ungranted");
 }
 
+/// The operational case that matters most: adding an agent to a fleet
+/// that has been running for a while.
+///
+/// The bootstrap window exists to bound TOFU — when "showed up on the
+/// gossip port" is the only admission evidence, that evidence must
+/// expire. An operator-signed grant is strictly stronger and does not,
+/// so it must pin even with the window long closed. Gating it on the
+/// window would mean a granted agent could never join an established
+/// fleet, which is exactly the friction grants exist to remove.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_granted_peer_joins_after_the_bootstrap_window_has_closed() {
+    let operator = Identity::generate();
+    let operator_pubkey_b64 = BASE64.encode(operator.verifying_key().to_bytes());
+
+    let dir_hub = TempDir::new().unwrap();
+    let dir_new = TempDir::new().unwrap();
+    let op_key = dir_hub.path().join("operator.key");
+    operator.save(&op_key).unwrap();
+
+    let new_id = Arc::new(Identity::generate());
+    let grant_path = dir_new.path().join("grant.b64");
+    bowery_cli::mesh_trust::mint_grant(
+        &op_key,
+        &new_id.fingerprint().to_hex(),
+        CLUSTER,
+        None,
+        Some(grant_path.clone()),
+    )
+    .unwrap();
+
+    let hub_addr = reserve_udp_port();
+    let new_addr = reserve_udp_port();
+
+    let mut cfg_hub = build_config(
+        dir_hub.path(),
+        hub_addr,
+        vec![],
+        operator_pubkey_b64.clone(),
+        EnrollmentPolicy::Grant,
+        None,
+    );
+    // Already expired: this is the established-fleet condition.
+    cfg_hub.known_neighbors.bootstrap_window = Duration::from_millis(1);
+
+    let hub = Agent::start(
+        cfg_hub,
+        Arc::new(Identity::generate()),
+        Box::new(NoopEventSource),
+    )
+    .await
+    .expect("start hub");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !hub.known_neighbors().bootstrap_active(),
+        "precondition: the hub's bootstrap window must be closed"
+    );
+
+    let newcomer = Agent::start(
+        build_config(
+            dir_new.path(),
+            new_addr,
+            vec![hub_addr.to_string()],
+            operator_pubkey_b64,
+            EnrollmentPolicy::Tofu,
+            Some(grant_path),
+        ),
+        new_id.clone(),
+        Box::new(NoopEventSource),
+    )
+    .await
+    .expect("start newcomer");
+
+    assert!(
+        wait_for_pins(&hub, 1, Duration::from_secs(20)).await,
+        "a granted peer must join an established fleet; the bootstrap \
+         window must not gate operator-signed admission"
+    );
+    assert!(
+        hub.known_neighbors()
+            .fingerprints()
+            .contains(&new_id.fingerprint())
+    );
+
+    hub.shutdown().await.expect("shutdown hub");
+    newcomer.shutdown().await.expect("shutdown newcomer");
+}
+
 /// Under the default `tofu` policy nothing changes — an existing fleet
 /// keeps forming a mesh after upgrading, which is why that remains the
 /// default.
