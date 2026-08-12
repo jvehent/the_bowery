@@ -92,7 +92,17 @@ pub struct ConnectEvent {
     /// Remote peer's address — the destination outbound, the *source*
     /// inbound.
     pub daddr_v4: [u8; 4],
+    /// **Our own** address on this socket.
+    ///
+    /// Needed to ask a peer "did you connect to me?" without naming the
+    /// wrong address: a host with several addresses that guessed would
+    /// get back "no record" for a connection the peer legitimately made
+    /// elsewhere, and alert that a healthy agent is lying. That is the
+    /// worst false positive this system can emit, so the address is
+    /// measured rather than assumed.
+    pub saddr_v4: [u8; 4],
     pub daddr_v6: [u8; 16],
+    pub saddr_v6: [u8; 16],
     /// Connecting task's comm. Zero for `DIRECTION_IN`, same reason as
     /// `pid`.
     pub comm: [u8; 16],
@@ -259,7 +269,9 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
     let sport: u16 = unsafe { ctx.read_at(24)? };
     let dport: u16 = unsafe { ctx.read_at(26)? };
     let daddr_v4: [u8; 4] = unsafe { ctx.read_at(36)? };
+    let saddr_v4: [u8; 4] = unsafe { ctx.read_at(32)? };
     let daddr_v6: [u8; 16] = unsafe { ctx.read_at(56)? };
+    let saddr_v6: [u8; 16] = unsafe { ctx.read_at(40)? };
 
     let Some(mut entry) = CONNECT_EVENTS.reserve::<ConnectEvent>(0) else {
         return Err(-1);
@@ -284,7 +296,9 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
         (*event).direction = direction;
         (*event)._pad = 0;
         (*event).daddr_v4 = daddr_v4;
+        (*event).saddr_v4 = saddr_v4;
         (*event).daddr_v6 = daddr_v6;
+        (*event).saddr_v6 = saddr_v6;
         (*event).comm = comm;
     }
     entry.submit(0);

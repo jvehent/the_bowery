@@ -85,6 +85,12 @@ pub struct NetworkConnect {
     pub family: NetFamily,
     /// Remote peer address.
     pub daddr: IpAddr,
+    /// **Our own** address on this socket. Measured, not assumed:
+    /// asking a peer "did you connect to me?" has to name the address
+    /// they actually reached, or a multi-homed host gets back "no
+    /// record" for a legitimate connection and alerts that a healthy
+    /// agent is lying.
+    pub local_addr: IpAddr,
     /// Remote peer port.
     pub dport: u16,
     /// Our own port. **Zero for outbound**: at the

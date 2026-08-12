@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS events (
     dst_addr     TEXT,
     dst_port     INTEGER,
     local_port   INTEGER,
+    local_addr   TEXT,
     direction    TEXT,
     path         TEXT,
     file_op      TEXT,
@@ -229,7 +230,11 @@ impl EventLog {
         // Columns added after the initial schema. Append here — never
         // reorder or remove, since the point is to reconcile with files
         // written by older builds.
-        const ADDED: &[(&str, &str)] = &[("local_port", "INTEGER"), ("direction", "TEXT")];
+        const ADDED: &[(&str, &str)] = &[
+            ("local_port", "INTEGER"),
+            ("direction", "TEXT"),
+            ("local_addr", "TEXT"),
+        ];
 
         let mut present = std::collections::HashSet::new();
         {
@@ -262,10 +267,10 @@ impl EventLog {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO events
                     (ts_unix_ms, kind, pid, ppid, uid, comm, exe_path, args,
-                     exit_code, net_family, dst_addr, dst_port, local_port, direction,
-                     path, file_op, open_flags)
+                     exit_code, net_family, dst_addr, dst_port, local_port, local_addr,
+                     direction, path, file_op, open_flags)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                         ?15, ?16, ?17)",
+                         ?15, ?16, ?17, ?18)",
             )?;
             for event in events {
                 let r = Row::from_event(event);
@@ -283,6 +288,7 @@ impl EventLog {
                     r.dst_addr,
                     r.dst_port,
                     r.local_port,
+                    r.local_addr,
                     r.direction,
                     r.path,
                     r.file_op,
@@ -443,6 +449,7 @@ struct Row {
     dst_addr: Option<String>,
     dst_port: Option<i64>,
     local_port: Option<i64>,
+    local_addr: Option<String>,
     direction: Option<&'static str>,
     path: Option<String>,
     file_op: Option<&'static str>,
@@ -466,6 +473,7 @@ impl Row {
             dst_addr: None,
             dst_port: None,
             local_port: None,
+            local_addr: None,
             direction: None,
             path: None,
             file_op: None,
@@ -502,6 +510,7 @@ impl Row {
                 r.dst_addr = Some(e.daddr.to_string());
                 r.dst_port = Some(i64::from(e.dport));
                 r.local_port = Some(i64::from(e.local_port));
+                r.local_addr = Some(e.local_addr.to_string());
                 r.direction = Some(e.direction.label());
             }
             Event::FileOpen(e) => {
@@ -580,6 +589,7 @@ mod tests {
                     comm: String::new(),
                     family: NetFamily::V4,
                     daddr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+                    local_addr: "0.0.0.0".parse().unwrap(),
                     dport: 4444,
                     local_port: 51000,
                     direction: bowery_events::NetDirection::Outbound,
@@ -825,6 +835,7 @@ mod migration_tests {
             comm: String::new(),
             family: NetFamily::V4,
             daddr: "10.0.0.42".parse().unwrap(),
+            local_addr: "0.0.0.0".parse().unwrap(),
             dport: 54321,
             local_port: 22,
             direction: NetDirection::Inbound,
@@ -888,6 +899,7 @@ mod correlation_tests {
             comm: comm.to_string(),
             family: NetFamily::V4,
             daddr: addr.parse().unwrap(),
+            local_addr: "0.0.0.0".parse().unwrap(),
             dport: port,
             local_port: 0, // as the kernel reports it at SYN_SENT
             direction: NetDirection::Outbound,
@@ -949,6 +961,7 @@ mod correlation_tests {
             comm: String::new(),
             family: NetFamily::V4,
             daddr: "10.0.0.5".parse().unwrap(),
+            local_addr: "0.0.0.0".parse().unwrap(),
             dport: 22,
             local_port: 22,
             direction: NetDirection::Inbound,

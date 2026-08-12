@@ -88,7 +88,9 @@ struct RawConnectEvent {
     direction: u8,
     _pad: u8,
     daddr_v4: [u8; 4],
+    saddr_v4: [u8; 4],
     daddr_v6: [u8; 16],
+    saddr_v6: [u8; 16],
     comm: [u8; 16],
 }
 
@@ -435,9 +437,17 @@ fn parse_connect(bytes: &[u8]) -> Option<Event> {
     let raw: RawConnectEvent =
         unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<RawConnectEvent>()) };
 
-    let (family, daddr) = match raw.family {
-        AF_INET => (NetFamily::V4, IpAddr::V4(Ipv4Addr::from(raw.daddr_v4))),
-        AF_INET6 => (NetFamily::V6, IpAddr::V6(Ipv6Addr::from(raw.daddr_v6))),
+    let (family, daddr, laddr) = match raw.family {
+        AF_INET => (
+            NetFamily::V4,
+            IpAddr::V4(Ipv4Addr::from(raw.daddr_v4)),
+            IpAddr::V4(Ipv4Addr::from(raw.saddr_v4)),
+        ),
+        AF_INET6 => (
+            NetFamily::V6,
+            IpAddr::V6(Ipv6Addr::from(raw.daddr_v6)),
+            IpAddr::V6(Ipv6Addr::from(raw.saddr_v6)),
+        ),
         other => {
             debug!(family = other, "unknown sock family in connect record");
             return None;
@@ -455,6 +465,7 @@ fn parse_connect(bytes: &[u8]) -> Option<Event> {
         comm: comm_to_string(&raw.comm),
         family,
         daddr,
+        local_addr: laddr,
         // NOT `from_be`. The kernel's inet_sock_set_state tracepoint
         // already applies ntohs() to both ports before they reach us
         // (include/trace/events/sock.h), so byte-swapping again yields
@@ -708,7 +719,9 @@ mod tests {
             // 443 in network byte order
             dport: 443,
             daddr_v4: [192, 168, 1, 50],
+            saddr_v4: [10, 0, 0, 1],
             daddr_v6: [0; 16],
+            saddr_v6: [0; 16],
             comm: *b"curl\0\0\0\0\0\0\0\0\0\0\0\0",
         };
         let event = parse_connect(as_bytes(&event_raw)).expect("parses");
@@ -736,7 +749,9 @@ mod tests {
             family: AF_INET6,
             dport: 80,
             daddr_v4: [0; 4],
+            saddr_v4: [10, 0, 0, 1],
             daddr_v6: v6,
+            saddr_v6: [0; 16],
             comm: *b"firefox\0\0\0\0\0\0\0\0\0",
         };
         let event = parse_connect(as_bytes(&event_raw)).expect("parses");
@@ -761,7 +776,9 @@ mod tests {
             family: 17, // AF_NETLINK — not something we care about
             dport: 0,
             daddr_v4: [0; 4],
+            saddr_v4: [10, 0, 0, 1],
             daddr_v6: [0; 16],
+            saddr_v6: [0; 16],
             comm: [0; 16],
         };
         assert!(parse_connect(as_bytes(&event_raw)).is_none());
@@ -811,7 +828,9 @@ mod inbound_tests {
             direction: DIRECTION_IN,
             _pad: 0,
             daddr_v4: [10, 0, 0, 42],
+            saddr_v4: [10, 0, 0, 1],
             daddr_v6: [0; 16],
+            saddr_v6: [0; 16],
             comm: [0; 16],
         };
         match parse_connect(as_bytes(&raw)).expect("parses") {
@@ -845,7 +864,9 @@ mod inbound_tests {
             direction: 0,
             _pad: 0,
             daddr_v4: [93, 184, 216, 34],
+            saddr_v4: [10, 0, 0, 1],
             daddr_v6: [0; 16],
+            saddr_v6: [0; 16],
             comm: *b"curl\0\0\0\0\0\0\0\0\0\0\0\0",
         };
         match parse_connect(as_bytes(&raw)).expect("parses") {
@@ -870,7 +891,7 @@ mod inbound_tests {
     #[test]
     fn raw_connect_layout_is_pinned() {
         assert_eq!(
-            RAW_CONNECT_SIZE, 48,
+            RAW_CONNECT_SIZE, 68,
             "ConnectEvent layout changed; update crates/bowery-ebpf/src/main.rs to match"
         );
     }

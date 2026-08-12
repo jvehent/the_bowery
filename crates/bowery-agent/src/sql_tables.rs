@@ -757,7 +757,7 @@ pub struct BoweryEventsTable {
 /// Columns mirrored from the event log's own schema, so the view is a
 /// straight passthrough and the two can't drift into different names.
 const EVENTS_COLUMNS: &str = "seq, ts_unix_ms, kind, pid, ppid, uid, comm, exe_path, args, \
-                              exit_code, net_family, dst_addr, dst_port, local_port, direction, \
+                              exit_code, net_family, dst_addr, dst_port, local_port, local_addr, direction, \
                               path, file_op, open_flags";
 
 const EVENTS_EMPTY_DDL: &str = "CREATE TABLE IF NOT EXISTS bowery_events (
@@ -775,6 +775,7 @@ const EVENTS_EMPTY_DDL: &str = "CREATE TABLE IF NOT EXISTS bowery_events (
     dst_addr     TEXT,
     dst_port     INTEGER,
     local_port   INTEGER,
+    local_addr   TEXT,
     direction    TEXT,
     path         TEXT,
     file_op      TEXT,
