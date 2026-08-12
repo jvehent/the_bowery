@@ -223,14 +223,23 @@ impl AlertsPane {
                     theme::detail_label()
                 },
             )));
-            // Both sides of the evidence: peers that have never seen the
-            // binary are what confirms (it's anomalous here), peers that
-            // have argue it's a normal fleet artifact.
+            // Every bucket, not a summary. Peers with no record of the
+            // observation are what confirms (it's anomalous here);
+            // peers that have one argue it's ordinary. Refusals and
+            // silence are shown separately and count toward neither —
+            // collapsing them would make an unreachable neighbourhood
+            // look like agreement.
             lines.push(kv(
-                "  never seen",
+                "  no record",
                 format!("{} (quorum {})", c.peers_unseen, c.quorum),
             ));
-            lines.push(kv("  have seen", c.peers_seen.to_string()));
+            // "recorded", not "has record": `kv` pads the label to 12
+            // columns, and a 12-char label leaves no gap before the
+            // value ("has record1").
+            lines.push(kv("  recorded", c.peers_seen.to_string()));
+            if c.peers_refused > 0 {
+                lines.push(kv("  declined", c.peers_refused.to_string()));
+            }
             lines.push(kv("  no reply", c.peers_no_reply.to_string()));
             lines.push(kv("  asked", c.peers_asked.to_string()));
         }
@@ -472,6 +481,7 @@ mod render_tests {
                 peers_unseen: unseen,
                 peers_seen: asked - unseen,
                 peers_no_reply: 0,
+                peers_refused: 0,
                 quorum: 2,
                 confirmed,
             }),
@@ -585,7 +595,18 @@ mod render_tests {
         pane.browser_mut().home();
         let detail = draw(&mut pane, true);
         assert!(detail.contains("CONFIRMED"), "verdict missing: {detail}");
-        assert!(detail.contains("never seen"), "evidence missing: {detail}");
+        // Both counts, with their gutter intact. `kv` pads labels into
+        // 12 columns, so a 12-character label runs straight into its
+        // value ("has record1") — asserting on the spacing is what
+        // catches that.
+        assert!(
+            detail.contains("no record 4 (quorum 2)"),
+            "denial count missing: {detail}"
+        );
+        assert!(
+            detail.contains("recorded  1"),
+            "corroboration count missing: {detail}"
+        );
 
         // Not-confirmed must not wear a checkmark — the badge is the
         // whole signal an operator scans for.

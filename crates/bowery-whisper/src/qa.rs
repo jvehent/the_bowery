@@ -159,7 +159,7 @@ pub async fn ask<R: FingerprintResolver>(
         let opened = verifier.open(&answer_bytes)?;
         let answer = match opened.payload.body {
             Some(Body::Answer(a)) => a,
-            Some(other) => return Err(AskError::UnexpectedBody(body_kind(&other))),
+            Some(other) => return Err(AskError::UnexpectedBody(other.kind_name())),
             None => return Err(AskError::MissingBody),
         };
         if answer.episode_id != expected_episode {
@@ -220,7 +220,7 @@ where
     let asker = opened.sender;
     let question = match opened.payload.body {
         Some(Body::Question(q)) => q,
-        Some(other) => return Err(AnswerError::UnexpectedBody(body_kind(&other))),
+        Some(other) => return Err(AnswerError::UnexpectedBody(other.kind_name())),
         None => return Err(AnswerError::MissingBody),
     };
 
@@ -271,22 +271,6 @@ where
     let outbound = sealer.seal_for(&asker, &WhisperPayload::answer(answer));
     reply.send(&outbound).await?;
     Ok(question)
-}
-
-fn body_kind(body: &Body) -> &'static str {
-    match body {
-        Body::Question(_) => "Question",
-        Body::Answer(_) => "Answer",
-        Body::Alert(_) => "Alert",
-        Body::OperatorCommand(_) => "OperatorCommand",
-        Body::OperatorResult(_) => "OperatorResult",
-        Body::Heartbeat(_) => "Heartbeat",
-        Body::NeighborOp(_) => "NeighborOp",
-        Body::Subscribe(_) => "Subscribe",
-        Body::Alerts(_) => "Alerts",
-        Body::ConnectionQuery(_) => "ConnectionQuery",
-        Body::ConnectionAnswer(_) => "ConnectionAnswer",
-    }
 }
 
 // ---------------------------------------------------------------------------

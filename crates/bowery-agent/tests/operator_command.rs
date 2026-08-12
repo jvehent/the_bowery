@@ -63,6 +63,10 @@ fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: St
             advertise_addr: None,
             qa: WhisperQaConfig::default(),
             bind_addr: loopback_ephemeral(),
+            // Left at the production default so every existing
+            // two-agent fixture also exercises the corroboration
+            // engine's startup and shutdown paths.
+            corroboration: bowery_agent::config::CorroborationConfig::default(),
         },
         heartbeat: HeartbeatConfig {
             interval: Duration::from_secs(5),
@@ -423,6 +427,7 @@ async fn fanout_streams_rows_from_relay_and_peer() {
             advertise_addr: None,
             qa: WhisperQaConfig::default(),
             bind_addr: loopback_ephemeral(),
+            corroboration: bowery_agent::config::CorroborationConfig::default(),
         },
         heartbeat: HeartbeatConfig {
             interval: Duration::from_millis(200),
@@ -478,6 +483,7 @@ async fn fanout_streams_rows_from_relay_and_peer() {
             advertise_addr: None,
             qa: WhisperQaConfig::default(),
             bind_addr: loopback_ephemeral(),
+            corroboration: bowery_agent::config::CorroborationConfig::default(),
         },
         heartbeat: HeartbeatConfig {
             interval: Duration::from_millis(200),

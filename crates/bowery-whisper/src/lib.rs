@@ -7,6 +7,7 @@
 //! Phase 1b adds the QUIC transport. Phase 5 wraps payloads in
 //! ChaCha20-Poly1305 ciphertext keyed by an X25519 ECDH session key.
 
+pub mod corroborate;
 mod envelope;
 pub mod fingerprint;
 pub mod forwarding;

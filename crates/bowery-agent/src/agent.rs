@@ -25,6 +25,7 @@ use bowery_response::{
 };
 
 use crate::config::ResponseEngineKind;
+use crate::corroboration::ResponderRegistry;
 use crate::eventlog_writer::EventLogHandle;
 use bowery_whisper::fingerprint::{TIER1_LEN, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::{KnownNeighbors, PinOutcome};
@@ -38,10 +39,11 @@ use ed25519_dalek::VerifyingKey;
 use crate::bloom_publisher;
 use crate::inbox::{AlertInbox, current_unix_ms};
 use crate::monitor::MonitorRules;
+use crate::seen::RecentlySeen;
 use crate::whisper_qa::{
     WhisperContext, WhisperQaTrigger, aggregate_local_sighting, spawn_whisper_qa_task,
 };
-use crate::yara_store::{YaraSeen, YaraStore};
+use crate::yara_store::YaraStore;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -97,6 +99,14 @@ pub enum AgentEvent {
     /// per-peer responses (or non-responses) so observers / dashboards
     /// can surface neighborhood corroboration.
     WhisperContextReady(WhisperContext),
+    /// A cross-host corroboration round finished, whether or not it
+    /// alerted. Carries the per-outcome tally and, when a peer owned up
+    /// to the observation, the evidence it returned — attribution the
+    /// observing host could not have derived on its own.
+    ///
+    /// Boxed because it is much larger than the other variants, and
+    /// every subscriber pays the size of the widest one.
+    CorroborationRound(Box<crate::corroboration::RoundOutcome>),
     /// Phase 6: an alert was appended to the operator inbox. Lets
     /// tests + dashboards observe inbox writes without polling.
     AlertEmitted {
@@ -192,6 +202,8 @@ pub struct Agent {
     pipeline_task: JoinHandle<()>,
     /// `None` when the event log is disabled or failed to open.
     eventlog_tasks: Option<(JoinHandle<()>, JoinHandle<()>)>,
+    /// `None` when cross-host corroboration is disabled.
+    corroboration_task: Option<JoinHandle<()>>,
     revocations: Arc<RevocationStore>,
     /// `None` when no file rules are configured (or inotify is unavailable).
     file_monitor_task: Option<JoinHandle<()>>,
@@ -556,16 +568,28 @@ impl Agent {
         };
         let eventlog_handle = eventlog.as_ref().map(|(h, _)| h.clone());
         let eventlog_store = eventlog.map(|(_, log)| log);
-        // Answering "did you connect to me?" needs our own outbound
-        // history plus a trustworthy view of who the asker is. `None`
-        // when the event log is off: with no history we cannot
-        // distinguish "I did not make that connection" from "I would not
-        // have recorded it either way", and answering anyway would
-        // manufacture evidence.
-        let correlation = eventlog_store.as_ref().map(|log| CorrelationContext {
-            log: log.clone(),
-            peers: mesh.peers_watcher(),
-        });
+        // Handlers for corroboration queries peers send us, one per
+        // kind. Registering a new kind of suspicion is a line here plus
+        // its handler — no change to the wire format, the dispatcher,
+        // the rate limiter, or the alert path.
+        //
+        // The connection handler needs our own outbound history, so it
+        // is only registered when the event log is on: with no history
+        // we cannot distinguish "I did not make that connection" from
+        // "I would not have recorded it either way", and answering
+        // anyway would manufacture evidence. An unregistered kind is
+        // refused, which is exactly the right answer.
+        let mut responders = crate::corroboration::ResponderRegistry::new();
+        if let Some(log) = eventlog_store.as_ref() {
+            responders = responders.with(Arc::new(
+                crate::corroboration::net_inbound::InboundConnectResponder::new(
+                    log.clone(),
+                    mesh.peers_watcher(),
+                ),
+            ));
+        }
+        let responders = Arc::new(responders);
+        debug!(?responders, "corroboration responders registered");
 
         let sql_engine = bowery_sql::Sql::new()
             .with_concurrency_cap(config.sql.max_concurrent_queries)
@@ -643,7 +667,7 @@ impl Agent {
                 store: yara_store.clone(),
                 // Remembering a push for 30 minutes is far longer than any
                 // flood takes to settle, so a rule can't lap the mesh.
-                seen: Arc::new(YaraSeen::new(Duration::from_mins(30), 4096)),
+                seen: Arc::new(RecentlySeen::new(Duration::from_mins(30), 4096)),
                 inbox: inbox.clone(),
                 scan_permits: Arc::new(tokio::sync::Semaphore::new(
                     config.yara.max_concurrent_scans.max(1),
@@ -675,7 +699,7 @@ impl Agent {
             let op_router_for_handler = op_router.clone();
             let events_for_handler = events_tx.clone();
             let qa_limit_for_handler = qa_rate_limit.clone();
-            let correlation_for_handler = correlation.clone();
+            let responders_for_handler = responders.clone();
             let handler: bowery_whisper::pool::InboundHandler = Arc::new(move |peer_fp, conn| {
                 let verifier = envelope_verifier.clone();
                 let operators = operators_for_handler.clone();
@@ -685,7 +709,7 @@ impl Agent {
                 let op_router = op_router_for_handler.clone();
                 let events = events_for_handler.clone();
                 let qa_rate_limit = qa_limit_for_handler.clone();
-                let correlation = correlation_for_handler.clone();
+                let responders = responders_for_handler.clone();
                 debug!(
                     peer = %peer_fp,
                     conn_id = conn.stable_id(),
@@ -701,7 +725,7 @@ impl Agent {
                     op_router,
                     events,
                     qa_rate_limit,
-                    correlation,
+                    responders,
                 ));
             });
             PeerConnections::with_handler(endpoint.clone(), handler)
@@ -717,7 +741,7 @@ impl Agent {
             op_router,
             events_tx.clone(),
             qa_rate_limit.clone(),
-            correlation.clone(),
+            responders.clone(),
             shutdown_rx.clone(),
         );
 
@@ -774,6 +798,31 @@ impl Agent {
             shutdown_rx.clone(),
         );
 
+        // Cross-host corroboration. Detectors raise claims; the engine
+        // picks an audience, asks, tallies, and alerts. Kind-agnostic:
+        // it is started once and every present and future detection
+        // shares it.
+        let (claims, corroboration_task) = if config.whisper.corroboration.enabled {
+            let (sink, task) = crate::corroboration::spawn(
+                crate::corroboration::CorroborationContext {
+                    pool: peer_connections.clone(),
+                    known_neighbors: known_neighbors.clone(),
+                    sealer: sealer.clone(),
+                    peers: mesh.peers_watcher(),
+                    inbox: inbox.clone(),
+                    originator_fp: fingerprint,
+                    backend_label: llm.name().to_string(),
+                    config: config.whisper.corroboration.clone(),
+                    events_tx: events_tx.clone(),
+                },
+                shutdown_rx.clone(),
+            );
+            (Some(sink), Some(task))
+        } else {
+            info!("cross-host corroboration disabled by config");
+            (None, None)
+        };
+
         // Operator file watches (inotify). `None` when there are no file
         // rules or inotify is unavailable — the channel then closes and the
         // pipeline just serves kernel events.
@@ -800,6 +849,8 @@ impl Agent {
             llm.name().to_string(),
             events_tx.clone(),
             eventlog_handle.clone(),
+            claims,
+            config.whisper.corroboration.clone(),
             shutdown_rx.clone(),
         );
 
@@ -843,6 +894,7 @@ impl Agent {
             heartbeat_task,
             pipeline_task,
             eventlog_tasks,
+            corroboration_task,
             revocations,
             file_monitor_task,
             role_publisher_task,
@@ -915,6 +967,11 @@ impl Agent {
         if let Some((writer, maintenance)) = self.eventlog_tasks.take() {
             let _ = writer.await;
             let _ = maintenance.await;
+        }
+        // After the pipeline: it holds the claim sink, and the engine
+        // exits when the last sender drops.
+        if let Some(task) = self.corroboration_task.take() {
+            let _ = task.await;
         }
         if let Some(task) = self.file_monitor_task.take() {
             let _ = task.await;
@@ -1169,7 +1226,7 @@ const MAX_REVOKE_TTL: u32 = 8;
 /// readable.
 pub(crate) struct YaraContext {
     pub store: Arc<YaraStore>,
-    pub seen: Arc<YaraSeen>,
+    pub seen: Arc<RecentlySeen>,
     pub inbox: Arc<AlertInbox>,
     /// Bounds concurrent scans: a fleet-wide push otherwise pins every
     /// core on every agent at once.
@@ -1284,7 +1341,7 @@ fn spawn_accept_task(
     op_router: Arc<OperatorCommandRouter>,
     events_tx: broadcast::Sender<AgentEvent>,
     qa_rate_limit: Arc<RateLimit>,
-    correlation: Option<CorrelationContext>,
+    responders: Arc<ResponderRegistry>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1304,10 +1361,10 @@ fn spawn_accept_task(
                             let op_router = op_router.clone();
                             let events = events_tx.clone();
                             let qa_rate_limit = qa_rate_limit.clone();
-                            let correlation = correlation.clone();
+                            let responders = responders.clone();
                             tokio::spawn(handle_connection(
                                 conn, verifier, operators, sealer, baseline, inbox, op_router,
-                                events, qa_rate_limit, correlation,
+                                events, qa_rate_limit, responders,
                             ));
                         }
                         Err(e) => warn!(error = %e, "accept failed"),
@@ -1341,7 +1398,7 @@ async fn handle_connection(
     op_router: Arc<OperatorCommandRouter>,
     events_tx: broadcast::Sender<AgentEvent>,
     qa_rate_limit: Arc<RateLimit>,
-    correlation: Option<CorrelationContext>,
+    responders: Arc<ResponderRegistry>,
 ) {
     let uni = tokio::spawn(handle_uni_stream_loop(
         conn.clone(),
@@ -1359,7 +1416,7 @@ async fn handle_connection(
         baseline,
         events_tx,
         qa_rate_limit,
-        correlation,
+        responders,
     ));
     let _ = tokio::join!(uni, bi);
 }
@@ -1449,7 +1506,7 @@ async fn handle_bi_stream_loop(
     baseline: Arc<Baseline>,
     events_tx: broadcast::Sender<AgentEvent>,
     qa_rate_limit: Arc<RateLimit>,
-    correlation: Option<CorrelationContext>,
+    responders: Arc<ResponderRegistry>,
 ) {
     loop {
         let Ok((bytes, reply)) = conn.accept_request().await else {
@@ -1468,21 +1525,25 @@ async fn handle_bi_stream_loop(
             nonce: env.nonce,
         });
         match env.payload.body {
-            Some(Body::ConnectionQuery(q)) => {
+            Some(Body::CorroborationQuery(q)) => {
                 // Same bucket as Q&A: this costs an indexed lookup, but
                 // it is still peer-triggered work.
                 if !qa_rate_limit.try_acquire(&env.sender) {
-                    warn!(sender = %env.sender, "correlation rate limit exceeded; shedding");
+                    warn!(sender = %env.sender, "corroboration rate limit exceeded; shedding");
                     continue;
                 }
-                let Some(ctx) = correlation.as_ref() else {
-                    debug!(sender = %env.sender, "no event log; cannot answer correlation query");
-                    continue;
+                // The dispatcher is kind-agnostic on purpose: adding a
+                // detection registers a handler and changes nothing
+                // here, so the rate limit, the shape checks, and the
+                // envelope crypto are inherited rather than
+                // reimplemented per kind.
+                let Some(answer) = responders.dispatch(env.sender, &q).await else {
+                    continue; // expired; the asker has already given up
                 };
-                if let Err(e) =
-                    respond_to_connection_query(reply, &sealer, ctx, env.sender, q).await
-                {
-                    warn!(sender = %env.sender, error = %e, "correlation response failed");
+                let outbound =
+                    sealer.seal_for(&env.sender, &WhisperPayload::corroboration_answer(answer));
+                if let Err(e) = reply.send(&outbound).await {
+                    warn!(sender = %env.sender, error = %e, "corroboration response failed");
                 }
             }
             Some(Body::Question(q)) => {
@@ -1499,27 +1560,11 @@ async fn handle_bi_stream_loop(
             other => {
                 warn!(
                     sender = %env.sender,
-                    body = ?other.as_ref().map(body_kind_name),
+                    body = ?other.as_ref().map(Body::kind_name),
                     "unexpected body on bi stream; ignoring"
                 );
             }
         }
-    }
-}
-
-fn body_kind_name(body: &Body) -> &'static str {
-    match body {
-        Body::Question(_) => "Question",
-        Body::Answer(_) => "Answer",
-        Body::Alert(_) => "Alert",
-        Body::OperatorCommand(_) => "OperatorCommand",
-        Body::OperatorResult(_) => "OperatorResult",
-        Body::Heartbeat(_) => "Heartbeat",
-        Body::NeighborOp(_) => "NeighborOp",
-        Body::Subscribe(_) => "Subscribe",
-        Body::Alerts(_) => "Alerts",
-        Body::ConnectionQuery(_) => "ConnectionQuery",
-        Body::ConnectionAnswer(_) => "ConnectionAnswer",
     }
 }
 
@@ -3043,6 +3088,8 @@ fn spawn_pipeline_task(
     backend_label: String,
     events_tx: broadcast::Sender<AgentEvent>,
     eventlog: Option<EventLogHandle>,
+    claims: Option<crate::corroboration::ClaimSink>,
+    corroboration: crate::config::CorroborationConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -3074,6 +3121,8 @@ fn spawn_pipeline_task(
                         &backend_label,
                         &events_tx,
                         eventlog.as_ref(),
+                        claims.as_ref(),
+                        &corroboration,
                         event,
                     ).await;
                 }
@@ -3095,6 +3144,8 @@ fn spawn_pipeline_task(
                                 &backend_label,
                                 &events_tx,
                                 eventlog.as_ref(),
+                                claims.as_ref(),
+                                &corroboration,
                                 event,
                             ).await;
                         }
@@ -3122,6 +3173,8 @@ async fn process_event(
     backend_label: &str,
     events_tx: &broadcast::Sender<AgentEvent>,
     eventlog: Option<&EventLogHandle>,
+    claims: Option<&crate::corroboration::ClaimSink>,
+    corroboration: &crate::config::CorroborationConfig,
     event: Event,
 ) {
     // Record first, analyse second. Every event goes to the log
@@ -3167,31 +3220,50 @@ async fn process_event(
             .await;
         }
         Event::NetworkConnect(conn) => {
-            process_network_connect(baseline, &conn).await;
+            process_network_connect(baseline, claims, corroboration, &conn).await;
         }
         // Recorded to the event log above; no analyzer path yet.
         Event::ProcessExit(_) | Event::FileOpen(_) => {}
     }
 }
 
-/// Fold an outbound connection into the host's destination baseline.
+/// Handle a connection event: fold outbound into the destination
+/// baseline, and raise a corroboration claim for inbound.
 ///
-/// This is the local half of a fleet-wide rarity signal. On its own,
-/// "this host has never contacted this endpoint" is weak — every
+/// The two directions carry different information and get different
+/// treatment, which is the point of measuring direction at all.
+///
+/// **Outbound** is the local half of a fleet-wide rarity signal. On its
+/// own, "this host has never contacted this endpoint" is weak — every
 /// legitimate first connection looks the same. It becomes strong when
 /// the same question is asked across the mesh, because an endpoint *no
 /// host in the fleet* has ever contacted is the shape of C2, exfil, or
 /// lateral movement to somewhere new.
-async fn process_network_connect(baseline: &Arc<Baseline>, conn: &bowery_events::NetworkConnect) {
-    // Only outbound connections are destinations *this host chose*. An
-    // inbound peer is somebody else's choice, and folding it in here
-    // would corrupt the rarity signal: a host that gets scanned would
-    // accumulate hundreds of "destinations" it never contacted, and
-    // every one of them would then look normal fleet-wide.
-    //
-    // The inbound record still reaches the event log, which is where the
-    // correlating question gets answered from.
+///
+/// **Inbound** is somebody else's choice, and this host cannot judge
+/// it. It never touches the destination baseline — a host that gets
+/// scanned would otherwise accumulate hundreds of "destinations" it
+/// never contacted, and every one of them would then look normal
+/// fleet-wide. Instead it becomes a claim: the host it came from is
+/// asked whether it made the connection, and a denial is the finding.
+async fn process_network_connect(
+    baseline: &Arc<Baseline>,
+    claims: Option<&crate::corroboration::ClaimSink>,
+    corroboration: &crate::config::CorroborationConfig,
+    conn: &bowery_events::NetworkConnect,
+) {
     if conn.direction != bowery_events::NetDirection::Outbound {
+        if let Some(claims) = claims
+            && let Some(claim) = crate::corroboration::net_inbound::claim_for(
+                conn,
+                corroboration.half_window,
+                corroboration.suspicion,
+            )
+        {
+            claims.raise(claim);
+        }
+        // The inbound record still reaches the event log, which is where
+        // the peer's own correlating question gets answered from.
         return;
     }
     let baseline = baseline.clone();
@@ -3988,104 +4060,6 @@ async fn run_peer_revoke_push(
         }
     };
     let _ = tokio::time::timeout(timeout, pump).await;
-}
-
-/// Everything the correlation responder needs.
-#[derive(Clone)]
-pub(crate) struct CorrelationContext {
-    pub log: Arc<bowery_eventlog::EventLog>,
-    /// Live mesh view, used to check that an asker is asking about its
-    /// own address.
-    pub peers: watch::Receiver<Vec<PeerInfo>>,
-}
-
-/// Longest history window a peer may ask us to search.
-///
-/// A correlation question is about one connection, so minutes is
-/// generous. The cap exists because the window is attacker-chosen: an
-/// unbounded one turns a cheap question into a full-history scan, and
-/// the whole point of the query is that answering it is cheap.
-const MAX_CORRELATION_WINDOW_MS: u64 = 10 * 60 * 1000;
-
-/// Answer "did you connect to me?" from our own outbound history.
-///
-/// The privacy property is enforced here, and it is the reason this
-/// message is safe to expose at all: **`dst_addr` must be an address of
-/// the asker**. A peer therefore only ever learns about traffic it was
-/// already party to — it observed the inbound side itself. Without the
-/// check this would be a primitive for enumerating any peer's outbound
-/// connections, one address at a time.
-async fn respond_to_connection_query(
-    reply: bowery_whisper::transport::Reply,
-    sealer: &Sealer,
-    ctx: &CorrelationContext,
-    asker: Fingerprint,
-    query: bowery_proto::ConnectionQuery,
-) -> Result<(), bowery_whisper::transport::Error> {
-    let mut answer = bowery_proto::ConnectionAnswer {
-        query_id: query.query_id.clone(),
-        ..Default::default()
-    };
-
-    // The asker's addresses, as *we* know them — never as they claim.
-    let asker_addr_matches = ctx
-        .peers
-        .borrow()
-        .iter()
-        .filter(|p| p.fingerprint == asker)
-        .any(|p| p.whisper_addr.ip().to_string() == query.dst_addr);
-
-    if !asker_addr_matches {
-        warn!(
-            asker = %asker,
-            dst_addr = %query.dst_addr,
-            "refusing correlation query: address is not the asker's own"
-        );
-        answer.refused = "dst_addr is not an address of the asker".to_string();
-        let outbound = sealer.seal_for(&asker, &WhisperPayload::connection_answer(answer));
-        return reply.send(&outbound).await;
-    }
-
-    let Ok(port) = u16::try_from(query.dst_port) else {
-        answer.refused = "dst_port out of range".to_string();
-        let outbound = sealer.seal_for(&asker, &WhisperPayload::connection_answer(answer));
-        return reply.send(&outbound).await;
-    };
-
-    // Clamp the window regardless of what was asked for.
-    let end = query.window_end_unix_ms;
-    let start = query
-        .window_start_unix_ms
-        .max(end.saturating_sub(MAX_CORRELATION_WINDOW_MS));
-
-    let log = ctx.log.clone();
-    let addr = query.dst_addr.clone();
-    let found =
-        tokio::task::spawn_blocking(move || log.find_outbound_to(&addr, port, start, end)).await;
-
-    match found {
-        Ok(Ok(Some(m))) => {
-            answer.matched = true;
-            answer.pid = m.pid;
-            answer.comm = m.comm;
-            answer.exe_path = m.exe_path;
-            answer.ts_unix_ms = m.ts_unix_ms;
-        }
-        Ok(Ok(None)) => {}
-        Ok(Err(e)) => {
-            warn!(error = %e, "correlation lookup failed");
-            // Distinct from "no record": an error here must not be read
-            // as evidence that the connection never happened.
-            answer.refused = format!("lookup failed: {e}");
-        }
-        Err(e) => {
-            warn!(error = %e, "correlation lookup task panicked");
-            answer.refused = "lookup task failed".to_string();
-        }
-    }
-
-    let outbound = sealer.seal_for(&asker, &WhisperPayload::connection_answer(answer));
-    reply.send(&outbound).await
 }
 
 #[cfg(test)]

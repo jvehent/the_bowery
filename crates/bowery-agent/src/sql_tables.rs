@@ -390,15 +390,17 @@ impl BoweryTable for BoweryAlertsTable {
                 confirmed         INTEGER,
                 peers_asked       INTEGER,
                 peers_unseen      INTEGER,
-                peers_seen        INTEGER
+                peers_seen        INTEGER,
+                peers_refused     INTEGER
             );",
         )?;
         let (alerts, _) = self.inbox.read_since(0, usize::MAX);
         let mut stmt = conn.prepare(
             "INSERT INTO bowery_alerts (originator_fp_hex, episode_id, exe_sha256_hex,
                                          exe_path, suspicion, rationale, ts_unix_ms, backend,
-                                         confirmed, peers_asked, peers_unseen, peers_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                         confirmed, peers_asked, peers_unseen, peers_seen,
+                                         peers_refused)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )?;
         for a in alerts {
             let originator_hex = hex_lower(&a.originator_fp);
@@ -419,6 +421,10 @@ impl BoweryTable for BoweryAlertsTable {
                 a.confirmation.map(|c| i64::from(c.peers_asked)),
                 a.confirmation.map(|c| i64::from(c.peers_unseen)),
                 a.confirmation.map(|c| i64::from(c.peers_seen)),
+                // Answered, but declined to say — a reachable peer that
+                // would not (or honestly could not) speak to it. Held
+                // apart from peers_seen/unseen because it is neither.
+                a.confirmation.map(|c| i64::from(c.peers_refused)),
             ])?;
         }
         Ok(())

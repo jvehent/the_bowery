@@ -484,6 +484,10 @@ pub fn quorum_verdict(peers: &[PeerSighting], quorum: usize) -> AlertConfirmatio
         peers_unseen: unseen,
         peers_seen: seen,
         peers_no_reply: no_reply,
+        // The binary-prevalence round has no refusal path: a peer
+        // either answers with a count or doesn't answer. Only the
+        // corroboration rounds can distinguish "I won't say".
+        peers_refused: 0,
         quorum: quorum_u32,
         // quorum == 0 disables confirmation outright rather than
         // confirming everything, which is what `>=` alone would do.

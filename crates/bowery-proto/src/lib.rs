@@ -71,7 +71,7 @@ pub const CANONICAL_SIG_DOMAIN: &[u8] = b"bowery/whisper/envelope/v2";
 /// The inner payload, with one variant per message type.
 #[derive(Clone, PartialEq, ProstMessage)]
 pub struct WhisperPayload {
-    #[prost(oneof = "Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
+    #[prost(oneof = "Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13")]
     pub body: Option<Body>,
 }
 
@@ -95,80 +95,201 @@ pub enum Body {
     Subscribe(Subscribe),
     #[prost(message, tag = "9")]
     Alerts(Alerts),
-    #[prost(message, tag = "10")]
-    ConnectionQuery(ConnectionQuery),
-    #[prost(message, tag = "11")]
-    ConnectionAnswer(ConnectionAnswer),
+    // Tags 10 and 11 are retired. They carried `ConnectionQuery` /
+    // `ConnectionAnswer`, the single-purpose ancestors of the
+    // corroboration pair below, and must never be reused: an agent
+    // still running that build would decode a tag-10 field as a
+    // connection query and answer it under the old rules. Skipping to
+    // 12/13 instead makes the mismatch a clean "unknown field →
+    // `body: None` → ignored" on both sides.
+    #[prost(message, tag = "12")]
+    CorroborationQuery(CorroborationQuery),
+    #[prost(message, tag = "13")]
+    CorroborationAnswer(CorroborationAnswer),
+}
+
+impl Body {
+    /// Stable discriminator name, for log lines and "unexpected body"
+    /// errors.
+    ///
+    /// It lives here, next to the variants, because it had drifted into
+    /// three identical copies across the transport, the Q&A module, and
+    /// the agent's stream dispatcher — each of which had to be found and
+    /// updated every time a variant was added.
+    #[must_use]
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Question(_) => "Question",
+            Self::Answer(_) => "Answer",
+            Self::Alert(_) => "Alert",
+            Self::OperatorCommand(_) => "OperatorCommand",
+            Self::OperatorResult(_) => "OperatorResult",
+            Self::Heartbeat(_) => "Heartbeat",
+            Self::NeighborOp(_) => "NeighborOp",
+            Self::Subscribe(_) => "Subscribe",
+            Self::Alerts(_) => "Alerts",
+            Self::CorroborationQuery(_) => "CorroborationQuery",
+            Self::CorroborationAnswer(_) => "CorroborationAnswer",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Variants
 // ---------------------------------------------------------------------------
 
-/// "Did you connect to me?" — the asker half of cross-host correlation.
+/// One key/value pair. The unit of a [`CorroborationQuery`]'s subject
+/// and a [`CorroborationAnswer`]'s evidence.
 ///
-/// Lateral movement is two events on two machines, and neither is
-/// remarkable alone: an inbound SSH is normal, an outbound SSH is
-/// normal. What is not normal is an inbound connection that *no host in
-/// the fleet admits making*. Only the two endpoints together can see
-/// that, and only the source knows which process did it.
+/// Untyped on purpose. The whole point of the corroboration messages is
+/// that the transport, the round engine, and the alert path never learn
+/// what any particular detection is *about* — only the handler
+/// registered for a `kind` interprets these, so adding a new kind of
+/// suspicion touches no shared code and needs no wire change.
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct Attribute {
+    #[prost(string, tag = "1")]
+    pub key: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
+}
+
+impl Attribute {
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+}
+
+/// Look a key up in a subject/evidence list. First match wins;
+/// duplicates are the sender's problem, not the reader's.
+#[must_use]
+pub fn attribute<'a>(attrs: &'a [Attribute], key: &str) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find(|a| a.key == key)
+        .map(|a| a.value.as_str())
+}
+
+/// What a peer says about an observation someone else made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Corroboration {
+    /// Never sent deliberately. It is the proto3 default, so it is what
+    /// a garbled, truncated, or older-build answer decodes to — and the
+    /// asker must treat it exactly like `Refused`. Reading a zero as a
+    /// denial would let a decoding bug anywhere in the fleet
+    /// manufacture alerts.
+    Unspecified = 0,
+    /// "Yes, that was me." Any evidence the responder can attach — the
+    /// process behind it, when it happened — rides in `evidence`.
+    Corroborated = 1,
+    /// "I looked, and I have no record of it." The alarming answer, and
+    /// the only one that counts toward a quorum.
+    Denied = 2,
+    /// "I will not answer": out of policy, or the local data needed to
+    /// answer honestly is unavailable. Deliberately distinct from
+    /// `Denied`, because "I won't say" and "it didn't happen" mean
+    /// opposite things about the asker's suspicion.
+    Refused = 3,
+}
+
+/// "Can anyone corroborate what I just saw?" — the asker half of a
+/// cross-host corroboration round.
 ///
-/// # The privacy constraint
+/// The observations worth whispering about share a shape: they are
+/// unremarkable on the host that sees them and only become evidence
+/// when a second host agrees or disagrees. Lateral movement is the
+/// motivating example — an inbound SSH is normal, an outbound SSH is
+/// normal, but an inbound connection that *no host in the fleet admits
+/// making* is not — and it is deliberately not the only one this
+/// message can carry.
 ///
-/// `dst_addr` must be an address of the **asker**, and the responder
-/// enforces that against its own view of the asker's address. The
-/// property this buys is worth stating precisely: a peer can only learn
-/// about traffic it was already party to, because it observed the
-/// inbound side itself. Without the check, this message would be a
-/// primitive for enumerating any peer's outbound connections.
-#[derive(Clone, PartialEq, ProstMessage)]
-pub struct ConnectionQuery {
+/// # Kinds, and why the wire stays dumb
+///
+/// `kind` selects the handler on both ends. Everything specific to a
+/// detection lives in `subject`, which this layer never inspects. A new
+/// kind of suspicion is a new handler registration, not a proto change,
+/// so the security-critical parts — envelope signing, recipient
+/// binding, replay and skew gating, rate limiting, the quorum rule —
+/// are written once and inherited rather than reimplemented per
+/// detection.
+///
+/// # The privacy constraint is per-kind, and is not optional
+///
+/// A generic "ask a peer about its history" message is a generic
+/// enumeration primitive unless every handler constrains what may be
+/// asked. Each responder is required to enforce a rule that limits a
+/// query to facts the asker already knows — the connection handler, for
+/// instance, requires the named address to be the **asker's own**, as
+/// the responder's own view of the mesh reports it, so a peer only ever
+/// learns about traffic it was already party to.
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct CorroborationQuery {
     /// Correlates the answer with the question. Echoed back verbatim.
     #[prost(string, tag = "1")]
     pub query_id: String,
-    /// The address that was connected to — must be the asker's own.
+    /// Handler selector, e.g. `net.inbound_connect`. An unknown kind is
+    /// refused, never guessed at.
     #[prost(string, tag = "2")]
-    pub dst_addr: String,
-    /// The port that was connected to (the asker's listening port).
-    #[prost(uint32, tag = "3")]
-    pub dst_port: u32,
-    /// Inclusive search window. Bounded by the responder regardless of
+    pub kind: String,
+    /// Absolute deadline (ms since unix epoch), matching `Question`'s
+    /// encoding. Past it the responder drops the query rather than
+    /// answering something the asker can no longer correlate.
+    #[prost(uint64, tag = "3")]
+    pub deadline_unix_ms: u64,
+    /// Inclusive search window. Clamped by the responder regardless of
     /// what is asked for, so a query cannot become a full-history scan.
     #[prost(uint64, tag = "4")]
     pub window_start_unix_ms: u64,
     #[prost(uint64, tag = "5")]
     pub window_end_unix_ms: u64,
+    /// The observation itself, interpreted only by the `kind`'s handler.
+    #[prost(message, repeated, tag = "6")]
+    pub subject: Vec<Attribute>,
 }
 
-/// The responder half of [`ConnectionQuery`].
+/// The responder half of [`CorroborationQuery`].
 ///
-/// `matched == false` is the interesting answer: the peer whose address
-/// the connection came from has no record of making it. That means
-/// either its agent is not seeing what it should — blind, tampered with,
-/// or newly compromised — or the source address was spoofed. Both are
-/// worth waking someone for, and neither is visible from one host.
-#[derive(Clone, PartialEq, ProstMessage)]
-pub struct ConnectionAnswer {
+/// [`Corroboration::Denied`] is the interesting answer: the peer that
+/// should know about this has no record of it. For a connection that
+/// means either its agent is not seeing what it should — blind,
+/// tampered with, or newly compromised — or the source address was
+/// spoofed. Both are worth waking someone for, and neither is visible
+/// from one host.
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct CorroborationAnswer {
     #[prost(string, tag = "1")]
     pub query_id: String,
-    #[prost(bool, tag = "2")]
-    pub matched: bool,
-    /// Populated only when `matched`. This is the attribution the
-    /// accepting host can never derive on its own.
-    #[prost(uint32, tag = "3")]
-    pub pid: u32,
-    #[prost(string, tag = "4")]
-    pub comm: String,
+    /// Echoed from the query. The asker checks it: an answer about a
+    /// different kind than was asked is discarded rather than tallied.
+    #[prost(string, tag = "2")]
+    pub kind: String,
+    #[prost(enumeration = "Corroboration", tag = "3")]
+    pub outcome: i32,
+    /// Populated on [`Corroboration::Corroborated`]. For a connection
+    /// this is the process attribution the accepting host can never
+    /// derive on its own.
+    #[prost(message, repeated, tag = "4")]
+    pub evidence: Vec<Attribute>,
+    /// Why, when the outcome is [`Corroboration::Refused`]. Operator
+    /// text only — the asker branches on `outcome`, never on this.
     #[prost(string, tag = "5")]
-    pub exe_path: String,
-    #[prost(uint64, tag = "6")]
-    pub ts_unix_ms: u64,
-    /// Set when the responder declined rather than searched — an
-    /// out-of-policy `dst_addr`, or no event log to consult. Kept
-    /// distinct from `matched == false` because "I won't answer" and "I
-    /// have no record" mean opposite things about the asker's alert.
-    #[prost(string, tag = "7")]
-    pub refused: String,
+    pub reason: String,
+}
+
+impl CorroborationAnswer {
+    /// Decoded outcome, with anything unrecognised folded into
+    /// [`Corroboration::Unspecified`] — which every caller must already
+    /// handle as "told me nothing", so a future peer sending an outcome
+    /// this build has never heard of degrades to silence rather than to
+    /// a denial.
+    #[must_use]
+    pub fn corroboration(&self) -> Corroboration {
+        Corroboration::try_from(self.outcome).unwrap_or(Corroboration::Unspecified)
+    }
 }
 
 /// Liveness ping. Sent at a configurable interval between paired peers.
@@ -321,26 +442,31 @@ pub struct Alert {
     pub confirmation: Option<AlertConfirmation>,
 }
 
-/// Outcome of asking role-similar peers about an episode's binary.
+/// What the neighbourhood said when asked about an alert.
 ///
-/// Polarity matters and is easy to get backwards: a peer answering
-/// `seen_count > 0` means "I have this binary in my baseline too", which
-/// argues the binary is a normal fleet artifact — *less* suspicious. So
-/// confirmation is driven by `peers_unseen`: a quorum of neighbours that
-/// have **never** seen it makes the binary anomalous for this fleet.
-/// `peers_seen` is reported alongside rather than folded in, so an
-/// operator can tell "nobody has this" from "everybody has this" instead
-/// of being handed a single opaque number.
+/// One shape serves both whisper rounds, because they ask the same
+/// question in different words: *does anyone else have a record of
+/// this?* For a binary that is "have you seen this executable"; for a
+/// connection it is "did you make this connection". In both, a peer
+/// answering **no** is the evidence that confirms.
+///
+/// Polarity matters and is easy to get backwards. A peer that *does*
+/// have a record argues the observation is ordinary — a binary the
+/// fleet runs everywhere, a connection somebody really did make — so it
+/// counts *against* the alert. Confirmation is therefore driven by
+/// `peers_unseen`. The counts are reported side by side rather than
+/// folded into one number so an operator can tell "nobody has this"
+/// from "everybody has this".
 #[derive(Clone, Copy, PartialEq, Eq, ProstMessage)]
 pub struct AlertConfirmation {
-    /// Peers actually dialled this round (after role-similarity ranking
-    /// and the bloom pre-filter).
+    /// Peers actually asked this round.
     #[prost(uint32, tag = "1")]
     pub peers_asked: u32,
-    /// Replied "never seen it" — the evidence that confirms.
+    /// Replied "I have no record of it" — the evidence that confirms.
     #[prost(uint32, tag = "2")]
     pub peers_unseen: u32,
-    /// Replied "seen it", with a count. Argues the binary is common.
+    /// Replied "I do have a record of it". Argues the observation is
+    /// ordinary.
     #[prost(uint32, tag = "3")]
     pub peers_seen: u32,
     /// Timed out or failed to dial. Never counts toward a quorum —
@@ -354,6 +480,14 @@ pub struct AlertConfirmation {
     /// `peers_unseen >= quorum`.
     #[prost(bool, tag = "6")]
     pub confirmed: bool,
+    /// Answered, but declined to say — the query was out of policy for
+    /// them, or they lacked the local data to answer honestly. Held
+    /// apart from `peers_no_reply` because a refusal is a *reachable,
+    /// working* peer choosing not to answer, which is worth seeing; it
+    /// is kept out of `peers_unseen` because "I won't say" is not "it
+    /// didn't happen".
+    #[prost(uint32, tag = "7")]
+    pub peers_refused: u32,
 }
 
 /// Operator-issued request to drain the agent's local inbox. Sent on a
@@ -898,16 +1032,16 @@ impl WhisperPayload {
     }
 
     #[must_use]
-    pub fn connection_query(q: ConnectionQuery) -> Self {
+    pub fn corroboration_query(q: CorroborationQuery) -> Self {
         Self {
-            body: Some(Body::ConnectionQuery(q)),
+            body: Some(Body::CorroborationQuery(q)),
         }
     }
 
     #[must_use]
-    pub fn connection_answer(a: ConnectionAnswer) -> Self {
+    pub fn corroboration_answer(a: CorroborationAnswer) -> Self {
         Self {
-            body: Some(Body::ConnectionAnswer(a)),
+            body: Some(Body::CorroborationAnswer(a)),
         }
     }
 
@@ -1173,6 +1307,7 @@ mod tests {
                 peers_unseen: 4,
                 peers_seen: 1,
                 peers_no_reply: 0,
+                peers_refused: 0,
                 quorum: 2,
                 confirmed: true,
             }),

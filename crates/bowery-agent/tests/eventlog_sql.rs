@@ -59,6 +59,10 @@ fn build_config(dir: &Path, eventlog_path: PathBuf) -> Config {
                 max_concurrent_rounds: 1,
             },
             bind_addr: "127.0.0.1:0".parse().unwrap(),
+            // Left at the production default so every existing
+            // two-agent fixture also exercises the corroboration
+            // engine's startup and shutdown paths.
+            corroboration: bowery_agent::config::CorroborationConfig::default(),
         },
         heartbeat: HeartbeatConfig {
             interval: Duration::from_secs(30),

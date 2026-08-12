@@ -491,7 +491,9 @@ Being straight about this matters more than looking finished.
 **Built and running** on a live fleet (an Ubuntu host plus Raspberry Pis over
 Tailscale): eBPF process monitoring with LSM-based exec blocking; local baseline
 and rule scoring; the whisper Q&A protocol with role-similarity peer selection
-and quorum-confirmed alerts; the append-only event log; the native SQL surface
+and quorum-confirmed alerts; cross-host corroboration, where an agent asks the
+host at the other end of a connection to account for it; the append-only event
+log; the native SQL surface
 with cross-fleet fan-out; operator-defined file and process monitoring; YARA
 rule distribution that propagates across the mesh; signed hash-chained audit
 logging; signed mesh enrollment and revocation with propagation; the operator
@@ -504,16 +506,17 @@ CLI and terminal console; a Pi/Tailscale deploy kit with hardened systemd units.
    product. Persistence mechanisms, privilege escalation, credential access,
    defense evasion, and above all lateral movement are unwritten — as is a
    coverage map against a framework like ATT&CK.
-2. **Cross-host correlation.** This is the capability the architecture exists
-   for and the one that isn't built yet. Lateral movement is invisible on one
-   host and obvious across two: agent B sees an inbound SSH and whispers *"did
-   anyone just open an outbound SSH to me?"*, and agent A confirms. No per-host
-   EDR can make that call. Nothing else in this list is as differentiating.
-3. **Rarity as a general primitive.** The whisper round answers exactly one
-   question today (have you seen this binary?). The same machinery generalizes
-   to parent→child process pairs, listening ports, and outbound destinations.
-   The process-lineage table is already populated on every exec — and read by
-   nothing.
+2. **Detections built on the corroboration substrate.** The substrate itself
+   now exists — an agent that sees an inbound connection asks the host it came
+   from *"did you connect to me?"*, and a denial raises an alert carrying the
+   denial as evidence. It is deliberately generic: a `kind` string and opaque
+   attributes on the wire, so a new question is a handler registration rather
+   than a protocol change. But only one kind is registered. Destination rarity,
+   parent→child process pairs, and listening ports are the obvious next ones
+   and need no new machinery.
+3. **Rarity as a general primitive.** The prevalence round answers exactly one
+   question today (have you seen this binary?). The process-lineage table is
+   already populated on every exec — and read by nothing.
 4. **Coverage telemetry.** The event log reports whether it's recording. The
    eBPF layer doesn't yet report whether its probes are still attached or
    whether the kernel ring buffer is dropping.
@@ -545,15 +548,19 @@ agents can talk to each other:
 - **Rarity as a detection primitive**, computed across a live fleet without
   central collection, and without any host revealing what it runs.
 - **Distributed detections** that no single host could make, where the evidence
-  is split across two machines and the correlation happens between them.
+  is split across two machines and the correlation happens between them. The
+  first of these now runs; what it taught us is that the hard part isn't
+  asking, it's knowing when a peer's *"no"* means "it didn't happen" rather
+  than "I wasn't watching".
 - **Herd immunity** — one agent confirms a bad artifact and the fleet blocks it
   within seconds, with no console round trip.
 - **Tamper-evidence through mutual witness**, where the property that makes
   logs trustworthy is that your neighbors remember what you told them.
 
 The substrate for all of that — identity, signed transport, a gossip mesh, peer
-selection, a query language, a local history — is built. What remains is
-teaching the neighborhood what to talk about.
+selection, a query language, a local history, and now a generic way to ask the
+neighborhood to corroborate an observation — is built. What remains is teaching
+the neighborhood what to talk about.
 
 ---
 

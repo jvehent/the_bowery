@@ -519,6 +519,7 @@ dependencies = [
  "bowery-crypto",
  "bowery-proto",
  "ed25519-dalek",
+ "hex",
  "proptest",
  "prost",
  "quinn",

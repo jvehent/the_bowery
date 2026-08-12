@@ -220,12 +220,13 @@ fn print_human(alert: &Alert) {
             "not confirmed"
         };
         println!(
-            "    mesh: {verdict} — {unseen}/{asked} peers never saw this \
-             (quorum {q}; {seen} have seen it, {nr} did not reply)",
+            "    mesh: {verdict} — {unseen}/{asked} peers have no record of this \
+             (quorum {q}; {seen} do, {rf} declined, {nr} did not reply)",
             unseen = c.peers_unseen,
             asked = c.peers_asked,
             q = c.quorum,
             seen = c.peers_seen,
+            rf = c.peers_refused,
             nr = c.peers_no_reply,
         );
     }
@@ -273,13 +274,15 @@ fn confirmation_to_json(c: Option<&bowery_proto::AlertConfirmation>) -> String {
         None => "null".to_string(),
         Some(c) => format!(
             "{{\"confirmed\":{conf},\"quorum\":{q},\"peers_asked\":{asked},\
-             \"peers_unseen\":{unseen},\"peers_seen\":{seen},\"peers_no_reply\":{nr}}}",
+             \"peers_unseen\":{unseen},\"peers_seen\":{seen},\"peers_no_reply\":{nr},\
+             \"peers_refused\":{rf}}}",
             conf = c.confirmed,
             q = c.quorum,
             asked = c.peers_asked,
             unseen = c.peers_unseen,
             seen = c.peers_seen,
             nr = c.peers_no_reply,
+            rf = c.peers_refused,
         ),
     }
 }
@@ -342,6 +345,7 @@ mod json_tests {
             peers_unseen: 4,
             peers_seen: 1,
             peers_no_reply: 0,
+            peers_refused: 0,
             quorum: 2,
             confirmed: true,
         });

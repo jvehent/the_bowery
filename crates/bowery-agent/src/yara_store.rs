@@ -242,78 +242,6 @@ impl YaraStore {
     }
 }
 
-/// Bounded record of push requests this agent has already handled, keyed
-/// by `(operator_fp, request_id)`.
-///
-/// This is the loop-prevention guarantee for mesh propagation: a cyclic
-/// pinned-peer graph (A→B→C→A, or simply two peers pinned to each other)
-/// would otherwise bounce a push forever. TTL bounds the blast radius
-/// structurally; this bounds it *exactly*, so each agent handles a given
-/// push once no matter how many paths reach it.
-///
-/// Entries expire so a long-lived agent doesn't accumulate ids forever,
-/// and the map is capped so a hostile flood of distinct request ids can't
-/// grow it without bound (oldest entries are evicted first).
-#[derive(Debug)]
-pub struct YaraSeen {
-    inner: std::sync::Mutex<SeenInner>,
-    ttl: std::time::Duration,
-    max_entries: usize,
-}
-
-#[derive(Debug)]
-struct SeenInner {
-    /// key → when it was first seen.
-    seen: HashMap<(String, String), std::time::Instant>,
-}
-
-impl YaraSeen {
-    pub fn new(ttl: std::time::Duration, max_entries: usize) -> Self {
-        Self {
-            inner: std::sync::Mutex::new(SeenInner {
-                seen: HashMap::new(),
-            }),
-            ttl,
-            max_entries,
-        }
-    }
-
-    /// Record `(operator_fp, request_id)` and report whether it is new.
-    /// `false` means "already handled — drop this push", which is what
-    /// terminates propagation loops.
-    pub fn check_and_record(&self, operator_fp: &str, request_id: &str) -> bool {
-        let now = std::time::Instant::now();
-        let mut guard = self.inner.lock().expect("yara seen poisoned");
-        // Drop expired entries first so a steady trickle of pushes keeps
-        // the map small without a background task.
-        guard
-            .seen
-            .retain(|_, first| now.duration_since(*first) < self.ttl);
-        if guard.seen.len() >= self.max_entries {
-            // Evict the oldest so a flood of distinct ids can't grow the
-            // map without bound.
-            if let Some(oldest) = guard
-                .seen
-                .iter()
-                .min_by_key(|(_, first)| **first)
-                .map(|(k, _)| k.clone())
-            {
-                guard.seen.remove(&oldest);
-            }
-        }
-        let key = (operator_fp.to_string(), request_id.to_string());
-        guard.seen.insert(key, now).is_none()
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.lock().expect("yara seen poisoned").seen.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
 /// Write `bytes` to `path` at 0600 via temp + atomic rename, so a crash
 /// mid-write can't leave a truncated rule or index behind.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -429,41 +357,6 @@ mod tests {
         let id = YaraStore::rule_id_for(bytes);
         let err = s.store(&id, bytes, "op", "r", 1).unwrap_err();
         assert!(matches!(err, YaraStoreError::TooLarge { .. }), "{err}");
-    }
-
-    #[test]
-    fn seen_set_drops_repeats_and_expires() {
-        let seen = YaraSeen::new(std::time::Duration::from_mins(1), 8);
-        // First delivery is handled; a second by another mesh path isn't.
-        assert!(seen.check_and_record("op", "req-1"), "first is new");
-        assert!(!seen.check_and_record("op", "req-1"), "repeat is dropped");
-        // A different request from the same operator is still new.
-        assert!(seen.check_and_record("op", "req-2"));
-        // Same request id from a *different* operator is a distinct push.
-        assert!(seen.check_and_record("op2", "req-1"));
-    }
-
-    #[test]
-    fn seen_set_evicts_when_full() {
-        // A flood of distinct request ids must not grow the map without
-        // bound.
-        let seen = YaraSeen::new(std::time::Duration::from_mins(1), 4);
-        for i in 0..50 {
-            seen.check_and_record("op", &format!("req-{i}"));
-        }
-        assert!(seen.len() <= 4, "capped, got {}", seen.len());
-    }
-
-    #[test]
-    fn seen_set_forgets_after_ttl() {
-        let seen = YaraSeen::new(std::time::Duration::from_millis(50), 8);
-        assert!(seen.check_and_record("op", "req"));
-        std::thread::sleep(std::time::Duration::from_millis(80));
-        // After the TTL an operator can legitimately re-push the same id.
-        assert!(
-            seen.check_and_record("op", "req"),
-            "expired entry is new again"
-        );
     }
 
     #[test]

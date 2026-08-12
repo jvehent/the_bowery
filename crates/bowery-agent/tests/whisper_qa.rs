@@ -61,6 +61,10 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>, quorum: u
                 max_concurrent_rounds: 4,
             },
             bind_addr: loopback_ephemeral(),
+            // Left at the production default so every existing
+            // two-agent fixture also exercises the corroboration
+            // engine's startup and shutdown paths.
+            corroboration: bowery_agent::config::CorroborationConfig::default(),
         },
         heartbeat: HeartbeatConfig {
             interval: Duration::from_millis(200),

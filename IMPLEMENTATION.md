@@ -2614,6 +2614,152 @@ few-shot examples) — same source of truth, three audiences.
 
 ---
 
+## 25. Cross-host corroboration
+
+[`crates/bowery-whisper/src/corroborate.rs`](crates/bowery-whisper/src/corroborate.rs)
+(transport) +
+[`crates/bowery-agent/src/corroboration/`](crates/bowery-agent/src/corroboration/mod.rs)
+(engine, registry, kinds).
+
+A whole class of detections has the same shape: the host that sees the
+event cannot tell whether it is benign, and exactly one other party can.
+An inbound connection is the motivating case — normal from here, normal
+from there, alarming only if the host it came from has no record of
+making it.
+
+The temptation is to build that one detection. We built the round
+instead, and made the detection data.
+
+### 25.1 Why generic
+
+Written per-detection, each one grows its own message pair, its own
+timeout handling, its own tally, its own idea of what silence means. The
+parts that rot are the security-relevant ones: one ends up without a rate
+limit, or counting a timeout as agreement, or letting a peer answer a
+question it was never asked.
+
+So the wire carries a `kind` string and an opaque list of key/value
+attributes, and nothing below the handler ever interprets them:
+
+```
+CorroborationQuery  { query_id, kind, deadline_unix_ms, window, subject: [Attribute] }
+CorroborationAnswer { query_id, kind, outcome, evidence: [Attribute], reason }
+
+enum Corroboration { Unspecified=0, Corroborated=1, Denied=2, Refused=3 }
+```
+
+`Unspecified` is the proto3 default, so it is what a garbled or
+older-build answer decodes to — and it is treated exactly like `Refused`.
+Reading a zero as a denial would let a decoding bug anywhere in the fleet
+manufacture alerts.
+
+These replaced `ConnectionQuery`/`ConnectionAnswer` on tags 10/11. **Tags
+10 and 11 are retired and must never be reused**: an agent still running
+the old build would decode a tag-10 field as a connection query and answer
+it under the old rules. Skipping to 12/13 makes the mismatch a clean
+"unknown field → `body: None` → ignored" on both sides.
+
+### 25.2 The round
+
+```
+detector ──raise(Claim)──► engine ──► audience ──► ask each peer
+                              │                        │
+                              └──── Tally ◄────────────┘
+                                     │
+                          Rule::confirms(&tally)
+                                     │
+                                 Alert (quorum-backed)
+```
+
+A `Claim` says what was observed (`kind` + attributes), who could know
+(`Audience`), and what would make it alarming (`Rule`). The engine owns
+everything else: dedup, the concurrency ceiling, peer resolution,
+sealing, timeouts, the tally, and the alert.
+
+`Audience` has two primitives. `PeerAtAddress` asks whoever the *live
+mesh view* says owns an address — never anything the observation itself
+asserts, and never an unpinned peer. `Neighbourhood { limit }` asks up to
+N pinned peers, for claims with no particular counterparty.
+
+`Tally` has four buckets, not two, and that is the point:
+
+| bucket | meaning | counts toward quorum |
+| --- | --- | --- |
+| `corroborated` | "yes, that was me" | no — it *clears* the claim |
+| `denied` | "I looked; I have no record" | **yes — the finding** |
+| `refused` | "I won't / can't say" | no |
+| `no_reply` | timed out, failed to dial | no |
+
+Collapsing `refused` or `no_reply` into `denied` is the mistake the type
+exists to prevent. Treating silence as agreement would let an attacker
+manufacture alerts by taking peers offline, and would make a partitioned
+mesh alert about everything it sees.
+
+### 25.3 Two properties that make the alert trustworthy
+
+**The responder decides what it is willing to be asked.** A generic "ask
+a peer about its history" primitive is a generic *enumeration* primitive
+unless every handler constrains queries to facts the asker already knows.
+`net.inbound_connect` requires the named address to be the **asker's
+own**, as this host's mesh view reports it — so a peer only ever learns
+about traffic it was already party to, having observed the other half
+itself. The trait doc states this as a contract rather than leaving each
+implementation to remember it.
+
+**A denial is only sent after actually looking.** `EventLog::covers_since`
+gates it: if the log's oldest row is newer than the query window, the
+honest answer is "I would not have recorded that either way", and the
+handler refuses. Without it, every freshly-installed agent denies every
+connection made before it was installed, and every agent whose retention
+trimmed the window denies whatever fell off the end. Those false
+accusations look exactly like the real finding and would vastly
+outnumber it.
+
+### 25.4 Adding a kind
+
+Two functions and one registration. Nothing shared changes — not the wire
+format, not the dispatcher, not the rate limiter, not the alert path:
+
+1. **A claim builder** — `fn claim_for(observation) -> Option<Claim>`,
+   returning `None` when there is nothing worth asking.
+2. **A responder** — `impl CorroborationResponder`, which applies its own
+   policy check and consults local state. Refuse rather than deny
+   whenever the honest answer is "I can't say".
+3. **Register it** in `Agent::start_with_llm`'s `ResponderRegistry`, and
+   call the builder from wherever the observation arrives.
+
+An unregistered kind is refused, not guessed at, so a rolling upgrade
+where one host knows a kind and another doesn't degrades to "that peer
+declined" rather than to a false finding.
+
+### 25.5 Operator surface
+
+The round reuses `AlertConfirmation` rather than adding a parallel
+concept, because both whisper rounds ask the same question in different
+words — *does anyone else have a record of this?* — and in both, a peer
+answering **no** is what confirms. `peers_refused` (tag 7) was added for
+the outcome the binary-prevalence round has no way to express.
+
+The alert therefore appears in the same inbox, the same `bowery_alerts`
+view, the same console badge, and the same CLI output as every other
+confirmed alert.
+
+### 25.6 What's deferred
+
+- **The claim is raised, then forgotten.** A corroborated answer carries
+  process attribution the observing host could never derive on its own;
+  today it is logged and broadcast on `AgentEvent::CorroborationRound`,
+  but not written back into the event log where an investigation would
+  find it later.
+- **Only one kind is registered.** Destination rarity
+  (`Audience::Neighbourhood` over the `net_destinations` table) is the
+  obvious next one, and needs no new machinery.
+- **`deny_quorum` is necessarily 1 for counterparty claims** — one host
+  made the connection, so only that host can deny it. The refusal path
+  carries the weight a larger quorum would elsewhere.
+
+---
+
 This document is meant to be a living reference. When a phase lands
 that introduces a new pattern, the owning section gets a new
 sub-heading; when something we said we'd do here turns out to be

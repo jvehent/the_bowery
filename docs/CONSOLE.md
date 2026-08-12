@@ -220,14 +220,23 @@ Columns: `time (UTC)` (RFC3339, millisecond precision), `agent`,
 `conf`, `susp`, `episode`, `exe`.
 
 `conf` is the neighbourhood verdict: `✓4/5` means four of the five
-peers asked have **never seen** this binary — the rarity signal that
-confirms an alert — and a confirmed row is drawn red + bold so it is
-found by scanning rather than by reading. A blank cell means no
-whisper round ran; a check-less `1/5` means the round ran and did not
-reach quorum. The detail overlay breaks out all four counts, including
-peers that *have* seen the binary (which argues it's a normal fleet
-artifact) and peers that never replied (which count for nothing —
-silence isn't evidence).
+peers asked have **no record** of the thing — the signal that confirms
+an alert — and a confirmed row is drawn red + bold so it is found by
+scanning rather than by reading. A blank cell means no whisper round
+ran; a check-less `1/5` means the round ran and did not reach quorum.
+
+One badge serves both rounds, because they ask the same question in
+different words. For a binary it is "have you seen this executable";
+for a connection it is "did you make this connection". In both, a peer
+answering **no** is what confirms.
+
+The detail overlay breaks out every bucket, and the distinctions
+matter: peers that *do* have a record (which argues the observation is
+ordinary), peers that **declined** to answer, and peers that never
+replied. Neither of the last two counts toward a quorum — a peer that
+won't say and a peer that can't be reached both told you nothing, and
+treating either as agreement would let an offline neighbourhood
+manufacture alerts.
 
 An episode that produces several alerts — the original, an LLM-refined
 one, a quorum-confirmed one — collapses to a single row showing the

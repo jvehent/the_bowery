@@ -367,6 +367,44 @@ impl EventLog {
         })
     }
 
+    /// Does this log's history reach back to `ts_unix_ms`?
+    ///
+    /// This is the guard that separates *"I did not make that
+    /// connection"* from *"I would not have recorded it either way"* —
+    /// two answers a correlating peer must never confuse, because the
+    /// first raises an alert and the second is worthless.
+    ///
+    /// Without it, every freshly-installed agent denies every
+    /// connection made before it was installed, and every agent whose
+    /// retention has trimmed the window denies whatever fell off the
+    /// end. Those denials are indistinguishable from the real finding,
+    /// and there would be enough of them to teach an operator to ignore
+    /// the alert entirely.
+    ///
+    /// The oldest row of *any* kind is the proxy, not the oldest
+    /// connect row: a log holding an exec from before the window proves
+    /// the recorder was alive then, whereas a host can legitimately go
+    /// hours without an outbound connection. It cannot detect a sensor
+    /// that was running but blind to connects specifically (the eBPF
+    /// version-skew failure) — nothing in the log can.
+    ///
+    /// Cheap: `MIN` over the `ts_unix_ms` index, unlike [`Self::stats`],
+    /// which counts rows.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `SQLite` failures. An empty log returns `false` — it
+    /// covers nothing.
+    pub fn covers_since(&self, ts_unix_ms: u64) -> Result<bool> {
+        let conn = self.inner.lock().expect("event log mutex poisoned");
+        let oldest: Option<i64> =
+            conn.query_row("SELECT MIN(ts_unix_ms) FROM events", [], |r| r.get(0))?;
+        Ok(match oldest {
+            Some(oldest) => u64::try_from(oldest).unwrap_or(0) <= ts_unix_ms,
+            None => false,
+        })
+    }
+
     /// Find an outbound connection this host made to `addr:port` within
     /// a time window.
     ///

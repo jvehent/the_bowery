@@ -9,10 +9,12 @@
 pub mod agent;
 mod bloom_publisher;
 pub mod config;
+pub mod corroboration;
 mod eventlog_writer;
 pub mod inbox;
 pub mod monitor;
 pub mod response_bpf;
+pub mod seen;
 pub mod sql_tables;
 pub mod whisper_qa;
 pub mod yara_store;

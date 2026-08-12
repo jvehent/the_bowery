@@ -370,6 +370,28 @@ quorum         = 2          # peers that must report NEVER SEEN to confirm
                             # an alert (0 disables confirmation)
 max_concurrent_rounds = 4   # Q&A rounds in flight; extras are shed
 
+# Cross-host corroboration — asking the mesh to account for something
+# this host saw but cannot judge alone. Today that means "did you
+# connect to me?"; the mechanism is generic and gains new questions by
+# registering a handler, not by changing these knobs.
+[whisper.corroboration]
+enabled        = true
+timeout        = "5s"       # per-peer deadline for one query
+half_window    = "5m"       # how far either side of the observation the
+                            # peer searches. Wide on purpose: too NARROW
+                            # produces false denials (the peer really did
+                            # connect, but its clock disagrees), and a
+                            # false denial is an accusation. Too wide only
+                            # suppresses an alert. Capped at 10m total by
+                            # the responder regardless.
+dedup_window   = "5m"       # same claim isn't asked twice inside this.
+                            # Decides whether a port scan costs one round
+                            # or one per probe.
+dedup_entries  = 4096
+queue_capacity = 256        # claims buffered; over-full sheds, never blocks
+max_concurrent_rounds = 4
+suspicion      = 0.85       # stamped on an alert a round confirms
+
 [heartbeat]
 interval = "30s"
 

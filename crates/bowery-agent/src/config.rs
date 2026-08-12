@@ -212,6 +212,8 @@ pub struct WhisperConfig {
     pub advertise_addr: Option<SocketAddr>,
     #[serde(default)]
     pub qa: WhisperQaConfig,
+    #[serde(default)]
+    pub corroboration: CorroborationConfig,
 }
 
 impl Default for WhisperConfig {
@@ -220,6 +222,7 @@ impl Default for WhisperConfig {
             bind_addr: default_whisper_bind_addr(),
             advertise_addr: None,
             qa: WhisperQaConfig::default(),
+            corroboration: CorroborationConfig::default(),
         }
     }
 }
@@ -309,6 +312,117 @@ const fn default_whisper_qa_max_concurrent_rounds() -> usize {
 
 fn default_whisper_qa_quorum() -> usize {
     2
+}
+
+/// `[whisper.corroboration]` — asking the mesh to account for something
+/// this host saw but cannot judge alone.
+///
+/// Generic by construction: these knobs govern the *round*, not any
+/// particular detection. A new kind of suspicion registers a handler
+/// and inherits all of them — the queue, the concurrency ceiling, the
+/// dedup window, the timeout — rather than growing its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorroborationConfig {
+    /// Run corroboration rounds at all.
+    ///
+    /// On by default. The rounds only fire for traffic between hosts
+    /// that are already mesh peers, and the answer is the only way to
+    /// see a whole class of lateral movement.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Per-peer deadline for one query.
+    #[serde(with = "humantime_serde", default = "default_corroboration_timeout")]
+    pub timeout: Duration,
+    /// Claims buffered between the detection pipeline and the round
+    /// engine. Over-full sheds rather than blocking: connect events
+    /// arrive far faster than execs, and a detector that blocked here
+    /// would stall the whole pipeline behind the mesh.
+    #[serde(default = "default_corroboration_queue_capacity")]
+    pub queue_capacity: usize,
+    /// Ceiling on rounds in flight. Rounds over the ceiling are shed,
+    /// not queued — a late answer is worth less than a responsive
+    /// agent.
+    #[serde(default = "default_corroboration_max_concurrent_rounds")]
+    pub max_concurrent_rounds: usize,
+    /// How long the same claim is remembered, so a repeat is not asked
+    /// again.
+    ///
+    /// This is the knob that decides whether a port scan costs one mesh
+    /// round or one per probe. Raising it is cheap; lowering it below a
+    /// minute is asking for amplification.
+    #[serde(
+        with = "humantime_serde",
+        default = "default_corroboration_dedup_window"
+    )]
+    pub dedup_window: Duration,
+    /// Distinct claims remembered at once. Bounded so a flood of
+    /// distinct sources can't grow the set without limit.
+    #[serde(default = "default_corroboration_dedup_entries")]
+    pub dedup_entries: usize,
+    /// How far either side of the observation the peer is asked to
+    /// search.
+    ///
+    /// This absorbs clock skew between two hosts, and it is deliberately
+    /// generous: a window that is too *narrow* produces false denials —
+    /// the peer really did make the connection, but its clock says
+    /// otherwise — and a false denial is an accusation. Too *wide*
+    /// produces false corroborations, which merely suppress an alert.
+    /// Erring toward the harmless failure is the whole reason for the
+    /// default. Capped by the responder at 10 minutes total regardless.
+    #[serde(
+        with = "humantime_serde",
+        default = "default_corroboration_half_window"
+    )]
+    pub half_window: Duration,
+    /// Suspicion stamped on an alert a round confirms.
+    #[serde(default = "default_corroboration_suspicion")]
+    pub suspicion: f32,
+}
+
+impl Default for CorroborationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            timeout: default_corroboration_timeout(),
+            queue_capacity: default_corroboration_queue_capacity(),
+            max_concurrent_rounds: default_corroboration_max_concurrent_rounds(),
+            dedup_window: default_corroboration_dedup_window(),
+            dedup_entries: default_corroboration_dedup_entries(),
+            half_window: default_corroboration_half_window(),
+            suspicion: default_corroboration_suspicion(),
+        }
+    }
+}
+
+fn default_corroboration_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+const fn default_corroboration_queue_capacity() -> usize {
+    256
+}
+const fn default_corroboration_max_concurrent_rounds() -> usize {
+    4
+}
+/// Five minutes. Long enough that a scan or a chatty client collapses to
+/// one round, short enough that a connection recurring later in the day
+/// is asked about again.
+fn default_corroboration_dedup_window() -> Duration {
+    Duration::from_mins(5)
+}
+const fn default_corroboration_dedup_entries() -> usize {
+    4096
+}
+/// Five minutes either side, which is exactly the responder's 10-minute
+/// cap. Matches the envelope's clock-skew tolerance, so two hosts that
+/// can whisper to each other at all can correlate with each other.
+fn default_corroboration_half_window() -> Duration {
+    Duration::from_mins(5)
+}
+/// High. A peer denying a connection it is the recorded source of means
+/// its agent is blind or the address was spoofed; neither is routine.
+fn default_corroboration_suspicion() -> f32 {
+    0.85
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -969,6 +1083,57 @@ mod tests {
             cfg.heartbeat.interval,
             Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS)
         );
+    }
+
+    /// The `[whisper.corroboration]` block exactly as `INSTALL.md`
+    /// documents it.
+    ///
+    /// `deny_unknown_fields` means a key that drifts from the docs isn't
+    /// ignored — it refuses to start the agent. An operator who copies
+    /// the documented block has to get a running agent out of it.
+    #[test]
+    fn parses_the_documented_corroboration_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        fs::write(
+            &path,
+            r#"
+[whisper.corroboration]
+enabled        = true
+timeout        = "5s"
+half_window    = "5m"
+dedup_window   = "5m"
+dedup_entries  = 4096
+queue_capacity = 256
+max_concurrent_rounds = 4
+suspicion      = 0.85
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("the documented block must parse");
+        let c = &cfg.whisper.corroboration;
+        assert!(c.enabled);
+        assert_eq!(c.timeout, Duration::from_secs(5));
+        assert_eq!(c.half_window, Duration::from_mins(5));
+        assert_eq!(c.dedup_window, Duration::from_mins(5));
+        assert_eq!(c.max_concurrent_rounds, 4);
+    }
+
+    #[test]
+    fn corroboration_defaults_are_on_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&dir.path().join("missing.toml")).unwrap();
+        let c = &cfg.whisper.corroboration;
+        assert!(c.enabled, "shipping this off means it never runs");
+        // The half-window must fit inside the responder's clamp, or the
+        // asker would routinely ask for more than it can get and the
+        // difference would show up as unexplained false denials.
+        let half_ms = u64::try_from(c.half_window.as_millis()).unwrap();
+        assert!(
+            half_ms * 2 <= crate::corroboration::net_inbound::MAX_WINDOW_MS,
+            "default window {half_ms}ms either side exceeds the responder's clamp"
+        );
+        assert!(c.queue_capacity > 0 && c.max_concurrent_rounds > 0);
     }
 
     #[test]

@@ -71,6 +71,10 @@ fn build_config(
             advertise_addr: None,
             qa: WhisperQaConfig::default(),
             bind_addr: loopback_ephemeral(),
+            // Left at the production default so every existing
+            // two-agent fixture also exercises the corroboration
+            // engine's startup and shutdown paths.
+            corroboration: bowery_agent::config::CorroborationConfig::default(),
         },
         heartbeat: HeartbeatConfig {
             interval: Duration::from_millis(200),
