@@ -67,6 +67,8 @@ pick() { local p; for p in "$@"; do [[ -f "$p" ]] && { printf '%s' "$p"; return 
 
 BIN="$(pick "$SRC/bowery-agent"          "$REPO/target/release/bowery-agent")"
 CLI="$(pick "$SRC/bowery"                "$REPO/target/release/bowery")"
+EBPF="$(pick "$SRC/bowery-ebpf" \
+             "$REPO/crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf")"
 SVC="$(pick "$SRC/bowery-agent.service"  "$REPO/deploy/systemd/bowery-agent.service")"
 SLICE="$(pick "$SRC/bowery.slice"        "$REPO/deploy/systemd/bowery.slice")"
 CFG_TEMPLATE="$SRC/agent.toml"
@@ -100,6 +102,27 @@ install -d -m 0755 /etc/bowery
 
 echo "==> installing binary + unit"
 install -m 0755 "$BIN"   /usr/bin/bowery-agent
+
+# The eBPF object. Optional — an agent without it still meshes, alerts
+# on operator file rules, and serves SQL — but it observes no kernel
+# events at all, which is most of the point. Absence is therefore loud.
+#
+# root-owned 0644 is not incidental: the loader refuses any object whose
+# owner is not root, on the grounds that loading a BPF program a
+# lower-privileged user could have edited is full kernel-memory access.
+# `install` here runs as root, so this is the correct ownership by
+# construction — but a hand-copied object under a user account will be
+# rejected at startup, with that reason in the log.
+if [[ -f "$EBPF" ]]; then
+    echo "==> installing eBPF object"
+    install -d -m 0755 /usr/local/lib/bowery
+    install -o root -g root -m 0644 "$EBPF" /usr/local/lib/bowery/bowery-ebpf
+else
+    echo "WARNING: no eBPF object found; this agent will run WITHOUT kernel"
+    echo "         events — no exec, exit, or connection monitoring, and an"
+    echo "         empty baseline. Build it with ./scripts/build-ebpf and"
+    echo "         re-run, or repackage with deploy/remote/package-agent.sh."
+fi
 install -m 0644 "$SVC"   /lib/systemd/system/bowery-agent.service
 install -m 0644 "$SLICE" /lib/systemd/system/bowery.slice
 
@@ -155,10 +178,33 @@ case "$DO_START" in
 esac
 
 if [[ "$start_now" == "yes" ]]; then
-    echo "==> enabling + starting bowery-agent"
-    systemctl enable --now bowery-agent.service
+    # `enable --now` STARTS a stopped service but does nothing at all to
+    # a running one, so on an upgrade it silently leaves the old binary
+    # and the old eBPF object in memory. That failure is quiet and
+    # convincing: the install reports success, the service is "active",
+    # and every symptom you were upgrading to fix is still there.
+    # Restart explicitly when it is already running.
+    if systemctl is-active --quiet bowery-agent.service; then
+        echo "==> restarting bowery-agent (upgrade over a running service)"
+        systemctl enable bowery-agent.service >/dev/null 2>&1 || true
+        systemctl restart bowery-agent.service
+    else
+        echo "==> enabling + starting bowery-agent"
+        systemctl enable --now bowery-agent.service
+    fi
     sleep 1
     systemctl --no-pager --lines=8 status bowery-agent.service || true
+
+    # Say plainly whether kernel monitoring came up. The agent degrades
+    # to "meshes fine, observes nothing" when the object is missing or
+    # the kernel can't load it, and that is far too easy to miss.
+    if journalctl -u bowery-agent.service -b --no-pager 2>/dev/null \
+        | grep -q "attached BPF event source"; then
+        echo "==> kernel event monitoring: ACTIVE"
+    else
+        echo "WARNING: kernel event monitoring did NOT start — this agent is"
+        echo "         observing nothing. Check: journalctl -u bowery-agent | grep -i bpf"
+    fi
 else
     echo "==> installed but NOT started (no operator key yet)."
     echo "    1. edit $CFG → set [operators] pubkeys_b64"

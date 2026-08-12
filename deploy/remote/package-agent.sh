@@ -60,6 +60,28 @@ CLI="target/$TARGET/release/bowery"
 [[ -f "$BIN" ]] || { echo "error: build produced no agent binary at $BIN" >&2; exit 1; }
 [[ -f "$CLI" ]] || { echo "error: build produced no CLI binary at $CLI" >&2; exit 1; }
 
+# The eBPF object. NOT cross-compiled, and deliberately not built here:
+# its target is `bpfel-unknown-none` — BPF bytecode, little-endian
+# variant — which has no host-arch component at all. One object is valid
+# on every little-endian Linux host, x86_64 and aarch64 alike, and the
+# structs it shares with the loader use only fixed-width types, so
+# `#[repr(C)]` layout matches on both. Verified by loading an
+# x86_64-built object on an aarch64 Pi 5 and capturing real events.
+#
+# Shipping it matters more than it looks: without it the agent falls
+# back to NoopEventSource and runs as a mesh node that observes nothing
+# — no execs, no baseline, no rules. Two Pis ran that way for days,
+# and because an empty baseline answered "never seen it" to every
+# whisper question, they quorum-confirmed every alert their neighbour
+# raised. A missing file, not a missing feature.
+EBPF_OBJ="crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf"
+if [[ ! -f "$EBPF_OBJ" ]]; then
+    echo "error: no eBPF object at $EBPF_OBJ" >&2
+    echo "  build it first:  ./scripts/build-ebpf" >&2
+    echo "  (it is architecture-neutral — build once, ship to every node)" >&2
+    exit 1
+fi
+
 STAGE_NAME="bowery-agent-$TARGET"
 DIST="deploy/remote/dist"
 STAGE="$DIST/$STAGE_NAME"
@@ -69,6 +91,7 @@ mkdir -p "$STAGE"
 echo "==> staging $STAGE"
 install -m 0755 "$BIN"                                   "$STAGE/bowery-agent"
 install -m 0755 "$CLI"                                   "$STAGE/bowery"
+install -m 0644 "$EBPF_OBJ"                              "$STAGE/bowery-ebpf"
 install -m 0644 deploy/systemd/bowery-agent.service      "$STAGE/bowery-agent.service"
 install -m 0644 deploy/systemd/bowery.slice              "$STAGE/bowery.slice"
 install -m 0644 deploy/remote/10-remote-node.conf        "$STAGE/10-remote-node.conf"

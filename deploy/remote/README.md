@@ -1,3 +1,12 @@
+> **The eBPF object is architecture-neutral.** It builds for
+> `bpfel-unknown-none` — BPF bytecode, little-endian variant — which has no
+> host-arch component, so the *same* `bowery-ebpf` file runs on x86_64 and
+> aarch64 alike. Build it once with `./scripts/build-ebpf`; only the agent
+> binary is cross-compiled. `package-agent.sh` refuses to build a tarball
+> without it, because an agent missing this file still meshes and still
+> answers SQL while observing **no kernel events at all** — which is a much
+> quieter failure than a crash.
+
 # Deploying a Bowery agent to a remote node (Raspberry Pi over Tailscale)
 
 This kit installs the agent on a remote Linux node you reach over
