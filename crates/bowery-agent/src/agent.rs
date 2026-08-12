@@ -604,12 +604,20 @@ impl Agent {
             .with_extra_table(Arc::new(crate::sql_tables::BoweryEventsTable::new(
                 eventlog_store.clone(),
             )))
-            .with_extra_table(Arc::new(crate::sql_tables::BoweryEventLogStatusTable::new(
-                eventlog_store.clone(),
-                eventlog_handle
-                    .as_ref()
-                    .map(EventLogHandle::dropped_counter),
-            )));
+            .with_extra_table(Arc::new({
+                let status = crate::sql_tables::BoweryEventLogStatusTable::new(
+                    eventlog_store.clone(),
+                    eventlog_handle
+                        .as_ref()
+                        .map(EventLogHandle::dropped_counter),
+                );
+                // Without the write-failure side, this view can report
+                // `recording=1, dropped=0` while every write is failing.
+                match eventlog_handle.as_ref() {
+                    Some(h) => status.with_health(h.health()),
+                    None => status,
+                }
+            }));
         let op_router = Arc::new(OperatorCommandRouter {
             sql: Some(Arc::new(sql_engine)),
             relay: Some(relay_ctx),

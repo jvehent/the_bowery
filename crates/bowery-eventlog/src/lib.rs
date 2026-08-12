@@ -193,6 +193,13 @@ impl EventLog {
         &self.path
     }
 
+    /// Raw connection handle, for tests that need to corrupt the schema
+    /// to exercise write-failure paths.
+    #[doc(hidden)]
+    pub fn conn_for_test(&self) -> &Mutex<Connection> {
+        &self.inner
+    }
+
     /// Add columns introduced after a log file was first created.
     ///
     /// `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so

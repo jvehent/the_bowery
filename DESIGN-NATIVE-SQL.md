@@ -122,7 +122,13 @@ They expose Bowery's own internal state.
   membership grant right now (`valid` / `absent` / `invalid: …` /
   `unchecked`). The pre-flight for switching `enrollment` to `grant`.
 - `bowery_eventlog_status` — is this host actually recording? `recording`,
-  `queryable`, `rows`, `dropped`, and the oldest/newest timestamps. An
+  `queryable`, `rows`, `dropped`, `write_failed`, `last_error`, and the
+  oldest/newest timestamps. `dropped` counts overload (the queue was
+  full); `write_failed` counts events that were accepted and then failed
+  on disk. They are separate because they have different causes and
+  fixes — and because conflating them once let a schema-migration bug
+  report `recording=1, dropped=0` on a host that had recorded nothing
+  for hours. An
   empty `bowery_events` is ambiguous — quiet host, or blind host — and
   this is what disambiguates it, fleet-wide under `--fanout`.
 

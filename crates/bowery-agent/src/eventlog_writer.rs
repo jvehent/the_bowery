@@ -34,6 +34,25 @@ const MAX_BATCH: usize = 512;
 pub(crate) struct EventLogHandle {
     tx: mpsc::Sender<Event>,
     dropped: Arc<AtomicU64>,
+    health: Arc<WriteHealth>,
+}
+
+/// Events lost *after* they left the queue, and why.
+///
+/// `dropped` covers overload — the queue was full and we shed. This
+/// covers the other way to lose events: the write itself failed. They
+/// are counted separately because they mean different things and are
+/// fixed differently, and because conflating them under one number is
+/// how a real incident got missed: a schema migration bug made every
+/// write fail while `bowery_eventlog_status` still reported
+/// `recording=1, dropped=0`. All green, nothing recorded.
+#[derive(Debug, Default)]
+pub(crate) struct WriteHealth {
+    pub failed: AtomicU64,
+    /// Text of the most recent failure. Present because a count alone
+    /// says something is wrong without saying what, and the operator
+    /// looking at this view is usually not the person who broke it.
+    pub last_error: std::sync::Mutex<Option<String>>,
 }
 
 impl EventLogHandle {
@@ -51,6 +70,11 @@ impl EventLogHandle {
         }
     }
 
+    /// Shared write-failure state, for the `bowery_eventlog_status` view.
+    pub(crate) fn health(&self) -> Arc<WriteHealth> {
+        self.health.clone()
+    }
+
     /// The shared counter, for the `bowery_eventlog_status` view.
     ///
     /// Handing out the `Arc` rather than a snapshot matters: the SQL
@@ -59,6 +83,15 @@ impl EventLogHandle {
     /// time.
     pub(crate) fn dropped_counter(&self) -> Arc<AtomicU64> {
         self.dropped.clone()
+    }
+}
+
+impl WriteHealth {
+    fn record_failure(&self, events_lost: u64, reason: &str) {
+        self.failed.fetch_add(events_lost, Ordering::Relaxed);
+        if let Ok(mut slot) = self.last_error.lock() {
+            *slot = Some(reason.to_string());
+        }
     }
 }
 
@@ -75,12 +108,15 @@ pub(crate) fn spawn(
 ) -> (EventLogHandle, JoinHandle<()>, JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<Event>(queue_capacity.max(1));
     let dropped = Arc::new(AtomicU64::new(0));
+    let health = Arc::new(WriteHealth::default());
     let handle = EventLogHandle {
         tx,
         dropped: dropped.clone(),
+        health: health.clone(),
     };
 
     let writer_log = log.clone();
+    let writer_health = health.clone();
     let writer = tokio::spawn(async move {
         let mut batch: Vec<Event> = Vec::with_capacity(MAX_BATCH);
         loop {
@@ -93,14 +129,21 @@ pub(crate) fn spawn(
                 break; // all senders dropped
             }
             let to_write = std::mem::take(&mut batch);
+            let lost_if_failed = u64::try_from(to_write.len()).unwrap_or(u64::MAX);
             let log = writer_log.clone();
             // `spawn_blocking`: SQLite is synchronous and this is the
             // one place we knowingly touch the disk.
             let written = tokio::task::spawn_blocking(move || log.append_batch(&to_write)).await;
             match written {
                 Ok(Ok(n)) => debug!(events = n, "event log batch committed"),
-                Ok(Err(e)) => warn!(error = %e, "event log write failed; events lost"),
-                Err(e) => warn!(error = %e, "event log writer task panicked"),
+                Ok(Err(e)) => {
+                    warn!(error = %e, "event log write failed; events lost");
+                    writer_health.record_failure(lost_if_failed, &e.to_string());
+                }
+                Err(e) => {
+                    warn!(error = %e, "event log writer task panicked");
+                    writer_health.record_failure(lost_if_failed, &e.to_string());
+                }
             }
             batch.clear();
         }
@@ -212,5 +255,77 @@ mod tests {
 
         writer.abort();
         maintenance.abort();
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    use bowery_events::ProcessExec;
+
+    use super::*;
+
+    /// Regression for a live incident: a schema mismatch made every
+    /// write fail, and `bowery_eventlog_status` still read
+    /// `recording=1, dropped=0`. All green, nothing recorded.
+    ///
+    /// `dropped` counts overload; it cannot count a write that was
+    /// accepted into the queue and then failed on disk. Those are
+    /// different failures with different fixes, and the second one had
+    /// no counter at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_write_is_counted_and_explains_itself() {
+        let log = Arc::new(EventLog::open_in_memory().unwrap());
+        // Break the table out from under the writer, the way an
+        // unmigrated schema does.
+        {
+            let conn = log.conn_for_test();
+            let guard = conn.lock().unwrap();
+            guard.execute_batch("DROP TABLE events;").unwrap();
+        }
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (handle, writer, maintenance) = spawn(
+            log,
+            64,
+            Retention::default(),
+            Duration::from_hours(1),
+            shutdown_rx,
+        );
+        let health = handle.health();
+        let dropped = handle.dropped_counter();
+
+        handle.record(Event::ProcessExec(ProcessExec {
+            pid: 1,
+            ppid: 1,
+            uid: 0,
+            comm: "t".into(),
+            exe_path: Some(PathBuf::from("/bin/t")),
+            args: vec![],
+            ts: SystemTime::now(),
+        }));
+        drop(handle);
+        writer.await.unwrap();
+        maintenance.abort();
+
+        assert_eq!(
+            health.failed.load(Ordering::Relaxed),
+            1,
+            "events lost to a failed write must be counted, not just logged"
+        );
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            0,
+            "the queue never overflowed; drops and write failures must not \
+             be conflated, since they have different causes and fixes"
+        );
+        let reason = health.last_error.lock().unwrap().clone();
+        assert!(
+            reason.is_some_and(|r| r.contains("events")),
+            "the view must carry the reason; a bare count says something is \
+             wrong without saying what"
+        );
     }
 }

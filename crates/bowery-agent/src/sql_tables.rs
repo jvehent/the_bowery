@@ -860,6 +860,7 @@ impl BoweryTable for BoweryEventsTable {
 pub struct BoweryEventLogStatusTable {
     log: Option<Arc<bowery_eventlog::EventLog>>,
     dropped: Option<Arc<std::sync::atomic::AtomicU64>>,
+    health: Option<Arc<crate::eventlog_writer::WriteHealth>>,
 }
 
 impl BoweryEventLogStatusTable {
@@ -867,7 +868,20 @@ impl BoweryEventLogStatusTable {
         log: Option<Arc<bowery_eventlog::EventLog>>,
         dropped: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Self {
-        Self { log, dropped }
+        Self {
+            log,
+            dropped,
+            health: None,
+        }
+    }
+
+    /// Attach write-failure reporting. Without it the view can say
+    /// "recording" while every write is failing — which is exactly what
+    /// happened, and exactly what this table exists to prevent.
+    #[must_use]
+    pub(crate) fn with_health(mut self, health: Arc<crate::eventlog_writer::WriteHealth>) -> Self {
+        self.health = Some(health);
+        self
     }
 }
 
@@ -886,7 +900,9 @@ impl BoweryTable for BoweryEventLogStatusTable {
                 oldest_ts_unix_ms  INTEGER,
                 newest_ts_unix_ms  INTEGER,
                 highest_seq        INTEGER,
-                dropped            INTEGER
+                dropped            INTEGER,
+                write_failed       INTEGER,
+                last_error         TEXT
             );",
         )?;
 
@@ -894,6 +910,12 @@ impl BoweryTable for BoweryEventLogStatusTable {
             .dropped
             .as_ref()
             .map_or(0, |d| d.load(std::sync::atomic::Ordering::Relaxed));
+        let (write_failed, last_error) = self.health.as_ref().map_or((0, None), |h| {
+            (
+                h.failed.load(std::sync::atomic::Ordering::Relaxed),
+                h.last_error.lock().ok().and_then(|g| g.clone()),
+            )
+        });
 
         let (recording, queryable, path, stats) = match &self.log {
             Some(log) => {
@@ -911,8 +933,8 @@ impl BoweryTable for BoweryEventLogStatusTable {
         conn.execute(
             "INSERT INTO bowery_eventlog_status
                 (recording, queryable, path, rows, oldest_ts_unix_ms,
-                 newest_ts_unix_ms, highest_seq, dropped)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 newest_ts_unix_ms, highest_seq, dropped, write_failed, last_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 i64::from(recording),
                 i64::from(queryable),
@@ -926,6 +948,8 @@ impl BoweryTable for BoweryEventLogStatusTable {
                     .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
                 i64::try_from(stats.highest_seq).unwrap_or(i64::MAX),
                 i64::try_from(dropped).unwrap_or(i64::MAX),
+                i64::try_from(write_failed).unwrap_or(i64::MAX),
+                last_error,
             ],
         )?;
         Ok(())
