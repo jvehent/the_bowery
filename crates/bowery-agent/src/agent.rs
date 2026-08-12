@@ -556,6 +556,16 @@ impl Agent {
         };
         let eventlog_handle = eventlog.as_ref().map(|(h, _)| h.clone());
         let eventlog_store = eventlog.map(|(_, log)| log);
+        // Answering "did you connect to me?" needs our own outbound
+        // history plus a trustworthy view of who the asker is. `None`
+        // when the event log is off: with no history we cannot
+        // distinguish "I did not make that connection" from "I would not
+        // have recorded it either way", and answering anyway would
+        // manufacture evidence.
+        let correlation = eventlog_store.as_ref().map(|log| CorrelationContext {
+            log: log.clone(),
+            peers: mesh.peers_watcher(),
+        });
 
         let sql_engine = bowery_sql::Sql::new()
             .with_concurrency_cap(config.sql.max_concurrent_queries)
@@ -665,6 +675,7 @@ impl Agent {
             let op_router_for_handler = op_router.clone();
             let events_for_handler = events_tx.clone();
             let qa_limit_for_handler = qa_rate_limit.clone();
+            let correlation_for_handler = correlation.clone();
             let handler: bowery_whisper::pool::InboundHandler = Arc::new(move |peer_fp, conn| {
                 let verifier = envelope_verifier.clone();
                 let operators = operators_for_handler.clone();
@@ -674,6 +685,7 @@ impl Agent {
                 let op_router = op_router_for_handler.clone();
                 let events = events_for_handler.clone();
                 let qa_rate_limit = qa_limit_for_handler.clone();
+                let correlation = correlation_for_handler.clone();
                 debug!(
                     peer = %peer_fp,
                     conn_id = conn.stable_id(),
@@ -689,6 +701,7 @@ impl Agent {
                     op_router,
                     events,
                     qa_rate_limit,
+                    correlation,
                 ));
             });
             PeerConnections::with_handler(endpoint.clone(), handler)
@@ -704,6 +717,7 @@ impl Agent {
             op_router,
             events_tx.clone(),
             qa_rate_limit.clone(),
+            correlation.clone(),
             shutdown_rx.clone(),
         );
 
@@ -1270,6 +1284,7 @@ fn spawn_accept_task(
     op_router: Arc<OperatorCommandRouter>,
     events_tx: broadcast::Sender<AgentEvent>,
     qa_rate_limit: Arc<RateLimit>,
+    correlation: Option<CorrelationContext>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1289,9 +1304,10 @@ fn spawn_accept_task(
                             let op_router = op_router.clone();
                             let events = events_tx.clone();
                             let qa_rate_limit = qa_rate_limit.clone();
+                            let correlation = correlation.clone();
                             tokio::spawn(handle_connection(
                                 conn, verifier, operators, sealer, baseline, inbox, op_router,
-                                events, qa_rate_limit,
+                                events, qa_rate_limit, correlation,
                             ));
                         }
                         Err(e) => warn!(error = %e, "accept failed"),
@@ -1325,6 +1341,7 @@ async fn handle_connection(
     op_router: Arc<OperatorCommandRouter>,
     events_tx: broadcast::Sender<AgentEvent>,
     qa_rate_limit: Arc<RateLimit>,
+    correlation: Option<CorrelationContext>,
 ) {
     let uni = tokio::spawn(handle_uni_stream_loop(
         conn.clone(),
@@ -1342,6 +1359,7 @@ async fn handle_connection(
         baseline,
         events_tx,
         qa_rate_limit,
+        correlation,
     ));
     let _ = tokio::join!(uni, bi);
 }
@@ -1431,6 +1449,7 @@ async fn handle_bi_stream_loop(
     baseline: Arc<Baseline>,
     events_tx: broadcast::Sender<AgentEvent>,
     qa_rate_limit: Arc<RateLimit>,
+    correlation: Option<CorrelationContext>,
 ) {
     loop {
         let Ok((bytes, reply)) = conn.accept_request().await else {
@@ -1449,6 +1468,23 @@ async fn handle_bi_stream_loop(
             nonce: env.nonce,
         });
         match env.payload.body {
+            Some(Body::ConnectionQuery(q)) => {
+                // Same bucket as Q&A: this costs an indexed lookup, but
+                // it is still peer-triggered work.
+                if !qa_rate_limit.try_acquire(&env.sender) {
+                    warn!(sender = %env.sender, "correlation rate limit exceeded; shedding");
+                    continue;
+                }
+                let Some(ctx) = correlation.as_ref() else {
+                    debug!(sender = %env.sender, "no event log; cannot answer correlation query");
+                    continue;
+                };
+                if let Err(e) =
+                    respond_to_connection_query(reply, &sealer, ctx, env.sender, q).await
+                {
+                    warn!(sender = %env.sender, error = %e, "correlation response failed");
+                }
+            }
             Some(Body::Question(q)) => {
                 // Check the budget before the O(baseline) scan, not after.
                 if !qa_rate_limit.try_acquire(&env.sender) {
@@ -1482,6 +1518,8 @@ fn body_kind_name(body: &Body) -> &'static str {
         Body::NeighborOp(_) => "NeighborOp",
         Body::Subscribe(_) => "Subscribe",
         Body::Alerts(_) => "Alerts",
+        Body::ConnectionQuery(_) => "ConnectionQuery",
+        Body::ConnectionAnswer(_) => "ConnectionAnswer",
     }
 }
 
@@ -3950,6 +3988,104 @@ async fn run_peer_revoke_push(
         }
     };
     let _ = tokio::time::timeout(timeout, pump).await;
+}
+
+/// Everything the correlation responder needs.
+#[derive(Clone)]
+pub(crate) struct CorrelationContext {
+    pub log: Arc<bowery_eventlog::EventLog>,
+    /// Live mesh view, used to check that an asker is asking about its
+    /// own address.
+    pub peers: watch::Receiver<Vec<PeerInfo>>,
+}
+
+/// Longest history window a peer may ask us to search.
+///
+/// A correlation question is about one connection, so minutes is
+/// generous. The cap exists because the window is attacker-chosen: an
+/// unbounded one turns a cheap question into a full-history scan, and
+/// the whole point of the query is that answering it is cheap.
+const MAX_CORRELATION_WINDOW_MS: u64 = 10 * 60 * 1000;
+
+/// Answer "did you connect to me?" from our own outbound history.
+///
+/// The privacy property is enforced here, and it is the reason this
+/// message is safe to expose at all: **`dst_addr` must be an address of
+/// the asker**. A peer therefore only ever learns about traffic it was
+/// already party to — it observed the inbound side itself. Without the
+/// check this would be a primitive for enumerating any peer's outbound
+/// connections, one address at a time.
+async fn respond_to_connection_query(
+    reply: bowery_whisper::transport::Reply,
+    sealer: &Sealer,
+    ctx: &CorrelationContext,
+    asker: Fingerprint,
+    query: bowery_proto::ConnectionQuery,
+) -> Result<(), bowery_whisper::transport::Error> {
+    let mut answer = bowery_proto::ConnectionAnswer {
+        query_id: query.query_id.clone(),
+        ..Default::default()
+    };
+
+    // The asker's addresses, as *we* know them — never as they claim.
+    let asker_addr_matches = ctx
+        .peers
+        .borrow()
+        .iter()
+        .filter(|p| p.fingerprint == asker)
+        .any(|p| p.whisper_addr.ip().to_string() == query.dst_addr);
+
+    if !asker_addr_matches {
+        warn!(
+            asker = %asker,
+            dst_addr = %query.dst_addr,
+            "refusing correlation query: address is not the asker's own"
+        );
+        answer.refused = "dst_addr is not an address of the asker".to_string();
+        let outbound = sealer.seal_for(&asker, &WhisperPayload::connection_answer(answer));
+        return reply.send(&outbound).await;
+    }
+
+    let Ok(port) = u16::try_from(query.dst_port) else {
+        answer.refused = "dst_port out of range".to_string();
+        let outbound = sealer.seal_for(&asker, &WhisperPayload::connection_answer(answer));
+        return reply.send(&outbound).await;
+    };
+
+    // Clamp the window regardless of what was asked for.
+    let end = query.window_end_unix_ms;
+    let start = query
+        .window_start_unix_ms
+        .max(end.saturating_sub(MAX_CORRELATION_WINDOW_MS));
+
+    let log = ctx.log.clone();
+    let addr = query.dst_addr.clone();
+    let found =
+        tokio::task::spawn_blocking(move || log.find_outbound_to(&addr, port, start, end)).await;
+
+    match found {
+        Ok(Ok(Some(m))) => {
+            answer.matched = true;
+            answer.pid = m.pid;
+            answer.comm = m.comm;
+            answer.exe_path = m.exe_path;
+            answer.ts_unix_ms = m.ts_unix_ms;
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) => {
+            warn!(error = %e, "correlation lookup failed");
+            // Distinct from "no record": an error here must not be read
+            // as evidence that the connection never happened.
+            answer.refused = format!("lookup failed: {e}");
+        }
+        Err(e) => {
+            warn!(error = %e, "correlation lookup task panicked");
+            answer.refused = "lookup task failed".to_string();
+        }
+    }
+
+    let outbound = sealer.seal_for(&asker, &WhisperPayload::connection_answer(answer));
+    reply.send(&outbound).await
 }
 
 #[cfg(test)]

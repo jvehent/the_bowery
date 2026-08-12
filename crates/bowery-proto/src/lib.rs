@@ -71,7 +71,7 @@ pub const CANONICAL_SIG_DOMAIN: &[u8] = b"bowery/whisper/envelope/v2";
 /// The inner payload, with one variant per message type.
 #[derive(Clone, PartialEq, ProstMessage)]
 pub struct WhisperPayload {
-    #[prost(oneof = "Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
     pub body: Option<Body>,
 }
 
@@ -95,11 +95,81 @@ pub enum Body {
     Subscribe(Subscribe),
     #[prost(message, tag = "9")]
     Alerts(Alerts),
+    #[prost(message, tag = "10")]
+    ConnectionQuery(ConnectionQuery),
+    #[prost(message, tag = "11")]
+    ConnectionAnswer(ConnectionAnswer),
 }
 
 // ---------------------------------------------------------------------------
 // Variants
 // ---------------------------------------------------------------------------
+
+/// "Did you connect to me?" — the asker half of cross-host correlation.
+///
+/// Lateral movement is two events on two machines, and neither is
+/// remarkable alone: an inbound SSH is normal, an outbound SSH is
+/// normal. What is not normal is an inbound connection that *no host in
+/// the fleet admits making*. Only the two endpoints together can see
+/// that, and only the source knows which process did it.
+///
+/// # The privacy constraint
+///
+/// `dst_addr` must be an address of the **asker**, and the responder
+/// enforces that against its own view of the asker's address. The
+/// property this buys is worth stating precisely: a peer can only learn
+/// about traffic it was already party to, because it observed the
+/// inbound side itself. Without the check, this message would be a
+/// primitive for enumerating any peer's outbound connections.
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct ConnectionQuery {
+    /// Correlates the answer with the question. Echoed back verbatim.
+    #[prost(string, tag = "1")]
+    pub query_id: String,
+    /// The address that was connected to — must be the asker's own.
+    #[prost(string, tag = "2")]
+    pub dst_addr: String,
+    /// The port that was connected to (the asker's listening port).
+    #[prost(uint32, tag = "3")]
+    pub dst_port: u32,
+    /// Inclusive search window. Bounded by the responder regardless of
+    /// what is asked for, so a query cannot become a full-history scan.
+    #[prost(uint64, tag = "4")]
+    pub window_start_unix_ms: u64,
+    #[prost(uint64, tag = "5")]
+    pub window_end_unix_ms: u64,
+}
+
+/// The responder half of [`ConnectionQuery`].
+///
+/// `matched == false` is the interesting answer: the peer whose address
+/// the connection came from has no record of making it. That means
+/// either its agent is not seeing what it should — blind, tampered with,
+/// or newly compromised — or the source address was spoofed. Both are
+/// worth waking someone for, and neither is visible from one host.
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct ConnectionAnswer {
+    #[prost(string, tag = "1")]
+    pub query_id: String,
+    #[prost(bool, tag = "2")]
+    pub matched: bool,
+    /// Populated only when `matched`. This is the attribution the
+    /// accepting host can never derive on its own.
+    #[prost(uint32, tag = "3")]
+    pub pid: u32,
+    #[prost(string, tag = "4")]
+    pub comm: String,
+    #[prost(string, tag = "5")]
+    pub exe_path: String,
+    #[prost(uint64, tag = "6")]
+    pub ts_unix_ms: u64,
+    /// Set when the responder declined rather than searched — an
+    /// out-of-policy `dst_addr`, or no event log to consult. Kept
+    /// distinct from `matched == false` because "I won't answer" and "I
+    /// have no record" mean opposite things about the asker's alert.
+    #[prost(string, tag = "7")]
+    pub refused: String,
+}
 
 /// Liveness ping. Sent at a configurable interval between paired peers.
 #[derive(Clone, PartialEq, Eq, ProstMessage)]
@@ -824,6 +894,20 @@ impl WhisperPayload {
     pub fn answer(a: Answer) -> Self {
         Self {
             body: Some(Body::Answer(a)),
+        }
+    }
+
+    #[must_use]
+    pub fn connection_query(q: ConnectionQuery) -> Self {
+        Self {
+            body: Some(Body::ConnectionQuery(q)),
+        }
+    }
+
+    #[must_use]
+    pub fn connection_answer(a: ConnectionAnswer) -> Self {
+        Self {
+            body: Some(Body::ConnectionAnswer(a)),
         }
     }
 

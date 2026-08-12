@@ -144,6 +144,19 @@ pub struct Stats {
     pub highest_seq: u64,
 }
 
+/// One outbound connection matching a peer's correlation query.
+///
+/// The process fields are the point: the accepting host can never know
+/// them, so this is the only way an inbound connection gets attributed
+/// to something that ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionMatch {
+    pub ts_unix_ms: u64,
+    pub pid: u32,
+    pub comm: String,
+    pub exe_path: String,
+}
+
 /// Append-only event store.
 #[derive(Debug)]
 pub struct EventLog {
@@ -346,6 +359,55 @@ impl EventLog {
             newest_ts_unix_ms: newest.map(|v| u64::try_from(v).unwrap_or(0)),
             highest_seq,
         })
+    }
+
+    /// Find an outbound connection this host made to `addr:port` within
+    /// a time window.
+    ///
+    /// This answers the one question a peer is allowed to ask: *"did you
+    /// connect to me?"*. The caller is expected to have already checked
+    /// that `addr` belongs to the asker — see the responder — because
+    /// the privacy property depends on it: a peer only learns about
+    /// traffic it was already party to, since it observed the inbound
+    /// side itself.
+    ///
+    /// Matched on (address, port, time) rather than a full 4-tuple
+    /// because `local_port` is 0 for outbound events: the kernel has not
+    /// assigned a source port at `TCP_CLOSE -> TCP_SYN_SENT`. A 4-tuple
+    /// match would look more precise and never fire.
+    pub fn find_outbound_to(
+        &self,
+        addr: &str,
+        port: u16,
+        window_start_unix_ms: u64,
+        window_end_unix_ms: u64,
+    ) -> Result<Option<ConnectionMatch>> {
+        let conn = self.inner.lock().expect("event log mutex poisoned");
+        let found = conn
+            .query_row(
+                "SELECT ts_unix_ms, pid, comm, exe_path FROM events
+                 WHERE kind = ?1 AND direction = 'out'
+                   AND dst_addr = ?2 AND dst_port = ?3
+                   AND ts_unix_ms BETWEEN ?4 AND ?5
+                 ORDER BY seq DESC LIMIT 1",
+                params![
+                    KIND_CONNECT,
+                    addr,
+                    i64::from(port),
+                    i64::try_from(window_start_unix_ms).unwrap_or(0),
+                    i64::try_from(window_end_unix_ms).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    Ok(ConnectionMatch {
+                        ts_unix_ms: u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
+                        pid: u32::try_from(row.get::<_, i64>(1).unwrap_or(0)).unwrap_or(0),
+                        comm: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        exe_path: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(found)
     }
 
     /// Checkpoint the WAL into the main file.
@@ -805,5 +867,100 @@ mod migration_tests {
         }
         let log = EventLog::open(&path).unwrap();
         assert_eq!(log.stats().unwrap().rows, 3);
+    }
+}
+
+#[cfg(test)]
+mod correlation_tests {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use bowery_events::{Event, NetDirection, NetFamily, NetworkConnect};
+
+    use super::*;
+
+    fn at(ms: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    fn outbound(addr: &str, port: u16, ms: u64, comm: &str) -> Event {
+        Event::NetworkConnect(NetworkConnect {
+            pid: 4242,
+            comm: comm.to_string(),
+            family: NetFamily::V4,
+            daddr: addr.parse().unwrap(),
+            dport: port,
+            local_port: 0, // as the kernel reports it at SYN_SENT
+            direction: NetDirection::Outbound,
+            ts: at(ms),
+        })
+    }
+
+    #[test]
+    fn a_matching_outbound_connection_is_found_with_its_process() {
+        let log = EventLog::open_in_memory().unwrap();
+        log.append_batch(&[outbound("10.0.0.5", 22, 1_000_000, "ssh")])
+            .unwrap();
+
+        let m = log
+            .find_outbound_to("10.0.0.5", 22, 999_000, 1_001_000)
+            .unwrap()
+            .expect("the connection we just recorded must be findable");
+        assert_eq!(m.comm, "ssh", "attribution is the whole point of asking");
+        assert_eq!(m.pid, 4242);
+    }
+
+    /// Every one of these is a way to wrongly claim "yes, that was me" —
+    /// which would launder an intrusion as legitimate traffic.
+    #[test]
+    fn near_misses_do_not_match() {
+        let log = EventLog::open_in_memory().unwrap();
+        log.append_batch(&[outbound("10.0.0.5", 22, 1_000_000, "ssh")])
+            .unwrap();
+
+        assert!(
+            log.find_outbound_to("10.0.0.6", 22, 999_000, 1_001_000)
+                .unwrap()
+                .is_none(),
+            "a different host must not match"
+        );
+        assert!(
+            log.find_outbound_to("10.0.0.5", 443, 999_000, 1_001_000)
+                .unwrap()
+                .is_none(),
+            "a different port must not match"
+        );
+        assert!(
+            log.find_outbound_to("10.0.0.5", 22, 2_000_000, 2_001_000)
+                .unwrap()
+                .is_none(),
+            "outside the window must not match"
+        );
+    }
+
+    /// An inbound record must never satisfy "did *you* connect to me?".
+    /// Both hosts see the same connection; only one of them dialled it,
+    /// and answering yes from the accept side would let two victims
+    /// alibi each other.
+    #[test]
+    fn an_inbound_record_never_answers_an_outbound_question() {
+        let log = EventLog::open_in_memory().unwrap();
+        log.append_batch(&[Event::NetworkConnect(NetworkConnect {
+            pid: 0,
+            comm: String::new(),
+            family: NetFamily::V4,
+            daddr: "10.0.0.5".parse().unwrap(),
+            dport: 22,
+            local_port: 22,
+            direction: NetDirection::Inbound,
+            ts: at(1_000_000),
+        })])
+        .unwrap();
+
+        assert!(
+            log.find_outbound_to("10.0.0.5", 22, 999_000, 1_001_000)
+                .unwrap()
+                .is_none(),
+            "direction must be part of the match"
+        );
     }
 }

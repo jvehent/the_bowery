@@ -284,6 +284,8 @@ fn body_kind(body: &Body) -> &'static str {
         Body::NeighborOp(_) => "NeighborOp",
         Body::Subscribe(_) => "Subscribe",
         Body::Alerts(_) => "Alerts",
+        Body::ConnectionQuery(_) => "ConnectionQuery",
+        Body::ConnectionAnswer(_) => "ConnectionAnswer",
     }
 }
 
