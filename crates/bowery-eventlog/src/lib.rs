@@ -430,6 +430,9 @@ impl Row {
             Event::NetworkConnect(e) => {
                 r.kind = KIND_CONNECT;
                 r.pid = Some(i64::from(e.pid));
+                if !e.comm.is_empty() {
+                    r.comm = Some(e.comm.clone());
+                }
                 r.net_family = Some(match e.family {
                     NetFamily::V4 => "v4",
                     NetFamily::V6 => "v6",
@@ -512,6 +515,7 @@ mod tests {
                 }),
                 Event::NetworkConnect(NetworkConnect {
                     pid: 100,
+                    comm: String::new(),
                     family: NetFamily::V4,
                     daddr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
                     dport: 4444,
@@ -756,6 +760,7 @@ mod migration_tests {
         // The write that used to fail.
         log.append_batch(&[Event::NetworkConnect(NetworkConnect {
             pid: 0,
+            comm: String::new(),
             family: NetFamily::V4,
             daddr: "10.0.0.42".parse().unwrap(),
             dport: 54321,

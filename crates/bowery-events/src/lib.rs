@@ -74,12 +74,23 @@ pub struct NetworkConnect {
     /// an inbound connection is knowable only on the host that made it —
     /// which is precisely why the two hosts have to compare notes.
     pub pid: u32,
+    /// Connecting task's `comm`. Empty for inbound, same reason as
+    /// `pid`.
+    ///
+    /// Carried because the *source* host is the only place a
+    /// connection's process is knowable, and a pid alone is a poor
+    /// answer minutes later: pids are reused, and the process is
+    /// usually gone by the time anyone asks.
+    pub comm: String,
     pub family: NetFamily,
     /// Remote peer address.
     pub daddr: IpAddr,
     /// Remote peer port.
     pub dport: u16,
-    /// Our own port.
+    /// Our own port. **Zero for outbound**: at the
+    /// `TCP_CLOSE -> TCP_SYN_SENT` transition the kernel has not yet
+    /// assigned a source port. Correlation therefore matches on
+    /// (remote address, remote port, time), not on a full 4-tuple.
     pub local_port: u16,
     pub direction: NetDirection,
     pub ts: SystemTime,

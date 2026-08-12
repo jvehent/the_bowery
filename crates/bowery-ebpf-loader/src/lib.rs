@@ -452,6 +452,7 @@ fn parse_connect(bytes: &[u8]) -> Option<Event> {
 
     Some(Event::NetworkConnect(NetworkConnect {
         pid: raw.pid,
+        comm: comm_to_string(&raw.comm),
         family,
         daddr,
         // NOT `from_be`. The kernel's inet_sock_set_state tracepoint
@@ -850,6 +851,10 @@ mod inbound_tests {
         match parse_connect(as_bytes(&raw)).expect("parses") {
             Event::NetworkConnect(c) => {
                 assert_eq!(c.dport, 443, "443 must not become 47873");
+                assert_eq!(
+                    c.comm, "curl",
+                    "the source host is the only place a connection's process                      is knowable; dropping comm throws that away"
+                );
                 assert_eq!(c.local_port, 51000);
                 // The ADDRESS really is raw network-order bytes, which is
                 // why it is built from the array rather than swapped.

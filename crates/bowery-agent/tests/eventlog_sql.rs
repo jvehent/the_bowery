@@ -122,6 +122,7 @@ async fn pipeline_events_become_queryable_history() {
         }),
         Event::NetworkConnect(NetworkConnect {
             pid: 4242,
+            comm: String::new(),
             family: NetFamily::V4,
             daddr: "203.0.113.9".parse().unwrap(),
             dport: 4444,
@@ -266,6 +267,7 @@ async fn history_is_readable_through_the_real_authorized_engine() {
             exec(11, "/usr/bin/curl"),
             Event::NetworkConnect(NetworkConnect {
                 pid: 11,
+                comm: String::new(),
                 family: NetFamily::V4,
                 daddr: "198.51.100.4".parse().unwrap(),
                 dport: 443,
@@ -330,6 +332,7 @@ async fn outbound_connections_become_a_queryable_destination_graph() {
     let source = Box::new(MockEventSource::new(vec![
         Event::NetworkConnect(NetworkConnect {
             pid: 900,
+            comm: String::new(),
             family: NetFamily::V4,
             daddr: "198.51.100.22".parse().unwrap(),
             dport: 22,
@@ -342,6 +345,7 @@ async fn outbound_connections_become_a_queryable_destination_graph() {
         // not.
         Event::NetworkConnect(NetworkConnect {
             pid: 901,
+            comm: String::new(),
             family: NetFamily::V4,
             daddr: "198.51.100.22".parse().unwrap(),
             dport: 22,
