@@ -574,10 +574,19 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
     );
 
     let verifier = Arc::new(Verifier::new(ctx.known_neighbors.clone(), local_fp));
+    // Each result is tagged with the peer it came from. A round that
+    // only reports counts is unreadable the moment it has more than one
+    // target: "refused=1" over a three-peer mesh leaves you diffing
+    // event logs to work out who, and *which* peer is silent or
+    // refusing is usually the finding — a peer that refuses everything
+    // is a peer whose sensor isn't recording.
     let asks = targets.into_iter().map(|peer| {
         let query = query.clone();
         let verifier = verifier.clone();
-        async move { ask_one(ctx, &verifier, &peer, query).await }
+        async move {
+            let fp = peer.fingerprint;
+            (fp, ask_one(ctx, &verifier, &peer, query).await)
+        }
     });
     let results = join_all(asks).await;
 
@@ -586,25 +595,39 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
         ..Tally::default()
     };
     let mut evidence = Vec::new();
-    for outcome in results {
-        match outcome {
-            Some(answer) => {
-                let corroboration = answer.corroboration();
-                if corroboration == Corroboration::Corroborated && evidence.is_empty() {
-                    evidence.clone_from(&answer.evidence);
-                }
-                if corroboration == Corroboration::Refused {
-                    debug!(
-                        kind = claim.kind,
-                        query_id = %query_id,
-                        reason = %answer.reason,
-                        "peer refused a corroboration query"
-                    );
-                }
-                tally.record(corroboration);
-            }
-            None => tally.no_reply += 1,
+    for (peer, outcome) in results {
+        let Some(answer) = outcome else {
+            debug!(
+                kind = claim.kind,
+                query_id = %query_id,
+                peer = %peer,
+                "peer did not answer a corroboration query"
+            );
+            tally.no_reply += 1;
+            continue;
+        };
+
+        let corroboration = answer.corroboration();
+        if corroboration == Corroboration::Corroborated && evidence.is_empty() {
+            evidence.clone_from(&answer.evidence);
+            info!(
+                kind = claim.kind,
+                query_id = %query_id,
+                peer = %peer,
+                evidence = %render_attributes(&answer.evidence),
+                "peer accounted for this observation"
+            );
         }
+        if corroboration == Corroboration::Refused {
+            debug!(
+                kind = claim.kind,
+                query_id = %query_id,
+                peer = %peer,
+                reason = %answer.reason,
+                "peer refused a corroboration query"
+            );
+        }
+        tally.record(corroboration);
     }
 
     let confirmed = claim.rule.confirms(&tally);
@@ -646,16 +669,9 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
             episode_id,
             suspicion: claim.suspicion,
         });
-    } else if !evidence.is_empty() {
-        // Not an alert, but not nothing: this is attribution the
-        // observing host cannot derive on its own.
-        info!(
-            kind = claim.kind,
-            query_id = %query_id,
-            evidence = %render_attributes(&evidence),
-            "corroborated by peer"
-        );
     }
+    // The corroborating peer's evidence is logged where it arrives,
+    // named with the peer that supplied it — see the ask loop above.
 
     let _ = ctx
         .events_tx
