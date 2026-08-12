@@ -80,9 +80,9 @@ struct RawExitEvent {
 struct RawConnectEvent {
     pid: u32,
     family: u16,
-    /// Network byte order — converted in user space.
+    /// Host byte order: the tracepoint applies `ntohs()` itself.
     dport: u16,
-    /// Network byte order — converted in user space.
+    /// Host byte order, same as `dport`.
     sport: u16,
     /// Mirrors `bowery_ebpf::DIRECTION_OUT` / `DIRECTION_IN`.
     direction: u8,
@@ -416,10 +416,18 @@ fn parse_exit(bytes: &[u8]) -> Option<Event> {
 
 fn parse_connect(bytes: &[u8]) -> Option<Event> {
     if bytes.len() < RAW_CONNECT_SIZE {
-        warn!(
+        // This is not a malformed packet, it is version skew: the eBPF
+        // object on disk was built from different source than this
+        // binary. Every connect event is being discarded, which looks
+        // exactly like a host that makes no network connections — so it
+        // is an error, not a warning, and it names the fix.
+        error!(
             got = bytes.len(),
             want = RAW_CONNECT_SIZE,
-            "short connect record"
+            "connect record size mismatch — the loaded eBPF object is out of \
+             sync with this agent; rebuild it (scripts/build-ebpf) and \
+             reinstall it alongside the binary. ALL connect events are being \
+             dropped until then"
         );
         return None;
     }
@@ -446,8 +454,15 @@ fn parse_connect(bytes: &[u8]) -> Option<Event> {
         pid: raw.pid,
         family,
         daddr,
-        dport: u16::from_be(raw.dport),
-        local_port: u16::from_be(raw.sport),
+        // NOT `from_be`. The kernel's inet_sock_set_state tracepoint
+        // already applies ntohs() to both ports before they reach us
+        // (include/trace/events/sock.h), so byte-swapping again yields
+        // garbage. Confirmed against live traffic: 443 was being
+        // recorded as 47873 (0x01BB read back as 0xBB01) and 80 as
+        // 20480. The addresses are different — those really are raw
+        // network-order bytes, which is why Ipv4Addr::from is correct.
+        dport: raw.dport,
+        local_port: raw.sport,
         direction,
         ts: std::time::SystemTime::now(),
     }))
@@ -685,12 +700,12 @@ mod tests {
     fn parse_connect_v4_decodes_ipv4_and_dport() {
         let event_raw = RawConnectEvent {
             pid: 1234,
-            sport: 54321u16.to_be(),
+            sport: 54321,
             direction: 0,
             _pad: 0,
             family: AF_INET,
             // 443 in network byte order
-            dport: 443u16.to_be(),
+            dport: 443,
             daddr_v4: [192, 168, 1, 50],
             daddr_v6: [0; 16],
             comm: *b"curl\0\0\0\0\0\0\0\0\0\0\0\0",
@@ -714,11 +729,11 @@ mod tests {
         v6[15] = 1;
         let event_raw = RawConnectEvent {
             pid: 99,
-            sport: 54321u16.to_be(),
+            sport: 54321,
             direction: 0,
             _pad: 0,
             family: AF_INET6,
-            dport: 80u16.to_be(),
+            dport: 80,
             daddr_v4: [0; 4],
             daddr_v6: v6,
             comm: *b"firefox\0\0\0\0\0\0\0\0\0",
@@ -739,7 +754,7 @@ mod tests {
     fn parse_connect_drops_unknown_family() {
         let event_raw = RawConnectEvent {
             pid: 1,
-            sport: 54321u16.to_be(),
+            sport: 54321,
             direction: 0,
             _pad: 0,
             family: 17, // AF_NETLINK — not something we care about
@@ -790,8 +805,8 @@ mod inbound_tests {
         let raw = RawConnectEvent {
             pid: 0,
             family: AF_INET,
-            dport: 54321u16.to_be(), // client's ephemeral port
-            sport: 22u16.to_be(),    // our listening port
+            dport: 54321, // client's ephemeral port
+            sport: 22,    // our listening port
             direction: DIRECTION_IN,
             _pad: 0,
             daddr_v4: [10, 0, 0, 42],
@@ -809,6 +824,36 @@ mod inbound_tests {
                     "the accept-side transition runs in softirq context; a pid here \
                      would be whatever task was interrupted"
                 );
+            }
+            other => panic!("expected NetworkConnect, got {other:?}"),
+        }
+    }
+
+    /// Ports arrive in host order because the tracepoint applies
+    /// `ntohs()` itself. Swapping them again turned 443 into 47873 in
+    /// production for the whole life of this code path — caught only by
+    /// reading real recorded traffic, since every synthetic test built
+    /// its fixture with the same wrong convention it was asserting.
+    #[test]
+    fn ports_are_taken_in_host_order_not_byte_swapped() {
+        let raw = RawConnectEvent {
+            pid: 42,
+            family: AF_INET,
+            dport: 443,
+            sport: 51000,
+            direction: 0,
+            _pad: 0,
+            daddr_v4: [93, 184, 216, 34],
+            daddr_v6: [0; 16],
+            comm: *b"curl\0\0\0\0\0\0\0\0\0\0\0\0",
+        };
+        match parse_connect(as_bytes(&raw)).expect("parses") {
+            Event::NetworkConnect(c) => {
+                assert_eq!(c.dport, 443, "443 must not become 47873");
+                assert_eq!(c.local_port, 51000);
+                // The ADDRESS really is raw network-order bytes, which is
+                // why it is built from the array rather than swapped.
+                assert_eq!(c.daddr.to_string(), "93.184.216.34");
             }
             other => panic!("expected NetworkConnect, got {other:?}"),
         }

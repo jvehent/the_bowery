@@ -191,6 +191,25 @@ if [[ "$DO_CONSOLE" == 1 ]]; then
 fi
 if [[ "$DO_AGENT" == 1 ]]; then
     run sudo install -m0755 target/release/bowery-agent "$BIN_DIR/bowery-agent"
+
+    # The eBPF object is loaded from disk at runtime, NOT embedded in the
+    # binary, so installing the agent alone leaves the kernel program at
+    # whatever version was there before. That skew is invisible until an
+    # event record changes size, at which point every event of that kind
+    # is silently discarded. Keep the two in lockstep.
+    EBPF_OBJ="crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf"
+    if [[ -f "$EBPF_OBJ" ]]; then
+        if [[ "$EBPF_OBJ" -ot target/release/bowery-agent ]]; then
+            echo "    WARNING: $EBPF_OBJ is older than the agent binary."
+            echo "             Run scripts/build-ebpf first if the eBPF source changed."
+        fi
+        run sudo install -d -m0755 /usr/local/lib/bowery
+        run sudo install -m0644 "$EBPF_OBJ" /usr/local/lib/bowery/bowery-ebpf
+        echo "    installed eBPF object -> /usr/local/lib/bowery/bowery-ebpf"
+    else
+        echo "    NOTE: no eBPF object at $EBPF_OBJ; leaving the installed one in place."
+        echo "          Build it with scripts/build-ebpf if you changed kernel-side code."
+    fi
 fi
 
 # Refresh the systemd unit + remote drop-in. This is what makes
