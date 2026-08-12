@@ -962,3 +962,98 @@ impl BoweryTable for BoweryEventLogStatusTable {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod alerts_view_tests {
+    use super::*;
+    use bowery_proto::{Alert, AlertConfirmation};
+    use std::time::Duration;
+
+    /// Every confirmation column the operator docs promise, queried by
+    /// name.
+    ///
+    /// This view had no coverage at all, and the columns are an
+    /// operator-facing contract: a rename or a forgotten binding
+    /// surfaces as `no such column` in someone's console at the moment
+    /// they are chasing an alert, not in CI. Selecting them explicitly
+    /// (rather than `SELECT *`) is the point — that is how a real query
+    /// fails.
+    #[tokio::test]
+    async fn exposes_every_confirmation_column() {
+        let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
+        inbox.append(Alert {
+            originator_fp: vec![0xab; 32],
+            episode_id: "corr-net.inbound_connect-deadbeef".into(),
+            exe_sha256_hex: String::new(),
+            exe_path: String::new(),
+            suspicion: 0.85,
+            rationale: "inbound connection from 10.0.0.2 to 10.0.0.1:22".into(),
+            suggested_actions: Vec::new(),
+            // Must be recent: the inbox evicts by retention, so a
+            // fixed past timestamp yields an empty view.
+            ts_unix_ms: crate::inbox::current_unix_ms(),
+            backend: "test".into(),
+            confirmation: Some(AlertConfirmation {
+                peers_asked: 4,
+                peers_unseen: 1,
+                peers_seen: 0,
+                peers_no_reply: 2,
+                peers_refused: 1,
+                quorum: 1,
+                confirmed: true,
+            }),
+        });
+
+        let sql = bowery_sql::Sql::new().with_extra_table(Arc::new(BoweryAlertsTable::new(inbox)));
+        let rows = sql
+            .query(
+                "SELECT episode_id, confirmed, peers_asked, peers_unseen, peers_seen,
+                        peers_refused, rationale
+                 FROM bowery_alerts WHERE episode_id LIKE 'corr-%'",
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("the documented query must run");
+
+        assert_eq!(rows.len(), 1);
+        let got = |name: &str| {
+            rows[0].columns.iter().find(|(c, _)| c == name).map_or_else(
+                || panic!("column {name} missing"),
+                |(_, v)| format!("{v:?}"),
+            )
+        };
+        assert!(got("confirmed").contains('1'), "{}", got("confirmed"));
+        assert!(got("peers_unseen").contains('1'));
+        assert!(got("peers_refused").contains('1'));
+        assert!(got("peers_asked").contains('4'));
+    }
+
+    /// An alert with no whisper round leaves the confirmation columns
+    /// NULL, so "nobody was asked" stays distinguishable from "asked,
+    /// and nobody agreed".
+    #[tokio::test]
+    async fn an_unwhispered_alert_has_null_confirmation_columns() {
+        let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
+        inbox.append(Alert {
+            originator_fp: vec![0xcd; 32],
+            episode_id: "ep-plain".into(),
+            exe_sha256_hex: String::new(),
+            exe_path: "/bin/true".into(),
+            suspicion: 0.5,
+            rationale: "x".into(),
+            suggested_actions: Vec::new(),
+            ts_unix_ms: crate::inbox::current_unix_ms(),
+            backend: "test".into(),
+            confirmation: None,
+        });
+        let sql = bowery_sql::Sql::new().with_extra_table(Arc::new(BoweryAlertsTable::new(inbox)));
+        let rows = sql
+            .query(
+                "SELECT episode_id FROM bowery_alerts WHERE peers_refused IS NULL",
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("query");
+        assert_eq!(rows.len(), 1, "absent confirmation must render as NULL");
+    }
+}
