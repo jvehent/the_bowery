@@ -2715,6 +2715,26 @@ trimmed the window denies whatever fell off the end. Those false
 accusations look exactly like the real finding and would vastly
 outnumber it.
 
+### 25.3.1 The same guard, retrofitted to the prevalence round
+
+The coverage rule generalises, and not applying it everywhere was a real
+bug. The binary-prevalence round (§13, `whisper_qa.rs`) had no
+equivalent: a peer whose baseline was empty answered `seen_count: 0` to
+every question, and since a quorum of "never seen it" is what confirms
+an alert, an agent with a dead event source silently rubber-stamped
+every alert its neighbours raised.
+
+Found running on a live fleet — two Pis with no eBPF object, baselines
+at zero, unanimously confirming `/usr/bin/ssh` as an anomaly.
+
+The fix mirrors `covers_since`: `Answer` gained a `refused` field (tag
+7), `local_knowledge` returns `Insufficient` below
+`[whisper.qa] min_baseline_binaries`, and `PeerSighting.sighting:
+Option<LocalSighting>` became `PeerReply` with three states — because
+`Option` could only encode two, and the missing third state *was* the
+bug. A hit outranks the threshold: "I have this too" is honest however
+little else you have observed.
+
 ### 25.4 Adding a kind
 
 Two functions and one registration. Nothing shared changes — not the wire

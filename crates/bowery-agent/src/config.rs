@@ -276,6 +276,27 @@ pub struct WhisperQaConfig {
     /// agent, and the underlying alert is already delivered either way.
     #[serde(default = "default_whisper_qa_max_concurrent_rounds")]
     pub max_concurrent_rounds: usize,
+    /// Distinct binaries this host must have observed before it will
+    /// answer a peer's question with "never seen it".
+    ///
+    /// Below this, the honest answer is *"I have not observed enough to
+    /// say"*, and the responder refuses instead. A refusal never counts
+    /// toward a peer's quorum.
+    ///
+    /// This exists because of a live failure, not a hypothetical. Two
+    /// agents were running with no working event source, so their
+    /// baselines were empty, so they answered `seen_count: 0` to every
+    /// question — and since a quorum of "never seen it" is exactly what
+    /// confirms an alert, every alert on their neighbour was being
+    /// confirmed unanimously by two hosts that had observed nothing.
+    /// `/usr/bin/ssh` was a CONFIRMED anomaly.
+    ///
+    /// The default is low: any host with a working sensor passes it
+    /// within a minute of boot, while a host with a broken one never
+    /// does. Setting it to `0` restores the old behaviour and with it
+    /// the bug.
+    #[serde(default = "default_whisper_qa_min_baseline_binaries")]
+    pub min_baseline_binaries: u64,
 }
 
 impl Default for WhisperQaConfig {
@@ -287,6 +308,7 @@ impl Default for WhisperQaConfig {
             min_similarity: default_whisper_qa_min_similarity(),
             quorum: default_whisper_qa_quorum(),
             max_concurrent_rounds: default_whisper_qa_max_concurrent_rounds(),
+            min_baseline_binaries: default_whisper_qa_min_baseline_binaries(),
         }
     }
 }
@@ -312,6 +334,14 @@ const fn default_whisper_qa_max_concurrent_rounds() -> usize {
 
 fn default_whisper_qa_quorum() -> usize {
     2
+}
+/// Sixteen distinct binaries. A host that is actually watching passes
+/// this within a minute of boot — otter1 sits at 222 — while a host
+/// whose event source never attached sits at 0 forever. Chosen to be
+/// comfortably below any real steady state rather than to be precise;
+/// the failure it guards against is "zero", not "a few".
+const fn default_whisper_qa_min_baseline_binaries() -> u64 {
+    16
 }
 
 /// `[whisper.corroboration]` — asking the mesh to account for something

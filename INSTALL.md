@@ -369,6 +369,15 @@ min_similarity = 0.0        # cosine cutoff; raise for stricter neighborhoods
 quorum         = 2          # peers that must report NEVER SEEN to confirm
                             # an alert (0 disables confirmation)
 max_concurrent_rounds = 4   # Q&A rounds in flight; extras are shed
+min_baseline_binaries = 16  # distinct binaries this host must have observed
+                            # before it will answer "never seen it". Below
+                            # this it REFUSES, and a refusal never counts
+                            # toward a peer's quorum. Guards the failure
+                            # where an agent with a dead event source has an
+                            # empty baseline, answers "never seen it" to
+                            # every question, and unanimously confirms every
+                            # alert its neighbours raise. 0 restores the old
+                            # behaviour and the bug with it.
 
 # Cross-host corroboration — asking the mesh to account for something
 # this host saw but cannot judge alone. Today that means "did you

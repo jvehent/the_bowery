@@ -370,6 +370,31 @@ pub struct Answer {
     /// etc.). Over 256 bytes is truncated by the asker.
     #[prost(string, tag = "6")]
     pub note: String,
+
+    /// Set when the responder declined rather than looked — it has
+    /// observed too little for "I have never seen it" to mean anything.
+    ///
+    /// This field exists because of a failure observed on a live fleet.
+    /// Two agents were running with no working event source, so their
+    /// baselines were empty, so they answered `seen_count: 0` to every
+    /// question ever asked. Since a quorum of "never seen it" is exactly
+    /// what confirms an alert, **every** alert on their neighbour was
+    /// being quorum-confirmed by two hosts that had never observed
+    /// anything at all — including `/usr/bin/ssh`.
+    ///
+    /// `seen_count: 0` conflates two opposite claims: *"I watch this
+    /// fleet and your binary is not part of it"* and *"I am not
+    /// watching"*. Only the first is evidence. A responder that cannot
+    /// make the first claim honestly must say so here, and an asker must
+    /// never count a refusal toward a quorum.
+    ///
+    /// Empty means the responder actually looked. Older peers have no
+    /// such field, so they decode to empty and are counted as having
+    /// looked — which is the pre-existing behaviour, not a regression,
+    /// and is why upgrading responders matters more than upgrading
+    /// askers.
+    #[prost(string, tag = "7")]
+    pub refused: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,6 +1305,7 @@ mod tests {
             first_seen_unix_ms: 1_700_000_000_000,
             last_seen_unix_ms: 1_700_000_300_000,
             note: "common across web tier".into(),
+            refused: String::new(),
         };
         let original = WhisperPayload::answer(a.clone());
         let bytes = original.encode_to_vec();

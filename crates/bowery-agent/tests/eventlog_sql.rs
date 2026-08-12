@@ -57,6 +57,8 @@ fn build_config(dir: &Path, eventlog_path: PathBuf) -> Config {
                 min_similarity: 0.0,
                 quorum: 0,
                 max_concurrent_rounds: 1,
+                min_baseline_binaries: bowery_agent::config::WhisperQaConfig::default()
+                    .min_baseline_binaries,
             },
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             // Left at the production default so every existing

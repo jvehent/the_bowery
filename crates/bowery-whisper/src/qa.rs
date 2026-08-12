@@ -195,13 +195,39 @@ pub struct LocalSighting {
     pub last_seen_unix_ms: u64,
 }
 
+/// What a responder is willing to say about a fingerprint.
+///
+/// `LocalSighting` converts into `Observed`, so a lookup that always
+/// has an opinion can keep returning one directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalAnswer {
+    /// Looked, and reports what was found. A zero `seen_count` here is
+    /// the real "never seen it".
+    Observed(LocalSighting),
+    /// Declined: too little observed for "never seen it" to be
+    /// evidence. Carries an operator-readable reason.
+    Refused(String),
+}
+
+impl From<LocalSighting> for LocalAnswer {
+    fn from(s: LocalSighting) -> Self {
+        Self::Observed(s)
+    }
+}
+
 /// Read one [`Question`] from `conn`, run `lookup` to find the local
 /// sighting, and send the corresponding [`Answer`] back. Returns the
 /// question that was answered (handy for tests + tracing).
 ///
+/// `lookup` may return [`LocalAnswer::Refused`] — and must, when this
+/// host has observed too little for "never seen it" to be evidence.
+/// The asker's quorum counts a refusal as neither seen nor unseen;
+/// answering a bare zero instead is how a host with a dead sensor ends
+/// up confirming every alert its neighbours raise.
+///
 /// `note` is a short string the responder attaches to its answer
 /// (e.g. its own role tag); pass `""` to omit.
-pub async fn answer_one<R, F>(
+pub async fn answer_one<R, F, A>(
     conn: &BoweryConnection,
     sealer: &Sealer,
     verifier: &Verifier<R>,
@@ -210,7 +236,8 @@ pub async fn answer_one<R, F>(
 ) -> Result<Question, AnswerError>
 where
     R: FingerprintResolver,
-    F: FnOnce(Tier1Fingerprint) -> LocalSighting,
+    F: FnOnce(Tier1Fingerprint) -> A,
+    A: Into<LocalAnswer>,
 {
     let (bytes, reply) = conn.accept_request().await?;
     let opened = verifier.open(&bytes)?;
@@ -259,14 +286,23 @@ where
     fp_bytes.copy_from_slice(&question.tier1_fp);
     let fp = Tier1Fingerprint::from_bytes(fp_bytes);
 
-    let sighting = lookup(fp);
-    let answer = Answer {
-        episode_id: question.episode_id.clone(),
-        tier1_fp: question.tier1_fp.clone(),
-        seen_count: sighting.seen_count,
-        first_seen_unix_ms: sighting.first_seen_unix_ms,
-        last_seen_unix_ms: sighting.last_seen_unix_ms,
-        note: note.to_string(),
+    let answer = match lookup(fp).into() {
+        LocalAnswer::Observed(sighting) => Answer {
+            episode_id: question.episode_id.clone(),
+            tier1_fp: question.tier1_fp.clone(),
+            seen_count: sighting.seen_count,
+            first_seen_unix_ms: sighting.first_seen_unix_ms,
+            last_seen_unix_ms: sighting.last_seen_unix_ms,
+            note: note.to_string(),
+            refused: String::new(),
+        },
+        LocalAnswer::Refused(reason) => Answer {
+            episode_id: question.episode_id.clone(),
+            tier1_fp: question.tier1_fp.clone(),
+            note: note.to_string(),
+            refused: reason,
+            ..Default::default()
+        },
     };
     let outbound = sealer.seal_for(&asker, &WhisperPayload::answer(answer));
     reply.send(&outbound).await?;

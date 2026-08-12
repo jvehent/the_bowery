@@ -238,6 +238,14 @@ won't say and a peer that can't be reached both told you nothing, and
 treating either as agreement would let an offline neighbourhood
 manufacture alerts.
 
+A **declined** count that is high, or equal to `asked`, is itself worth
+reading: it means those hosts have observed too little to have an
+opinion, which usually means their event source isn't running. An agent
+that answers honestly about its own blindness is far more useful than
+one that votes anyway — before this existed, two agents with dead
+sensors were unanimously confirming every alert their neighbour raised,
+`/usr/bin/ssh` included.
+
 An episode that produces several alerts — the original, an LLM-refined
 one, a quorum-confirmed one — collapses to a single row showing the
 newest, since the later ones supersede rather than accompany the

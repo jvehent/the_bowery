@@ -77,13 +77,41 @@ pub(crate) struct WhisperQaTrigger {
     pub ctx: AnalysisContext,
 }
 
-/// Per-peer summary of a single round. `None` for `sighting` means the
-/// peer didn't reply (timeout, dial failure, malformed response).
+/// What one peer said in a round.
+///
+/// Three states, not two. `Option<LocalSighting>` used to carry this,
+/// and the missing third state is what let two agents with empty
+/// baselines confirm every alert their neighbour raised: a peer that
+/// cannot answer and a peer that answered "no" were the same value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerReply {
+    /// Looked, and reports what it found. `seen_count == 0` here is the
+    /// real "never seen it" — evidence.
+    Observed(qa::LocalSighting),
+    /// Answered, but declined: too little observed for its "no" to mean
+    /// anything. Carries the responder's reason.
+    Refused(String),
+    /// Timed out, failed to dial, or replied unintelligibly.
+    Silent,
+}
+
+impl PeerReply {
+    /// The sighting, if the peer actually looked.
+    #[must_use]
+    pub fn observed(&self) -> Option<qa::LocalSighting> {
+        match self {
+            Self::Observed(s) => Some(*s),
+            Self::Refused(_) | Self::Silent => None,
+        }
+    }
+}
+
+/// Per-peer summary of a single round.
 #[derive(Debug, Clone)]
 pub struct PeerSighting {
     pub peer: Fingerprint,
     pub similarity: f32,
-    pub sighting: Option<qa::LocalSighting>,
+    pub reply: PeerReply,
     pub note: String,
 }
 
@@ -108,20 +136,53 @@ pub struct WhisperContext {
 // Local-side aggregation (for the responder).
 // ---------------------------------------------------------------------------
 
-/// Scan the baseline and aggregate sightings whose tier-1 fingerprint
-/// matches `target`. Returns `LocalSighting::default()` (i.e.
-/// `seen_count == 0`) if the baseline has no matching rows.
+/// What this host can honestly say about a tier-1 fingerprint.
+///
+/// The distinction is the whole point: `Observed(zero)` and
+/// `Insufficient` both mean "I have no record", and only the first is
+/// evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalKnowledge {
+    /// This host has observed enough for "never seen it" to be
+    /// informative. The sighting may still be zero — that is the
+    /// finding.
+    Observed(LocalSighting),
+    /// Too little observed to have an opinion. Carries what little
+    /// there was, so the refusal can say so.
+    Insufficient { binaries: u64 },
+}
+
+/// Scan the baseline once, answering both "how much have I observed?"
+/// and "have I seen this?".
+///
+/// **The count is not decoration.** A host whose baseline is empty
+/// answers `seen_count: 0` to every question, and a quorum of
+/// "never seen it" is exactly what confirms an alert — so an agent with
+/// a broken event source silently rubber-stamps every alert its
+/// neighbours raise. That is not hypothetical: it was found running on
+/// a live fleet, confirming `/usr/bin/ssh` as an anomaly by unanimous
+/// agreement of two hosts that had observed nothing whatsoever.
+///
+/// Below `min_binaries` this returns [`LocalKnowledge::Insufficient`]
+/// and the responder refuses instead of answering zero. Both facts come
+/// from the same scan because the scan is the expensive part.
 ///
 /// O(n) over the binary table; fine at fleet sizes we care about (a
 /// host's own binary set is bounded). If this becomes a hotspot we'll
 /// add an indexed `tier1` column to the baseline schema.
-pub fn aggregate_local_sighting(baseline: &Baseline, target: Tier1Fingerprint) -> LocalSighting {
+pub fn local_knowledge(
+    baseline: &Baseline,
+    target: Tier1Fingerprint,
+    min_binaries: u64,
+) -> LocalKnowledge {
     let mut seen_count = 0u64;
     let mut first_seen_unix_ms = u64::MAX;
     let mut last_seen_unix_ms = 0u64;
     let mut hits = 0u64;
+    let mut observed_binaries = 0u64;
 
     let _ = baseline.for_each_binary(|rec| {
+        observed_binaries += 1;
         if Tier1Fingerprint::derive(&rec.sha256) != target {
             return;
         }
@@ -143,13 +204,36 @@ pub fn aggregate_local_sighting(baseline: &Baseline, target: Tier1Fingerprint) -
         last_seen_unix_ms = last_seen_unix_ms.max(last);
     });
 
-    if hits == 0 {
-        return LocalSighting::default();
+    // A hit outranks the threshold: if we have actually seen the
+    // binary, saying so is always honest and always useful, however
+    // little else we have observed.
+    if hits == 0 && observed_binaries < min_binaries {
+        return LocalKnowledge::Insufficient {
+            binaries: observed_binaries,
+        };
     }
-    LocalSighting {
+    if hits == 0 {
+        return LocalKnowledge::Observed(LocalSighting::default());
+    }
+    LocalKnowledge::Observed(LocalSighting {
         seen_count,
         first_seen_unix_ms,
         last_seen_unix_ms,
+    })
+}
+
+/// Back-compat shim: aggregate sightings without the coverage check.
+///
+/// Only for callers that have already established coverage some other
+/// way. Prefer [`local_knowledge`] — answering from this directly is
+/// how the blind-witness bug happened.
+#[must_use]
+pub fn aggregate_local_sighting(baseline: &Baseline, target: Tier1Fingerprint) -> LocalSighting {
+    match local_knowledge(baseline, target, 0) {
+        LocalKnowledge::Observed(s) => s,
+        // Unreachable with min_binaries == 0, but a total is still the
+        // honest zero here.
+        LocalKnowledge::Insufficient { .. } => LocalSighting::default(),
     }
 }
 
@@ -387,36 +471,45 @@ async fn run_round(
     let mut total_seen_count = 0u64;
     let mut corroborating_peers = 0usize;
     for (peer, similarity, outcome) in results {
-        match outcome {
+        let (reply, note) = match outcome {
+            // A peer that declined is not a peer that said no. Checked
+            // before `seen_count`, because a refusing responder leaves
+            // the count at its zero default and reading that as "never
+            // seen it" is precisely the bug this field exists to close.
+            Ok(answer) if !answer.refused.is_empty() => {
+                debug!(
+                    peer = %peer.fingerprint,
+                    reason = %answer.refused,
+                    "peer declined to answer a whisper question"
+                );
+                (PeerReply::Refused(answer.refused.clone()), answer.note)
+            }
             Ok(answer) => {
                 let seen = answer.seen_count;
-                let note = answer.note.clone();
-                let sighting = LocalSighting {
-                    seen_count: seen,
-                    first_seen_unix_ms: answer.first_seen_unix_ms,
-                    last_seen_unix_ms: answer.last_seen_unix_ms,
-                };
                 if seen > 0 {
                     corroborating_peers += 1;
                     total_seen_count = total_seen_count.saturating_add(seen);
                 }
-                peers.push(PeerSighting {
-                    peer: peer.fingerprint,
-                    similarity,
-                    sighting: Some(sighting),
-                    note,
-                });
+                (
+                    PeerReply::Observed(LocalSighting {
+                        seen_count: seen,
+                        first_seen_unix_ms: answer.first_seen_unix_ms,
+                        last_seen_unix_ms: answer.last_seen_unix_ms,
+                    }),
+                    answer.note,
+                )
             }
             Err(e) => {
                 debug!(peer = %peer.fingerprint, error = %e, "whisper ask failed");
-                peers.push(PeerSighting {
-                    peer: peer.fingerprint,
-                    similarity,
-                    sighting: None,
-                    note: String::new(),
-                });
+                (PeerReply::Silent, String::new())
             }
-        }
+        };
+        peers.push(PeerSighting {
+            peer: peer.fingerprint,
+            similarity,
+            reply,
+            note,
+        });
     }
 
     info!(
@@ -471,11 +564,13 @@ pub fn quorum_verdict(peers: &[PeerSighting], quorum: usize) -> AlertConfirmatio
     let mut unseen = 0u32;
     let mut seen = 0u32;
     let mut no_reply = 0u32;
+    let mut refused = 0u32;
     for p in peers {
-        match &p.sighting {
-            Some(s) if s.seen_count > 0 => seen += 1,
-            Some(_) => unseen += 1,
-            None => no_reply += 1,
+        match &p.reply {
+            PeerReply::Observed(s) if s.seen_count > 0 => seen += 1,
+            PeerReply::Observed(_) => unseen += 1,
+            PeerReply::Refused(_) => refused += 1,
+            PeerReply::Silent => no_reply += 1,
         }
     }
     let quorum_u32 = u32::try_from(quorum).unwrap_or(u32::MAX);
@@ -484,10 +579,7 @@ pub fn quorum_verdict(peers: &[PeerSighting], quorum: usize) -> AlertConfirmatio
         peers_unseen: unseen,
         peers_seen: seen,
         peers_no_reply: no_reply,
-        // The binary-prevalence round has no refusal path: a peer
-        // either answers with a count or doesn't answer. Only the
-        // corroboration rounds can distinguish "I won't say".
-        peers_refused: 0,
+        peers_refused: refused,
         quorum: quorum_u32,
         // quorum == 0 disables confirmation outright rather than
         // confirming everything, which is what `>=` alone would do.
@@ -503,6 +595,13 @@ fn confirmation_rationale(c: &AlertConfirmation) -> String {
     );
     if c.peers_seen > 0 {
         let _ = write!(s, " ({} have seen it)", c.peers_seen);
+    }
+    if c.peers_refused > 0 {
+        let _ = write!(
+            s,
+            ", {} could not say (too little observed)",
+            c.peers_refused
+        );
     }
     if c.peers_no_reply > 0 {
         let _ = write!(s, ", {} did not reply", c.peers_no_reply);
@@ -596,7 +695,7 @@ pub(crate) fn inject_whisper_context(ctx: &mut AnalysisContext, ctx_in: &Whisper
     ctx.extra.push(("neighborhood".to_string(), summary));
 
     for peer in &ctx_in.peers {
-        let Some(sighting) = peer.sighting else {
+        let Some(sighting) = peer.reply.observed() else {
             continue;
         };
         if sighting.seen_count == 0 {
@@ -861,7 +960,7 @@ mod tests {
                 PeerSighting {
                     peer: corroborating,
                     similarity: 0.95,
-                    sighting: Some(LocalSighting {
+                    reply: PeerReply::Observed(LocalSighting {
                         seen_count: 12,
                         first_seen_unix_ms: 1,
                         last_seen_unix_ms: 2,
@@ -871,13 +970,13 @@ mod tests {
                 PeerSighting {
                     peer: zero_sighting,
                     similarity: 0.80,
-                    sighting: Some(LocalSighting::default()), // no observation
+                    reply: PeerReply::Observed(LocalSighting::default()), // no observation
                     note: String::new(),
                 },
                 PeerSighting {
                     peer: no_response,
                     similarity: 0.70,
-                    sighting: None, // didn't reply
+                    reply: PeerReply::Silent, // didn't reply
                     note: String::new(),
                 },
             ],
@@ -921,7 +1020,7 @@ mod quorum_tests {
         PeerSighting {
             peer: fp(b),
             similarity: 0.9,
-            sighting: Some(LocalSighting::default()),
+            reply: PeerReply::Observed(LocalSighting::default()),
             note: String::new(),
         }
     }
@@ -931,7 +1030,7 @@ mod quorum_tests {
         PeerSighting {
             peer: fp(b),
             similarity: 0.9,
-            sighting: Some(LocalSighting {
+            reply: PeerReply::Observed(LocalSighting {
                 seen_count: count,
                 first_seen_unix_ms: 1,
                 last_seen_unix_ms: 2,
@@ -945,7 +1044,7 @@ mod quorum_tests {
         PeerSighting {
             peer: fp(b),
             similarity: 0.9,
-            sighting: None,
+            reply: PeerReply::Silent,
             note: String::new(),
         }
     }

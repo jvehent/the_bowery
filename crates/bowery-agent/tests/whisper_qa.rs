@@ -59,6 +59,8 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>, quorum: u
                 min_similarity: -1.0, // accept anything; tiny test fleet
                 quorum,
                 max_concurrent_rounds: 4,
+                min_baseline_binaries: bowery_agent::config::WhisperQaConfig::default()
+                    .min_baseline_binaries,
             },
             bind_addr: loopback_ephemeral(),
             // Left at the production default so every existing
@@ -200,10 +202,13 @@ async fn high_suspicion_exec_triggers_whisper_round_and_aggregates_beta_sighting
     let beta_sighting = &context.peers[0];
     assert_eq!(beta_sighting.peer, beta_fp);
     assert!(
-        beta_sighting.sighting.is_some(),
+        beta_sighting.reply.observed().is_some(),
         "beta should have replied (no transport error / timeout)"
     );
-    let s = beta_sighting.sighting.unwrap();
+    // Beta clears the coverage check by having actually seen the
+    // binary: a hit outranks the baseline-size threshold, because
+    // "I have this too" is honest however little else you have observed.
+    let s = beta_sighting.reply.observed().unwrap();
     assert_eq!(s.seen_count, 2, "beta upserted twice");
     assert_eq!(context.corroborating_peers, 1);
     assert_eq!(context.total_seen_count, 2);
@@ -397,7 +402,22 @@ async fn neighbourhood_quorum_confirms_an_alert_nobody_else_has_seen() {
     .await
     .expect("start beta");
 
-    // Beta's baseline is deliberately left empty for this sha.
+    // Beta must be a *credible* witness, not merely a silent one. Seed
+    // its baseline past the coverage threshold with unrelated binaries:
+    // the claim under test is "a host that watches this fleet has never
+    // seen your payload", and a host that has observed nothing at all
+    // cannot make it. Leaving the baseline empty here is what the live
+    // fleet was doing when it confirmed /usr/bin/ssh as an anomaly.
+    let min = bowery_agent::config::WhisperQaConfig::default().min_baseline_binaries;
+    for i in 0..(min + 4) {
+        let mut sha = [0u8; 32];
+        sha[0..8].copy_from_slice(&i.to_le_bytes());
+        agent_beta
+            .baseline()
+            .upsert_binary(&sha)
+            .expect("seed beta");
+    }
+
     let mut events = agent_alpha.subscribe();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let context = loop {
@@ -425,8 +445,9 @@ async fn neighbourhood_quorum_confirms_an_alert_nobody_else_has_seen() {
     );
     assert_eq!(context.peers.len(), 1, "expected beta in the round");
     let sighting = context.peers[0]
-        .sighting
-        .expect("beta should have replied rather than timing out");
+        .reply
+        .observed()
+        .expect("beta should have looked and answered, not refused or timed out");
     assert_eq!(sighting.seen_count, 0, "beta has never seen this payload");
     assert_eq!(context.corroborating_peers, 0);
 
@@ -450,8 +471,112 @@ async fn neighbourhood_quorum_confirms_an_alert_nobody_else_has_seen() {
     assert_eq!(c.peers_unseen, 1);
     assert_eq!(c.peers_seen, 0);
     assert_eq!(c.peers_no_reply, 0);
+    assert_eq!(c.peers_refused, 0, "beta was seeded past the coverage bar");
     assert_eq!(c.peers_asked, 1);
     assert_eq!(c.quorum, 1);
+
+    agent_alpha.shutdown().await.expect("shutdown alpha");
+    agent_beta.shutdown().await.expect("shutdown beta");
+}
+
+/// A peer with an empty baseline must not confirm anything.
+///
+/// This is the bug as found in production, reduced. Two agents were
+/// running with no working event source, so their baselines were empty,
+/// so they answered "never seen it" to every question — and a quorum of
+/// "never seen it" is exactly what confirms an alert. Every alert on
+/// their neighbour was being confirmed unanimously by two hosts that had
+/// observed nothing whatsoever, `/usr/bin/ssh` among them.
+///
+/// The distinction that fixes it: "I watch this fleet and your binary is
+/// not part of it" is evidence; "I am not watching" is not. Only the
+/// first may count toward a quorum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_with_an_empty_baseline_refuses_and_never_confirms() {
+    let workdir_alpha = TempDir::new().unwrap();
+    let workdir_beta = TempDir::new().unwrap();
+
+    let payload_path = workdir_alpha.path().join("payload");
+    std::fs::write(&payload_path, b"blind-witness-regression").unwrap();
+
+    let mesh_addr_alpha = reserve_udp_port();
+    let mesh_addr_beta = reserve_udp_port();
+
+    // A quorum of one: the weakest possible bar, so if anything is going
+    // to confirm on a blind peer's say-so, it will be this.
+    let cfg_alpha = build_config(
+        workdir_alpha.path(),
+        mesh_addr_alpha,
+        vec![mesh_addr_beta.to_string()],
+        1,
+    );
+    let cfg_beta = build_config(
+        workdir_beta.path(),
+        mesh_addr_beta,
+        vec![mesh_addr_alpha.to_string()],
+        1,
+    );
+
+    let alpha_source = Box::new(
+        MockEventSource::new(vec![make_exec(4321, payload_path)])
+            .with_delay(Duration::from_secs(2)),
+    );
+    let agent_alpha = Agent::start(cfg_alpha, Arc::new(Identity::generate()), alpha_source)
+        .await
+        .expect("start alpha");
+    // Beta observes nothing, ever — exactly the Pis' situation.
+    let agent_beta = Agent::start(
+        cfg_beta,
+        Arc::new(Identity::generate()),
+        Box::new(NoopEventSource),
+    )
+    .await
+    .expect("start beta");
+    assert_eq!(
+        agent_beta.baseline_binary_count().unwrap(),
+        0,
+        "beta must be genuinely blind for this test to mean anything"
+    );
+
+    let mut events = agent_alpha.subscribe();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let context = loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!timeout.is_zero(), "timed out waiting for the round");
+        match tokio::time::timeout(timeout, events.recv()).await {
+            Ok(Ok(AgentEvent::WhisperContextReady(ctx))) => break ctx,
+            Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
+            Ok(Err(RecvError::Closed)) => panic!("event channel closed early"),
+            Err(tokio::time::error::Elapsed { .. }) => panic!("timed out waiting for the round"),
+        }
+    };
+
+    assert_eq!(context.peers.len(), 1, "expected beta in the round");
+    // Beta answered — it is reachable and working. It just declined.
+    assert!(
+        matches!(
+            context.peers[0].reply,
+            bowery_agent::whisper_qa::PeerReply::Refused(_)
+        ),
+        "a blind peer must refuse, not report never-seen-it: {:?}",
+        context.peers[0].reply
+    );
+
+    let (alerts, _) = agent_alpha.inbox().read_since(0, 100);
+    assert!(
+        !alerts
+            .iter()
+            .any(|a| a.confirmation.is_some_and(|c| c.confirmed)),
+        "a blind peer's refusal must never confirm an alert"
+    );
+    // And the refusal is visible to the operator rather than silently
+    // folded into "no reply", which would read as an unreachable peer.
+    let confirmations: Vec<_> = alerts.iter().filter_map(|a| a.confirmation).collect();
+    if let Some(c) = confirmations.first() {
+        assert_eq!(c.peers_refused, 1);
+        assert_eq!(c.peers_unseen, 0, "a refusal is not a never-seen-it vote");
+        assert_eq!(c.peers_no_reply, 0, "beta answered; it is not silent");
+    }
 
     agent_alpha.shutdown().await.expect("shutdown alpha");
     agent_beta.shutdown().await.expect("shutdown beta");

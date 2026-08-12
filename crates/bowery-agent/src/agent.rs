@@ -40,9 +40,7 @@ use crate::bloom_publisher;
 use crate::inbox::{AlertInbox, current_unix_ms};
 use crate::monitor::MonitorRules;
 use crate::seen::RecentlySeen;
-use crate::whisper_qa::{
-    WhisperContext, WhisperQaTrigger, aggregate_local_sighting, spawn_whisper_qa_task,
-};
+use crate::whisper_qa::{WhisperContext, WhisperQaTrigger, spawn_whisper_qa_task};
 use crate::yara_store::YaraStore;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -700,6 +698,7 @@ impl Agent {
             let events_for_handler = events_tx.clone();
             let qa_limit_for_handler = qa_rate_limit.clone();
             let responders_for_handler = responders.clone();
+            let min_baseline_for_handler = config.whisper.qa.min_baseline_binaries;
             let handler: bowery_whisper::pool::InboundHandler = Arc::new(move |peer_fp, conn| {
                 let verifier = envelope_verifier.clone();
                 let operators = operators_for_handler.clone();
@@ -710,6 +709,7 @@ impl Agent {
                 let events = events_for_handler.clone();
                 let qa_rate_limit = qa_limit_for_handler.clone();
                 let responders = responders_for_handler.clone();
+                let min_baseline_binaries = min_baseline_for_handler;
                 debug!(
                     peer = %peer_fp,
                     conn_id = conn.stable_id(),
@@ -726,6 +726,7 @@ impl Agent {
                     events,
                     qa_rate_limit,
                     responders,
+                    min_baseline_binaries,
                 ));
             });
             PeerConnections::with_handler(endpoint.clone(), handler)
@@ -742,6 +743,7 @@ impl Agent {
             events_tx.clone(),
             qa_rate_limit.clone(),
             responders.clone(),
+            config.whisper.qa.min_baseline_binaries,
             shutdown_rx.clone(),
         );
 
@@ -1342,6 +1344,7 @@ fn spawn_accept_task(
     events_tx: broadcast::Sender<AgentEvent>,
     qa_rate_limit: Arc<RateLimit>,
     responders: Arc<ResponderRegistry>,
+    min_baseline_binaries: u64,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1364,7 +1367,7 @@ fn spawn_accept_task(
                             let responders = responders.clone();
                             tokio::spawn(handle_connection(
                                 conn, verifier, operators, sealer, baseline, inbox, op_router,
-                                events, qa_rate_limit, responders,
+                                events, qa_rate_limit, responders, min_baseline_binaries,
                             ));
                         }
                         Err(e) => warn!(error = %e, "accept failed"),
@@ -1399,6 +1402,7 @@ async fn handle_connection(
     events_tx: broadcast::Sender<AgentEvent>,
     qa_rate_limit: Arc<RateLimit>,
     responders: Arc<ResponderRegistry>,
+    min_baseline_binaries: u64,
 ) {
     let uni = tokio::spawn(handle_uni_stream_loop(
         conn.clone(),
@@ -1417,6 +1421,7 @@ async fn handle_connection(
         events_tx,
         qa_rate_limit,
         responders,
+        min_baseline_binaries,
     ));
     let _ = tokio::join!(uni, bi);
 }
@@ -1499,6 +1504,7 @@ async fn handle_uni_stream_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // keeps the wiring explicit at the call site
 async fn handle_bi_stream_loop(
     conn: BoweryConnection,
     verifier: Arc<Verifier<ResolverArc>>,
@@ -1507,6 +1513,7 @@ async fn handle_bi_stream_loop(
     events_tx: broadcast::Sender<AgentEvent>,
     qa_rate_limit: Arc<RateLimit>,
     responders: Arc<ResponderRegistry>,
+    min_baseline_binaries: u64,
 ) {
     loop {
         let Ok((bytes, reply)) = conn.accept_request().await else {
@@ -1552,7 +1559,15 @@ async fn handle_bi_stream_loop(
                     warn!(sender = %env.sender, "whisper Q&A rate limit exceeded; shedding");
                     continue;
                 }
-                if let Err(e) = respond_to_question(reply, &sealer, &baseline, env.sender, q).await
+                if let Err(e) = respond_to_question(
+                    reply,
+                    &sealer,
+                    &baseline,
+                    env.sender,
+                    q,
+                    min_baseline_binaries,
+                )
+                .await
                 {
                     warn!(sender = %env.sender, error = %e, "whisper Q&A response failed");
                 }
@@ -1574,6 +1589,7 @@ async fn respond_to_question(
     baseline: &Arc<Baseline>,
     asker: Fingerprint,
     question: bowery_proto::Question,
+    min_baseline_binaries: u64,
 ) -> Result<(), bowery_whisper::transport::Error> {
     if question.tier1_fp.len() != TIER1_LEN {
         warn!(
@@ -1609,25 +1625,48 @@ async fn respond_to_question(
     let target = Tier1Fingerprint::from_bytes(fp_bytes);
 
     let baseline = baseline.clone();
-    let sighting = match tokio::task::spawn_blocking(move || {
-        aggregate_local_sighting(&baseline, target)
+    let knowledge = match tokio::task::spawn_blocking(move || {
+        crate::whisper_qa::local_knowledge(&baseline, target, min_baseline_binaries)
     })
     .await
     {
-        Ok(s) => s,
+        Ok(k) => k,
         Err(e) => {
             warn!(error = %e, "baseline scan task panicked");
             return Ok(());
         }
     };
 
-    let answer = bowery_proto::Answer {
-        episode_id: question.episode_id,
-        tier1_fp: question.tier1_fp,
-        seen_count: sighting.seen_count,
-        first_seen_unix_ms: sighting.first_seen_unix_ms,
-        last_seen_unix_ms: sighting.last_seen_unix_ms,
-        note: String::new(),
+    // Refusing is the whole point of the coverage check: a host that has
+    // observed nothing must not answer "never seen it", because a quorum
+    // of those is what confirms an alert on the asker.
+    let answer = match knowledge {
+        crate::whisper_qa::LocalKnowledge::Observed(sighting) => bowery_proto::Answer {
+            episode_id: question.episode_id,
+            tier1_fp: question.tier1_fp,
+            seen_count: sighting.seen_count,
+            first_seen_unix_ms: sighting.first_seen_unix_ms,
+            last_seen_unix_ms: sighting.last_seen_unix_ms,
+            note: String::new(),
+            refused: String::new(),
+        },
+        crate::whisper_qa::LocalKnowledge::Insufficient { binaries } => {
+            debug!(
+                sender = %asker,
+                binaries,
+                min = min_baseline_binaries,
+                "declining a whisper question: too little observed to answer honestly"
+            );
+            bowery_proto::Answer {
+                episode_id: question.episode_id,
+                tier1_fp: question.tier1_fp,
+                note: String::new(),
+                refused: format!(
+                    "observed only {binaries} binaries; too few to say whether this is rare"
+                ),
+                ..Default::default()
+            }
+        }
     };
     let outbound = sealer.seal_for(&asker, &WhisperPayload::answer(answer));
     reply.send(&outbound).await
