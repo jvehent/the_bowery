@@ -12,22 +12,58 @@
 #   - The PINNED nightly + rust-src (crates/bowery-ebpf/rust-toolchain.toml;
 #     rustup auto-installs it). The pin exists because bpf-linker is coupled
 #     to an LLVM major version — see that file.
-#   - bpf-linker (cargo install bpf-linker), able to load LLVM matching the
-#     pinned nightly (LLVM 22 for bpf-linker 0.10.4). On Ubuntu that means
-#     either a system LLVM 22 (`apt install llvm`) or the toolchain's
-#     libLLVM via `rustup component add rustc-dev llvm-tools`. Note: if the
+#   - bpf-linker, PINNED:  cargo install bpf-linker --version 0.10.4
+#
+#     Never bare `cargo install bpf-linker`. It resolves to the newest
+#     release, whose llvm-sys wants a newer LLVM than the pinned nightly
+#     emits — 0.11.0 needs LLVM 23.1 where this toolchain is LLVM 22.1 —
+#     and the build fails at `llvm-config` if you're lucky or produces a
+#     BTF-less object if you're not.
+#
+#     It must load LLVM matching the pinned nightly (LLVM 22 for
+#     bpf-linker 0.10.4). On Ubuntu that means either a system LLVM 22
+#     (`apt install llvm-22`, which needs apt.llvm.org — the distro repo
+#     stops at 20) or the toolchain's libLLVM via
+#     `rustup component add rustc-dev llvm-tools`. Note: if the
 #     toolchain's libLLVM-<ver>.so is a GNU-ld `INPUT(...)` stub instead of
 #     a symlink to the real libLLVM.so.*, recreate it as a symlink.
+#
+#   None of this is needed just to SHIP the object: it targets
+#   bpfel-unknown-none and is architecture-neutral, so one host with a
+#   working toolchain can build it for the whole fleet. If the setup
+#   above is fighting you, build it on a host that already works and copy
+#   the artifact.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EBPF_DIR="$REPO_ROOT/crates/bowery-ebpf"
 
+# The bpf-linker release whose llvm-sys major matches the nightly pinned
+# in crates/bowery-ebpf/rust-toolchain.toml. Bump both together, never
+# one alone.
+EXPECTED_BPF_LINKER="0.10.4"
+
 if ! command -v bpf-linker >/dev/null; then
     echo "error: bpf-linker not found on PATH" >&2
-    echo "       install with: cargo install bpf-linker" >&2
+    echo "       install the PINNED version:" >&2
+    echo "         cargo install bpf-linker --version $EXPECTED_BPF_LINKER" >&2
+    echo "       Bare \`cargo install bpf-linker\` installs the newest release," >&2
+    echo "       which needs a newer LLVM than this toolchain emits." >&2
+    echo "       Or skip it: the object is architecture-neutral, so you can" >&2
+    echo "       build it on any host that works and copy the artifact." >&2
     exit 1
+fi
+
+# A mismatched linker is the failure that wastes an afternoon: it links
+# without complaint and silently drops .BTF. The check below catches the
+# result, but naming the cause here is cheaper than decoding it there.
+GOT_BPF_LINKER="$(bpf-linker --version 2>/dev/null | awk '{print $2}')"
+if [[ -n "$GOT_BPF_LINKER" && "$GOT_BPF_LINKER" != "$EXPECTED_BPF_LINKER" ]]; then
+    echo "WARNING: bpf-linker $GOT_BPF_LINKER found, but this toolchain is" >&2
+    echo "         pinned against $EXPECTED_BPF_LINKER. LLVM majors must match" >&2
+    echo "         rustc's or the object loses its .BTF section." >&2
+    echo "         cargo install bpf-linker --version $EXPECTED_BPF_LINKER --force" >&2
 fi
 
 cd "$EBPF_DIR"

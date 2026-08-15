@@ -77,8 +77,14 @@ CLI="target/$TARGET/release/bowery"
 EBPF_OBJ="crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf"
 if [[ ! -f "$EBPF_OBJ" ]]; then
     echo "error: no eBPF object at $EBPF_OBJ" >&2
-    echo "  build it first:  ./scripts/build-ebpf" >&2
-    echo "  (it is architecture-neutral — build once, ship to every node)" >&2
+    echo "  build it:  ./scripts/build-ebpf" >&2
+    echo "" >&2
+    echo "  If the bpf-linker/LLVM setup is not working on this machine, you do" >&2
+    echo "  NOT need to fix it here. The object targets bpfel-unknown-none and" >&2
+    echo "  is architecture-neutral, so any host with a working toolchain can" >&2
+    echo "  build it for the whole fleet:" >&2
+    echo "    scp <buildhost>:.../crates/bowery-ebpf/target/bpfel-unknown-none/release/bowery-ebpf \\\\" >&2
+    echo "        $EBPF_OBJ" >&2
     exit 1
 fi
 
