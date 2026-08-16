@@ -1097,3 +1097,104 @@ Known gaps, smallest first:
   every expected peer reported) and per-peer relay log rate-limiting.
 - **Phase 11+** — key rotation ceremony, Sybil resistance at fleet
   scale, multi-OS.
+
+---
+
+## Email notifications (`bowery notify`)
+
+Alerts otherwise wait in a per-agent inbox until somebody looks. This
+emails them, with **no backend to run**: a one-shot CLI on a timer,
+pulling over the same signed transport `bowery alerts` uses.
+
+Install it on **one always-on machine you already own** — not on the
+monitored agents. Agents get no SMTP credential and no new egress path;
+a compromised host therefore cannot flood you, read the secret, or watch
+for its own detection.
+
+### 1. A Gmail app password
+
+Gmail rejects normal account passwords over SMTP. You need an
+**App Password**, which requires 2-Step Verification on the account:
+
+1. Turn on 2-Step Verification (myaccount.google.com → Security).
+2. Security → **App passwords** → generate one for "Mail".
+3. Store the 16-character value, spaces removed:
+
+```bash
+install -m 600 /dev/null ~/.bowery/smtp-password
+printf '%s' 'abcdefghijklmnop' > ~/.bowery/smtp-password
+```
+
+`bowery notify` **refuses to run** if that file is group- or
+world-readable. A secret every account on the box can read is not a
+secret.
+
+### 2. `~/.bowery/notify.toml`
+
+```toml
+[email]
+to            = ["julien.vehent@gmail.com"]
+from          = "julien.vehent@gmail.com"   # Gmail: must equal `username`
+smtp_host     = "smtp.gmail.com"
+smtp_port     = 587
+username      = "julien.vehent@gmail.com"
+password_file = "~/.bowery/smtp-password"
+starttls      = true       # 587 STARTTLS; set false for 465 implicit TLS
+
+[filter]
+min_suspicion  = 0.9       # below this, don't wake anyone
+confirmed_only = false     # true = only peer-quorum-confirmed alerts
+```
+
+Any SMTP relay works — your own server, SES, Postmark, Fastmail. Gmail
+is just the documented first case.
+
+### 3. Try it without sending
+
+```bash
+bowery notify --dry-run
+```
+
+Polls every agent in `~/.bowery/peers.toml`, prints the exact message,
+and **does not advance the cursors** — so you can run it repeatedly
+while tuning `min_suspicion`. Needs no SMTP credential.
+
+### 4. Put it on a timer
+
+```bash
+sudo cp deploy/notify/bowery-notify.{service,timer} /etc/systemd/system/
+sudo systemctl edit bowery-notify.service     # set User= and Environment=HOME=
+sudo systemctl enable --now bowery-notify.timer
+systemctl list-timers bowery-notify.timer
+```
+
+Default cadence is 15 minutes. Nothing is sent when nothing is new, so a
+short interval costs only a few QUIC round trips.
+
+### What the message contains, and why
+
+The **subject** is built only from host names and counts — never from
+alert text. That is what makes header injection impossible by
+construction rather than by escaping, because `exe_path` is whatever an
+attacker managed to execute.
+
+The **body** carries the detail you need to triage from a phone
+(suspicion, episode, path, sha, rationale), with control characters
+stripped, every field length-capped, `text/plain` only, and a footer
+saying plainly that those fields came from the monitored host and are
+leads rather than facts. Verify against the signed source before acting.
+
+Alerts that supersede each other — the pre-filter's, the LLM's
+refinement, the quorum's confirmation — collapse to one entry per
+episode, newest kept, worst first.
+
+### Operational notes
+
+- **Cursors** live in `~/.bowery/notify-cursor.json`, keyed by agent
+  fingerprint, and advance **only after a successful send**. A failed
+  SMTP attempt re-sends next run rather than dropping alerts.
+- **A failed run exits non-zero**, including when some agents were
+  unreachable, so `systemctl status` and `OnFailure=` see it. A notifier
+  that fails quietly is the thing it was built to prevent.
+- **One unreachable agent doesn't suppress the rest** — the digest goes
+  out with what was collected, and the failure is reported alongside.

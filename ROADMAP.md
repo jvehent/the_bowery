@@ -218,9 +218,9 @@ phone is both a denial of attention and a way to bury the one alert that
 matters. Whatever sends must be budgeted, and the budget must be
 enforced on the sending side, not hoped for.
 
-### Recommended: an operator-side bridge, not agent egress
+### Built: an operator-side bridge, not agent egress
 
-Add `bowery notify` — a CLI subcommand that drains alerts through the
+`bowery notify` — a CLI subcommand that drains alerts through the
 **existing signed `Subscribe` / fan-out path**, filters to confirmed or
 above-threshold, and POSTs a digest to a webhook. Run it from a systemd
 timer on any always-on box you already own (a Pi is ideal).
@@ -246,11 +246,17 @@ via their own relay for email. None of it is infrastructure we run.
 
 ### The rules that make it safe
 
-- **A notification is a pointer, not evidence.** Send host, count,
-  episode id, and a fixed severity word. Not the rationale, not the
-  path. The operator verifies against the signed source with one CLI
-  command. This closes the exfil channel by construction rather than by
-  sanitising attacker-controlled text, which never fully works.
+- **Nothing attacker-controlled reaches a header.** The subject is
+  built from manifest host names and counts only. Header injection
+  becomes impossible by construction rather than filtered-for.
+- **How much detail the body carries depends on where it lands.** For a
+  *webhook*, pointer-only: host, count, episode id — the body traverses
+  a third-party service and is a plausible exfil channel. For *email to
+  the operator's own mailbox*, the detail goes in, sanitised and capped,
+  because it lands somewhere the attacker cannot read and the cost of
+  withholding it is someone woken at 03:00 who cannot triage without a
+  laptop. The email footer says plainly that those fields came from the
+  monitored host and are leads, not facts.
 - **Digest, don't stream.** One message per window per host, with
   counts. Bounded by design.
 - **Delivery failure is itself visible.** A notifier that silently stops
@@ -258,7 +264,7 @@ via their own relay for email. None of it is infrastructure we run.
   last-success land in SQL / exit status rather than only in a log line.
 - **Secret from a 0600 file**, never from the config file, never logged.
 
-### Second, optional: `[notify]` in the agent
+### Still open: `[notify]` in the agent
 
 For fleets with no always-on operator box, the same sink can live in the
 agent — same pointer-not-payload rule, same budget, plus a hard

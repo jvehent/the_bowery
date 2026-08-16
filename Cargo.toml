@@ -78,6 +78,19 @@ toml = "0.8"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Email notification sink (`bowery notify`). rustls, never native-tls:
+# the CLI cross-compiles to aarch64-musl for the Pi package, and an
+# OpenSSL dependency would drag a C toolchain into that build.
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "hostname",
+    "smtp-transport",
+    "tokio1",
+    "tokio1-rustls",
+    "ring",
+    "webpki-roots",
+] }
+
 # Errors
 anyhow = "1"
 thiserror = "2"

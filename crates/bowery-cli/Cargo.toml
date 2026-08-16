@@ -28,6 +28,7 @@ bowery-whisper = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
+lettre = { workspace = true }
 ed25519-dalek = { workspace = true }
 humantime = "2"
 prost = { workspace = true }

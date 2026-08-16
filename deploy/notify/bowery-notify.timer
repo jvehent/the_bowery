@@ -1,0 +1,24 @@
+# Fires `bowery notify` on an interval. The timer is what "holds the CLI
+# open" so an operator doesn't have to.
+#
+# 15 minutes is a deliberate compromise: fast enough that a confirmed
+# finding reaches a phone while it still matters, slow enough that a
+# noisy hour arrives as a handful of digests rather than a stream. The
+# notifier sends nothing when nothing is new, so a short interval costs
+# only a few QUIC round trips.
+
+[Unit]
+Description=Run the Bowery alert notifier periodically
+Documentation=https://github.com/jvehent/the_bowery
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+# Don't align every node in a fleet onto the same second.
+RandomizedDelaySec=60s
+# If the box was asleep, run once on wake rather than skipping the window.
+Persistent=true
+Unit=bowery-notify.service
+
+[Install]
+WantedBy=timers.target

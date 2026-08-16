@@ -23,4 +23,5 @@ pub mod doctor;
 pub mod exec;
 pub mod mesh_trust;
 pub mod model;
+pub mod notify;
 pub mod peers;

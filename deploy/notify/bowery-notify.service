@@ -1,0 +1,58 @@
+# Email new Bowery alerts to an operator who isn't watching a console.
+#
+# One-shot, driven by bowery-notify.timer. Nothing runs between firings,
+# and nothing is stored off-host — the digest is composed from alerts
+# pulled over the same signed transport `bowery alerts` uses.
+#
+# Install on ONE always-on machine you already own (a Pi is ideal). The
+# monitored agents get no notification credential and no new egress path,
+# which is the entire point of putting this here rather than in them.
+#
+#   sudo cp bowery-notify.{service,timer} /etc/systemd/system/
+#   sudo systemctl edit bowery-notify.service   # set User= and Environment=HOME=
+#   sudo systemctl enable --now bowery-notify.timer
+
+[Unit]
+Description=Bowery alert email notifier
+Documentation=https://github.com/jvehent/the_bowery
+# Pointless before the network is up; the agents are remote.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# MUST be overridden: this needs the operator's identity key and
+# ~/.bowery, so it runs as the operator, never as root. Left unset on
+# purpose so an unedited copy fails loudly rather than running wrong.
+# User=youroperator
+# Environment=HOME=/home/youroperator
+
+ExecStart=/usr/bin/bowery notify
+
+# A failed run means alerts did NOT reach anyone. That is exactly the
+# condition this service exists to prevent, so make it visible rather
+# than letting it retry quietly forever.
+SuccessExitStatus=0
+
+# Hardening. It needs the network, the operator key, and nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# The cursor file is the one thing it writes. Without this, ProtectHome
+# would make every run re-send the entire inbox.
+ReadWritePaths=-%h/.bowery

@@ -16,7 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_crypto::Identity;
 use clap::{Parser, Subcommand};
 
-use bowery_cli::{alerts, audit, doctor, exec, mesh_trust, model, peers};
+use bowery_cli::{alerts, audit, doctor, exec, mesh_trust, model, notify, peers};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -56,6 +56,34 @@ enum Command {
     Alerts {
         #[command(subcommand)]
         sub: AlertsCommand,
+    },
+
+    /// Email new alerts to an operator who isn't watching a console.
+    ///
+    /// Drains every agent in the peer manifest over the same signed
+    /// transport `bowery alerts` uses, filters by the rules in the
+    /// notify config, and sends ONE digest. Single-shot by design: run
+    /// it from a systemd timer, which is what holds the CLI open on
+    /// your behalf.
+    ///
+    /// Sends nothing when nothing is new, so a timer can fire often.
+    Notify {
+        /// Operator identity key used to sign the Subscribe.
+        #[arg(long, default_value = "~/.bowery/operator.key")]
+        operator_key: PathBuf,
+        /// Notify config (SMTP + filters).
+        #[arg(long, default_value = "~/.bowery/notify.toml")]
+        config: PathBuf,
+        /// Peer manifest naming the agents to poll.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Where per-agent delivery cursors are kept.
+        #[arg(long, default_value = "~/.bowery/notify-cursor.json")]
+        cursor_file: PathBuf,
+        /// Compose and print the message without sending, and without
+        /// advancing cursors. Needs no SMTP credential.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Fetch and validate LLM model artifacts (GGUF files) from a
@@ -576,6 +604,38 @@ impl Cli {
                     interval,
                     json,
                 ))?;
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::Notify {
+                operator_key,
+                config,
+                manifest,
+                cursor_file,
+                dry_run,
+            } => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(
+                        tracing_subscriber::EnvFilter::try_from_default_env()
+                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                    )
+                    .with_target(false)
+                    .with_writer(std::io::stderr)
+                    .init();
+                let manifest_path = match manifest {
+                    Some(p) => p,
+                    None => peers::default_path()?,
+                };
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building tokio runtime")?;
+                runtime.block_on(notify::run(&notify::RunArgs {
+                    operator_key: notify::expand_tilde(&operator_key),
+                    config_path: notify::expand_tilde(&config),
+                    manifest_path,
+                    cursor_path: notify::expand_tilde(&cursor_file),
+                    dry_run,
+                }))?;
                 Ok(ExitCode::SUCCESS)
             }
             Command::Model {
