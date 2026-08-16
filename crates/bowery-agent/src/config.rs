@@ -297,6 +297,27 @@ pub struct WhisperQaConfig {
     /// the bug.
     #[serde(default = "default_whisper_qa_min_baseline_binaries")]
     pub min_baseline_binaries: u64,
+    /// How long this host's baseline must have been accumulating —
+    /// measured from its oldest observation — before it will answer
+    /// "never seen it".
+    ///
+    /// The count above is a floor against a just-booted agent; **this**
+    /// is the bound that makes a "no" mean something. A host that has
+    /// been watching for eighteen hours has run a few dozen binaries and
+    /// truthfully reports "never seen it" about nearly everything its
+    /// neighbours run — which is not evidence of rarity, it is evidence
+    /// of youth. Observed live: two agents nineteen hours old
+    /// quorum-confirmed `/usr/bin/pkexec`, `/usr/bin/nice` and
+    /// `/usr/bin/flock` as anomalies, having genuinely never executed
+    /// them.
+    ///
+    /// A peer below either bound refuses, and a refusal never counts
+    /// toward a quorum. Set to `0` to disable the age bound.
+    #[serde(
+        with = "humantime_serde",
+        default = "default_whisper_qa_min_baseline_age"
+    )]
+    pub min_baseline_age: Duration,
 }
 
 impl Default for WhisperQaConfig {
@@ -309,6 +330,7 @@ impl Default for WhisperQaConfig {
             quorum: default_whisper_qa_quorum(),
             max_concurrent_rounds: default_whisper_qa_max_concurrent_rounds(),
             min_baseline_binaries: default_whisper_qa_min_baseline_binaries(),
+            min_baseline_age: default_whisper_qa_min_baseline_age(),
         }
     }
 }
@@ -335,13 +357,22 @@ const fn default_whisper_qa_max_concurrent_rounds() -> usize {
 fn default_whisper_qa_quorum() -> usize {
     2
 }
-/// Sixteen distinct binaries. A host that is actually watching passes
-/// this within a minute of boot — otter1 sits at 222 — while a host
-/// whose event source never attached sits at 0 forever. Chosen to be
-/// comfortably below any real steady state rather than to be precise;
-/// the failure it guards against is "zero", not "a few".
+/// A floor, not a maturity test — that is `min_baseline_age`'s job.
+///
+/// Raised from 16 after watching 16 fail in production: a host clears it
+/// within a minute of boot, which is exactly when its opinion is worth
+/// least. 64 still admits a genuinely small host (a Pi running one
+/// service plateaus well above it) while excluding one that started this
+/// afternoon.
 const fn default_whisper_qa_min_baseline_binaries() -> u64 {
-    16
+    64
+}
+/// Three days. Long enough that a host has seen its own daily and weekly
+/// jobs run at least once, so "I have never executed that" reflects what
+/// the host does rather than how recently it booted. Short enough that a
+/// rebuilt node rejoins the quorum the same week.
+fn default_whisper_qa_min_baseline_age() -> Duration {
+    Duration::from_hours(72)
 }
 
 /// `[whisper.corroboration]` — asking the mesh to account for something

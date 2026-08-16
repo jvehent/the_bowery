@@ -61,6 +61,13 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>, quorum: u
                 max_concurrent_rounds: 4,
                 min_baseline_binaries: bowery_agent::config::WhisperQaConfig::default()
                     .min_baseline_binaries,
+                // The count bar stays at its production value — the
+                // empty-baseline regression test below depends on it.
+                // The AGE bar has to be off: a test cannot age a
+                // baseline by three days, and seeded rows are all
+                // milliseconds old. The age bound is covered by unit
+                // tests in whisper_qa.rs instead.
+                min_baseline_age: Duration::ZERO,
             },
             bind_addr: loopback_ephemeral(),
             // Left at the production default so every existing

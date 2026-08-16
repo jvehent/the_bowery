@@ -369,15 +369,21 @@ min_similarity = 0.0        # cosine cutoff; raise for stricter neighborhoods
 quorum         = 2          # peers that must report NEVER SEEN to confirm
                             # an alert (0 disables confirmation)
 max_concurrent_rounds = 4   # Q&A rounds in flight; extras are shed
-min_baseline_binaries = 16  # distinct binaries this host must have observed
-                            # before it will answer "never seen it". Below
-                            # this it REFUSES, and a refusal never counts
-                            # toward a peer's quorum. Guards the failure
-                            # where an agent with a dead event source has an
-                            # empty baseline, answers "never seen it" to
-                            # every question, and unanimously confirms every
-                            # alert its neighbours raise. 0 restores the old
-                            # behaviour and the bug with it.
+# Standing to answer "never seen it". A peer below EITHER bound refuses,
+# and a refusal never counts toward a quorum.
+min_baseline_binaries = 64  # distinct binaries observed. A floor against a
+                            # just-booted agent (an empty baseline answers
+                            # "never seen it" to everything and unanimously
+                            # confirms every alert its neighbours raise).
+min_baseline_age = "72h"    # how long the baseline has been accumulating.
+                            # This is the bound that matters. A host that
+                            # has watched for 19 hours has run a few dozen
+                            # binaries and truthfully reports "never seen
+                            # it" about nearly everything its neighbours
+                            # run — youth, not rarity. Observed live:
+                            # two 19-hour-old agents quorum-confirmed
+                            # /usr/bin/nice and /usr/bin/pkexec as
+                            # anomalies. Set either to 0 to disable it.
 
 # Cross-host corroboration — asking the mesh to account for something
 # this host saw but cannot judge alone. Today that means "did you

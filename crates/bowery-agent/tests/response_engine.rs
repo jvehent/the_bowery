@@ -93,6 +93,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, response: ResponseConfig) -> 
                 max_concurrent_rounds: 4,
                 min_baseline_binaries: bowery_agent::config::WhisperQaConfig::default()
                     .min_baseline_binaries,
+                min_baseline_age: bowery_agent::config::WhisperQaConfig::default().min_baseline_age,
             },
             bind_addr: loopback_ephemeral(),
             // Left at the production default so every existing

@@ -136,6 +136,26 @@ pub struct WhisperContext {
 // Local-side aggregation (for the responder).
 // ---------------------------------------------------------------------------
 
+/// How much a host must have observed before its "never seen it" is
+/// worth counting.
+///
+/// Two bounds, because one is not enough and we learned that the
+/// expensive way. Breadth alone (`min_binaries`) is satisfied within a
+/// minute of boot, and a host that has run 40 binaries in its first
+/// afternoon truthfully reports "never seen it" about nearly everything
+/// its neighbours run. Age alone would let a host that booted a week ago
+/// and executed nothing vote on everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageBar {
+    /// Distinct binaries observed. A floor against a just-started agent.
+    pub min_binaries: u64,
+    /// How long the baseline has been accumulating, measured from the
+    /// oldest observation. This is the bound that actually matters: it
+    /// is the difference between "I watch this fleet and your binary is
+    /// not part of it" and "I have not been here long enough to know".
+    pub min_age: Duration,
+}
+
 /// What this host can honestly say about a tier-1 fingerprint.
 ///
 /// The distinction is the whole point: `Observed(zero)` and
@@ -147,9 +167,9 @@ pub enum LocalKnowledge {
     /// informative. The sighting may still be zero — that is the
     /// finding.
     Observed(LocalSighting),
-    /// Too little observed to have an opinion. Carries what little
-    /// there was, so the refusal can say so.
-    Insufficient { binaries: u64 },
+    /// Too little observed to have an opinion. Carries both measures so
+    /// the refusal can say which bound it missed.
+    Insufficient { binaries: u64, age: Duration },
 }
 
 /// Scan the baseline once, answering both "how much have I observed?"
@@ -173,16 +193,21 @@ pub enum LocalKnowledge {
 pub fn local_knowledge(
     baseline: &Baseline,
     target: Tier1Fingerprint,
-    min_binaries: u64,
+    bar: CoverageBar,
 ) -> LocalKnowledge {
     let mut seen_count = 0u64;
     let mut first_seen_unix_ms = u64::MAX;
     let mut last_seen_unix_ms = 0u64;
     let mut hits = 0u64;
     let mut observed_binaries = 0u64;
+    let mut oldest_first_seen: Option<SystemTime> = None;
 
     let _ = baseline.for_each_binary(|rec| {
         observed_binaries += 1;
+        oldest_first_seen = Some(match oldest_first_seen {
+            Some(prev) if prev <= rec.first_seen => prev,
+            _ => rec.first_seen,
+        });
         if Tier1Fingerprint::derive(&rec.sha256) != target {
             return;
         }
@@ -204,12 +229,18 @@ pub fn local_knowledge(
         last_seen_unix_ms = last_seen_unix_ms.max(last);
     });
 
-    // A hit outranks the threshold: if we have actually seen the
-    // binary, saying so is always honest and always useful, however
-    // little else we have observed.
-    if hits == 0 && observed_binaries < min_binaries {
+    // How long this baseline has been accumulating.
+    let age = oldest_first_seen
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .unwrap_or(Duration::ZERO);
+
+    // A hit outranks both bounds: if we have actually seen the binary,
+    // saying so is always honest and always useful, however little else
+    // we have observed. Only a *negative* answer needs standing.
+    if hits == 0 && (observed_binaries < bar.min_binaries || age < bar.min_age) {
         return LocalKnowledge::Insufficient {
             binaries: observed_binaries,
+            age,
         };
     }
     if hits == 0 {
@@ -229,7 +260,11 @@ pub fn local_knowledge(
 /// how the blind-witness bug happened.
 #[must_use]
 pub fn aggregate_local_sighting(baseline: &Baseline, target: Tier1Fingerprint) -> LocalSighting {
-    match local_knowledge(baseline, target, 0) {
+    let no_bar = CoverageBar {
+        min_binaries: 0,
+        min_age: Duration::ZERO,
+    };
+    match local_knowledge(baseline, target, no_bar) {
         LocalKnowledge::Observed(s) => s,
         // Unreachable with min_binaries == 0, but a total is still the
         // honest zero here.
@@ -845,6 +880,82 @@ mod tests {
         let s = aggregate_local_sighting(&baseline, target_tier1);
         assert_eq!(s.seen_count, 2);
         assert!(s.last_seen_unix_ms >= s.first_seen_unix_ms);
+    }
+
+    /// A young host with plenty of binaries must still abstain.
+    ///
+    /// This is the production failure, reduced: two agents nineteen
+    /// hours old, with 39 and 46 binaries each, honestly answered
+    /// "never seen it" about `/usr/bin/pkexec`, `/usr/bin/nice` and
+    /// `/usr/bin/flock` — and quorum-confirmed all three as anomalies.
+    /// They were not blind, and they were not lying. They were young,
+    /// and a count-only bar cannot tell the difference.
+    #[test]
+    fn a_young_baseline_abstains_however_many_binaries_it_holds() {
+        let baseline = Baseline::open_in_memory().unwrap();
+        for i in 0..200u32 {
+            let mut sha = [0u8; 32];
+            sha[0..4].copy_from_slice(&i.to_le_bytes());
+            baseline.upsert_binary(&sha).unwrap();
+        }
+        // Seeded rows are milliseconds old, so this baseline is 200
+        // binaries wide and no time deep — exactly the shape that
+        // slipped through.
+        let bar = CoverageBar {
+            min_binaries: 64,
+            min_age: Duration::from_hours(72),
+        };
+        let unrelated = Tier1Fingerprint::derive(b"never-inserted");
+        assert!(
+            matches!(
+                local_knowledge(&baseline, unrelated, bar),
+                LocalKnowledge::Insufficient { .. }
+            ),
+            "breadth without time is not standing to say `never seen it`"
+        );
+
+        // Same baseline, age bound lifted: now it may answer.
+        let no_age_bar = CoverageBar {
+            min_binaries: 64,
+            min_age: Duration::ZERO,
+        };
+        assert!(matches!(
+            local_knowledge(&baseline, unrelated, no_age_bar),
+            LocalKnowledge::Observed(_)
+        ));
+    }
+
+    #[test]
+    fn a_hit_outranks_both_bounds() {
+        // "I have this too" is honest however young you are, and it is
+        // the answer that *suppresses* an alert — so refusing to give it
+        // would make the guard actively harmful.
+        let baseline = Baseline::open_in_memory().unwrap();
+        let sha = [7u8; 32];
+        baseline.upsert_binary(&sha).unwrap();
+        let bar = CoverageBar {
+            min_binaries: 10_000,
+            min_age: Duration::from_hours(72),
+        };
+        match local_knowledge(&baseline, Tier1Fingerprint::derive(&sha), bar) {
+            LocalKnowledge::Observed(s) => assert_eq!(s.seen_count, 1),
+            other @ LocalKnowledge::Insufficient { .. } => {
+                panic!("a hit must be reported, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_baseline_is_insufficient_under_any_bar() {
+        let baseline = Baseline::open_in_memory().unwrap();
+        let bar = CoverageBar {
+            min_binaries: 1,
+            min_age: Duration::ZERO,
+        };
+        assert!(matches!(
+            local_knowledge(&baseline, Tier1Fingerprint::derive(b"x"), bar),
+            LocalKnowledge::Insufficient { binaries: 0, .. }
+        ));
     }
 
     #[test]
