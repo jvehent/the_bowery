@@ -179,6 +179,14 @@ pub async fn sql(
         command: Some(body),
     };
     trace.sent_query(&target_fp.to_string(), &request_id, fanout, authorized);
+    trace.message(
+        &format!(
+            "--> full message to {}",
+            trace.label(&target_fp.to_string())
+        ),
+        None,
+        &render_command(&cmd),
+    );
     let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
 
     let exchange_timeout = timeout + Duration::from_secs(2);
@@ -220,6 +228,8 @@ pub async fn sql(
             // resolver, so `agent_fp` is attacker-settable but the envelope
             // signature is not.
             let sender = opened.sender;
+            // Captured before `opened.payload` is moved out below.
+            let env_meta = EnvelopeMeta::from_sealed(&bytes, &opened);
             let result = match opened.payload.body {
                 Some(Body::OperatorResult(r)) => r,
                 other => bail!("agent replied with unexpected body: {other:?}"),
@@ -231,6 +241,11 @@ pub async fn sql(
                     request_id
                 );
             }
+            trace.message(
+                &format!("<-- full message from {}", trace.label(&sender.to_string())),
+                Some(&env_meta),
+                &render_result(&result),
+            );
             match result.result {
                 Some(OperatorResultBody::SqlChunk(chunk)) => {
                     let SqlChunk {
@@ -387,7 +402,8 @@ impl WhisperTrace {
         self.names = names;
     }
 
-    fn label(&self, fp_hex: &str) -> String {
+    #[must_use]
+    pub fn label(&self, fp_hex: &str) -> String {
         let short: String = fp_hex.chars().take(12).collect();
         self.names
             .get(fp_hex)
@@ -461,6 +477,40 @@ impl WhisperTrace {
         self.say("   ", msg);
     }
 
+    /// Print the decoded message behind an envelope.
+    ///
+    /// Rendered field-by-field rather than via `{:#?}`: the derived
+    /// Debug for a `SqlChunk` prints every cell of every row, which
+    /// buries the thing you opened the trace to see. Rows are elided
+    /// past [`Self::MAX_SHOWN_ROWS`] and the count of what was hidden
+    /// is stated, because silently showing three of nine hundred is how
+    /// a trace misleads.
+    ///
+    /// The envelope header is shown too — nonce, timestamp, signature
+    /// size — since that is the anti-replay and recipient-binding
+    /// machinery, and it is otherwise invisible.
+    pub fn message(&self, header: &str, env: Option<&EnvelopeMeta>, body: &str) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!("[whisper {:>6}ms] {header}", self.ms());
+        if let Some(m) = env {
+            eprintln!(
+                "[whisper        ]   envelope: nonce={} ts={} payload={}B sig={}B",
+                m.nonce,
+                format_unix_ms(m.ts_unix_ms),
+                m.payload_bytes,
+                m.signature_bytes
+            );
+        }
+        for line in body.lines() {
+            eprintln!("[whisper        ]   {line}");
+        }
+    }
+
+    /// Rows printed in full before eliding.
+    pub const MAX_SHOWN_ROWS: usize = 5;
+
     /// Final accounting: who answered, and with how much.
     pub fn summary(&self) {
         if !self.enabled {
@@ -478,6 +528,164 @@ impl WhisperTrace {
                 self.rows_by_sender.get(fp).copied().unwrap_or(0)
             );
         }
+    }
+}
+
+/// Envelope fields worth showing: the parts that make replay and
+/// recipient binding work, which no other output surfaces.
+#[derive(Debug, Clone, Copy)]
+pub struct EnvelopeMeta {
+    pub nonce: u64,
+    pub ts_unix_ms: u64,
+    pub payload_bytes: usize,
+    pub signature_bytes: usize,
+}
+
+impl EnvelopeMeta {
+    /// Recover the wire-level fields by decoding the sealed bytes.
+    ///
+    /// The verifier hands back the *opened* payload and drops the
+    /// framing, so the signature length and on-wire payload size have to
+    /// come from a second decode. It is a trace-only cost, paid only
+    /// under `--verbose-whisper`.
+    #[must_use]
+    pub fn from_sealed(bytes: &[u8], opened: &bowery_whisper::VerifiedEnvelope) -> Self {
+        let sig = <bowery_proto::WhisperEnvelope as prost::Message>::decode(bytes)
+            .map_or(0, |e| e.signature.len());
+        Self {
+            nonce: opened.nonce,
+            ts_unix_ms: opened.ts_unix_ms,
+            payload_bytes: bytes.len(),
+            signature_bytes: sig,
+        }
+    }
+}
+
+/// `2026-08-16T20:54:27.579Z`, or the raw number if it is not a sane time.
+fn format_unix_ms(ms: u64) -> String {
+    let secs = i64::try_from(ms / 1000).unwrap_or(0);
+    let millis = ms % 1000;
+    time::OffsetDateTime::from_unix_timestamp(secs).map_or_else(
+        |_| ms.to_string(),
+        |t| {
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second()
+            )
+        },
+    )
+}
+
+/// Render an `OperatorCommand` for the trace.
+#[must_use]
+pub fn render_command(cmd: &OperatorCommand) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "OperatorCommand {{");
+    let _ = writeln!(out, "  request_id: {:?}", cmd.request_id);
+    let _ = writeln!(out, "  timeout_ms: {}", cmd.timeout_ms);
+    if cmd.forwarded_from_operator.is_empty() {
+        let _ = writeln!(out, "  forwarded_from_operator: <none>");
+    } else {
+        let _ = writeln!(
+            out,
+            "  forwarded_from_operator: {}B (OperatorAuthorization — lets the \
+             relay prove to peers that you authorised this)",
+            cmd.forwarded_from_operator.len()
+        );
+    }
+    match &cmd.command {
+        Some(OperatorCommandBody::Sql(q)) => {
+            let _ = writeln!(out, "  Sql {{");
+            let _ = writeln!(out, "    sql: {:?}", q.sql);
+            let _ = writeln!(out, "    fanout: {}", q.fanout);
+            let _ = writeln!(out, "    peers: {}", q.peers.len());
+            let _ = writeln!(out, "  }}");
+        }
+        Some(other) => {
+            let _ = writeln!(out, "  {other:?}");
+        }
+        None => {
+            let _ = writeln!(out, "  <no command body>");
+        }
+    }
+    let _ = write!(out, "}}");
+    out
+}
+
+/// Render an `OperatorResult` for the trace, eliding bulk rows.
+#[must_use]
+pub fn render_result(result: &bowery_proto::OperatorResult) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "OperatorResult {{");
+    let _ = writeln!(out, "  request_id: {:?}", result.request_id);
+    match &result.result {
+        Some(OperatorResultBody::SqlChunk(c)) => {
+            let _ = writeln!(out, "  SqlChunk {{");
+            let _ = writeln!(
+                out,
+                "    agent_fp: {} (self-declared; rows are attributed to the signer)",
+                if c.agent_fp.is_empty() {
+                    "<empty — fan-out terminator>".to_string()
+                } else {
+                    hex_fp(&c.agent_fp).chars().take(12).collect()
+                }
+            );
+            let _ = writeln!(out, "    columns: {:?}", c.columns);
+            let _ = writeln!(out, "    end: {}", c.end);
+            let _ = writeln!(out, "    rows: {}", c.rows.len());
+            for row in c.rows.iter().take(WhisperTrace::MAX_SHOWN_ROWS) {
+                let cells: Vec<String> = row.values.iter().map(render_value).collect();
+                let _ = writeln!(out, "      [{}]", cells.join(", "));
+            }
+            if c.rows.len() > WhisperTrace::MAX_SHOWN_ROWS {
+                let _ = writeln!(
+                    out,
+                    "      … {} more row(s) not shown",
+                    c.rows.len() - WhisperTrace::MAX_SHOWN_ROWS
+                );
+            }
+            let _ = writeln!(out, "  }}");
+        }
+        Some(OperatorResultBody::Error(e)) => {
+            let _ = writeln!(
+                out,
+                "  Error {{ kind: {:?}, message: {:?} }}",
+                e.kind, e.message
+            );
+        }
+        Some(other) => {
+            let _ = writeln!(out, "  {other:?}");
+        }
+        None => {
+            let _ = writeln!(out, "  <no result body>");
+        }
+    }
+    let _ = write!(out, "}}");
+    out
+}
+
+/// One SQL cell, typed the way the wire types it.
+fn render_value(v: &bowery_proto::SqlValue) -> String {
+    use bowery_proto::SqlValueKind as K;
+    match &v.value {
+        Some(K::Integer(i)) => i.to_string(),
+        Some(K::Real(f)) => format!("{f}"),
+        Some(K::Text(t)) if t.chars().count() > 48 => {
+            let head: String = t.chars().take(48).collect();
+            format!("{head:?}…")
+        }
+        Some(K::Text(t)) => format!("{t:?}"),
+        Some(K::Blob(b)) => format!("<{} bytes>", b.len()),
+        // Absent oneof means SQL NULL — prost cannot distinguish an
+        // unset field from a zero integer, so absence carries it.
+        None => "NULL".to_string(),
     }
 }
 
