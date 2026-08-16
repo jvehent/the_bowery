@@ -74,6 +74,51 @@ pub struct NotifyConfig {
     pub email: EmailConfig,
     #[serde(default)]
     pub filter: FilterConfig,
+    #[serde(default)]
+    pub virustotal: VtConfig,
+}
+
+/// Optional `VirusTotal` screening, to keep known-clean binaries out of an
+/// operator's inbox.
+///
+/// Off by default, and deliberately: a hash lookup discloses to
+/// `VirusTotal` that somebody is investigating that hash, which for a
+/// targeted implant is a tip-off to whoever planted it. Turning this on
+/// is a judgement an operator makes about their own estate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VtConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// File containing only the API key, mode 0600.
+    #[serde(default)]
+    pub api_key_file: Option<PathBuf>,
+    /// Drop alerts whose binary no engine flags.
+    #[serde(default = "default_true")]
+    pub suppress_known_clean: bool,
+    /// Ceiling on lookups per run. The public API allows 4 a minute and
+    /// 500 a day, so a digest full of new hashes must not try to spend
+    /// the quota in one go.
+    #[serde(default = "default_vt_max_lookups")]
+    pub max_lookups: usize,
+    #[serde(default)]
+    pub cache_file: Option<PathBuf>,
+}
+
+impl Default for VtConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key_file: None,
+            suppress_known_clean: true,
+            max_lookups: default_vt_max_lookups(),
+            cache_file: None,
+        }
+    }
+}
+
+const fn default_vt_max_lookups() -> usize {
+    20
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +438,64 @@ pub fn dedup_by_episode(alerts: Vec<Alert>) -> Vec<Alert> {
     out
 }
 
+/// What `VirusTotal` screening did to a digest.
+///
+/// Reported in the email itself. A filter that silently removes alerts
+/// is indistinguishable from one that is broken, and this one removes
+/// alerts on the word of a third party — so the operator is told how
+/// many, and that they can be read in full with `bowery alerts`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VtOutcome {
+    pub looked_up: usize,
+    pub suppressed: usize,
+    pub flagged: usize,
+    /// Lookups that could not be made — no key, quota spent, API down.
+    /// These suppress nothing, and their count is stated so an operator
+    /// can tell "nothing was malicious" from "nothing was checked".
+    pub unavailable: usize,
+}
+
+impl VtOutcome {
+    #[must_use]
+    pub fn line(&self) -> Option<String> {
+        use std::fmt::Write as _;
+
+        if self.looked_up == 0 {
+            return None;
+        }
+        let mut s = format!("VirusTotal: {} hash(es) checked", self.looked_up);
+        if self.flagged > 0 {
+            let _ = write!(s, ", {} FLAGGED", self.flagged);
+        }
+        if self.suppressed > 0 {
+            let _ = write!(s, ", {} alert(s) held back as known-clean", self.suppressed);
+        }
+        if self.unavailable > 0 {
+            let _ = write!(
+                s,
+                ", {} could not be checked (sent anyway)",
+                self.unavailable
+            );
+        }
+        Some(s)
+    }
+}
+
+/// Decide an alert's fate given a `VirusTotal` verdict.
+///
+/// The safety property, stated as code: an alert is dropped **only** on
+/// a positive clean verdict, and only when the operator asked for that.
+/// Every other outcome — unknown hash, missing key, rate limit, network
+/// failure — keeps the alert. A monitoring system must not fall silent
+/// because a third-party API had a bad day.
+#[must_use]
+pub fn vt_decision(verdict: &crate::virustotal::Verdict, suppress_known_clean: bool) -> bool {
+    if verdict.may_suppress() && suppress_known_clean {
+        return false; // drop it
+    }
+    true // keep it
+}
+
 /// Does this alert clear the operator's filter?
 #[must_use]
 pub fn passes(alert: &Alert, filter: &FilterConfig) -> bool {
@@ -494,8 +597,29 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         return Ok(());
     }
 
+    // VirusTotal screening. Only ever removes alerts on a positive
+    // clean verdict; a missing key, a spent quota or an API outage
+    // leaves the digest exactly as it was.
+    let vt = screen_with_virustotal(&cfg, &mut hosts).await;
+    if hosts.iter().all(|h| h.alerts.is_empty()) {
+        for (fp, cursor) in advanced {
+            cursors.by_fp.insert(fp, cursor);
+        }
+        cursors.save(&args.cursor_path)?;
+        if let Some(line) = vt.line() {
+            println!("notify: nothing to send — {line}");
+        }
+        return Ok(());
+    }
+
     let subject = subject(&hosts);
-    let body = body(&hosts);
+    let body = format!(
+        "{}{}",
+        body(&hosts),
+        vt.line()
+            .map(|l| format!("\n{l}\nHeld-back alerts remain readable with `bowery alerts`.\n"))
+            .unwrap_or_default()
+    );
 
     if args.dry_run {
         println!("--- would send ---");
@@ -522,6 +646,84 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         bail!("sent, but {poll_failures} agent(s) could not be polled");
     }
     Ok(())
+}
+
+/// Look up each alert's binary and drop the ones no engine flags.
+///
+/// Returns what happened, for the digest to report. Never returns an
+/// error: a failure here must leave the alerts alone rather than
+/// abort the run.
+async fn screen_with_virustotal(cfg: &NotifyConfig, hosts: &mut [HostAlerts]) -> VtOutcome {
+    use crate::virustotal::{VtCache, VtClient, default_cache_path, now_unix_s, read_api_key};
+
+    let mut outcome = VtOutcome::default();
+    if !cfg.virustotal.enabled {
+        return outcome;
+    }
+    let Some(key_path) = cfg.virustotal.api_key_file.as_ref() else {
+        eprintln!("notify: [virustotal] enabled but no api_key_file; skipping screening");
+        return outcome;
+    };
+    let key = match read_api_key(&expand_tilde(key_path)) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("notify: VirusTotal key unusable ({e}); sending unscreened");
+            return outcome;
+        }
+    };
+    let Ok(client) = VtClient::new(key) else {
+        eprintln!("notify: could not build the VirusTotal client; sending unscreened");
+        return outcome;
+    };
+
+    let cache_path = cfg
+        .virustotal
+        .cache_file
+        .clone()
+        .map_or_else(default_cache_path, |p| expand_tilde(&p));
+    let mut cache = VtCache::load(&cache_path);
+    let now = now_unix_s();
+    let mut budget = cfg.virustotal.max_lookups;
+
+    for host in hosts.iter_mut() {
+        let mut kept: Vec<Alert> = Vec::with_capacity(host.alerts.len());
+        for alert in std::mem::take(&mut host.alerts) {
+            if alert.exe_sha256_hex.is_empty() {
+                kept.push(alert);
+                continue;
+            }
+            let verdict = if let Some(v) = cache.get(&alert.exe_sha256_hex, now) {
+                v
+            } else if budget == 0 {
+                // Out of budget is not a clean bill of health.
+                outcome.unavailable += 1;
+                kept.push(alert);
+                continue;
+            } else {
+                budget -= 1;
+                let v = client.lookup(&alert.exe_sha256_hex).await;
+                cache.put(&alert.exe_sha256_hex, &v, now);
+                v
+            };
+            outcome.looked_up += 1;
+            if verdict.is_malicious() {
+                outcome.flagged += 1;
+            }
+            if matches!(verdict, crate::virustotal::Verdict::Unavailable(_)) {
+                outcome.unavailable += 1;
+            }
+            if vt_decision(&verdict, cfg.virustotal.suppress_known_clean) {
+                kept.push(alert);
+            } else {
+                outcome.suppressed += 1;
+            }
+        }
+        host.alerts = kept;
+    }
+    if let Err(e) = cache.save(&cache_path) {
+        eprintln!("notify: could not save the VirusTotal cache: {e}");
+    }
+    outcome
 }
 
 async fn send_email(cfg: &NotifyConfig, subject: &str, body: &str) -> Result<()> {
@@ -916,6 +1118,7 @@ password_file = "/dev/null"
                 starttls: true,
             },
             filter: FilterConfig::default(),
+            virustotal: VtConfig::default(),
         };
         let err = cfg.password().unwrap_err().to_string();
         assert!(err.contains("group/world accessible"), "{err}");

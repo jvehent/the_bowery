@@ -1211,6 +1211,52 @@ Alerts that supersede each other — the pre-filter's, the LLM's
 refinement, the quorum's confirmation — collapse to one entry per
 episode, newest kept, worst first.
 
+### VirusTotal screening (optional)
+
+Cuts false positives by holding back alerts whose binary no antivirus
+engine flags.
+
+```bash
+install -m 600 /dev/null ~/.bowery/virustotal.key
+printf '%s' 'YOUR_VT_API_KEY' > ~/.bowery/virustotal.key
+```
+
+```toml
+[virustotal]
+enabled              = true
+api_key_file         = "~/.bowery/virustotal.key"
+suppress_known_clean = true   # drop alerts no engine flags
+max_lookups          = 20     # per run; public API allows 4/min, 500/day
+```
+
+Check one hash by hand at any time:
+
+```bash
+bowery vt <sha256>      # exit 0 clean, 1 flagged, 2 unknown/unavailable
+```
+
+**Understand what a lookup discloses.** Querying VirusTotal tells VT — and
+anyone with Intelligence access — that somebody is investigating that
+hash. Adversaries watch VT for their own samples, so for a suspected
+targeted implant an automatic lookup is a tip-off, sent before you have
+decided what to do. That is why this is off by default, why agents never
+do it, and why the key lives only on your box. Hashes only; no file is
+ever uploaded.
+
+**It can only ever suppress, never silence.** An alert is held back only
+on a positive clean verdict. A missing key, a spent quota, an API
+outage, an unparseable response, a hash VT has never seen — every one of
+those sends the alert anyway. A monitoring system must not go quiet
+because a third-party API had a bad day.
+
+Every digest states what screening did (`3 hash(es) checked, 2 held back
+as known-clean`), so a filter that removes alerts is never invisible,
+and held-back alerts stay readable with `bowery alerts`.
+
+Verdicts are cached for a week in `~/.bowery/vt-cache.json` to stay
+inside the quota. Failures are never cached — that would turn one outage
+into a week of not looking.
+
 ### Operational notes
 
 - **Cursors** live in `~/.bowery/notify-cursor.json`, keyed by agent

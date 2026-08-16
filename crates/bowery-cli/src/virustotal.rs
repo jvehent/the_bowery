@@ -1,11 +1,11 @@
-//! VirusTotal lookups, for `bowery vt` and the `bowery notify` filter.
+//! `VirusTotal` lookups, for `bowery vt` and the `bowery notify` filter.
 //!
 //! # Operator-side only, and deliberately
 //!
 //! Agents never call this. Three reasons, and the first is the one that
 //! matters:
 //!
-//! **A hash lookup is disclosure.** Querying VirusTotal tells VirusTotal
+//! **A hash lookup is disclosure.** Querying `VirusTotal` tells `VirusTotal`
 //! — and anyone with Intelligence access — that somebody is looking at
 //! that hash. Adversaries monitor VT for their own samples, so an
 //! automatic lookup from a compromised host is a tip-off that you have
@@ -40,7 +40,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// What VirusTotal knows about a hash.
+/// What `VirusTotal` knows about a hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     /// At least one engine flags it. Never suppressed — escalated.
@@ -107,13 +107,17 @@ pub fn parse_verdict(body: &str) -> Verdict {
     else {
         return Verdict::Unavailable("response had no analysis stats".into());
     };
-    let get = |k: &str| stats.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let get = |k: &str| {
+        stats
+            .get(k)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
     let malicious = u32::try_from(get("malicious")).unwrap_or(u32::MAX);
     let suspicious = u32::try_from(get("suspicious")).unwrap_or(0);
-    let total = u32::try_from(
-        get("malicious") + get("suspicious") + get("undetected") + get("harmless"),
-    )
-    .unwrap_or(u32::MAX);
+    let total =
+        u32::try_from(get("malicious") + get("suspicious") + get("undetected") + get("harmless"))
+            .unwrap_or(u32::MAX);
 
     // No engine has an opinion at all. Treated as "cannot say" rather
     // than clean: a zero-engine result is a response we do not
@@ -157,6 +161,7 @@ pub struct VtCache {
 
 /// How long a verdict is reused. Engines do add detections for a hash
 /// they once called clean, so this is a week rather than forever.
+#[allow(clippy::duration_suboptimal_units)] // from_days is not const-stable
 pub const CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 impl VtCache {

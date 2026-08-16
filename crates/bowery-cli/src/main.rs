@@ -16,7 +16,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use bowery_crypto::Identity;
 use clap::{Parser, Subcommand};
 
-use bowery_cli::{alerts, audit, doctor, exec, mesh_trust, model, notify, peers};
+use bowery_cli::{alerts, audit, doctor, exec, mesh_trust, model, notify, peers, virustotal};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -56,6 +56,24 @@ enum Command {
     Alerts {
         #[command(subcommand)]
         sub: AlertsCommand,
+    },
+
+    /// Look a SHA-256 up on `VirusTotal`.
+    ///
+    /// Hashes only — no file is ever uploaded. Be aware that a lookup
+    /// discloses to `VirusTotal`, and to anyone with Intelligence access,
+    /// that somebody is investigating this hash. Adversaries watch VT
+    /// for their own samples, so for a suspected targeted implant this
+    /// is a decision to make deliberately rather than a reflex.
+    ///
+    /// Agents never do this: it would put an API key on every monitored
+    /// host and disclose findings before an operator had decided to.
+    Vt {
+        /// Hex SHA-256 of the binary. `bowery alerts` prints these.
+        sha256: String,
+        /// File containing only the API key, mode 0600.
+        #[arg(long, default_value = "~/.bowery/virustotal.key")]
+        api_key_file: PathBuf,
     },
 
     /// Email new alerts to an operator who isn't watching a console.
@@ -620,6 +638,28 @@ impl Cli {
                     json,
                 ))?;
                 Ok(ExitCode::SUCCESS)
+            }
+            Command::Vt {
+                sha256,
+                api_key_file,
+            } => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building tokio runtime")?;
+                let key = virustotal::read_api_key(&notify::expand_tilde(&api_key_file))?;
+                let client = virustotal::VtClient::new(key)?;
+                let verdict = runtime.block_on(client.lookup(&sha256));
+                println!("{}", verdict.summary());
+                // Exit code carries the verdict so a script can branch:
+                // 0 clean, 1 flagged, 2 unknown or unavailable. Absence
+                // of a detection is not the same as a clean bill, so
+                // "unknown" is deliberately not 0.
+                Ok(match verdict {
+                    virustotal::Verdict::Clean { .. } => ExitCode::SUCCESS,
+                    virustotal::Verdict::Malicious { .. } => ExitCode::from(1),
+                    _ => ExitCode::from(2),
+                })
             }
             Command::Notify {
                 operator_key,
