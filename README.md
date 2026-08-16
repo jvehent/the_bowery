@@ -15,6 +15,15 @@ A distributed Linux EDR built around a peer-to-peer **whispering protocol**: age
 - A native, pure-Rust SQL surface (`bowery-sql` + `bowery-tables`) that turns each agent into a queryable host-state engine — 13 procfs/sysfs/etc-backed tables plus 7 Bowery-internal views, streamed back over the operator wire with end-to-end signed multi-agent fan-out.
 - A signed operator CLI that connects to any agent, drains a per-agent alert inbox, prints (or JSON-streams) high-suspicion verdicts, and fans SQL queries across the mesh. There is no backend.
 
+## Getting started
+
+[**USAGE.md**](USAGE.md) walks a new operator from an empty machine to a
+running fleet: concepts, build (including the pinned `bpf-linker` and the
+architecture-neutral eBPF object), signed enrollment, the everyday
+commands, and an honest section on the three things that routinely
+confuse people. [INSTALL.md](INSTALL.md) is the per-option config
+reference.
+
 ## Why
 
 Existing EDRs send everything home and decide centrally. The Bowery flips that: each agent decides locally, but only after asking the neighborhood whether the activity is normal *here*. It's a neighborhood watch for production fleets. Detection is local + corroborated; only operator-facing alerts cross the trust boundary, signed end-to-end.
