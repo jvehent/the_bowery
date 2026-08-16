@@ -41,13 +41,19 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aya::Ebpf;
+use aya::maps::PerCpuArray;
 use aya::maps::ring_buf::RingBuf;
 use aya::maps::{HashMap as AyaHashMap, MapData};
 use aya::programs::{Lsm, TracePoint};
 use aya::{Btf, BtfError};
-use bowery_events::source::{DEFAULT_CHANNEL_CAPACITY, EventSource};
+use bowery_events::source::{
+    DEFAULT_CHANNEL_CAPACITY, EventSource, PROBE_CONNECT, PROBE_EXEC, PROBE_EXIT, PROBE_NAMES,
+    ProbeHealth,
+};
 use bowery_events::{
     Event, NetDirection, NetFamily, NetworkConnect, ProcessExec, ProcessExit, enrich,
 };
@@ -128,6 +134,10 @@ pub enum LoaderError {
 #[derive(Debug)]
 pub struct BpfEventSource {
     obj_path: PathBuf,
+    /// Shared with the drain tasks and with whoever asks via
+    /// [`EventSource::health`]. Created before `start` so a caller can
+    /// hold it across the `Box<Self>` consumption.
+    health: Arc<ProbeHealth>,
 }
 
 impl BpfEventSource {
@@ -145,7 +155,10 @@ impl BpfEventSource {
     pub fn from_path(path: impl Into<PathBuf>) -> Result<Self, LoaderError> {
         let path = path.into();
         validate_bpf_object(&path)?;
-        Ok(Self { obj_path: path })
+        Ok(Self {
+            obj_path: path,
+            health: Arc::new(ProbeHealth::new()),
+        })
     }
 
     /// Try the env var (only when the agent's `BOWERY_BPF_DEV_MODE`
@@ -180,6 +193,12 @@ impl BpfEventSource {
 
     pub fn obj_path(&self) -> &Path {
         &self.obj_path
+    }
+
+    /// Live probe health. Clone it before `start` consumes the source.
+    #[must_use]
+    pub fn health(&self) -> Arc<ProbeHealth> {
+        self.health.clone()
     }
 }
 
@@ -231,18 +250,35 @@ impl EventSource for BpfEventSource {
     fn start(self: Box<Self>) -> mpsc::Receiver<Event> {
         let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
         let obj_path = self.obj_path;
+        let health = self.health;
 
         tokio::spawn(async move {
-            if let Err(e) = run(&obj_path, tx).await {
-                error!(error = %e, path = %obj_path.display(), "BPF source exited");
-            }
+            let result = run(&obj_path, tx, health.clone()).await;
+            // A source that exits is exactly as blind as one that never
+            // started, and until now it said so only in a log line that
+            // nobody reads at 03:00. Record it where the watchdog and
+            // the SQL surface can see it.
+            let reason = match result {
+                Ok(()) => "BPF source exited without error".to_string(),
+                Err(e) => e.to_string(),
+            };
+            error!(reason = %reason, path = %obj_path.display(), "BPF source exited");
+            health.mark_stopped(reason);
         });
 
         rx
     }
+
+    fn health(&self) -> Option<Arc<ProbeHealth>> {
+        Some(self.health.clone())
+    }
 }
 
-async fn run(obj_path: &Path, tx: mpsc::Sender<Event>) -> Result<(), LoaderError> {
+async fn run(
+    obj_path: &Path,
+    tx: mpsc::Sender<Event>,
+    health: Arc<ProbeHealth>,
+) -> Result<(), LoaderError> {
     info!(path = %obj_path.display(), "loading BPF object");
     // aya can panic on malformed BTF in some 0.13 paths. catch_unwind
     // turns that into a clean error rather than tearing down the
@@ -271,33 +307,107 @@ async fn run(obj_path: &Path, tx: mpsc::Sender<Event>) -> Result<(), LoaderError
         "sched",
         "sched_process_exec",
     )?;
+    health.mark_attached(PROBE_EXEC);
     attach_tp(
         &mut ebpf,
         "sched_process_exit",
         "sched",
         "sched_process_exit",
     )?;
+    health.mark_attached(PROBE_EXIT);
     attach_tp(
         &mut ebpf,
         "inet_sock_set_state",
         "sock",
         "inet_sock_set_state",
     )?;
+    health.mark_attached(PROBE_CONNECT);
 
     let exec_ring = take_ring(&mut ebpf, "EVENTS")?;
     let exit_ring = take_ring(&mut ebpf, "EXIT_EVENTS")?;
     let connect_ring = take_ring(&mut ebpf, "CONNECT_EVENTS")?;
 
+    // Optional by design: an object built before the counter existed
+    // simply has no DROPS map, and an agent must keep working against
+    // it. Absent means "cannot tell", which the snapshot reports as
+    // unknown rather than as zero.
+    let drops_map: Option<PerCpuArray<MapData, u64>> = if let Some(map) = ebpf.take_map("DROPS") {
+        PerCpuArray::try_from(map).map_or_else(
+            |e| {
+                warn!(error = %e, "DROPS map present but unusable; drop counts unavailable");
+                None
+            },
+            Some,
+        )
+    } else {
+        warn!(
+            "BPF object has no DROPS map — ring-buffer loss cannot be measured. \
+             Rebuild the object (scripts/build-ebpf) to enable it."
+        );
+        None
+    };
+
     // The three drains share the same Event channel. If any one of them
     // errors out we propagate; a closed receiver is a normal shutdown
     // signal (handled inside the drain loop, returns Ok).
     tokio::try_join!(
-        drain_ring(exec_ring, tx.clone(), parse_exec, "exec"),
-        drain_ring(exit_ring, tx.clone(), parse_exit, "exit"),
-        drain_ring(connect_ring, tx, parse_connect, "connect"),
+        drain_ring(
+            exec_ring,
+            tx.clone(),
+            parse_exec,
+            PROBE_EXEC,
+            health.clone()
+        ),
+        drain_ring(
+            exit_ring,
+            tx.clone(),
+            parse_exit,
+            PROBE_EXIT,
+            health.clone()
+        ),
+        drain_ring(
+            connect_ring,
+            tx,
+            parse_connect,
+            PROBE_CONNECT,
+            health.clone()
+        ),
+        poll_drops(drops_map, health),
     )?;
 
     Ok(())
+}
+
+/// How often the kernel's drop counters are copied into [`ProbeHealth`].
+///
+/// Polled rather than event-driven because drops happen precisely when
+/// the ring is full — the moment userspace is least likely to be woken
+/// promptly — and because a host that has gone quiet still needs its
+/// last known loss reported.
+const DROP_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+async fn poll_drops(
+    map: Option<PerCpuArray<MapData, u64>>,
+    health: Arc<ProbeHealth>,
+) -> Result<(), LoaderError> {
+    let Some(map) = map else {
+        // Never resolves: the other branches of try_join! run forever,
+        // and returning Ok here would end the join and take the sensor
+        // down with it.
+        std::future::pending::<()>().await;
+        unreachable!()
+    };
+    let slots = [PROBE_EXEC, PROBE_EXIT, PROBE_CONNECT];
+    loop {
+        for (i, probe) in slots.iter().enumerate() {
+            let Ok(idx) = u32::try_from(i) else { continue };
+            if let Ok(per_cpu) = map.get(&idx, 0) {
+                let total: u64 = per_cpu.iter().copied().fold(0u64, u64::saturating_add);
+                health.set_kernel_drops(*probe, total);
+            }
+        }
+        tokio::time::sleep(DROP_POLL_INTERVAL).await;
+    }
 }
 
 fn attach_tp(
@@ -321,6 +431,15 @@ fn attach_tp(
     Ok(())
 }
 
+/// Wall-clock now in ms, for `last_event` staleness reporting.
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 fn take_ring(ebpf: &mut Ebpf, name: &str) -> Result<RingBuf<MapData>, LoaderError> {
     let map = ebpf
         .take_map(name)
@@ -335,11 +454,13 @@ async fn drain_ring<F>(
     mut ring: RingBuf<MapData>,
     tx: mpsc::Sender<Event>,
     parse: F,
-    name: &'static str,
+    probe: usize,
+    health: Arc<ProbeHealth>,
 ) -> Result<(), LoaderError>
 where
     F: Fn(&[u8]) -> Option<Event>,
 {
+    let name = PROBE_NAMES.get(probe).copied().unwrap_or("?");
     let async_fd = AsyncFd::new(ring.as_raw_fd())?;
     loop {
         let mut guard = match async_fd.readable().await {
@@ -355,11 +476,19 @@ where
             let bytes: &[u8] = &item;
             let parsed = parse(bytes);
             drop(item); // release the ring slot before any user-space work
-            if let Some(event) = parsed
-                && tx.send(event).await.is_err()
-            {
-                debug!(ring = name, "consumer dropped channel; exiting drain");
-                return Ok(());
+            match parsed {
+                Some(event) => {
+                    health.record_event(probe, now_unix_ms());
+                    if tx.send(event).await.is_err() {
+                        debug!(ring = name, "consumer dropped channel; exiting drain");
+                        return Ok(());
+                    }
+                }
+                // A record the kernel produced and userspace could not
+                // use: version skew, or an address family we don't
+                // model. Counted apart from a kernel drop because the
+                // remedy is different.
+                None => health.record_parse_failure(probe),
             }
         }
 

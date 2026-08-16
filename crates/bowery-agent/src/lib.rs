@@ -13,6 +13,7 @@ pub mod corroboration;
 mod eventlog_writer;
 pub mod inbox;
 pub mod monitor;
+pub mod probe_watchdog;
 pub mod response_bpf;
 pub mod seen;
 pub mod sql_tables;

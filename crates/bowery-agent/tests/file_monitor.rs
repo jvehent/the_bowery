@@ -182,8 +182,11 @@ async fn unwatched_file_change_emits_no_alert() {
     std::fs::write(&other, b"changed").unwrap();
 
     // Timing out is the expected outcome; any non-alert agent event is fine.
+    // `sensor-*` episodes are the probe watchdog reporting on the event
+    // source, not the file monitor — this test is about the file rule.
     if let Ok(Ok(AgentEvent::AlertEmitted { episode_id, .. })) =
         tokio::time::timeout(Duration::from_secs(2), events.recv()).await
+        && !episode_id.starts_with("sensor-")
     {
         panic!("unwatched file must not alert, got {episode_id}");
     }

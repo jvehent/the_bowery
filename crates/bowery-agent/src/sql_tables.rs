@@ -432,6 +432,105 @@ impl BoweryTable for BoweryAlertsTable {
 }
 
 // ---------------------------------------------------------------------------
+// bowery_probe_status — is the kernel sensor actually watching?
+// ---------------------------------------------------------------------------
+
+/// `bowery_probe_status` — one row per kernel probe, plus whether the
+/// sensor is running at all.
+///
+/// Exists because two agents on a live fleet ran for days observing
+/// nothing: no BPF object, a silent fall back to the no-op source, one
+/// log line at startup. They kept gossiping, answering SQL, and voting
+/// in whisper quorums the whole time. `bowery_eventlog_status` said
+/// `recording=1` — truthfully, since the writer was fine — and it was
+/// the absence of rows, noticed by accident, that gave it away.
+///
+/// The failure this closes is that *nothing downstream can tell "quiet"
+/// from "blind"*. Query it fleet-wide with `--fanout`:
+///
+/// ```sql
+/// SELECT probe, attached, emitted, kernel_drops FROM bowery_probe_status
+/// ```
+#[derive(Debug)]
+pub struct BoweryProbeStatusTable {
+    /// `None` when the agent has no health-reporting source, which is
+    /// itself the finding: it is not watching.
+    health: Option<Arc<bowery_events::source::ProbeHealth>>,
+}
+
+impl BoweryProbeStatusTable {
+    #[must_use]
+    pub fn new(health: Option<Arc<bowery_events::source::ProbeHealth>>) -> Self {
+        Self { health }
+    }
+}
+
+impl BoweryTable for BoweryProbeStatusTable {
+    fn name(&self) -> &'static str {
+        "bowery_probe_status"
+    }
+
+    fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bowery_probe_status (
+                probe              TEXT,
+                watching           INTEGER,
+                attached           INTEGER,
+                emitted            INTEGER,
+                parse_failed       INTEGER,
+                kernel_drops       INTEGER,
+                last_event_unix_ms INTEGER,
+                stopped_reason     TEXT
+            );",
+        )?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO bowery_probe_status (probe, watching, attached, emitted,
+                                              parse_failed, kernel_drops,
+                                              last_event_unix_ms, stopped_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+
+        let Some(health) = self.health.as_ref() else {
+            // One explicit row rather than an empty table. An empty
+            // result reads as "no probes configured"; this reads as
+            // "this host is not watching", which is the truth and is
+            // what an operator needs to see.
+            stmt.execute(params![
+                "(none)",
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                Option::<i64>::None,
+                Option::<i64>::None,
+                "no kernel event source — agent is not observing",
+            ])?;
+            return Ok(());
+        };
+
+        let watching = i64::from(health.is_watching());
+        let stopped = health.stopped_reason();
+        for p in health.snapshot() {
+            stmt.execute(params![
+                p.name,
+                watching,
+                i64::from(p.attached),
+                i64::try_from(p.emitted).unwrap_or(i64::MAX),
+                i64::try_from(p.parse_failed).unwrap_or(i64::MAX),
+                // NULL, not 0, when the loaded object predates the
+                // counter: "no drops" and "cannot tell" are the whole
+                // distinction this table exists to draw.
+                p.kernel_drops.map(|d| i64::try_from(d).unwrap_or(i64::MAX)),
+                p.last_event_unix_ms
+                    .map(|t| i64::try_from(t).unwrap_or(i64::MAX)),
+                stopped.clone(),
+            ])?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bowery_audit — the response engine's signed audit-log envelopes.
 // ---------------------------------------------------------------------------
 

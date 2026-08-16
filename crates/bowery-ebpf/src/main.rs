@@ -38,7 +38,7 @@
 use aya_ebpf::{
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid},
     macros::{lsm, map, tracepoint},
-    maps::{LruHashMap, RingBuf},
+    maps::{LruHashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, TracePointContext},
 };
 
@@ -135,6 +135,45 @@ static EXIT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 #[map]
 static CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
+// ---------------------------------------------------------------------------
+// Loss accounting.
+// ---------------------------------------------------------------------------
+
+/// Per-ring count of events the kernel could not hand to userspace.
+///
+/// `RingBuf::reserve` returns `None` when the ring is full, and the
+/// probe then has no choice but to drop the event. Nothing about that
+/// is visible from userspace: a saturated sensor and a quiet host
+/// produce byte-identical output, which is the worst failure mode an
+/// EDR has. Counting here is the only place the information exists.
+///
+/// `PerCpuArray`, not `Array`: each CPU increments only its own slot,
+/// so the counter needs no atomics and cannot lose increments to a
+/// race. Userspace sums across CPUs.
+///
+/// Indices are [`DROP_EXEC`], [`DROP_EXIT`], [`DROP_CONNECT`].
+#[map]
+static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(DROP_SLOTS, 0);
+
+pub const DROP_EXEC: u32 = 0;
+pub const DROP_EXIT: u32 = 1;
+pub const DROP_CONNECT: u32 = 2;
+/// Sized with headroom so a new probe doesn't require userspace to
+/// tolerate a resized map mid-upgrade.
+pub const DROP_SLOTS: u32 = 8;
+
+/// Record one dropped event. Best-effort by construction: if the
+/// counter itself is unavailable there is nothing useful to do, and a
+/// probe must never fail because its telemetry did.
+#[inline(always)]
+fn count_drop(slot: u32) {
+    if let Some(ptr) = DROPS.get_ptr_mut(slot) {
+        // SAFETY: per-CPU slot, so this CPU is the only writer; the
+        // pointer is valid for the lifetime of the map.
+        unsafe { *ptr = (*ptr).saturating_add(1) };
+    }
+}
+
 /// Phase-7 LSM blocklist keyed by 16-byte `comm` (Linux kernel's
 /// `task->comm`). Userspace inserts an entry to forbid the matching
 /// process from execing anything new — `block_exec` returns `-EPERM`
@@ -163,6 +202,7 @@ pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
 
 fn try_exec(_ctx: &TracePointContext) -> Result<(), i64> {
     let Some(mut entry) = EVENTS.reserve::<ExecEvent>(0) else {
+        count_drop(DROP_EXEC);
         return Err(-1);
     };
 
@@ -201,6 +241,7 @@ fn try_exit(_ctx: &TracePointContext) -> Result<(), i64> {
     }
 
     let Some(mut entry) = EXIT_EVENTS.reserve::<ExitEvent>(0) else {
+        count_drop(DROP_EXIT);
         return Err(-1);
     };
     let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
@@ -274,6 +315,7 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
     let saddr_v6: [u8; 16] = unsafe { ctx.read_at(40)? };
 
     let Some(mut entry) = CONNECT_EVENTS.reserve::<ConnectEvent>(0) else {
+        count_drop(DROP_CONNECT);
         return Err(-1);
     };
     // Only meaningful when we are the ones dialling; see `ConnectEvent::pid`.

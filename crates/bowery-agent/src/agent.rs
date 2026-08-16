@@ -205,6 +205,7 @@ pub struct Agent {
     revocations: Arc<RevocationStore>,
     /// `None` when no file rules are configured (or inotify is unavailable).
     file_monitor_task: Option<JoinHandle<()>>,
+    probe_watchdog_task: JoinHandle<()>,
     role_publisher_task: JoinHandle<()>,
     bloom_publisher_task: JoinHandle<()>,
     llm_outcomes_task: JoinHandle<()>,
@@ -251,6 +252,19 @@ impl Agent {
     ) -> Result<Self, AgentError> {
         let fingerprint = identity.fingerprint();
         info!(fingerprint = %fingerprint, "starting agent");
+
+        // Taken before `start` consumes the source, and before the SQL
+        // surface is assembled so `bowery_probe_status` can read it.
+        // `None` means the agent has no health-reporting sensor — not
+        // missing information, but the finding itself: it is not
+        // watching.
+        let probe_health = event_source.health();
+        if probe_health.is_none() {
+            warn!(
+                "no health-reporting event source; this agent observes no kernel events \
+                 and will alert about its own blindness"
+            );
+        }
 
         let operators = Arc::new(load_operators(&config.operators.pubkeys_b64)?);
 
@@ -636,6 +650,9 @@ impl Agent {
             .with_extra_table(Arc::new(crate::sql_tables::BoweryEventsTable::new(
                 eventlog_store.clone(),
             )))
+            .with_extra_table(Arc::new(crate::sql_tables::BoweryProbeStatusTable::new(
+                probe_health.clone(),
+            )))
             .with_extra_table(Arc::new({
                 let status = crate::sql_tables::BoweryEventLogStatusTable::new(
                     eventlog_store.clone(),
@@ -863,6 +880,18 @@ impl Agent {
             shutdown_rx.clone(),
         );
 
+        // Blindness reaches an operator the same way any finding does.
+        // Started after the pipeline so a source that fails immediately
+        // has already recorded why.
+        let probe_watchdog_task = crate::probe_watchdog::spawn(
+            probe_health.clone(),
+            inbox.clone(),
+            fingerprint,
+            llm.name().to_string(),
+            events_tx.clone(),
+            shutdown_rx.clone(),
+        );
+
         let role_publisher_task = spawn_role_publisher_task(
             mesh.clone(),
             baseline.clone(),
@@ -906,6 +935,7 @@ impl Agent {
             corroboration_task,
             revocations,
             file_monitor_task,
+            probe_watchdog_task,
             role_publisher_task,
             bloom_publisher_task,
             llm_outcomes_task,
@@ -985,6 +1015,7 @@ impl Agent {
         if let Some(task) = self.file_monitor_task.take() {
             let _ = task.await;
         }
+        let _ = self.probe_watchdog_task.await;
         let _ = self.role_publisher_task.await;
         let _ = self.bloom_publisher_task.await;
         let _ = self.llm_outcomes_task.await;
