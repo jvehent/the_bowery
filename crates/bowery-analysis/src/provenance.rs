@@ -217,6 +217,74 @@ fn parse_md5(hex: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// A [`PackageIndex`] plus a memo of what has already been hashed.
+///
+/// Provenance must be consulted on **every** execution, not just the
+/// first. The rarity curve decays slowly — a binary seen once, twice,
+/// three times still scores 0.89, 0.80, 0.73 — so gating on
+/// "never seen before" leaves every one of those above the alert
+/// threshold. That gating shipped, and `/usr/bin/column` alerted at 0.80
+/// on a host whose provenance index had loaded correctly.
+///
+/// Hashing on every exec would be the obvious cost, so it is memoised
+/// by path. The stored digest is checked against the caller's SHA-256:
+/// if the file's contents changed, the entry is stale and is recomputed,
+/// which is exactly the trojanised-binary case the index exists to
+/// catch.
+#[derive(Debug)]
+pub struct ProvenanceCache {
+    index: PackageIndex,
+    memo: std::sync::Mutex<HashMap<PathBuf, ([u8; 32], Provenance)>>,
+    max_entries: usize,
+}
+
+impl ProvenanceCache {
+    #[must_use]
+    pub fn new(index: PackageIndex) -> Self {
+        Self {
+            index,
+            memo: std::sync::Mutex::new(HashMap::new()),
+            // A host runs a few thousand distinct binaries at most; this
+            // bounds a pathological case rather than a real one.
+            max_entries: 8192,
+        }
+    }
+
+    #[must_use]
+    pub fn index(&self) -> &PackageIndex {
+        &self.index
+    }
+
+    /// Provenance of `path`, whose current contents hash to `sha`.
+    ///
+    /// `sha` is the SHA-256 the pipeline already computed, used here
+    /// only as a cache key — the comparison against the package
+    /// manager's record is still md5, because that is what dpkg stores.
+    #[must_use]
+    pub fn classify(&self, path: &Path, sha: &[u8; 32]) -> Provenance {
+        if !self.index.is_available() {
+            return Provenance::Unknown;
+        }
+        if let Ok(memo) = self.memo.lock()
+            && let Some((cached_sha, provenance)) = memo.get(path)
+            && cached_sha == sha
+        {
+            return *provenance;
+        }
+        let provenance = self.index.classify(path, file_md5(path));
+        if let Ok(mut memo) = self.memo.lock() {
+            // Crude eviction: a host that legitimately runs 8192
+            // distinct binaries is rare, and re-hashing after a clear is
+            // cheaper than tracking recency.
+            if memo.len() >= self.max_entries {
+                memo.clear();
+            }
+            memo.insert(path.to_path_buf(), (*sha, provenance));
+        }
+        provenance
+    }
+}
+
 /// How provenance changes a rarity score.
 ///
 /// Rarity asks "has this host run this before". Provenance answers a
@@ -386,6 +454,60 @@ mod tests {
         // carry an episode on their own.
         let (score, _) = adjust_score(1.0, Provenance::PackagedIntact);
         assert!(score > 0.0, "must not erase the signal entirely");
+    }
+
+    #[test]
+    fn the_cache_applies_at_every_execution_not_just_the_first() {
+        // The shipped bug: provenance was gated on baseline_seen_count
+        // == 0, but rarity stays above the alert threshold for the first
+        // several runs (0.89, 0.80, 0.73). /usr/bin/column alerted at
+        // 0.80 on a host whose index had loaded fine.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("nice");
+        std::fs::write(&bin, b"binary contents").unwrap();
+        let md5 = file_md5(&bin).unwrap();
+
+        let mut by_path = HashMap::new();
+        by_path.insert(bin.clone(), md5);
+        let index = PackageIndex {
+            by_path,
+            available: true,
+        };
+        let cache = ProvenanceCache::new(index);
+        let sha = [7u8; 32];
+
+        // Every call answers, however many times it has run before.
+        for _ in 0..5 {
+            assert_eq!(cache.classify(&bin, &sha), Provenance::PackagedIntact);
+        }
+    }
+
+    #[test]
+    fn a_changed_binary_invalidates_its_cache_entry() {
+        // Otherwise the memo would keep vouching for a file that has
+        // since been rewritten — turning the cache into a way to hide
+        // exactly what the index exists to catch.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("nice");
+        std::fs::write(&bin, b"original").unwrap();
+        let md5 = file_md5(&bin).unwrap();
+
+        let mut by_path = HashMap::new();
+        by_path.insert(bin.clone(), md5);
+        let cache = ProvenanceCache::new(PackageIndex {
+            by_path,
+            available: true,
+        });
+
+        assert_eq!(cache.classify(&bin, &[1u8; 32]), Provenance::PackagedIntact);
+
+        // Contents replaced: new sha, and the file no longer matches.
+        std::fs::write(&bin, b"trojanised").unwrap();
+        assert_eq!(
+            cache.classify(&bin, &[2u8; 32]),
+            Provenance::PackagedModified,
+            "a new sha must force a re-read rather than reuse the memo"
+        );
     }
 
     #[test]

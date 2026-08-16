@@ -842,7 +842,7 @@ impl Agent {
                      provenance and will score as never-seen"
                 );
             }
-            Arc::new(index)
+            Arc::new(bowery_analysis::provenance::ProvenanceCache::new(index))
         };
 
         // Cross-host corroboration. Detectors raise claims; the engine
@@ -3186,7 +3186,7 @@ fn spawn_pipeline_task(
     eventlog: Option<EventLogHandle>,
     claims: Option<crate::corroboration::ClaimSink>,
     corroboration: crate::config::CorroborationConfig,
-    packages: Arc<bowery_analysis::provenance::PackageIndex>,
+    packages: Arc<bowery_analysis::provenance::ProvenanceCache>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -3274,7 +3274,7 @@ async fn process_event(
     eventlog: Option<&EventLogHandle>,
     claims: Option<&crate::corroboration::ClaimSink>,
     corroboration: &crate::config::CorroborationConfig,
-    packages: &Arc<bowery_analysis::provenance::PackageIndex>,
+    packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
     event: Event,
 ) {
     // Record first, analyse second. Every event goes to the log
@@ -3539,7 +3539,7 @@ async fn process_exec(
     alert_threshold: f32,
     backend_label: &str,
     events_tx: &broadcast::Sender<AgentEvent>,
-    packages: &Arc<bowery_analysis::provenance::PackageIndex>,
+    packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
     exec: ProcessExec,
 ) {
     let Some(exe_path) = exec.exe_path.clone() else {
@@ -3582,20 +3582,18 @@ async fn process_exec(
 
     // Provenance: was this on the disk before anyone logged in?
     //
-    // Only consulted for a binary this host has not seen before — which
-    // is exactly the case that scores 1.0 and was drowning the alert
-    // stream with first executions of `/usr/bin/nice`. After warm-up it
-    // almost never runs.
+    // Consulted on EVERY execution, not just the first. The rarity curve
+    // decays slowly — seen once, twice, three times still scores 0.89,
+    // 0.80, 0.73 — so gating this on "never seen before" left every one
+    // of those above the alert threshold. It did, and `/usr/bin/column`
+    // alerted at 0.80 on a host whose index had loaded correctly. The
+    // hash is memoised per path, so the cost after warm-up is a map
+    // lookup.
     let mut verdict = verdict;
-    if verdict.score.baseline_seen_count == 0
-        && let Some(exe) = exec.exe_path.clone()
-    {
+    if let Some(exe) = exec.exe_path.clone() {
         let index = packages.clone();
-        if let Ok(provenance) = tokio::task::spawn_blocking(move || {
-            let md5 = bowery_analysis::provenance::file_md5(&exe);
-            index.classify(&exe, md5)
-        })
-        .await
+        if let Ok(provenance) =
+            tokio::task::spawn_blocking(move || index.classify(&exe, &sha)).await
         {
             let (adjusted, why) =
                 bowery_analysis::provenance::adjust_score(verdict.suspicion, provenance);
