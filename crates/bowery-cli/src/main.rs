@@ -303,6 +303,21 @@ enum ExecCommand {
         /// supplied will surface as `BadSignature` rejections.
         #[arg(long)]
         fanout: bool,
+
+        /// Narrate the envelopes exchanged with the mesh.
+        ///
+        /// Fan-out is the one path where "fewer rows than I expected"
+        /// has several very different causes — a peer that never
+        /// replied, one that returned an error, a relay that closed
+        /// early — and the results alone cannot tell them apart. This
+        /// shows each chunk as it arrives, flags any peer whose
+        /// self-declared `agent_fp` disagrees with the key that signed
+        /// it, and prints a per-agent row tally at the end.
+        ///
+        /// Writes to stderr, so redirecting stdout still gives a clean
+        /// result file.
+        #[arg(long)]
+        verbose_whisper: bool,
         /// Base64-encoded Ed25519 verifying key of a peer that may
         /// respond to a fan-out query. Repeat for each peer you
         /// trust; the operator-side verifier registers all of
@@ -673,6 +688,7 @@ impl Cli {
                         sql,
                         timeout,
                         fanout,
+                        verbose_whisper,
                         peer_pubkeys_b64,
                         format,
                     },
@@ -699,6 +715,7 @@ impl Cli {
                     sql,
                     timeout,
                     fanout,
+                    verbose_whisper,
                     sink.as_mut(),
                 ))?;
                 Ok(ExitCode::SUCCESS)

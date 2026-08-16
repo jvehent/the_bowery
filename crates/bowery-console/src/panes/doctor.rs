@@ -84,6 +84,7 @@ impl DoctorPane {
                 "SELECT 1 AS one".to_string(),
                 Duration::from_secs(5),
                 false,
+                false, // console renders its own view: no stderr trace
                 &mut sink,
             )
             .await;

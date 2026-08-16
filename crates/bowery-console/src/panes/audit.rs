@@ -67,6 +67,7 @@ impl AuditPane {
                 sql,
                 Duration::from_secs(10),
                 false,
+                false, // console renders its own view: no stderr trace
                 &mut sink,
             )
             .await;

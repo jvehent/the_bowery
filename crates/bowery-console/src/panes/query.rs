@@ -207,6 +207,7 @@ impl QueryPane {
                 sql_for_task.clone(),
                 timeout,
                 false,
+                false, // console renders its own view: no stderr trace
                 &mut sink,
             )
             .await;

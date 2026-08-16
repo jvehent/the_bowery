@@ -74,8 +74,10 @@ pub async fn sql(
     sql: String,
     timeout: Duration,
     fanout: bool,
+    verbose_whisper: bool,
     sink: &mut dyn SqlSink,
 ) -> Result<()> {
+    let mut trace = WhisperTrace::new(verbose_whisper);
     let identity = Arc::new(
         Identity::load(&operator_key)
             .with_context(|| format!("loading operator key from {}", operator_key.display()))?,
@@ -113,6 +115,7 @@ pub async fn sql(
             resolver.insert(vk);
             agent_names.insert(peer.fp.to_ascii_lowercase(), peer.name.clone());
         }
+        trace.set_names(agent_names.clone());
         sink.set_agent_names(agent_names);
     }
     for b64 in &peer_pubkeys_b64 {
@@ -168,12 +171,14 @@ pub async fn sql(
     } else {
         Vec::new()
     };
+    let authorized = !forwarded.is_empty();
     let cmd = OperatorCommand {
         forwarded_from_operator: forwarded,
         request_id: request_id.clone(),
         timeout_ms,
         command: Some(body),
     };
+    trace.sent_query(&target_fp.to_string(), &request_id, fanout, authorized);
     let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
 
     let exchange_timeout = timeout + Duration::from_secs(2);
@@ -199,6 +204,8 @@ pub async fn sql(
                     if fanout {
                         // Connection close terminates the fan-out
                         // stream — the relay's done with peers.
+                        trace.note(&format!("relay closed the connection ({e})"));
+                        trace.summary();
                         return Ok::<(), anyhow::Error>(());
                     }
                     return Err(anyhow::Error::from(e).context("awaiting SqlChunk envelope"));
@@ -240,8 +247,18 @@ pub async fn sql(
                     // a terminator to truncate the fleet-wide result stream
                     // (previously the shape alone ended the loop).
                     if is_fanout_terminator(fanout, end, &declared_fp, sender, target_fp) {
+                        trace.note("relay sent the fan-out terminator; all peers finished");
+                        trace.summary();
                         return Ok::<(), anyhow::Error>(());
                     }
+                    trace.chunk(
+                        &sender.to_string(),
+                        &hex_fp(&declared_fp),
+                        rows.len(),
+                        chunk_cols.len(),
+                        end,
+                        bytes.len(),
+                    );
                     // Attribute rows to the authenticated sender, not the
                     // self-declared agent_fp, so a peer cannot stamp another
                     // host's fingerprint onto fabricated rows.
@@ -261,10 +278,17 @@ pub async fn sql(
                         sink.row(&columns, &agent_fp, &row);
                     }
                     if end && !fanout {
+                        trace.summary();
                         return Ok::<(), anyhow::Error>(());
                     }
                 }
                 Some(OperatorResultBody::Error(e)) => {
+                    trace.note(&format!(
+                        "error from {}: {} ({})",
+                        trace.label(&sender.to_string()),
+                        e.message,
+                        e.kind
+                    ));
                     eprintln!("agent refused query: {} ({})", e.message, e.kind);
                     bail!("sql query failed: {}", e.kind);
                 }
@@ -321,6 +345,140 @@ fn agent_name_for(names: &HashMap<String, String>, agent_fp: &[u8]) -> String {
         .get(&hex_fp(agent_fp))
         .cloned()
         .unwrap_or_else(|| "?".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Whisper trace (`--verbose-whisper`)
+// ---------------------------------------------------------------------------
+
+/// Narrates the envelopes a fan-out query exchanges.
+///
+/// Fan-out is the one operator path where "it returned fewer rows than I
+/// expected" has several very different causes — a peer that never
+/// replied, a peer that replied with an error, a relay that closed
+/// early — and the normal output cannot tell them apart. This makes the
+/// exchange visible without changing it.
+///
+/// Everything goes to **stderr**, so `bowery exec sql --fanout … >
+/// results.tsv` still produces a clean file.
+#[derive(Debug)]
+pub struct WhisperTrace {
+    enabled: bool,
+    started: std::time::Instant,
+    names: HashMap<String, String>,
+    /// Rows attributed to each authenticated sender, for the summary.
+    rows_by_sender: HashMap<String, usize>,
+    order: Vec<String>,
+}
+
+impl WhisperTrace {
+    #[must_use]
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            started: std::time::Instant::now(),
+            names: HashMap::new(),
+            rows_by_sender: HashMap::new(),
+            order: Vec::new(),
+        }
+    }
+
+    fn set_names(&mut self, names: HashMap<String, String>) {
+        self.names = names;
+    }
+
+    fn label(&self, fp_hex: &str) -> String {
+        let short: String = fp_hex.chars().take(12).collect();
+        self.names
+            .get(fp_hex)
+            .map_or_else(|| short.clone(), |n| format!("{n} ({short})"))
+    }
+
+    fn ms(&self) -> u128 {
+        self.started.elapsed().as_millis()
+    }
+
+    fn say(&self, arrow: &str, msg: &str) {
+        if self.enabled {
+            eprintln!("[whisper {:>6}ms] {arrow} {msg}", self.ms());
+        }
+    }
+
+    pub fn sent_query(&self, relay: &str, request_id: &str, fanout: bool, authorized: bool) {
+        self.say(
+            "-->",
+            &format!(
+                "OperatorCommand::Sql to {} request_id={request_id} fanout={fanout}{}",
+                self.label(relay),
+                if authorized {
+                    " +OperatorAuthorization"
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
+
+    pub fn chunk(
+        &mut self,
+        sender_hex: &str,
+        declared_hex: &str,
+        rows: usize,
+        columns: usize,
+        end: bool,
+        bytes: usize,
+    ) {
+        if !self.rows_by_sender.contains_key(sender_hex) {
+            self.order.push(sender_hex.to_string());
+        }
+        *self
+            .rows_by_sender
+            .entry(sender_hex.to_string())
+            .or_insert(0) += rows;
+        self.say(
+            "<--",
+            &format!(
+                "SqlChunk from {} rows={rows} cols={columns} end={end} {bytes}B",
+                self.label(sender_hex)
+            ),
+        );
+        // The one thing worth shouting about. Rows are attributed to the
+        // envelope signer, never to this self-declared field, so a
+        // mismatch is a peer *trying* to stamp another host's identity
+        // onto its rows — defeated, but worth seeing.
+        if !declared_hex.is_empty() && declared_hex != sender_hex {
+            eprintln!(
+                "[whisper {:>6}ms] !!! chunk claims agent_fp={} but was signed by {} \
+                 — attributed to the signer",
+                self.ms(),
+                self.label(declared_hex),
+                self.label(sender_hex)
+            );
+        }
+    }
+
+    pub fn note(&self, msg: &str) {
+        self.say("   ", msg);
+    }
+
+    /// Final accounting: who answered, and with how much.
+    pub fn summary(&self) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "[whisper {:>6}ms] --- {} agent(s) reported",
+            self.ms(),
+            self.order.len()
+        );
+        for fp in &self.order {
+            eprintln!(
+                "[whisper        ]     {} rows={}",
+                self.label(fp),
+                self.rows_by_sender.get(fp).copied().unwrap_or(0)
+            );
+        }
+    }
 }
 
 /// Construct the right stdout-rendering sink for the operator CLI's

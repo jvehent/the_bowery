@@ -229,6 +229,7 @@ pub async fn check(path: &Path, operator_key: &Path, timeout: Duration) -> Resul
             "SELECT 1".to_string(),
             timeout,
             false,
+            false, // reachability probe: no whisper trace
             &mut sink,
         )
         .await;
