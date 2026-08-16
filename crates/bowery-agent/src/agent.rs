@@ -3296,8 +3296,11 @@ async fn process_event(
         Event::NetworkConnect(conn) => {
             process_network_connect(baseline, claims, corroboration, &conn).await;
         }
+        Event::FileOpen(open) => {
+            process_file_open(inbox, originator_fp, backend_label, events_tx, &open);
+        }
         // Recorded to the event log above; no analyzer path yet.
-        Event::ProcessExit(_) | Event::FileOpen(_) => {}
+        Event::ProcessExit(_) => {}
     }
 }
 
@@ -3355,6 +3358,77 @@ async fn process_network_connect(
         Ok(Err(e)) => warn!(error = %e, "recording network destination failed"),
         Err(e) => warn!(error = %e, "destination upsert task panicked"),
     }
+}
+
+/// Alert on a write to a path the built-in watch set covers.
+///
+/// The kernel sensor reports every write-intent open; this is what makes
+/// the ones that matter reach an operator. Persistence, privilege
+/// escalation, credential and log-tampering paths are built in rather
+/// than configured, because an operator should not have to know in
+/// advance that `/etc/ld.so.preload` is how a host gets owned.
+///
+/// No whisper confirmation is attached. "Did anyone else write this
+/// file" is a question the corroboration substrate could answer — and a
+/// package upgrade writing the same unit on every host is exactly what
+/// it would explain away — but the kind is not registered yet, and
+/// stamping an unconfirmed block on the alert would imply a check that
+/// never ran.
+fn process_file_open(
+    inbox: &Arc<AlertInbox>,
+    originator_fp: Fingerprint,
+    backend_label: &str,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    open: &bowery_events::FileOpen,
+) {
+    let path = open.path.display().to_string();
+    let Some(hit) = bowery_analysis::file_watch::classify(&path) else {
+        return;
+    };
+    // A truncated path may have matched a prefix rule on the part we
+    // did see. Say so rather than quoting a path that is not the whole
+    // one — an investigator matching against it needs to know.
+    let path_note = if open.truncated {
+        " (path truncated by the sensor)"
+    } else {
+        ""
+    };
+    let episode_id = format!("file-{}-{}", hit.rule_id, current_unix_ms());
+    let alert = Alert {
+        originator_fp: originator_fp.as_bytes().to_vec(),
+        episode_id: episode_id.clone(),
+        exe_sha256_hex: String::new(),
+        // The path is the finding; the process that wrote it is the lead.
+        exe_path: path.clone(),
+        suspicion: hit.severity,
+        rationale: format!(
+            "{} write to {path}{path_note} by {} (pid {}) — {}",
+            hit.category.label(),
+            if open.comm.is_empty() {
+                "an unnamed process"
+            } else {
+                open.comm.as_str()
+            },
+            open.pid,
+            hit.why
+        ),
+        suggested_actions: Vec::new(),
+        ts_unix_ms: current_unix_ms(),
+        backend: backend_label.to_string(),
+        confirmation: None,
+    };
+    warn!(
+        rule = hit.rule_id,
+        path = %path,
+        comm = %open.comm,
+        pid = open.pid,
+        "file watch hit"
+    );
+    inbox.append(alert);
+    let _ = events_tx.send(AgentEvent::AlertEmitted {
+        episode_id,
+        suspicion: hit.severity,
+    });
 }
 
 /// Emit an alert for a change to an operator-watched file.

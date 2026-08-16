@@ -5,7 +5,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bowery_agent::config::{
     AlertsConfig, BaselineConfig, BloomConfig, Config, FileRule, HeartbeatConfig, IdentityConfig,
@@ -16,6 +16,7 @@ use bowery_agent::{Agent, AgentEvent};
 use bowery_analysis::RuleSeverity;
 use bowery_crypto::Identity;
 use bowery_events::source::MockEventSource;
+use bowery_events::{Event, FileOpen};
 use tempfile::TempDir;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -219,4 +220,64 @@ async fn agent_rejects_process_rule_with_no_matcher() {
         format!("{err}").contains("no matcher"),
         "unexpected error: {err}"
     );
+}
+
+/// A write to a built-in watch path alerts, with the process named.
+///
+/// Distinct from the operator-configured file rules above: nobody has to
+/// know in advance that `/etc/ld.so.preload` matters. The path here is a
+/// temp-dir stand-in, so the assertion is on the *rule firing*, which is
+/// unit-tested against the real paths in `bowery_analysis::file_watch`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_to_a_persistence_path_alerts_and_names_the_process() {
+    let workdir = TempDir::new().unwrap();
+    let cfg = build_config(workdir.path(), reserve_udp_port(), MonitorConfig::default());
+
+    // Feed the event the kernel sensor would produce.
+    let source = Box::new(MockEventSource::new(vec![Event::FileOpen(FileOpen {
+        pid: 4242,
+        comm: "curl".into(),
+        path: "/root/.ssh/authorized_keys".into(),
+        flags: 0o1101,
+        truncated: false,
+        ts: SystemTime::now(),
+    })]));
+
+    let identity = Arc::new(Identity::generate());
+    let agent = Agent::start(cfg, identity, source).await.expect("start");
+    let mut events = agent.subscribe();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let episode = loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !left.is_zero(),
+            "timed out waiting for the file-watch alert"
+        );
+        if let Ok(Ok(AgentEvent::AlertEmitted { episode_id, .. })) =
+            tokio::time::timeout(left, events.recv()).await
+            && episode_id.starts_with("file-persist.authorized_keys-")
+        {
+            break episode_id;
+        }
+    };
+
+    let (alerts, _) = agent.inbox().read_since(0, 100);
+    let alert = alerts
+        .iter()
+        .find(|a| a.episode_id == episode)
+        .expect("alert in the inbox");
+    assert!(alert.rationale.contains("/root/.ssh/authorized_keys"));
+    // The process is the lead an operator follows next.
+    assert!(alert.rationale.contains("curl"), "{}", alert.rationale);
+    assert!(alert.rationale.contains("pid 4242"), "{}", alert.rationale);
+    // And it explains why the path matters at all.
+    assert!(
+        alert.rationale.contains("passwordless login"),
+        "{}",
+        alert.rationale
+    );
+    assert!(alert.suspicion > 0.9);
+
+    agent.shutdown().await.expect("shutdown");
 }

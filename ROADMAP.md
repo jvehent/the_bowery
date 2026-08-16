@@ -138,7 +138,7 @@ because nothing is coming.
 neighbour that stops answering, or refuses everything, is visible in the
 corroboration tallies already on the wire but nothing acts on it.
 
-### Phase B — Close the file gap *(largest coverage win)*
+### Phase B — Close the file gap *(BUILT: sensor + persistence/credential rules)*
 
 Add file operations to the kernel sensor: open-for-write, create,
 rename, unlink, chmod/chown, with path resolution. Then ship
@@ -151,7 +151,28 @@ rename, unlink, chmod/chown, with path resolution. Then ship
 - **Impact**: mass-rename / mass-write rate per process, the shape of
   ransomware.
 
-This single phase turns four empty rows into populated ones.
+**Built:** a `sys_enter_openat` probe filtered kernel-side to write
+intent (reads outnumber writes by orders of magnitude and would saturate
+the ring), with its assumed argument offsets verified against the
+kernel's own format file and the probe refusing to attach on a proven
+mismatch. Plus a built-in watch set covering persistence
+(`ld.so.preload`, systemd units, cron, `authorized_keys`, PAM, udev,
+shell rc), privilege escalation (`sudoers`), credentials (`shadow`,
+`passwd`, private keys) and log tampering — each alert naming the
+process and explaining why the path matters.
+
+Two limits are recorded rather than hidden: paths are captured to 256
+bytes and flagged when truncated, and relative paths (an `openat`
+against a dirfd the probe cannot resolve) are stored but never matched,
+because guessing would attribute a write to a file nobody touched.
+
+**Still open in this phase:** credential *reads* (`/etc/shadow` being
+read rather than written) need a read-side filter, and mass-write rate
+detection for ransomware is unbuilt. Package-manager writes will produce
+hits — deliberately not suppressed by process name, since `comm` is
+attacker-controlled and a suppression list is an evasion recipe. Fleet
+corroboration is the right answer there and the substrate already
+exists.
 
 *Note the kernel constraint discovered on the Pis: `CONFIG_BPF_LSM` is
 off on Raspberry Pi kernels, so LSM-hook-based file monitoring won't run
