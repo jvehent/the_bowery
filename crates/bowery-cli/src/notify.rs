@@ -563,13 +563,59 @@ async fn send_email(cfg: &NotifyConfig, subject: &str, body: &str) -> Result<()>
 
     // The error is deliberately not wrapped with the credential in
     // scope; lettre's SMTP errors carry server text, never the password.
-    transport.send(email).await.with_context(|| {
-        format!(
-            "sending via {}:{}",
-            cfg.email.smtp_host, cfg.email.smtp_port
-        )
-    })?;
+    if let Err(e) = transport.send(email).await {
+        let text = e.to_string();
+        let hint = auth_hint(&text)
+            .map(|h| format!("\n\nhint: {h}"))
+            .unwrap_or_default();
+        bail!(
+            "sending via {}:{}: {text}{hint}",
+            cfg.email.smtp_host,
+            cfg.email.smtp_port
+        );
+    }
     Ok(())
+}
+
+/// Turn an SMTP rejection into something an operator can act on.
+///
+/// Authentication is where first runs fail, and the server's own text —
+/// "Application-specific password required", say — assumes you already
+/// know what that means and where to get one. Matched on response text
+/// rather than a typed error because the useful distinctions live in the
+/// enhanced status codes, which the SMTP crate does not model.
+#[must_use]
+pub fn auth_hint(err_text: &str) -> Option<&'static str> {
+    let t = err_text.to_ascii_lowercase();
+    if t.contains("application-specific password") || t.contains("invalidsecondfactor") {
+        return Some(
+            "Gmail rejects account passwords over SMTP. Create an App Password \
+             (which requires 2-Step Verification on the account) at \
+             https://myaccount.google.com/apppasswords — it is 16 lowercase \
+             letters shown as 4 groups of 4. Store it WITHOUT the spaces in the \
+             file named by [email] password_file.",
+        );
+    }
+    if t.contains("username and password not accepted")
+        || t.contains("invalid login")
+        || t.contains("535")
+    {
+        return Some(
+            "The relay rejected the credential. Check that [email] username is \
+             the mailbox owning the password, and that the password file holds \
+             only the password — no quotes, no comment, no trailing text.",
+        );
+    }
+    if t.contains("must issue a starttls command") {
+        return Some("The relay wants STARTTLS: set [email] starttls = true (port 587).");
+    }
+    if t.contains("wrong version number") || t.contains("record overflow") {
+        return Some(
+            "TLS failed in the way a port/mode mismatch usually looks: use \
+             starttls = true with port 587, or starttls = false with port 465.",
+        );
+    }
+    None
 }
 
 #[cfg(test)]
@@ -748,6 +794,33 @@ mod tests {
             confirmed_only: false,
         };
         assert!(passes(&alert("d", 0.95, false), &loose));
+    }
+
+    #[test]
+    fn the_gmail_first_run_failure_explains_itself() {
+        // Verbatim from a real first run against smtp.gmail.com. The
+        // server's wording says nothing about where to get an app
+        // password, or that it requires 2FA to exist at all.
+        let real = "permanent error (534): 5.7.9 Application-specific password required. \
+                    For more information, go to \
+                    https://support.google.com/mail/?p=InvalidSecondFactor - gsmtp";
+        let hint = auth_hint(real).expect("THE first-run failure must explain itself");
+        assert!(hint.contains("apppasswords"), "points at where to get one");
+        assert!(hint.contains("2-Step"), "and what it requires first");
+        assert!(
+            hint.contains("WITHOUT the spaces"),
+            "and the formatting trap"
+        );
+    }
+
+    #[test]
+    fn generic_auth_and_tls_failures_are_recognised() {
+        assert!(auth_hint("535 5.7.8 Username and Password not accepted").is_some());
+        assert!(auth_hint("Must issue a STARTTLS command first").is_some());
+        assert!(auth_hint("tls handshake: wrong version number").is_some());
+        // Not every failure has advice; inventing some is worse than the
+        // server's own text.
+        assert!(auth_hint("452 4.2.2 mailbox full").is_none());
     }
 
     #[test]
