@@ -55,6 +55,7 @@ bowery-yara = { path = "crates/bowery-yara", version = "0.0.1" }
 # Crypto
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8"] }
 sha2 = "0.10"
+md-5 = "0.10"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 base64 = "0.22"

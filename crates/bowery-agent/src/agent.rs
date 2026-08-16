@@ -824,6 +824,27 @@ impl Agent {
             shutdown_rx.clone(),
         );
 
+        // Package provenance. Reading ~2400 .md5sums files is a few
+        // hundred milliseconds of blocking I/O, so it happens once here
+        // rather than on any event path. An absent database yields an
+        // index that answers "unknown" to everything, which damps
+        // nothing — the honest behaviour on a non-dpkg host.
+        let packages = {
+            let index =
+                tokio::task::spawn_blocking(bowery_analysis::provenance::PackageIndex::load_system)
+                    .await
+                    .unwrap_or_else(|_| bowery_analysis::provenance::PackageIndex::unavailable());
+            if index.is_available() {
+                info!(executables = index.len(), "package provenance index loaded");
+            } else {
+                warn!(
+                    "no package database found; first executions cannot be damped by \
+                     provenance and will score as never-seen"
+                );
+            }
+            Arc::new(index)
+        };
+
         // Cross-host corroboration. Detectors raise claims; the engine
         // picks an audience, asks, tallies, and alerts. Kind-agnostic:
         // it is started once and every present and future detection
@@ -877,6 +898,7 @@ impl Agent {
             eventlog_handle.clone(),
             claims,
             config.whisper.corroboration.clone(),
+            packages,
             shutdown_rx.clone(),
         );
 
@@ -3164,6 +3186,7 @@ fn spawn_pipeline_task(
     eventlog: Option<EventLogHandle>,
     claims: Option<crate::corroboration::ClaimSink>,
     corroboration: crate::config::CorroborationConfig,
+    packages: Arc<bowery_analysis::provenance::PackageIndex>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -3197,6 +3220,7 @@ fn spawn_pipeline_task(
                         eventlog.as_ref(),
                         claims.as_ref(),
                         &corroboration,
+                        &packages,
                         event,
                     ).await;
                 }
@@ -3220,6 +3244,7 @@ fn spawn_pipeline_task(
                                 eventlog.as_ref(),
                                 claims.as_ref(),
                                 &corroboration,
+                                &packages,
                                 event,
                             ).await;
                         }
@@ -3249,6 +3274,7 @@ async fn process_event(
     eventlog: Option<&EventLogHandle>,
     claims: Option<&crate::corroboration::ClaimSink>,
     corroboration: &crate::config::CorroborationConfig,
+    packages: &Arc<bowery_analysis::provenance::PackageIndex>,
     event: Event,
 ) {
     // Record first, analyse second. Every event goes to the log
@@ -3278,6 +3304,7 @@ async fn process_event(
                 alert_threshold,
                 backend_label,
                 events_tx,
+                packages,
                 exec,
             )
             .await;
@@ -3512,6 +3539,7 @@ async fn process_exec(
     alert_threshold: f32,
     backend_label: &str,
     events_tx: &broadcast::Sender<AgentEvent>,
+    packages: &Arc<bowery_analysis::provenance::PackageIndex>,
     exec: ProcessExec,
 ) {
     let Some(exe_path) = exec.exe_path.clone() else {
@@ -3551,6 +3579,40 @@ async fn process_exec(
             return;
         }
     };
+
+    // Provenance: was this on the disk before anyone logged in?
+    //
+    // Only consulted for a binary this host has not seen before — which
+    // is exactly the case that scores 1.0 and was drowning the alert
+    // stream with first executions of `/usr/bin/nice`. After warm-up it
+    // almost never runs.
+    let mut verdict = verdict;
+    if verdict.score.baseline_seen_count == 0
+        && let Some(exe) = exec.exe_path.clone()
+    {
+        let index = packages.clone();
+        if let Ok(provenance) = tokio::task::spawn_blocking(move || {
+            let md5 = bowery_analysis::provenance::file_md5(&exe);
+            index.classify(&exe, md5)
+        })
+        .await
+        {
+            let (adjusted, why) =
+                bowery_analysis::provenance::adjust_score(verdict.suspicion, provenance);
+            if (adjusted - verdict.suspicion).abs() > f32::EPSILON {
+                debug!(
+                    pid = exec.pid,
+                    from = verdict.suspicion,
+                    to = adjusted,
+                    provenance = provenance.label(),
+                    "provenance adjusted the verdict"
+                );
+            }
+            verdict.suspicion = adjusted;
+            verdict.score.reason = format!("{} ({why})", verdict.score.reason);
+        }
+    }
+    let verdict = verdict;
 
     let baseline_for_write = baseline.clone();
     let outcome =

@@ -16,6 +16,7 @@ pub mod analyzer;
 pub mod episode;
 pub mod file_watch;
 pub mod peer_select;
+pub mod provenance;
 pub mod role;
 pub mod rule;
 pub mod score;
