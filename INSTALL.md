@@ -1161,15 +1161,38 @@ while tuning `min_suspicion`. Needs no SMTP credential.
 
 ### 4. Put it on a timer
 
+On a host where the operator is a real user account — including a
+combined agent + operator box — run it as a **user service**. Nothing to
+edit, and `%h` / `HOME` resolve on their own:
+
 ```bash
-sudo cp deploy/notify/bowery-notify.{service,timer} /etc/systemd/system/
-sudo systemctl edit bowery-notify.service     # set User= and Environment=HOME=
-sudo systemctl enable --now bowery-notify.timer
-systemctl list-timers bowery-notify.timer
+mkdir -p ~/.config/systemd/user
+cp deploy/notify/bowery-notify.{service,timer} ~/.config/systemd/user/
+sudo loginctl enable-linger "$USER"     # required: see below
+systemctl --user daemon-reload
+systemctl --user enable --now bowery-notify.timer
+systemctl --user list-timers bowery-notify.timer
 ```
+
+**`enable-linger` is not optional.** Without it the user manager exits
+when you log out, and a headless box silently stops notifying — which is
+the exact failure this exists to prevent. Check it with
+`loginctl show-user "$USER" -p Linger`.
+
+Where there is no operator login account to run as, install to
+`/etc/systemd/system/` instead and `systemctl edit` the unit to set
+`User=` and `Environment=HOME=`.
 
 Default cadence is 15 minutes. Nothing is sent when nothing is new, so a
 short interval costs only a few QUIC round trips.
+
+Verify a run end to end:
+
+```bash
+systemctl --user start bowery-notify.service    # fire it now
+systemctl --user status bowery-notify.service   # exit status + output
+journalctl --user -u bowery-notify.service -n 20
+```
 
 ### What the message contains, and why
 

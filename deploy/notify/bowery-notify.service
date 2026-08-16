@@ -8,9 +8,24 @@
 # monitored agents get no notification credential and no new egress path,
 # which is the entire point of putting this here rather than in them.
 #
-#   sudo cp bowery-notify.{service,timer} /etc/systemd/system/
-#   sudo systemctl edit bowery-notify.service   # set User= and Environment=HOME=
-#   sudo systemctl enable --now bowery-notify.timer
+# The same file works two ways. Prefer the first on a host where the
+# operator is a real user account (e.g. a combined agent + operator box):
+#
+#   USER SERVICE — no editing, %h and HOME resolve on their own.
+#     mkdir -p ~/.config/systemd/user
+#     cp bowery-notify.{service,timer} ~/.config/systemd/user/
+#     sudo loginctl enable-linger "$USER"   # or it stops when you log out
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now bowery-notify.timer
+#
+#   SYSTEM SERVICE — when there is no operator login account to run as.
+#     sudo cp bowery-notify.{service,timer} /etc/systemd/system/
+#     sudo systemctl edit bowery-notify.service  # set User= and Environment=HOME=
+#     sudo systemctl enable --now bowery-notify.timer
+#
+# `enable-linger` is not optional for the user path: without it the user
+# manager exits at logout and a headless box silently stops notifying —
+# the exact failure this service exists to prevent.
 
 [Unit]
 Description=Bowery alert email notifier
