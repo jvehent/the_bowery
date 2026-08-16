@@ -824,26 +824,30 @@ impl Agent {
             shutdown_rx.clone(),
         );
 
-        // Package provenance. Reading ~2400 .md5sums files is a few
-        // hundred milliseconds of blocking I/O, so it happens once here
-        // rather than on any event path. An absent database yields an
-        // index that answers "unknown" to everything, which damps
-        // nothing — the honest behaviour on a non-dpkg host.
-        let packages = {
-            let index =
-                tokio::task::spawn_blocking(bowery_analysis::provenance::PackageIndex::load_system)
-                    .await
-                    .unwrap_or_else(|_| bowery_analysis::provenance::PackageIndex::unavailable());
-            if index.is_available() {
-                info!(executables = index.len(), "package provenance index loaded");
-            } else {
-                warn!(
-                    "no package database found; first executions cannot be damped by \
-                     provenance and will score as never-seen"
-                );
-            }
-            Arc::new(bowery_analysis::provenance::ProvenanceCache::new(index))
-        };
+        // Package provenance, loaded in the background and never
+        // awaited. Reading dpkg's metadata took five seconds on a runner
+        // with 53,000 packaged executables, and awaiting it here delayed
+        // every task created afterwards — including the file monitor,
+        // which meant five seconds of a "ready" agent not watching the
+        // files it was configured to watch. An optimisation must not
+        // gate the sensors. Until the index arrives, provenance answers
+        // Unknown, which damps nothing.
+        let packages = Arc::new(bowery_analysis::provenance::ProvenanceCache::empty());
+        {
+            let packages = packages.clone();
+            tokio::task::spawn_blocking(move || {
+                let index = bowery_analysis::provenance::PackageIndex::load_system();
+                if index.is_available() {
+                    info!(executables = index.len(), "package provenance index loaded");
+                } else {
+                    warn!(
+                        "no package database found; executions cannot be damped by \
+                         provenance and rare binaries will score as never-seen"
+                    );
+                }
+                packages.install(index);
+            });
+        }
 
         // Cross-host corroboration. Detectors raise claims; the engine
         // picks an audience, asks, tallies, and alerts. Kind-agnostic:

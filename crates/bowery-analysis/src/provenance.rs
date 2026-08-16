@@ -233,16 +233,27 @@ fn parse_md5(hex: &str) -> Option<[u8; 16]> {
 /// catch.
 #[derive(Debug)]
 pub struct ProvenanceCache {
-    index: PackageIndex,
+    /// Behind a lock because it arrives *after* startup — see
+    /// [`Self::install`].
+    index: std::sync::RwLock<PackageIndex>,
     memo: std::sync::Mutex<HashMap<PathBuf, ([u8; 32], Provenance)>>,
     max_entries: usize,
 }
 
 impl ProvenanceCache {
+    /// A cache with no index yet: everything is
+    /// [`Provenance::Unknown`], which damps nothing.
+    ///
+    /// Startup must not wait for this. Reading dpkg's metadata took five
+    /// seconds on a CI runner with 53,000 packaged executables, and
+    /// blocking on it delayed every later task — including the file
+    /// monitor, which meant five seconds of a "running" agent not
+    /// watching the files it was configured to watch. An optimisation
+    /// must never gate the sensors.
     #[must_use]
-    pub fn new(index: PackageIndex) -> Self {
+    pub fn empty() -> Self {
         Self {
-            index,
+            index: std::sync::RwLock::new(PackageIndex::unavailable()),
             memo: std::sync::Mutex::new(HashMap::new()),
             // A host runs a few thousand distinct binaries at most; this
             // bounds a pathological case rather than a real one.
@@ -251,8 +262,42 @@ impl ProvenanceCache {
     }
 
     #[must_use]
-    pub fn index(&self) -> &PackageIndex {
-        &self.index
+    pub fn new(index: PackageIndex) -> Self {
+        let cache = Self::empty();
+        cache.install(index);
+        cache
+    }
+
+    /// Publish a loaded index, once it is ready.
+    ///
+    /// Clears the memo: entries recorded while the index was still
+    /// loading answered `Unknown`, and keeping them would make the
+    /// index permanently useless for every binary that ran during
+    /// startup — which on a booting host is most of them.
+    pub fn install(&self, index: PackageIndex) {
+        if let Ok(mut guard) = self.index.write() {
+            *guard = index;
+        }
+        if let Ok(mut memo) = self.memo.lock() {
+            memo.clear();
+        }
+    }
+
+    /// Is an index loaded yet?
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.index.read().is_ok_and(|i| i.is_available())
+    }
+
+    /// Executables indexed, for startup logging.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.index.read().map_or(0, |i| i.len())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Provenance of `path`, whose current contents hash to `sha`.
@@ -262,7 +307,12 @@ impl ProvenanceCache {
     /// manager's record is still md5, because that is what dpkg stores.
     #[must_use]
     pub fn classify(&self, path: &Path, sha: &[u8; 32]) -> Provenance {
-        if !self.index.is_available() {
+        let Ok(index) = self.index.read() else {
+            return Provenance::Unknown;
+        };
+        if !index.is_available() {
+            // Still loading, or no package database. Either way the
+            // question cannot be answered, and Unknown damps nothing.
             return Provenance::Unknown;
         }
         if let Ok(memo) = self.memo.lock()
@@ -271,7 +321,7 @@ impl ProvenanceCache {
         {
             return *provenance;
         }
-        let provenance = self.index.classify(path, file_md5(path));
+        let provenance = index.classify(path, file_md5(path));
         if let Ok(mut memo) = self.memo.lock() {
             // Crude eviction: a host that legitimately runs 8192
             // distinct binaries is rare, and re-hashing after a clear is
@@ -480,6 +530,50 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(cache.classify(&bin, &sha), Provenance::PackagedIntact);
         }
+    }
+
+    #[test]
+    fn an_unloaded_cache_answers_unknown_and_damps_nothing() {
+        // Startup must not block on the index, so there is a window
+        // where it has not arrived. Unknown is the honest answer and
+        // leaves scores alone.
+        let cache = ProvenanceCache::empty();
+        assert!(!cache.is_ready());
+        assert_eq!(
+            cache.classify(Path::new("/usr/bin/nice"), &[0u8; 32]),
+            Provenance::Unknown
+        );
+        let (score, _) = adjust_score(1.0, Provenance::Unknown);
+        assert!((score - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn installing_an_index_clears_answers_given_while_it_loaded() {
+        // Otherwise every binary that ran during startup — on a booting
+        // host, most of them — would be permanently memoised as Unknown
+        // and the index would never apply to them.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("nice");
+        std::fs::write(&bin, b"contents").unwrap();
+        let md5 = file_md5(&bin).unwrap();
+
+        let cache = ProvenanceCache::empty();
+        let sha = [3u8; 32];
+        assert_eq!(cache.classify(&bin, &sha), Provenance::Unknown);
+
+        let mut by_path = HashMap::new();
+        by_path.insert(bin.clone(), md5);
+        cache.install(PackageIndex {
+            by_path,
+            available: true,
+        });
+
+        assert!(cache.is_ready());
+        assert_eq!(
+            cache.classify(&bin, &sha),
+            Provenance::PackagedIntact,
+            "the stale Unknown must not survive the install"
+        );
     }
 
     #[test]

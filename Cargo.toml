@@ -79,6 +79,14 @@ toml = "0.8"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# VirusTotal lookups (`bowery vt`, and the notify filter). rustls for
+# the same reason as lettre: the CLI cross-compiles to aarch64-musl.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "charset",
+    "http2",
+] }
+
 # Email notification sink (`bowery notify`). rustls, never native-tls:
 # the CLI cross-compiles to aarch64-musl for the Pi package, and an
 # OpenSSL dependency would drag a C toolchain into that build.

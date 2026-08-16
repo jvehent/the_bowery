@@ -29,6 +29,7 @@ anyhow = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
 lettre = { workspace = true }
+reqwest = { workspace = true }
 time = { workspace = true }
 ed25519-dalek = { workspace = true }
 humantime = "2"
