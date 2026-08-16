@@ -337,7 +337,13 @@ async fn run(
                 warn!(error = %e, "DROPS map present but unusable; drop counts unavailable");
                 None
             },
-            Some,
+            |m| {
+                // Symmetric with the warning below: an operator needs to
+                // know which of the two states they are in without
+                // reading the SQL view.
+                info!("ring-buffer loss accounting active");
+                Some(m)
+            },
         )
     } else {
         warn!(

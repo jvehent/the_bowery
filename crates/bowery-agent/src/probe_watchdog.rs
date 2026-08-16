@@ -55,6 +55,21 @@ pub const CHECK_INTERVAL: Duration = Duration::from_mins(1);
 /// about.
 pub const REMIND_AFTER: Duration = Duration::from_hours(1);
 
+/// How long a source is allowed to finish attaching before silence is
+/// read as blindness.
+///
+/// Attachment is asynchronous: the source is spawned, loads the object,
+/// then attaches each probe. The first live run of this watchdog alerted
+/// `SENSOR BLIND` one millisecond before the tracepoints came up — a
+/// false alarm at every boot, which is precisely the crying-wolf failure
+/// this module's own documentation warns against. Thirty seconds is far
+/// longer than attachment takes and far shorter than a shift.
+///
+/// The grace applies only to a source that exists and might still come
+/// up. Having no source at all, or a source that has stopped, is
+/// reported at once — neither is going to change.
+pub const STARTUP_GRACE: Duration = Duration::from_secs(30);
+
 /// Suspicion stamped on a sensor alert.
 ///
 /// High on purpose. A blind agent is not a detection — it is the
@@ -70,12 +85,16 @@ pub enum Verdict {
     Blind { reason: String },
     /// Watching, but the kernel discarded events since the last check.
     Dropping { total: u64, since_last: u64 },
+    /// A source exists but has not attached yet, and is still inside
+    /// its startup grace. Not an alert, and not health either.
+    Starting,
 }
 
 impl Verdict {
+    /// Nothing to report. Covers both "working" and "not up yet".
     #[must_use]
     pub fn is_healthy(&self) -> bool {
-        matches!(self, Self::Healthy)
+        matches!(self, Self::Healthy | Self::Starting)
     }
 
     /// Stable key for "is this the same problem as last time?", so a
@@ -87,6 +106,7 @@ impl Verdict {
             Self::Healthy => "healthy",
             Self::Blind { .. } => "blind",
             Self::Dropping { .. } => "dropping",
+            Self::Starting => "starting",
         }
     }
 }
@@ -97,7 +117,7 @@ impl Verdict {
 /// when the agent has no health-reporting source, and `previous_drops`
 /// is the total from the last pass.
 #[must_use]
-pub fn assess(health: Option<&ProbeHealth>, previous_drops: u64) -> Verdict {
+pub fn assess(health: Option<&ProbeHealth>, previous_drops: u64, since_start: Duration) -> Verdict {
     let Some(health) = health else {
         return Verdict::Blind {
             reason: "no kernel event source: the BPF object is missing or failed to load, \
@@ -111,8 +131,17 @@ pub fn assess(health: Option<&ProbeHealth>, previous_drops: u64) -> Verdict {
         };
     }
     if !health.is_watching() {
+        // Still coming up: probes attach a few milliseconds after the
+        // source is spawned, and calling that blindness alerts on every
+        // boot.
+        if since_start < STARTUP_GRACE {
+            return Verdict::Starting;
+        }
         return Verdict::Blind {
-            reason: "no kernel probe is attached".to_string(),
+            reason: format!(
+                "no kernel probe attached within {}s of start",
+                STARTUP_GRACE.as_secs()
+            ),
         };
     }
     let total = health.total_kernel_drops();
@@ -130,6 +159,7 @@ pub fn assess(health: Option<&ProbeHealth>, previous_drops: u64) -> Verdict {
 pub fn rationale(verdict: &Verdict) -> String {
     match verdict {
         Verdict::Healthy => "kernel sensor healthy".to_string(),
+        Verdict::Starting => "kernel sensor still attaching".to_string(),
         Verdict::Blind { reason } => format!(
             "SENSOR BLIND — {reason}. Every detection on this host is \
              inactive while this persists; its whisper answers should not \
@@ -154,6 +184,7 @@ pub fn spawn(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let started_at = tokio::time::Instant::now();
         let mut previous_drops = 0u64;
         let mut last_alert: Option<(&'static str, tokio::time::Instant)> = None;
 
@@ -167,7 +198,11 @@ pub fn spawn(
                 _ = shutdown_rx.changed() => break,
             }
 
-            let verdict = assess(health.as_deref(), previous_drops);
+            let verdict = assess(
+                health.as_deref(),
+                previous_drops,
+                tokio::time::Instant::now().duration_since(started_at),
+            );
             if let Verdict::Dropping { total, .. } = &verdict {
                 previous_drops = *total;
             }
@@ -228,11 +263,14 @@ mod tests {
     use super::*;
     use bowery_events::source::{PROBE_EXEC, ProbeHealth};
 
+    /// Long enough that the startup grace has expired.
+    const GRACE_PASSED: Duration = Duration::from_mins(5);
+
     #[test]
     fn no_source_at_all_is_blind() {
         // The case that actually happened: no BPF object, silent
         // fallback to the no-op source, days of observing nothing.
-        let v = assess(None, 0);
+        let v = assess(None, 0, Duration::ZERO);
         assert!(matches!(v, Verdict::Blind { .. }));
         assert!(rationale(&v).contains("SENSOR BLIND"));
         assert!(
@@ -245,7 +283,7 @@ mod tests {
     fn an_attached_source_with_no_drops_is_healthy() {
         let h = ProbeHealth::new();
         h.mark_attached(PROBE_EXEC);
-        assert_eq!(assess(Some(&h), 0), Verdict::Healthy);
+        assert_eq!(assess(Some(&h), 0, GRACE_PASSED), Verdict::Healthy);
     }
 
     #[test]
@@ -255,16 +293,52 @@ mod tests {
         let h = ProbeHealth::new();
         h.mark_attached(PROBE_EXEC);
         h.mark_stopped("ringbuf poll failed");
-        match assess(Some(&h), 0) {
+        match assess(Some(&h), 0, GRACE_PASSED) {
             Verdict::Blind { reason } => assert!(reason.contains("ringbuf poll failed")),
             other => panic!("expected blind, got {other:?}"),
         }
     }
 
     #[test]
-    fn attached_but_never_marked_is_blind() {
+    fn a_source_that_has_not_attached_yet_is_starting_not_blind() {
+        // Caught on real hardware: the first tick beat the probes by one
+        // millisecond and alerted SENSOR BLIND at every boot.
         let h = ProbeHealth::new();
-        assert!(matches!(assess(Some(&h), 0), Verdict::Blind { .. }));
+        assert_eq!(assess(Some(&h), 0, Duration::ZERO), Verdict::Starting);
+        assert!(
+            assess(Some(&h), 0, Duration::ZERO).is_healthy(),
+            "still-attaching must not alert"
+        );
+    }
+
+    #[test]
+    fn a_source_that_never_attaches_is_blind_once_the_grace_expires() {
+        let h = ProbeHealth::new();
+        match assess(Some(&h), 0, GRACE_PASSED) {
+            Verdict::Blind { reason } => assert!(reason.contains("within 30s")),
+            other => panic!("expected blind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_source_is_blind_immediately_without_waiting_out_the_grace() {
+        // Nothing is coming: there is no source to attach. Waiting 30s
+        // to say so would be 30s of believing the host is covered.
+        assert!(matches!(
+            assess(None, 0, Duration::ZERO),
+            Verdict::Blind { .. }
+        ));
+    }
+
+    #[test]
+    fn a_stopped_source_is_blind_immediately_too() {
+        let h = ProbeHealth::new();
+        h.mark_attached(PROBE_EXEC);
+        h.mark_stopped("ringbuf poll failed");
+        assert!(matches!(
+            assess(Some(&h), 0, Duration::ZERO),
+            Verdict::Blind { .. }
+        ));
     }
 
     #[test]
@@ -274,7 +348,7 @@ mod tests {
         h.set_kernel_drops(PROBE_EXEC, 40);
 
         // First observation: 40 new.
-        match assess(Some(&h), 0) {
+        match assess(Some(&h), 0, GRACE_PASSED) {
             Verdict::Dropping { total, since_last } => {
                 assert_eq!(total, 40);
                 assert_eq!(since_last, 40);
@@ -283,10 +357,10 @@ mod tests {
         }
         // Same total on the next pass is not a new problem — otherwise
         // one saturated moment alerts forever.
-        assert_eq!(assess(Some(&h), 40), Verdict::Healthy);
+        assert_eq!(assess(Some(&h), 40, GRACE_PASSED), Verdict::Healthy);
 
         h.set_kernel_drops(PROBE_EXEC, 55);
-        match assess(Some(&h), 40) {
+        match assess(Some(&h), 40, GRACE_PASSED) {
             Verdict::Dropping { since_last, .. } => assert_eq!(since_last, 15),
             other => panic!("expected dropping, got {other:?}"),
         }
@@ -300,7 +374,10 @@ mod tests {
         h.mark_attached(PROBE_EXEC);
         h.set_kernel_drops(PROBE_EXEC, 99);
         h.mark_stopped("exited");
-        assert!(matches!(assess(Some(&h), 0), Verdict::Blind { .. }));
+        assert!(matches!(
+            assess(Some(&h), 0, GRACE_PASSED),
+            Verdict::Blind { .. }
+        ));
     }
 
     #[test]
@@ -311,7 +388,7 @@ mod tests {
         let h = ProbeHealth::new();
         h.mark_attached(PROBE_EXEC);
         assert_eq!(h.snapshot()[PROBE_EXEC].emitted, 0);
-        assert_eq!(assess(Some(&h), 0), Verdict::Healthy);
+        assert_eq!(assess(Some(&h), 0, GRACE_PASSED), Verdict::Healthy);
     }
 
     #[test]

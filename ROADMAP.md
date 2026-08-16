@@ -107,22 +107,36 @@ every detection added below inherits that fate until it's fixed.
 Ordered by "how much attack coverage per unit of work", with the
 constraint that nothing below matters on an agent that isn't watching.
 
-### Phase A — Make the sensor trustworthy *(prerequisite)*
+### Phase A — Make the sensor trustworthy *(BUILT)*
 
 We discovered two agents observing nothing by noticing a SQL result
 looked odd, days after deployment. That must be impossible to miss.
 
-- **Probe health telemetry**: which probes are attached, ring-buffer
-  drop counts, per-probe event counters — exposed as `bowery_probe_status`.
-- **Blindness is an alert, not a log line.** An agent whose probes
-  detached, or whose event rate flatlines against its own history, says
-  so out loud.
-- **Peers notice too.** A neighbour that stops answering, or starts
-  refusing everything, is reported. This falls out of the corroboration
-  machinery already built: refusal counts are already on the wire.
+- **Probe health telemetry** — `bowery_probe_status` reports per probe:
+  attached, events emitted, parse failures, kernel drops, last event.
+- **The kernel counts what it drops.** `RingBuf::reserve` returning
+  `None` was invisible: a saturated sensor and a quiet host produced
+  identical output. A per-CPU counter in the BPF object, polled every
+  10s, is the only place that fact exists. Reported as NULL rather than
+  zero on an object that predates it — "no drops" and "cannot tell" are
+  the distinction the whole phase is about.
+- **Blindness is an alert**, raised on transition and repeated hourly,
+  so it reaches the console, SQL, and `bowery notify` like any finding.
 
-*Why first: every row below is worthless on a blind agent, and blindness
-is currently silent.*
+Deliberately excluded: **a quiet host**. "No events recently" is
+indistinguishable from an idle machine, and paging someone whenever a Pi
+idles overnight is how the alert gets ignored. Staleness is reported for
+a human to judge.
+
+Two bugs found by running it on hardware rather than reasoning about it:
+the watchdog alerted `SENSOR BLIND` one millisecond before the probes
+attached (fixed with a startup grace that applies only to a source that
+might still come up), and a missing object correctly alerts immediately
+because nothing is coming.
+
+**Still open from this phase:** peers noticing for each other. A
+neighbour that stops answering, or refuses everything, is visible in the
+corroboration tallies already on the wire but nothing acts on it.
 
 ### Phase B — Close the file gap *(largest coverage win)*
 
