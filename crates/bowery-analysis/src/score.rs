@@ -119,6 +119,7 @@ mod tests {
         Episode::from_exec(ProcessExec {
             pid: 1,
             ppid: 1,
+            parent_comm: String::new(),
             uid: 0,
             comm: "x".into(),
             exe_path: Some(PathBuf::from("/usr/bin/curl")),

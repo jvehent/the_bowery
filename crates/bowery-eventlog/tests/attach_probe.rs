@@ -16,6 +16,7 @@ fn readonly_uri_attach_sees_committed_rows_and_refuses_writes() {
     log.append_batch(&[Event::ProcessExec(ProcessExec {
         pid: 7,
         ppid: 1,
+        parent_comm: String::new(),
         uid: 0,
         comm: "probe".into(),
         exe_path: Some("/bin/probe".into()),
@@ -55,6 +56,7 @@ fn readonly_attach_visibility_of_uncheckpointed_writes() {
     log.append_batch(&[Event::ProcessExec(ProcessExec {
         pid: 1,
         ppid: 1,
+        parent_comm: String::new(),
         uid: 0,
         comm: "a".into(),
         exe_path: None,
@@ -68,6 +70,7 @@ fn readonly_attach_visibility_of_uncheckpointed_writes() {
     log.append_batch(&[Event::ProcessExec(ProcessExec {
         pid: 2,
         ppid: 1,
+        parent_comm: String::new(),
         uid: 0,
         comm: "b".into(),
         exe_path: None,

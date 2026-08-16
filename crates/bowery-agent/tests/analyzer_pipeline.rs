@@ -89,6 +89,7 @@ fn make_exec(pid: u32, args: Vec<&str>, exe_path: std::path::PathBuf) -> Event {
     Event::ProcessExec(ProcessExec {
         pid,
         ppid: 1,
+        parent_comm: String::new(),
         uid: 0,
         comm: "test".into(),
         exe_path: Some(exe_path),

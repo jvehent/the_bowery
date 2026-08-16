@@ -130,3 +130,57 @@ mod tests {
         assert!(pid_exe_path(0).is_none(), "pid 0 is not a real process");
     }
 }
+
+/// Parent pid, from `/proc/<pid>/stat`.
+///
+/// The `sched_process_exec` tracepoint does not carry a parent, and
+/// getting one in the probe would need `task->real_parent` via CO-RE —
+/// which needs kernel BTF, which Raspberry Pi kernels do not ship. So it
+/// is read here, right after the exec, when the process almost always
+/// still exists.
+///
+/// Parsed from after the **last** `)` on purpose: field 2 is the comm in
+/// parentheses and a process may legally be called `evil) 0 0 (`, which
+/// splitting on whitespace would let it use to forge its own ancestry.
+#[must_use]
+pub fn pid_ppid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    // Fields after the comm: state, ppid, …
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// A process's `comm`, from `/proc/<pid>/comm`.
+#[must_use]
+pub fn pid_comm(pid: u32) -> Option<String> {
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim_end().to_string())
+}
+
+#[cfg(test)]
+mod parent_tests {
+    use super::*;
+
+    #[test]
+    fn our_own_parent_is_readable() {
+        let me = std::process::id();
+        let ppid = pid_ppid(me).expect("own ppid should be readable");
+        assert!(ppid > 0, "pid 1 aside, a parent always exists");
+    }
+
+    #[test]
+    fn our_own_comm_is_readable() {
+        let comm = pid_comm(std::process::id()).expect("own comm");
+        assert!(!comm.is_empty());
+        assert!(!comm.ends_with('\n'), "trailing newline must be trimmed");
+    }
+
+    #[test]
+    fn a_dead_pid_yields_none_rather_than_panicking() {
+        // Racing a process that exited between exec and enrichment is
+        // routine, not exceptional.
+        assert!(pid_ppid(u32::MAX).is_none());
+        assert!(pid_comm(u32::MAX).is_none());
+    }
+}

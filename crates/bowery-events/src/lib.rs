@@ -34,6 +34,14 @@ pub enum Event {
 pub struct ProcessExec {
     pub pid: u32,
     pub ppid: u32,
+    /// Parent's `comm`, read from `/proc` right after the exec.
+    ///
+    /// The `sched_process_exec` tracepoint carries no parent, and
+    /// resolving one in the probe needs `task->real_parent` via CO-RE —
+    /// which needs kernel BTF, which Pi kernels do not ship. Empty when
+    /// the parent had already exited, which is a lost race rather than
+    /// a finding.
+    pub parent_comm: String,
     pub uid: u32,
     /// Linux `task->comm` (16 bytes max).
     pub comm: String,

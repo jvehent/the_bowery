@@ -198,6 +198,7 @@ mod tests {
         Event::ProcessExec(ProcessExec {
             pid,
             ppid: 1,
+            parent_comm: String::new(),
             uid: 0,
             comm: "t".into(),
             exe_path: Some(PathBuf::from("/bin/t")),
@@ -300,6 +301,7 @@ mod health_tests {
         handle.record(Event::ProcessExec(ProcessExec {
             pid: 1,
             ppid: 1,
+            parent_comm: String::new(),
             uid: 0,
             comm: "t".into(),
             exe_path: Some(PathBuf::from("/bin/t")),

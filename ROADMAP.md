@@ -179,21 +179,27 @@ off on Raspberry Pi kernels, so LSM-hook-based file monitoring won't run
 there. Prefer tracepoints/kprobes where possible and degrade explicitly
 where not — with Phase A making the degradation visible.*
 
-### Phase C — Detection content on data we already collect *(cheap)*
+### Phase C — Detection content on data we already collect *(provenance + lineage BUILT)*
 
 No new sensors required:
 
-- **Package provenance**, which is also the fix for the noise problem: a
+- **Package provenance** *(built)* — the fix for the noise problem. A
   binary owned by an installed package and unmodified since install is
-  not interesting on first execution. This kills the `/usr/bin/nice`
-  class outright and lets rarity mean something again.
-- **Lineage rules**: service → shell, shell → network client, web
-  server → interpreter. The table is already there.
-- **uid-transition rules**: setuid exec, a non-root process becoming
-  root, capability changes.
-- **Discovery patterns**: the recon burst that precedes most lateral
-  movement.
-- **An ATT&CK coverage map**, honestly scored, kept in-repo.
+  damped to 15% on first execution, which kills the `/usr/bin/nice`
+  class. The same index makes a *mismatch* a finding: a packaged system
+  binary whose contents changed is trojanised, scored 1.0.
+- **Lineage rules** *(built)* — service → shell, service → downloader,
+  service → interpreter, scheduler → downloader. Correcting the note
+  above: `process_lineage` was neither written nor read, and lineage
+  needed the parent, which `sched_process_exec` does not carry and CO-RE
+  cannot fetch without the BTF Pi kernels lack. It is read from `/proc`
+  at exec time instead. One hop only; deeper ancestry needs a process
+  table that survives exits.
+- **uid-transition rules** *(open)*: setuid exec, a non-root process
+  becoming root, capability changes.
+- **Discovery patterns** *(open)*: the recon burst that precedes most
+  lateral movement.
+- **An ATT&CK coverage map** *(open)*, honestly scored, kept in-repo.
 
 ### Phase D — Make response worth arming
 

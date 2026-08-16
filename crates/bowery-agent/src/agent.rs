@@ -3612,6 +3612,34 @@ async fn process_exec(
             verdict.score.reason = format!("{} ({why})", verdict.score.reason);
         }
     }
+    // Lineage: who asked for this?
+    //
+    // Every binary a lineage rule names is legitimate somewhere — `sh`
+    // and `curl` are not suspicious. The parent is the signal, and it is
+    // one comparison against data the sensor now carries.
+    //
+    // Applied after provenance on purpose: `/bin/sh` is a packaged,
+    // unmodified binary and would otherwise be damped to 15% precisely
+    // when nginx started it.
+    if !exec.parent_comm.is_empty()
+        && let Some(child) = exec.exe_path.as_ref().map(|p| p.display().to_string())
+        && let Some(hit) = bowery_analysis::lineage::classify(&exec.parent_comm, &child)
+    {
+        if hit.severity > verdict.suspicion {
+            verdict.suspicion = hit.severity;
+        }
+        verdict.score.reason = format!(
+            "{} | {} spawned {}: {}",
+            verdict.score.reason, exec.parent_comm, child, hit.why
+        );
+        warn!(
+            rule = hit.rule_id,
+            parent = %exec.parent_comm,
+            child = %child,
+            pid = exec.pid,
+            "lineage hit"
+        );
+    }
     let verdict = verdict;
 
     let baseline_for_write = baseline.clone();

@@ -92,6 +92,7 @@ mod tests {
         Episode::from_exec(ProcessExec {
             pid: 42,
             ppid: 1,
+            parent_comm: String::new(),
             uid: 0,
             comm: "x".into(),
             exe_path: exe.map(PathBuf::from),

@@ -139,6 +139,7 @@ mod tests {
         Event::ProcessExec(ProcessExec {
             pid,
             ppid: 1,
+            parent_comm: String::new(),
             uid: 0,
             comm: "test".into(),
             exe_path: None,

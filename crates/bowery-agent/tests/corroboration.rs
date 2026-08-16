@@ -123,6 +123,7 @@ fn ancient_exec() -> Event {
     Event::ProcessExec(ProcessExec {
         pid: 1,
         ppid: 0,
+        parent_comm: String::new(),
         uid: 0,
         comm: "init".into(),
         exe_path: Some("/sbin/init".into()),

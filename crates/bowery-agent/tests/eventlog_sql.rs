@@ -102,6 +102,7 @@ fn exec(pid: u32, path: &str) -> Event {
     Event::ProcessExec(ProcessExec {
         pid,
         ppid: 1,
+        parent_comm: String::new(),
         uid: 0,
         comm: "probe".into(),
         exe_path: Some(PathBuf::from(path)),

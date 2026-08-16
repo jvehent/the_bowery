@@ -676,11 +676,19 @@ fn parse_exec(bytes: &[u8]) -> Option<Event> {
     let comm = comm_to_string(&raw.comm);
     let exe_path = enrich::pid_exe_path(raw.pid);
     let args = enrich::pid_cmdline(raw.pid).unwrap_or_default();
+    // Read the parent now, while the process almost certainly still
+    // exists. Lineage rules ("nginx spawned a shell") are the whole
+    // reason, and a few microseconds later the answer may be gone.
+    let ppid = enrich::pid_ppid(raw.pid).unwrap_or(0);
+    let parent_comm = if ppid == 0 {
+        String::new()
+    } else {
+        enrich::pid_comm(ppid).unwrap_or_default()
+    };
     Some(Event::ProcessExec(ProcessExec {
         pid: raw.pid,
-        // sched_process_exec doesn't carry ppid; let the pipeline fill
-        // it from /proc if it cares (Phase 3 doesn't).
-        ppid: 0,
+        ppid,
+        parent_comm,
         uid: raw.uid,
         comm,
         exe_path,

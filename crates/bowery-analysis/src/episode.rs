@@ -53,6 +53,7 @@ mod tests {
         ProcessExec {
             pid,
             ppid: 1,
+            parent_comm: String::new(),
             uid: 1000,
             comm: "bash".into(),
             exe_path: Some(PathBuf::from("/bin/bash")),
