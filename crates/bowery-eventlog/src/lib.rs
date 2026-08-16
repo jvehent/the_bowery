@@ -554,7 +554,15 @@ impl Row {
             Event::FileOpen(e) => {
                 r.kind = KIND_FILE_OPEN;
                 r.pid = Some(i64::from(e.pid));
-                r.path = Some(e.path.display().to_string());
+                r.comm = Some(e.comm.clone());
+                // A truncated path is marked in the row itself rather
+                // than silently stored short: an investigator matching
+                // on a prefix needs to know the tail is missing.
+                r.path = Some(if e.truncated {
+                    format!("{}\u{2026}", e.path.display())
+                } else {
+                    e.path.display().to_string()
+                });
                 r.open_flags = Some(i64::from(e.flags));
             }
             Event::FileChange(e) => {

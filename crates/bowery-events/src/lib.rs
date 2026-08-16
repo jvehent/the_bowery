@@ -54,8 +54,19 @@ pub struct ProcessExit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileOpen {
     pub pid: u32,
+    /// Opening task's `comm`. A path without the process that touched it
+    /// is half a finding.
+    pub comm: String,
+    /// May be **relative**: `openat` resolves against a dirfd, which a
+    /// kernel probe cannot follow. Rules match absolute paths only, and
+    /// the relative ones are counted so the blind spot is measured.
     pub path: PathBuf,
+    /// Raw `openat` flags.
     pub flags: u32,
+    /// The path was longer than the probe's buffer and was cut short.
+    /// Carried rather than hidden: a silently shortened path is one that
+    /// quietly stops matching a rule.
+    pub truncated: bool,
     pub ts: SystemTime,
 }
 

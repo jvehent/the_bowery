@@ -51,11 +51,11 @@ use aya::maps::{HashMap as AyaHashMap, MapData};
 use aya::programs::{Lsm, TracePoint};
 use aya::{Btf, BtfError};
 use bowery_events::source::{
-    DEFAULT_CHANNEL_CAPACITY, EventSource, PROBE_CONNECT, PROBE_EXEC, PROBE_EXIT, PROBE_NAMES,
-    ProbeHealth,
+    DEFAULT_CHANNEL_CAPACITY, EventSource, PROBE_CONNECT, PROBE_EXEC, PROBE_EXIT, PROBE_FILE,
+    PROBE_NAMES, ProbeHealth,
 };
 use bowery_events::{
-    Event, NetDirection, NetFamily, NetworkConnect, ProcessExec, ProcessExit, enrich,
+    Event, FileOpen, NetDirection, NetFamily, NetworkConnect, ProcessExec, ProcessExit, enrich,
 };
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
@@ -79,6 +79,21 @@ struct RawExecEvent {
 struct RawExitEvent {
     pid: u32,
     comm: [u8; 16],
+}
+
+/// Mirrors `bowery_ebpf::FILE_PATH_LEN`.
+const FILE_PATH_LEN: usize = 256;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawFileEvent {
+    pid: u32,
+    flags: u32,
+    truncated: u8,
+    _pad0: u8,
+    _pad1: u16,
+    comm: [u8; 16],
+    path: [u8; FILE_PATH_LEN],
 }
 
 #[repr(C)]
@@ -105,6 +120,7 @@ const DIRECTION_IN: u8 = 1;
 const RAW_EXEC_SIZE: usize = std::mem::size_of::<RawExecEvent>();
 const RAW_EXIT_SIZE: usize = std::mem::size_of::<RawExitEvent>();
 const RAW_CONNECT_SIZE: usize = std::mem::size_of::<RawConnectEvent>();
+const RAW_FILE_SIZE: usize = core::mem::size_of::<RawFileEvent>();
 
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
@@ -274,6 +290,7 @@ impl EventSource for BpfEventSource {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one linear bring-up sequence
 async fn run(
     obj_path: &Path,
     tx: mpsc::Sender<Event>,
@@ -323,9 +340,39 @@ async fn run(
     )?;
     health.mark_attached(PROBE_CONNECT);
 
+    // Attached only if its assumed layout checks out.
+    let file_probe = match verify_openat_layout() {
+        Ok(()) => attach_tp(
+            &mut ebpf,
+            "sys_enter_openat",
+            "syscalls",
+            "sys_enter_openat",
+        )
+        .inspect(|()| health.mark_attached(PROBE_FILE))
+        .map_err(|e| warn!(error = %e, "file probe unavailable"))
+        .is_ok(),
+        Err(reason) => {
+            error!(
+                reason = %reason,
+                "refusing to attach the file probe: the kernel's tracepoint layout \
+                 does not match what the BPF program reads"
+            );
+            false
+        }
+    };
+
     let exec_ring = take_ring(&mut ebpf, "EVENTS")?;
     let exit_ring = take_ring(&mut ebpf, "EXIT_EVENTS")?;
     let connect_ring = take_ring(&mut ebpf, "CONNECT_EVENTS")?;
+    // Absent on an object built before the file probe existed, which
+    // must still load: an agent has to survive its own rollout.
+    let file_ring = if file_probe {
+        take_ring(&mut ebpf, "FILE_EVENTS")
+            .map_err(|e| warn!(error = %e, "FILE_EVENTS ring unavailable"))
+            .ok()
+    } else {
+        None
+    };
 
     // Optional by design: an object built before the counter existed
     // simply has no DROPS map, and an agent must keep working against
@@ -373,15 +420,36 @@ async fn run(
         ),
         drain_ring(
             connect_ring,
-            tx,
+            tx.clone(),
             parse_connect,
             PROBE_CONNECT,
             health.clone()
         ),
+        drain_optional_ring(file_ring, tx, parse_file, PROBE_FILE, health.clone()),
         poll_drops(drops_map, health),
     )?;
 
     Ok(())
+}
+
+/// Drain a ring that may not exist on this object or kernel.
+async fn drain_optional_ring<F>(
+    ring: Option<RingBuf<MapData>>,
+    tx: mpsc::Sender<Event>,
+    parse: F,
+    probe: usize,
+    health: Arc<ProbeHealth>,
+) -> Result<(), LoaderError>
+where
+    F: Fn(&[u8]) -> Option<Event>,
+{
+    if let Some(ring) = ring {
+        return drain_ring(ring, tx, parse, probe, health).await;
+    }
+    // Never resolves: returning would end the try_join! and take the
+    // working probes down with the missing one.
+    std::future::pending::<()>().await;
+    unreachable!()
 }
 
 /// How often the kernel's drop counters are copied into [`ProbeHealth`].
@@ -414,6 +482,67 @@ async fn poll_drops(
         }
         tokio::time::sleep(DROP_POLL_INTERVAL).await;
     }
+}
+
+/// What the eBPF program assumes about `sys_enter_openat`'s layout.
+///
+/// Structural rather than architectural, but assumed tracepoint offsets
+/// have already produced one shipped bug here, and this failure is
+/// quiet: a wrong offset gives a garbage pointer and a silently empty
+/// path, which looks exactly like a host that opens no files.
+const OPENAT_EXPECTED: [(&str, usize); 2] = [("filename", 24), ("flags", 32)];
+
+/// Check the assumed offsets against the kernel's published format.
+///
+/// `Err` only on a *proven* mismatch, which fails closed: the probe is
+/// not attached and the sensor reports itself incomplete rather than
+/// recording wrong paths. An unreadable format file is an inability to
+/// check, not a mismatch, so it warns and proceeds.
+fn verify_openat_layout() -> Result<(), String> {
+    let candidates = [
+        "/sys/kernel/tracing/events/syscalls/sys_enter_openat/format",
+        "/sys/kernel/debug/tracing/events/syscalls/sys_enter_openat/format",
+    ];
+    let Some(text) = candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+    else {
+        warn!(
+            "could not read the sys_enter_openat format file; proceeding with \
+             assumed argument offsets"
+        );
+        return Ok(());
+    };
+    for (field, expected) in OPENAT_EXPECTED {
+        let Some(actual) = parse_field_offset(&text, field) else {
+            warn!(field, "field absent from tracepoint format; cannot verify");
+            continue;
+        };
+        if actual != expected {
+            return Err(format!(
+                "sys_enter_openat.{field} is at offset {actual}, but the BPF program reads {expected}"
+            ));
+        }
+    }
+    info!("sys_enter_openat layout verified against the kernel");
+    Ok(())
+}
+
+/// Pull `offset:N` for a named field out of a tracepoint format file.
+fn parse_field_offset(format: &str, field: &str) -> Option<usize> {
+    format.lines().find_map(|line| {
+        let line = line.trim();
+        if !line.starts_with("field:") {
+            return None;
+        }
+        let (decl, rest) = line.split_once(';')?;
+        let name = decl.rsplit([' ', '*']).find(|t| !t.is_empty())?;
+        if name != field {
+            return None;
+        }
+        let off = rest.split("offset:").nth(1)?;
+        off.split(';').next()?.trim().parse().ok()
+    })
 }
 
 fn attach_tp(
@@ -505,6 +634,34 @@ where
 // ---------------------------------------------------------------------------
 // Parsers — one per ring buffer.
 // ---------------------------------------------------------------------------
+
+fn parse_file(bytes: &[u8]) -> Option<Event> {
+    if bytes.len() < RAW_FILE_SIZE {
+        warn!(got = bytes.len(), want = RAW_FILE_SIZE, "short file record");
+        return None;
+    }
+    // SAFETY: size-checked above; RawFileEvent is repr(C) POD.
+    let raw: RawFileEvent = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<RawFileEvent>()) };
+
+    let path = cstr_to_string(&raw.path);
+    if path.is_empty() {
+        return None;
+    }
+    Some(Event::FileOpen(FileOpen {
+        pid: raw.pid,
+        comm: comm_to_string(&raw.comm),
+        path: PathBuf::from(path),
+        flags: raw.flags,
+        truncated: raw.truncated != 0,
+        ts: std::time::SystemTime::now(),
+    }))
+}
+
+/// Decode a NUL-terminated buffer that may fill its whole extent.
+fn cstr_to_string(buf: &[u8]) -> String {
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
 
 fn parse_exec(bytes: &[u8]) -> Option<Event> {
     if bytes.len() < RAW_EXEC_SIZE {
