@@ -498,33 +498,37 @@ with cross-fleet fan-out; operator-defined file and process monitoring; YARA
 rule distribution that propagates across the mesh; signed hash-chained audit
 logging; signed mesh enrollment and revocation with propagation; the operator
 CLI and terminal console; a Pi/Tailscale deploy kit with hardened systemd units.
+Since then: sensor self-attestation, so a blind agent says so instead of
+quietly observing nothing; file-write monitoring with fifteen built-in
+persistence, privilege-escalation, credential and log-tampering rules;
+package provenance and process lineage, which between them removed most
+of the noise that made the alert stream unreadable; and email
+notification with optional VirusTotal screening, so a finding reaches an
+operator who isn't watching a console.
 
 **Honestly missing**, in rough order of how much it matters:
 
-1. **Detection content.** There is a rule engine with a handful of rules. A
-   detection *engine* with no detection *library* is a framework, not a
-   product. Persistence mechanisms, privilege escalation, credential access,
-   defense evasion, and above all lateral movement are unwritten — as is a
-   coverage map against a framework like ATT&CK.
-2. **Detections built on the corroboration substrate.** The substrate itself
-   now exists — an agent that sees an inbound connection asks the host it came
-   from *"did you connect to me?"*, and a denial raises an alert carrying the
-   denial as evidence. It is deliberately generic: a `kind` string and opaque
-   attributes on the wire, so a new question is a handler registration rather
-   than a protocol change. But only one kind is registered. Destination rarity,
-   parent→child process pairs, and listening ports are the obvious next ones
-   and need no new machinery.
+1. **Detection content, still.** Persistence, privilege escalation,
+   credential access and defense evasion now have rules where they had none,
+   and lineage catches the canonical webshell. But this is a first library,
+   not a comprehensive one: credential *reads*, mass-write ransomware shapes,
+   uid transitions and discovery bursts are unwritten, as is an honest
+   coverage map against a framework like ATT&CK. See
+   [ROADMAP.md](ROADMAP.md).
+2. **Detections built on the corroboration substrate.** The substrate exists
+   and is deliberately generic — a `kind` string and opaque attributes on the
+   wire, so a new question is a handler registration rather than a protocol
+   change. Only one kind is registered. Destination rarity, parent→child
+   process pairs, and "did an operator really push you this rule?" are the
+   obvious next ones and need no new machinery.
 3. **Rarity as a general primitive.** The prevalence round answers exactly one
-   question today (have you seen this binary?). The process-lineage table is
-   already populated on every exec — and read by nothing.
-4. **Coverage telemetry.** The event log reports whether it's recording. The
-   eBPF layer doesn't yet report whether its probes are still attached or
-   whether the kernel ring buffer is dropping.
-5. **Quorum-gated enforcement.** The design specifies hard actions requiring
-   standing operator authorization *or* k-of-n peer quorum. The quorum signal
-   now exists and is operator-visible, but the response engine doesn't yet
-   consume it.
-6. **Peer-witnessed audit.** Root on a host means deleting the local audit log.
+   question today (have you seen this binary?), and only about binaries.
+4. **Response worth arming.** `block_exec` keys on `comm`, which is
+   attacker-controlled — bypassable by anyone who reads the source, and
+   weaponisable by naming a process `sshd`. Inode-keyed blocking, network
+   isolation, dry-run mode, and wiring the quorum signal the response engine
+   still never sees are all unbuilt.
+5. **Peer-witnessed audit.** Root on a host means deleting the local audit log.
    Peers could witness the chain head, making deletion detectable — an attacker
    can't retract hashes their neighbors already hold. This falls naturally out
    of the protocol that already exists.

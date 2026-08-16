@@ -2780,6 +2780,240 @@ confirmed alert.
 
 ---
 
+## 26. Sensor self-attestation (roadmap phase A)
+
+[`bowery-events/src/source.rs`](crates/bowery-events/src/source.rs) (the
+`ProbeHealth` type), [`bowery-ebpf-loader`](crates/bowery-ebpf-loader/src/lib.rs)
+(populating it), [`probe_watchdog.rs`](crates/bowery-agent/src/probe_watchdog.rs)
+(acting on it), `bowery_probe_status` (exposing it).
+
+Two agents ran for days observing nothing — no BPF object, a silent fall
+back to the no-op source, one WARN at startup — while gossiping,
+answering SQL, and voting in whisper quorums as though healthy. It was
+found by accident, from a row count that looked wrong.
+
+**Nothing downstream could tell "quiet" from "blind".** That is what
+this closes.
+
+### 26.1 The kernel counts what it drops
+
+`RingBuf::reserve` returns `None` when a ring is full and the probe
+discards the event. Nothing about that was visible from userspace: a
+saturated sensor and an idle host produced byte-identical output. A
+`PerCpuArray` counter incremented at each reserve failure, polled every
+10s, is the only place that fact exists. Per-CPU so it needs no atomics
+and cannot lose increments to a race.
+
+Drops report as **NULL, never 0**, on an object built before the counter
+existed. "No drops" and "cannot tell" are the exact distinction that let
+the original failure hide, and an object without the map still loads —
+an agent has to survive its own rollout.
+
+### 26.2 What is and isn't an alert
+
+`EventSource::health()` returning `None` means the source cannot report,
+which is treated as **blind** rather than unknown, because that is
+precisely the production failure. A source that *stops* is equally
+blind; previously that was a log line and nothing else.
+
+A **quiet host is deliberately not an alert.** "No events recently" is
+indistinguishable from an idle machine, and paging whenever a Pi idles
+overnight is how the alert gets ignored. Staleness is reported in SQL
+for a human to judge.
+
+A 30-second startup grace applies only to a source that might still come
+up. The first live run alerted `SENSOR BLIND` one millisecond before the
+probes attached — a false alarm at every boot, which is the crying-wolf
+failure this module's own docs warn against. A *missing* source still
+alerts immediately: nothing is coming, and waiting to say so is time
+spent believing the host is covered.
+
+---
+
+## 27. File-write monitoring (roadmap phase B)
+
+[`bowery-ebpf/src/main.rs`](crates/bowery-ebpf/src/main.rs) (the probe),
+[`file_watch.rs`](crates/bowery-analysis/src/file_watch.rs) (the rules).
+
+The kernel sensor watched no file operations, which is why persistence,
+credential access, defense evasion and impact were four empty rows in
+the roadmap's coverage table — they are overwhelmingly file-shaped.
+
+### 27.1 Why a tracepoint, not an LSM hook
+
+LSM hooks are the natural choice and are unusable fleet-wide:
+Raspberry Pi kernels ship `CONFIG_BPF_LSM=n`, found while bringing eBPF
+up on dartagnan. `sys_enter_openat` works everywhere the existing probes
+do.
+
+**Filtered in the kernel**, on write intent
+(`O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC`/`O_APPEND`). Reads outnumber
+writes by orders of magnitude; shipping them all would saturate the ring
+and force exactly the drops §26 exists to report. Write intent is what
+persistence, tampering and ransomware have in common.
+
+### 27.2 The offsets are verified, not assumed
+
+Argument N of any syscall-enter tracepoint sits at `16 + 8*N` — that is
+structural, from `struct syscall_trace_enter`, not per-architecture
+guesswork. It still gets checked against the kernel's published format
+file at attach time, and the probe **refuses to attach on a proven
+mismatch**.
+
+This project has already shipped one bug from assumed tracepoint offsets
+that every test agreed with (byte-swapped ports), and this failure is
+quieter: a wrong offset yields a garbage pointer and silently empty
+paths, indistinguishable from a host that opens no files. An unreadable
+format file is an inability to check rather than a mismatch, so it warns
+and proceeds.
+
+### 27.3 Two limits recorded rather than hidden
+
+Paths are captured to 256 bytes and **flagged when truncated**, because
+a silently shortened path is one that quietly stops matching a rule.
+Relative paths — an `openat` against a dirfd the probe cannot resolve —
+are stored but never matched, since guessing would attribute a write to
+a file nobody touched.
+
+### 27.4 The watch set
+
+Fifteen built-in rules across persistence (`ld.so.preload`, systemd
+units, cron, `authorized_keys`, PAM, udev, shell rc), privilege
+escalation (`sudoers`), credentials (`shadow`, `passwd`, SSH keys) and
+log tampering. Built in rather than configured: an operator should not
+have to know in advance that `/etc/ld.so.preload` is how a host gets
+owned. Configuration is for paths specific to their estate.
+
+Every rule carries an explanation, and a test enforces that they are
+real ones — it caught two of the author's that were too thin to help
+anyone at 03:00.
+
+**No suppression by process name.** A package upgrade writes systemd
+units and it is tempting to ignore `dpkg`, but `comm` is 16 bytes any
+process can set with `prctl`, so a suppression list keyed on it is an
+instruction for how to evade the rule. Package writes produce hits; the
+honest fix is fleet corroboration (a write every host makes at the same
+moment is an upgrade), and that substrate exists, unwired.
+
+---
+
+## 28. Provenance and lineage (roadmap phase C)
+
+[`provenance.rs`](crates/bowery-analysis/src/provenance.rs),
+[`lineage.rs`](crates/bowery-analysis/src/lineage.rs).
+
+### 28.1 Package provenance
+
+A binary never seen before scored 1.0, which made ordinary distro
+binaries the loudest thing in the stream — the live fleet
+quorum-confirmed `/usr/bin/ssh`, `/usr/bin/nice` and `/usr/bin/pkexec`
+as anomalies.
+
+A binary the package manager installed whose contents still match is
+**damped to 15%**: it was on disk before anyone logged in. Damped, not
+zeroed, because `bash` and `curl` ship with the distro and the
+writable-path, suspicious-args and lineage rules must still be able to
+carry an episode alone.
+
+The same index is a detection: a **mismatch** means a packaged system
+binary has been rewritten, scored 1.0.
+
+Three deliberate asymmetries, all in the fail-safe direction: an
+unreadable file is `Unknown` (never `Modified`) so losing a race with
+`rm` cannot accuse a binary; no package database is `Unknown` (never
+`Unpackaged`) so a non-dpkg host does not mark its whole system
+suspicious; and md5 is used because it is what dpkg records — an
+attacker who can rewrite `/usr/bin/nice` can rewrite the `.md5sums`
+beside it, so this catches the ordinary case, not a determined one.
+SHA-256 remains the identity.
+
+Only executable paths are indexed (~2,400 of dpkg's ~226,000 entries on
+otter1); the rest is memory a Pi should not spend on paths never looked
+up.
+
+**Two bugs worth recording**, both found by running it rather than
+reasoning about it. It was first gated on `baseline_seen_count == 0`,
+but the rarity curve decays slowly (0.89, 0.80, 0.73 for the next three
+runs) so every one of those stayed above the alert threshold with
+provenance never consulted — `/usr/bin/column` alerted at 0.80 on a host
+whose index had loaded fine. And the load was *awaited* at startup,
+which on a runner with 53,000 packaged executables took five seconds and
+delayed every later task including the file monitor: five seconds of a
+"ready" agent not watching. It now loads in a detached task and answers
+`Unknown` until it arrives.
+
+### 28.2 Lineage
+
+"nginx spawned a shell" needs no new sensor, and the agent could not
+express it — `process_lineage` sat in the baseline schema being neither
+written nor read.
+
+Lineage needs the parent, and `sched_process_exec` carries none.
+Fetching it in the probe means `task->real_parent` via CO-RE, which
+needs kernel BTF, which Pi kernels do not ship — the same constraint
+that ruled out LSM file hooks. So it is read from `/proc` right after
+the exec, beside the `exe_path` and cmdline enrichment already
+happening there.
+
+`/proc/<pid>/stat` is parsed from after the **last** `)`, not by
+splitting on whitespace: field 2 is the comm in parentheses, and a
+process may legally name itself `evil) 0 0 (` to forge its own
+ancestry.
+
+Four rules, ranked: service→shell (0.95), service→downloader (0.9),
+scheduler→downloader (0.8), service→interpreter (0.75, since CGI stacks
+do this legitimately). The most important test is a negative — **sshd
+starting a shell must not alert**, since it exists to start shells and
+firing on every login would teach an operator to ignore the rule set.
+
+Applied *after* provenance deliberately: `/bin/sh` is packaged and
+unmodified, so it would otherwise be damped to 15% at exactly the moment
+nginx started it.
+
+---
+
+## 29. Reaching an operator who isn't watching
+
+### 29.1 `bowery notify`
+
+[`notify.rs`](crates/bowery-cli/src/notify.rs). Drains alerts over the
+existing signed `Subscribe` transport and emails a digest. Runs on an
+operator box, never on agents: a notification credential on every
+monitored host is one every compromised host has.
+
+The subject is built only from manifest host names and counts, which
+makes header injection impossible by construction rather than
+filtered-for. The body carries triage detail with control characters
+flattened and fields capped, and says plainly that those fields came
+from the monitored host.
+
+Cursors advance only after a successful send; one unreachable agent does
+not suppress the rest; a failed run exits non-zero.
+
+### 29.2 VirusTotal screening
+
+[`virustotal.rs`](crates/bowery-cli/src/virustotal.rs). Operator-side
+only — a hash lookup discloses to VT, and anyone with Intelligence
+access, that somebody is investigating that hash, and adversaries watch
+VT for their own samples.
+
+**It may only ever suppress on a positive clean verdict, and must fail
+open.** Missing key, spent quota, API outage, unparseable response,
+zero-engine result, or an unknown hash all send the alert anyway.
+`Verdict::may_suppress` encodes it and a test asserts no malformed body
+can reach a suppressing state. Every digest reports what screening did,
+so the filter is never invisible.
+
+### 29.3 `--verbose-whisper`
+
+Narrates a fan-out query: the outbound command, every chunk as it
+lands, envelope nonce/timestamp/signature sizes, and a per-agent tally.
+It also makes a security property observable — rows are attributed to
+the envelope signer, never the self-declared `agent_fp`, and a
+disagreement is called out loudly.
+
+---
+
 This document is meant to be a living reference. When a phase lands
 that introduces a new pattern, the owning section gets a new
 sub-heading; when something we said we'd do here turns out to be

@@ -52,6 +52,14 @@ relay can drop a revocation but never forge one.
 put its *public* key in each agent's config. That is what lets you drain
 alerts and run queries. There is no password anywhere.
 
+**What it detects, on one host.** Rule hits (exec from a world-writable
+path, suspicious arguments), rarity (a binary this host has not run
+before), **file writes to paths that matter** (`ld.so.preload`, systemd
+units, cron, `authorized_keys`, PAM, `sudoers`, `shadow`, auth logs),
+and **lineage** (a network service spawning a shell). Two things damp
+the noise: a binary the package manager installed and has not modified
+is not interesting on first run, and `sshd` starting a shell is a login.
+
 **Whispering is what makes it more than N separate agents.** Two kinds
 run today:
 
@@ -289,6 +297,18 @@ for the Gmail app-password setup and the systemd timer:
 bowery notify --dry-run
 ```
 
+**Check a hash against VirusTotal** (operator-side only; see
+[INSTALL.md](INSTALL.md) for the optional `bowery notify` filter):
+
+```bash
+bowery vt <sha256>      # exit 0 clean, 1 flagged, 2 unknown/unavailable
+```
+
+A lookup discloses to VirusTotal that somebody is investigating that
+hash. Adversaries watch VT for their own samples, so for a suspected
+targeted implant this is a deliberate decision, not a reflex — which is
+why agents never do it and the key lives only on your box.
+
 **Push a YARA rule across the mesh:**
 
 ```bash
@@ -317,6 +337,7 @@ a clean result file.
 | Who talked to this endpoint? | `SELECT * FROM bowery_net_destinations WHERE dst_addr = '203.0.113.4'` |
 | What happened at 14:32? | `SELECT ts_unix_ms, kind, comm, path FROM bowery_events WHERE ts_unix_ms BETWEEN … ORDER BY seq` |
 | Is the history recording? | `SELECT recording, rows, oldest_ts_unix_ms FROM bowery_eventlog_status` |
+| What files are being written? | `SELECT comm, path FROM bowery_events WHERE kind='file_open' ORDER BY seq DESC` |
 | Who is in the mesh? | `SELECT fingerprint_hex, whisper_addr, pinned, grant_state FROM bowery_mesh_peers` |
 
 Add `--fanout` to any of them to ask the whole fleet at once.
@@ -341,12 +362,17 @@ would truthfully report "never seen it" about nearly everything you run,
 which is youth, not rarity. New nodes abstain for three days and then
 join in on their own.
 
-**"Everything is alerting."** A first execution of any binary currently
-scores high, including ordinary distro tools. Package provenance is the
-fix and is not built yet ([ROADMAP.md](ROADMAP.md) §3, phase C). Until
-then, keep `bowery notify`'s `min_suspicion` high, or leave the timer
-off and read alerts by hand. This is the most important known rough
-edge.
+**"An agent alerts on ordinary binaries."** A first execution scores
+high by design — rarity is a real signal. Two things should be damping
+it: package provenance (a distro binary that still matches its package
+drops to 15%) and, optionally, VirusTotal screening in `bowery notify`.
+If you are still seeing `/usr/bin/nice` at 1.00, check the agent logged
+`package provenance index loaded executables=N` at startup; without that
+line the index did not load and nothing is being damped.
+
+What remains after both is a binary that is **rare here, not owned by
+any package, and unknown to the industry** — which is a much shorter
+list, and the one worth reading.
 
 ---
 

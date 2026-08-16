@@ -55,18 +55,21 @@ kernel's 16-byte `comm`.
 
 Walking the phases of a real intrusion rather than a feature list:
 
-| phase | what we'd catch today |
-| --- | --- |
-| Initial access | **nothing** — no visibility into the vector |
-| Execution | partial — exec events, 3 rules, YARA when pushed |
-| **Persistence** | **nothing** |
-| **Privilege escalation** | **almost nothing** — `uid` is recorded, never analysed |
-| **Defense evasion** | **nothing** — no file deletes, no log tampering, and `comm`-keyed blocking is itself trivially evaded |
-| **Credential access** | **nothing** — no file reads at all |
-| Discovery | **nothing** — no recon-pattern analysis |
-| **Lateral movement** | **partial, and genuinely ahead** — the corroboration work |
-| Collection / exfil | partial — connect events + destination rarity, queryable, not alerting |
-| Impact (ransomware, wipers) | **nothing** — no mass-write signal |
+Assessed before phases A–C; the right-hand column is where it stands
+now.
+
+| phase | at assessment | today |
+| --- | --- | --- |
+| Initial access | nothing | nothing — no visibility into the vector |
+| Execution | partial | partial + provenance and lineage damp the noise |
+| **Persistence** | **nothing** | rules for units, cron, `authorized_keys`, `ld.so.preload`, PAM, udev, shell rc |
+| **Privilege escalation** | almost nothing | `sudoers` writes; uid *transitions* still unanalysed |
+| **Defense evasion** | **nothing** | auth/wtmp tampering; `comm`-keyed blocking still evadable |
+| **Credential access** | **nothing** | writes to `shadow`/`passwd`/SSH keys; **reads** still invisible |
+| Discovery | nothing | nothing — no recon-pattern analysis |
+| **Lateral movement** | partial, genuinely ahead | unchanged — the corroboration work |
+| Collection / exfil | partial | partial — destination rarity queryable, not alerting |
+| Impact (ransomware) | **nothing** | nothing — no mass-write rate signal |
 
 The pattern is stark. We have unusually good infrastructure for the one
 phase most products handle worst (lateral movement, because it needs two
@@ -75,15 +78,19 @@ passes through on one host.
 
 ### The three structural gaps
 
-**No file visibility.** The kernel sensors don't watch file operations at
-all. inotify covers only paths an operator listed in advance. This one
-gap is why persistence, credential access, defense evasion, and impact
-are all empty rows: they are overwhelmingly file-shaped, and we are
-blind to files.
+**No file visibility.** *(closed in phase B.)* The kernel sensors watched
+no file operations at all, and inotify covered only paths an operator
+listed in advance. This one gap was why persistence, credential access,
+defense evasion and impact were empty rows — they are overwhelmingly
+file-shaped. A `sys_enter_openat` probe now reports write-intent opens.
+Credential *reads* and mass-write rates remain unbuilt.
 
-**Nothing reads the process tree.** `process_lineage` is populated on
-every exec and read by nothing. "`nginx` spawned `sh`" is the oldest
-detection in the book, needs no new sensor, and we can't express it.
+**Nothing reads the process tree.** *(closed in phase C.)*
+"`nginx` spawned `sh`" is the oldest detection in the book and needed no
+new sensor. Correcting the original claim: `process_lineage` was neither
+written nor read — dead schema — and the parent had to come from
+`/proc`, since `sched_process_exec` carries none and CO-RE cannot fetch
+it without the BTF Pi kernels lack.
 
 **The response engine can be lied to.** `block_exec` keys on `comm`,
 which is attacker-controlled (`prctl(PR_SET_NAME)`, or just rename the
@@ -94,11 +101,17 @@ the real one.
 ### And the meta-problem: the alerts aren't trustworthy yet
 
 We spent this week watching the fleet quorum-confirm `/usr/bin/ssh`,
-`/usr/bin/nice` and `/usr/bin/pkexec` as anomalies. Two root causes are
-now fixed (blind peers, young peers). The third is not: **a first
-execution of a distro-packaged binary scores 1.0 and alerts.** An EDR
-that cries wolf about `nice` trains its operator to close the tab, and
-every detection added below inherits that fate until it's fixed.
+`/usr/bin/nice` and `/usr/bin/pkexec` as anomalies. All three root
+causes are now addressed: blind peers (phase A), young peers
+(`min_baseline_age`), and first executions of distro-packaged binaries
+(phase C provenance, plus optional VirusTotal screening at the notify
+boundary).
+
+What remains after all of it is a binary that is **rare here, owned by
+no package, and unknown to the industry** — a much shorter list, and the
+one worth reading. Keeping it that way is the standing constraint on
+every detection added below: an EDR that cries wolf about `nice` trains
+its operator to close the tab.
 
 ---
 
