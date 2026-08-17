@@ -57,6 +57,8 @@ use bowery_events::source::{
 use bowery_events::{
     Event, FileOpen, NetDirection, NetFamily, NetworkConnect, ProcessExec, ProcessExit, enrich,
 };
+pub mod btf;
+
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
