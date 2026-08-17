@@ -207,6 +207,7 @@ pub struct Agent {
     file_monitor_task: Option<JoinHandle<()>>,
     probe_watchdog_task: JoinHandle<()>,
     peer_watchdog_task: Option<JoinHandle<()>>,
+    action_release_task: JoinHandle<()>,
     role_publisher_task: JoinHandle<()>,
     bloom_publisher_task: JoinHandle<()>,
     llm_outcomes_task: JoinHandle<()>,
@@ -818,6 +819,24 @@ impl Agent {
         let (llm_out_tx, llm_out_rx) = mpsc::channel::<InferenceOutcome>(queue_cfg.capacity);
         let llm_queue = InferenceQueue::start(llm.clone(), &queue_cfg, llm_out_tx);
         let llm_submitter = llm_queue.submitter();
+        // Shared with the whisper round: parked here when an action
+        // needs the fleet's agreement, released there when it arrives.
+        let pending_actions = Arc::new(crate::pending_actions::PendingActions::new(
+            crate::pending_actions::DEFAULT_TTL,
+        ));
+        // Bounded: a released action is rare (it needs a confirmed
+        // round), and a full channel must shed rather than block the
+        // whisper task.
+        let (release_tx, release_rx) = mpsc::channel::<crate::pending_actions::Release>(256);
+        let action_release_task = spawn_action_release_task(
+            release_rx,
+            pending_actions.clone(),
+            response_engine.clone(),
+            audit_sink.clone(),
+            identity.clone(),
+            events_tx.clone(),
+            shutdown_rx.clone(),
+        );
         let llm_outcomes_task = spawn_llm_outcomes_task(
             llm_out_rx,
             inbox.clone(),
@@ -827,6 +846,7 @@ impl Agent {
             response_engine.clone(),
             audit_sink.clone(),
             identity.clone(),
+            pending_actions.clone(),
             events_tx.clone(),
             shutdown_rx.clone(),
         );
@@ -844,6 +864,8 @@ impl Agent {
             config.llm.invocation_threshold,
             events_tx.clone(),
             crate::whisper_qa::ConfirmSink {
+                pending: pending_actions.clone(),
+                release_tx: Some(release_tx.clone()),
                 inbox: inbox.clone(),
                 originator_fp: fingerprint,
                 alert_threshold: config.alerts.threshold,
@@ -1017,6 +1039,7 @@ impl Agent {
             file_monitor_task,
             probe_watchdog_task,
             peer_watchdog_task,
+            action_release_task,
             role_publisher_task,
             bloom_publisher_task,
             llm_outcomes_task,
@@ -1097,6 +1120,7 @@ impl Agent {
             let _ = task.await;
         }
         let _ = self.probe_watchdog_task.await;
+        let _ = self.action_release_task.await;
         if let Some(t) = self.peer_watchdog_task {
             let _ = t.await;
         }
@@ -4238,6 +4262,107 @@ fn sha_to_hex(sha: &[u8; 32]) -> String {
 // LLM outcomes bridge
 // ---------------------------------------------------------------------------
 
+/// Carries out (or records the abandonment of) actions that were held
+/// waiting on the fleet.
+///
+/// Separate from the whisper task on purpose: `finish_round` must not
+/// block on a kill or a BPF map write, and the audit trail is written by
+/// the same path that writes every other entry.
+///
+/// The sweeper is the other half. An episode whose suspicion never
+/// reached the whisper threshold fires no round at all, so nothing will
+/// ever release it — without a sweep those actions would sit in the
+/// store until the process exited, and the fact that they were decided
+/// and dropped would never reach the audit log.
+#[allow(clippy::too_many_arguments)]
+fn spawn_action_release_task(
+    mut releases: mpsc::Receiver<crate::pending_actions::Release>,
+    pending: Arc<crate::pending_actions::PendingActions>,
+    response_engine: Arc<dyn ResponseEngine>,
+    audit_sink: Arc<dyn AuditSink>,
+    identity: Arc<Identity>,
+    events_tx: broadcast::Sender<AgentEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut sweep = tokio::time::interval(Duration::from_secs(30));
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let release = tokio::select! {
+                r = releases.recv() => match r {
+                    Some(r) => Some(r),
+                    None => break,
+                },
+                _ = sweep.tick() => None,
+                _ = shutdown_rx.changed() => break,
+            };
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            let mut batch: Vec<crate::pending_actions::Release> = Vec::new();
+            match release {
+                Some(r) => batch.push(r),
+                None => {
+                    for (episode_id, actions) in pending.take_expired(std::time::Instant::now()) {
+                        for action in actions {
+                            batch.push(crate::pending_actions::Release {
+                                episode_id: episode_id.clone(),
+                                action,
+                                dropped: Some(crate::pending_actions::Dropped::Expired),
+                            });
+                        }
+                    }
+                }
+            }
+            for r in batch {
+                let id = r.action.id();
+                let outcome = match r.dropped {
+                    Some(why) => {
+                        // Recorded as a suppression, which is exactly
+                        // what it is: a gate said no. The reason names
+                        // the gate so this is never confused with a
+                        // policy denial or a failed kill.
+                        warn!(
+                            action_id = id,
+                            episode = %r.episode_id,
+                            reason = why.reason(),
+                            "held action abandoned"
+                        );
+                        ActionOutcome::suppressed(why.reason())
+                    }
+                    None => match response_engine.execute(&r.action).await {
+                        Ok(o) => o,
+                        Err(e) => {
+                            error!(
+                                action_id = id,
+                                episode = %r.episode_id,
+                                error = %e,
+                                "response engine FAILED to enforce a corroborated action"
+                            );
+                            ActionOutcome::failed(e.to_string())
+                        }
+                    },
+                };
+                let _ = events_tx.send(AgentEvent::ActionAttempted {
+                    episode_id: r.episode_id.clone(),
+                    action_id: id,
+                    outcome: outcome.clone(),
+                });
+                audit::record(
+                    &audit_sink,
+                    &identity,
+                    response_engine.name(),
+                    &r.episode_id,
+                    r.action,
+                    outcome,
+                )
+                .await;
+            }
+        }
+        info!("action release task stopped");
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_llm_outcomes_task(
     mut outcomes: mpsc::Receiver<InferenceOutcome>,
@@ -4248,6 +4373,7 @@ fn spawn_llm_outcomes_task(
     response_engine: Arc<dyn ResponseEngine>,
     audit_sink: Arc<dyn AuditSink>,
     identity: Arc<Identity>,
+    pending_actions: Arc<crate::pending_actions::PendingActions>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -4265,6 +4391,7 @@ fn spawn_llm_outcomes_task(
                         &response_engine,
                         &audit_sink,
                         &identity,
+                        &pending_actions,
                         outcome,
                     );
                 }
@@ -4274,8 +4401,8 @@ fn spawn_llm_outcomes_task(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // one linear outcome path
+#[allow(clippy::too_many_arguments)]
 fn handle_llm_outcome(
     events_tx: &broadcast::Sender<AgentEvent>,
     inbox: &Arc<AlertInbox>,
@@ -4285,6 +4412,7 @@ fn handle_llm_outcome(
     response_engine: &Arc<dyn ResponseEngine>,
     audit_sink: &Arc<dyn AuditSink>,
     identity: &Arc<Identity>,
+    pending_actions: &Arc<crate::pending_actions::PendingActions>,
     outcome: InferenceOutcome,
 ) {
     match outcome {
@@ -4351,6 +4479,27 @@ fn handle_llm_outcome(
                     debug!(action_id, episode = %episode_id, "unknown action id; skipping");
                     continue;
                 };
+                // Hard actions can be made to wait for the fleet.
+                //
+                // Parked rather than gated inside the engine, because
+                // the two facts arrive at different times: the action is
+                // decided here, with the whisper round only just fired
+                // and the alert still carrying no confirmation. An
+                // engine asked "is this corroborated?" now would always
+                // answer no and deny everything forever.
+                //
+                // `finish_round` releases it if the neighbourhood
+                // confirms, and drops it — with a recorded reason — if
+                // it does not. Nothing is ever silently forgotten.
+                if response_engine.policy().needs_corroboration(action.id()) {
+                    info!(
+                        action_id = action.id(),
+                        episode = %episode_id,
+                        "action held pending neighbourhood corroboration"
+                    );
+                    pending_actions.park(&episode_id, vec![action], std::time::Instant::now());
+                    continue;
+                }
                 let engine = response_engine.clone();
                 let audit_sink = audit_sink.clone();
                 let identity = identity.clone();

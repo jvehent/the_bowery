@@ -100,6 +100,7 @@ mod tests {
             allowed_actions: ids.iter().map(|s| (*s).to_string()).collect(),
             disabled: false,
             block_exec_deny_list: Vec::new(),
+            require_corroboration: Vec::new(),
         }
     }
 

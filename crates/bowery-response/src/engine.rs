@@ -115,6 +115,7 @@ mod tests {
             allowed_actions: vec!["kill_process".into()],
             disabled: false,
             block_exec_deny_list: vec![],
+            require_corroboration: Vec::new(),
         };
         let eng = NoopEngine::new(policy);
         let outcome = eng.execute(&kill_action()).await.unwrap();
@@ -130,6 +131,7 @@ mod tests {
             allowed_actions: vec!["kill_process".into()],
             disabled: true,
             block_exec_deny_list: vec![],
+            require_corroboration: Vec::new(),
         };
         let eng = NoopEngine::new(policy);
         let outcome = eng.execute(&kill_action()).await.unwrap();

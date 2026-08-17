@@ -88,6 +88,31 @@ pub struct ResponsePolicy {
     /// critical service.
     #[serde(default)]
     pub block_exec_deny_list: Vec<String>,
+
+    /// Action ids that may only run once the neighbourhood has
+    /// confirmed the episode.
+    ///
+    /// `DESIGN.md` has specified from the start that a hard action needs
+    /// standing operator authorization *or* k-of-n peer agreement. This
+    /// is the second half: a listed action is held until the whisper
+    /// round for its episode confirms, and dropped — with a recorded
+    /// reason — if it does not.
+    ///
+    /// # Why this defaults to empty
+    ///
+    /// Defaulting it *on* would be the more cautious-looking choice and
+    /// the wrong one. Corroboration can only arrive from peers, so on a
+    /// single-node install, a partitioned host, or an episode scoring
+    /// below the whisper threshold, no confirmation is ever coming — and
+    /// an operator who had deliberately armed enforcement would find it
+    /// silently inert. That is the failure this project keeps having to
+    /// fix, in a new place.
+    ///
+    /// Enforcement is already off by default (`[response] mode`), so
+    /// arming is a deliberate act; this narrows *what* an armed host
+    /// does rather than standing in for the decision to arm it.
+    #[serde(default)]
+    pub require_corroboration: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -136,6 +161,19 @@ impl ResponsePolicy {
             return false;
         }
         self.allowed_actions.iter().any(|s| s == id)
+    }
+
+    /// Must this action wait for the neighbourhood to confirm?
+    ///
+    /// Consulted at the decision point rather than inside an engine:
+    /// the two facts arrive at different times. An action is decided
+    /// when the verdict is produced, while the whisper round has only
+    /// just been fired and the alert still carries no confirmation, so
+    /// an engine asked this question would always answer "not yet" and
+    /// deny everything forever.
+    #[must_use]
+    pub fn needs_corroboration(&self, id: &str) -> bool {
+        self.require_corroboration.iter().any(|s| s == id)
     }
 
     /// True iff `comm` may be added to a `BlockExec` block-list. Returns
@@ -202,6 +240,7 @@ mod tests {
             allowed_actions: vec!["kill_process".into()],
             disabled: false,
             block_exec_deny_list: vec![],
+            require_corroboration: Vec::new(),
         };
         assert!(p.permits("kill_process"));
         assert!(!p.permits("block_exec"));
@@ -213,6 +252,7 @@ mod tests {
             allowed_actions: vec!["kill_process".into()],
             disabled: true,
             block_exec_deny_list: vec![],
+            require_corroboration: Vec::new(),
         };
         assert!(!p.permits("kill_process"));
     }
@@ -227,6 +267,7 @@ mod tests {
             ],
             disabled: false,
             block_exec_deny_list: vec![],
+            require_corroboration: Vec::new(),
         };
         let mut w = p.warnings();
         w.sort();
@@ -241,6 +282,7 @@ mod tests {
             allowed_actions: vec!["block_exec".into()],
             disabled: false,
             block_exec_deny_list: vec![],
+            require_corroboration: Vec::new(),
         };
         assert!(p.permits("block_exec"));
         assert!(!p.permits_block_exec_comm("sshd"));
@@ -256,6 +298,7 @@ mod tests {
             allowed_actions: vec!["block_exec".into()],
             disabled: false,
             block_exec_deny_list: vec!["my-critical-app".into()],
+            require_corroboration: Vec::new(),
         };
         assert!(!p.permits_block_exec_comm("my-critical-app"));
         // Defaults still hold.

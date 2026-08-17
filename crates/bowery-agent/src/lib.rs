@@ -14,6 +14,7 @@ mod eventlog_writer;
 pub mod inbox;
 pub mod monitor;
 pub mod peer_watchdog;
+pub mod pending_actions;
 pub mod probe_watchdog;
 pub mod proc_table;
 pub mod response_bpf;

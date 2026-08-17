@@ -491,6 +491,16 @@ engine = "noop"         # noop | process-kill | bpf-lsm
 # policy_path    = "/etc/bowery/response-policy.toml"   # deny-all by default
 # audit_log_path = "/var/log/bowery/actions.jsonl"      # signed, one line per action
 #
+# In the policy file, `require_corroboration = ["kill_process"]` holds a
+# listed action until the whisper round for its episode confirms — the
+# k-of-n half of DESIGN.md's "standing authorization OR peer agreement".
+# It defaults to EMPTY on purpose: corroboration can only come from
+# peers, so on a single-node install, a partitioned host, or an episode
+# below the whisper threshold none is ever coming, and an operator who
+# had deliberately armed enforcement would find it silently inert. A
+# held action that is never confirmed is dropped and recorded as
+# suppressed with the reason, never silently forgotten.
+#
 # `dry-run` is the step to take before `enforce`: every gate runs, the
 # host is never touched, and each action is recorded as `would_execute`
 # — NOT as `suppressed`, which means a gate refused it. Read the audit

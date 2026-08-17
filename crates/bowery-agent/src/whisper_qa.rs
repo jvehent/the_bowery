@@ -57,6 +57,16 @@ pub(crate) struct ConfirmSink {
     /// Peers that must report *never seen it*. Zero disables
     /// confirmation.
     pub quorum: usize,
+    /// Actions held back at decision time, waiting on this round.
+    ///
+    /// Released when the neighbourhood confirms, dropped with a
+    /// recorded reason when it does not — never silently forgotten,
+    /// because an action that was decided and not carried out is
+    /// exactly what an operator reads the audit trail to find.
+    pub pending: Arc<crate::pending_actions::PendingActions>,
+    /// Where a released action goes. `None` on a build with no response
+    /// engine wired, in which case nothing is ever parked either.
+    pub release_tx: Option<mpsc::Sender<crate::pending_actions::Release>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +676,39 @@ fn finish_round(
     // already read past it. The LLM refinement path establishes the same
     // supersede-by-episode_id pattern.
     let verdict = quorum_verdict(&context.peers, confirm.quorum);
+
+    // Release, or abandon, anything the response path parked on this
+    // round. Both outcomes are reported: an action that was decided and
+    // never carried out is exactly what an operator reads the audit
+    // trail to find, so "the fleet did not agree" must never look the
+    // same as "nothing was ever decided".
+    if let Some(tx) = confirm.release_tx.as_ref() {
+        let now = std::time::Instant::now();
+        let (actions, dropped) = if verdict.confirmed {
+            (confirm.pending.release(&context.episode_id, now), None)
+        } else {
+            (
+                confirm.pending.discard(&context.episode_id),
+                Some(crate::pending_actions::Dropped::NotCorroborated),
+            )
+        };
+        for action in actions {
+            if dropped.is_none() {
+                info!(
+                    action_id = action.id(),
+                    episode = %context.episode_id,
+                    peers_unseen = verdict.peers_unseen,
+                    "neighbourhood corroborated; releasing held action"
+                );
+            }
+            let _ = tx.try_send(crate::pending_actions::Release {
+                episode_id: context.episode_id.clone(),
+                action,
+                dropped,
+            });
+        }
+    }
+
     if verdict.confirmed && pre_suspicion >= confirm.alert_threshold {
         let alert = Alert {
             originator_fp: confirm.originator_fp.as_bytes().to_vec(),

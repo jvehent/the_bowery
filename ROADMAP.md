@@ -303,10 +303,32 @@ No new sensors required:
   cannot run BPF-LSM at all, so this lands as a capability that degrades
   explicitly rather than one that works fleet-wide.
 - **Network isolation** as an action.
-- **Quorum-gated enforcement**: `DESIGN.md` has always specified hard
-  actions requiring standing authorization *or* k-of-n peer agreement.
-  The quorum signal now exists and is trustworthy; the response engine
-  still never sees it. Connect them.
+- **Quorum-gated enforcement** *(built)* — `DESIGN.md` specified from the
+  start that a hard action needs standing authorization *or* k-of-n peer
+  agreement. The signal had been trustworthy for a while and the
+  response engine never saw it; `require_corroboration` is the wire.
+
+  It could not be a check inside the engine, because the two facts
+  arrive at different times: the action is decided when the verdict is
+  produced, with the round only just fired and the alert still carrying
+  no confirmation, so an engine asked "is this corroborated?" would
+  always answer no and deny everything forever. The action is parked and
+  released by `finish_round` instead.
+
+  Three things it must not do, each pinned by a test. A parked action
+  must never fire late — by then the process is gone and the pid may
+  belong to something else, so acting is worse than not acting. A round
+  that does not confirm must *drop* the action and record why, since
+  silence there is indistinguishable from an action that ran in the one
+  log an operator consults. And an episode that never runs a round at
+  all — anything below the whisper threshold — must expire and be
+  reported rather than wait forever.
+
+  Defaults to empty, which looks like the less cautious choice and is
+  not: corroboration only comes from peers, so defaulting it on would
+  make enforcement silently inert on a single-node install, a
+  partitioned host, or a sub-threshold episode — after an operator had
+  deliberately armed it.
 
 ### Phase E — The things only this architecture can do
 
