@@ -918,6 +918,7 @@ impl Agent {
                 config.detection.repeat_window,
             )),
             config.detection.repeat_window,
+            Arc::new(crate::proc_table::ProcTable::default()),
             shutdown_rx.clone(),
         );
 
@@ -3211,6 +3212,7 @@ fn spawn_pipeline_task(
     discovery: Arc<bowery_analysis::DiscoveryTracker>,
     suppressor: Arc<bowery_analysis::AlertSuppressor>,
     suppress_window: Duration,
+    procs: Arc<crate::proc_table::ProcTable>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -3249,6 +3251,7 @@ fn spawn_pipeline_task(
                         &discovery,
                         &suppressor,
                         suppress_window,
+                        &procs,
                         event,
                     ).await;
                 }
@@ -3277,6 +3280,7 @@ fn spawn_pipeline_task(
                                 &discovery,
                                 &suppressor,
                                 suppress_window,
+                                &procs,
                                 event,
                             ).await;
                         }
@@ -3311,6 +3315,7 @@ async fn process_event(
     discovery: &Arc<bowery_analysis::DiscoveryTracker>,
     suppressor: &Arc<bowery_analysis::AlertSuppressor>,
     suppress_window: Duration,
+    procs: &Arc<crate::proc_table::ProcTable>,
     event: Event,
 ) {
     // Record first, analyse second. Every event goes to the log
@@ -3321,6 +3326,25 @@ async fn process_event(
     // pipeline still has no scoring path for.
     if let Some(log) = eventlog {
         log.record(event.clone());
+    }
+
+    // Remember pid → exe *before* dispatching, so a file access by a
+    // process that has already exited can still name its binary. Done
+    // here rather than by querying the event log because the log is
+    // written through an mpsc drained by a writer task: the exec row is
+    // usually not committed yet when the file-open for the same pid
+    // arrives, and the lookup would lose exactly the short-lived
+    // processes it exists to catch.
+    match &event {
+        Event::ProcessExec(e) => {
+            if let Some(exe) = e.exe_path.as_deref() {
+                procs.record(e.pid, exe, e.ts);
+            }
+        }
+        // Close the pid-reuse window as soon as the kernel tells us,
+        // rather than waiting out the TTL.
+        Event::ProcessExit(e) => procs.forget(e.pid),
+        _ => {}
     }
 
     // ProcessExec drives the full analyzer pipeline; FileChange is the
@@ -3372,6 +3396,7 @@ async fn process_event(
                 suppress_window,
                 claims,
                 corroboration,
+                procs,
                 &open,
             )
             .await;
@@ -3484,6 +3509,7 @@ async fn process_file_open(
     suppress_window: Duration,
     claims: Option<&crate::corroboration::ClaimSink>,
     corroboration: &crate::config::CorroborationConfig,
+    procs: &Arc<crate::proc_table::ProcTable>,
     open: &bowery_events::FileOpen,
 ) {
     let path = open.path.display().to_string();
@@ -3507,7 +3533,22 @@ async fn process_file_open(
     // established, here an exemption could not be earned, and a detection
     // that goes quiet whenever it cannot look is one an attacker only has
     // to outrun.
-    let exe = bowery_events::enrich::pid_exe_path(open.pid);
+    // /proc first — it is authoritative for a process that still
+    // exists. When the process has already gone, fall back to the exec
+    // we recorded for that pid.
+    //
+    // That fallback is the whole reason `unix_chkpwd` was the last
+    // source of credential-read noise on the fleet: PAM forks it, it
+    // reads /etc/shadow, it exits, and /proc/<pid>/exe is gone before
+    // the agent can look. Failing closed made that an alert every time,
+    // which was correct but useless — the exemption could not be earned
+    // because the question could not be asked.
+    //
+    // This does not weaken failing closed. It improves the agent's
+    // ability to *look*; when neither source can name the binary, the
+    // finding is still raised.
+    let exe =
+        bowery_events::enrich::pid_exe_path(open.pid).or_else(|| procs.exe_at(open.pid, open.ts));
     let (exe_sha, provenance) = match exe.clone() {
         Some(exe) => {
             let packages = packages.clone();
@@ -3598,7 +3639,7 @@ async fn process_file_open(
         confirmation: None,
         // The process that touched the file is the lead to follow, so
         // its ancestry and open handles travel with the alert.
-        context: file_open_context(open),
+        context: file_open_context(open, exe_str.as_deref()),
     };
     warn!(
         rule = hit.rule_id,
@@ -3710,7 +3751,10 @@ fn exec_context(exec: &ProcessExec) -> Vec<bowery_proto::Attribute> {
 
 /// Context for a file-watch alert: who touched it, and what else they
 /// had open at the time.
-fn file_open_context(open: &bowery_events::FileOpen) -> Vec<bowery_proto::Attribute> {
+fn file_open_context(
+    open: &bowery_events::FileOpen,
+    exe: Option<&str>,
+) -> Vec<bowery_proto::Attribute> {
     use bowery_proto::Attribute;
 
     let mut ctx = vec![Attribute::new("pid", open.pid.to_string())];
@@ -3718,8 +3762,8 @@ fn file_open_context(open: &bowery_events::FileOpen) -> Vec<bowery_proto::Attrib
     // ran against. `comm` travels beside it rather than instead of it:
     // a disagreement between the two ("comm sshd, exe /tmp/x") is itself
     // the finding, and collapsing them would hide it.
-    if let Some(exe) = bowery_events::enrich::pid_exe_path(open.pid) {
-        ctx.push(Attribute::new("exe", exe.display().to_string()));
+    if let Some(exe) = exe {
+        ctx.push(Attribute::new("exe", exe.to_string()));
     }
     if !open.comm.is_empty() {
         ctx.push(Attribute::new("comm", open.comm.clone()));

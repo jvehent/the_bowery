@@ -3196,6 +3196,51 @@ The count travels with the alert rather than being dropped. "`sshd` read
 a host key" and "`sshd` read a host key 4,000 times in the last hour" are
 different events, and the second is the interesting one.
 
+### 28b.2a Naming a process that has already exited
+
+With the flood gone, one source of credential-read noise remained on the
+fleet: `unix_chkpwd`, roughly one alert per hour per host. PAM forks it,
+it reads `/etc/shadow`, it exits — all in milliseconds. By the time the
+agent read `/proc/<pid>/exe` the process was gone, so the reader could
+not be named, the exemption could not be earned, and the alert fired.
+
+That was *correct*: the exemption must be demonstrated, not assumed. But
+it was useless, because the question could not be asked at all.
+
+The obvious fix is to join `file_open` against the `exec` row for the
+same pid — the agent already records every exec with a resolved
+`exe_path`, and that is exactly the join `file_access_seen` uses. It
+does not work here. [`EventLogHandle`] records through an `mpsc` drained
+by a writer task, so the exec row is usually **not committed yet** when
+the file-open for that pid is processed. The lookup would race, and lose
+precisely for the short-lived processes it exists to catch.
+
+So [`proc_table.rs`](crates/bowery-agent/src/proc_table.rs) keeps a
+bounded pid → exe map, filled synchronously by the same pipeline task
+that dispatches both events, in channel order. `/proc` is still tried
+first — it is authoritative for a process that still exists — and the
+table answers only when `/proc` cannot.
+
+This does not weaken failing closed. It improves the agent's ability to
+*look*; when neither source can name the binary, the finding is still
+raised.
+
+Three bounds, because a wrong answer here can only ever **grant** an
+exemption, which is the direction that turns a finding into silence:
+
+- **The exec must precede the access.** A later exec cannot explain an
+  earlier read, and answering with it would attribute a file access to a
+  binary that had not started yet.
+- **A 5-minute TTL.** A pid can be reused by a process that `fork`s
+  without `exec`ing; such a child inherits its parent's binary, so the
+  recorded path would name the wrong one and no exec would overwrite it.
+- **A cap, and eviction on `ProcessExit`**, which closes the reuse window
+  as soon as the kernel says so rather than waiting out the TTL.
+
+The alert's `exe` context attribute is now populated from the same
+resolution rather than re-reading `/proc`, so the context cannot
+disagree with the rationale about who the reader was.
+
 ### 28b.3 Our own deploy was the loudest thing on the host
 
 `dpkg -S /usr/bin/bowery` → *no path found*. `deploy/remote/` `scp`s the

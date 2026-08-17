@@ -343,3 +343,90 @@ async fn an_identical_finding_repeated_is_folded_into_one_alert() {
 
     agent.shutdown().await.expect("shutdown");
 }
+
+/// A process that has already exited can still be named, so the
+/// sanctioned-reader exemption can still be earned.
+///
+/// This is the last mechanical source of credential-read noise on the
+/// live fleet, in its exact shape: PAM forks `unix_chkpwd`, it reads
+/// `/etc/shadow`, it exits in milliseconds, and `/proc/<pid>/exe` is
+/// gone before the agent looks. Failing closed made that an alert every
+/// time — correct, but useless, because the exemption could not be
+/// earned when the question could not be asked.
+///
+/// The exec is fed through the same pipeline first, exactly as the
+/// kernel would report it. The assertion is on the *rationale naming
+/// the resolved path* rather than on silence, because this test host's
+/// binary is not a packaged `unix_chkpwd` and so is legitimately not
+/// exempt — what is being pinned is that the agent can now name a
+/// binary it could not name before. `bowery_analysis::file_watch`
+/// covers the exemption decision itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_that_already_exited_is_still_named_from_the_exec_record() {
+    let workdir = TempDir::new().unwrap();
+    let cfg = build_config(workdir.path(), reserve_udp_port(), MonitorConfig::default());
+
+    // A pid that certainly does not exist, so /proc cannot answer and
+    // only the recorded exec can.
+    let ghost = 4_194_301;
+    let now = SystemTime::now();
+    let source = Box::new(MockEventSource::new(vec![
+        Event::ProcessExec(bowery_events::ProcessExec {
+            pid: ghost,
+            ppid: 1,
+            parent_comm: "sshd".into(),
+            uid: 0,
+            comm: "unix_chkpwd".into(),
+            exe_path: Some("/usr/sbin/unix_chkpwd".into()),
+            args: vec!["/usr/sbin/unix_chkpwd".into()],
+            ts: now,
+        }),
+        Event::FileOpen(FileOpen {
+            pid: ghost,
+            comm: "unix_chkpwd".into(),
+            path: "/root/.ssh/authorized_keys".into(),
+            flags: 0o1101,
+            truncated: false,
+            sensitive_read: false,
+            ts: now,
+        }),
+    ]));
+
+    let identity = Arc::new(Identity::generate());
+    let agent = Agent::start(cfg, identity, source).await.expect("start");
+    let mut events = agent.subscribe();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let episode = loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for the alert");
+        if let Ok(Ok(AgentEvent::AlertEmitted { episode_id, .. })) =
+            tokio::time::timeout(left, events.recv()).await
+            && episode_id.starts_with("file-persist.authorized_keys-")
+        {
+            break episode_id;
+        }
+    };
+
+    let (alerts, _) = agent.inbox().read_since(0, 100);
+    let alert = alerts
+        .iter()
+        .find(|a| a.episode_id == episode)
+        .expect("alert in the inbox");
+    assert!(
+        alert.rationale.contains("/usr/sbin/unix_chkpwd"),
+        "the exited reader must be named from the exec record, got: {}",
+        alert.rationale
+    );
+    // And the context carries it too, rather than disagreeing with the
+    // rationale about who the reader was.
+    assert!(
+        alert
+            .context
+            .iter()
+            .any(|a| a.key == "exe" && a.value == "/usr/sbin/unix_chkpwd"),
+        "context must name the same binary the rationale does"
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}
