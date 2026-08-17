@@ -354,6 +354,19 @@ pub fn setid_bits(path: &Path) -> Option<(bool, bool)> {
     ))
 }
 
+/// Every rule id [`setid_finding`] can return.
+///
+/// Hand-maintained alongside the match below; the test at the bottom of
+/// this module proves the two agree.
+#[must_use]
+pub const fn rule_ids() -> &'static [&'static str] {
+    &[
+        "privesc.setid_packaged_modified",
+        "privesc.setid_unpackaged",
+        "privesc.setid_unknown_provenance",
+    ]
+}
+
 /// Does a set-id binary at this provenance warrant an alert?
 ///
 /// A setuid-root binary is how an unprivileged process becomes root, so
@@ -436,6 +449,25 @@ pub fn adjust_score(score: f32, provenance: Provenance) -> (f32, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The set-id rule ids are enumerated by hand for the ATT&CK map;
+    /// prove they match what `setid_finding` returns for every possible
+    /// provenance.
+    #[test]
+    fn rule_ids_matches_what_setid_finding_can_return() {
+        use std::collections::HashSet;
+        let reachable: HashSet<&str> = [
+            Provenance::PackagedIntact,
+            Provenance::PackagedModified,
+            Provenance::Unpackaged,
+            Provenance::Unknown,
+        ]
+        .into_iter()
+        .filter_map(|p| setid_finding(true, false, p).map(|(id, _, _)| id))
+        .collect();
+        let declared: HashSet<&str> = rule_ids().iter().copied().collect();
+        assert_eq!(reachable, declared);
+    }
 
     fn write_md5sums(dir: &Path, pkg: &str, lines: &[&str]) {
         std::fs::write(dir.join(format!("{pkg}.md5sums")), lines.join("\n")).unwrap();

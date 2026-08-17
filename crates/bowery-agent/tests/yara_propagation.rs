@@ -95,6 +95,7 @@ fn build_config(
         response: ResponseConfig::default(),
         sql: bowery_agent::config::SqlConfig::default(),
         monitor: MonitorConfig::default(),
+        detection: bowery_agent::config::DetectionConfig::default(),
         eventlog: bowery_agent::config::EventLogConfig {
             enabled: false,
             ..Default::default()

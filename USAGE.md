@@ -58,10 +58,18 @@ before), **file writes to paths that matter** (`ld.so.preload`, systemd
 units, cron, `authorized_keys`, PAM, `sudoers`, `shadow`, auth logs),
 **reads of credentials** (`/etc/shadow`, SSH private keys, `~/.aws`,
 `~/.kube`, `.pgpass`, `.netrc`), **set-id backdoors** (a setuid-root
-binary no package owns), and **lineage** (a network service spawning a
-shell). Two things damp
+binary no package owns), **lineage** (a network service spawning a
+shell), **privilege transitions** (a process running as root whose
+parent was not, outside the sanctioned `sudo`/`su`/`pkexec` path), and
+**reconnaissance bursts** (five different discovery commands from one
+parent inside a minute). Two things damp
 the noise: a binary the package manager installed and has not modified
 is not interesting on first run, and `sshd` starting a shell is a login.
+
+Per-technique detail, including what is *not* covered, is in
+[`docs/ATTACK-COVERAGE.md`](docs/ATTACK-COVERAGE.md). It is generated
+from the rule tables, so it cannot claim coverage the code does not
+have.
 
 **Whispering is what makes it more than N separate agents.** Two kinds
 run today:
@@ -197,6 +205,23 @@ enrollment = "tofu"                     # switch to "grant" in §6
 > any interface that appears late in boot, binding a specific IP fails
 > if the agent starts first. Binding `0.0.0.0` and advertising `100.x`
 > is what makes both boot order and peer dialing work.
+
+Nothing above turns detections on — the built-in ones are already
+running. `[detection]` exists only to tune them, and every key shown is
+the default:
+
+```toml
+[detection]
+uid_transitions     = true   # root whose parent was not, outside sudo/su/pkexec
+discovery_bursts    = true   # several different recon commands from one parent
+discovery_window    = "1m"
+discovery_threshold = 5      # DISTINCT commands; `id` in a loop never trips it
+```
+
+Turn one off only on a host where it is structurally noisy — a build box
+whose every script runs `uname` and `dpkg`, say. Unlike `[monitor]`,
+which is empty until you write a rule, these are on for a host nobody
+configured.
 
 Restart, then collect each node's identity:
 

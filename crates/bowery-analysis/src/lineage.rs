@@ -84,6 +84,21 @@ fn in_set(name: &str, set: &[&str]) -> bool {
     set.contains(&name)
 }
 
+/// Every lineage rule id.
+///
+/// The rules are `if` arms rather than a table, so this list is
+/// maintained by hand — and [`crate::attack`]'s test is what catches a
+/// rule added to `classify` without being added here.
+#[must_use]
+pub const fn rule_ids() -> &'static [&'static str] {
+    &[
+        "lineage.service_spawned_shell",
+        "lineage.service_spawned_downloader",
+        "lineage.service_spawned_interpreter",
+        "lineage.scheduled_downloader",
+    ]
+}
+
 /// Judge a parent→child pair.
 ///
 /// `child` may be a full path or a bare comm; only the final component
@@ -148,6 +163,38 @@ pub fn classify(parent_comm: &str, child: &str) -> Option<LineageHit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rule_ids` is hand-maintained, so prove it matches what
+    /// `classify` can actually return.
+    ///
+    /// Every parent set crossed with every child set is a few hundred
+    /// pairs — cheap enough to be exhaustive, which means a rule added
+    /// to `classify` and not to `rule_ids` fails here rather than
+    /// quietly disappearing from the ATT&CK map.
+    #[test]
+    fn rule_ids_matches_what_classify_can_return() {
+        use std::collections::HashSet;
+        let parents = NETWORK_SERVICES.iter().chain(SCHEDULERS.iter());
+        let children = SHELLS
+            .iter()
+            .chain(NETWORK_TOOLS.iter())
+            .chain(INTERPRETERS.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let mut reachable = HashSet::new();
+        for p in parents {
+            for c in &children {
+                if let Some(hit) = classify(p, c) {
+                    reachable.insert(hit.rule_id);
+                }
+            }
+        }
+        let declared: HashSet<&str> = rule_ids().iter().copied().collect();
+        assert_eq!(
+            reachable, declared,
+            "classify and rule_ids disagree; the ATT&CK map is built from rule_ids"
+        );
+    }
 
     #[test]
     fn the_canonical_webshell_is_caught() {

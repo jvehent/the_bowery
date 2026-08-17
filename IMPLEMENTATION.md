@@ -3015,6 +3015,112 @@ Applied *after* provenance deliberately: `/bin/sh` is packaged and
 unmodified, so it would otherwise be damped to 15% at exactly the moment
 nginx started it.
 
+### 28.3 Privilege transitions
+
+[`escalation.rs`](crates/bowery-analysis/src/escalation.rs).
+
+Becoming root is not suspicious — Linux ships `sudo`, `su` and `pkexec`
+precisely so people can. What is suspicious is reaching uid 0 *without*
+going through one of them: the privilege came from somewhere else.
+
+The rule is therefore a transition plus an exemption. A process runs as
+uid 0, its parent's real uid is non-zero, and the exec did **not** go
+through a packaged, unmodified setuid binary. Two findings come out of
+it: `privesc.uid_transition_untrusted_setuid` (0.95) when the binary is
+setuid but not one a package vouches for, and
+`privesc.uid_transition_no_helper` (0.9) when no setuid helper was
+involved at all — which is the shape a kernel or service exploit leaves
+behind.
+
+Three details each fix a specific way this would otherwise be wrong:
+
+**The exemption is anchored on package provenance, not on a name.** A
+list of `["sudo", "su", "pkexec"]` would exempt exactly the thing being
+looked for: a binary *called* `sudo` that no package owns. Provenance
+answers the question the name only pretends to.
+
+**Both uids are the real uid.** `bpf_get_current_uid_gid` returns
+`current_uid()`, the real uid, and `pid_uid` reads the first field of
+`/proc/<pid>/status`'s `Uid:` line, which is also the real one. This is
+load-bearing: a setuid binary changes the *effective* uid while the real
+one still names whoever ran it, so mixing the two would report a
+transition for every `sudo` and none for a genuine escalation.
+
+**An unknown parent reports nothing.** The parent is read from `/proc`
+and is often already gone. Treating "cannot read" as "was not root"
+would alert on most root processes on a booting host.
+
+### 28.4 Discovery bursts
+
+Same file. `whoami` is not a detection — it runs constantly, on every
+host, in scripts nobody wrote for an attacker. What distinguishes
+reconnaissance is the *burst*: several different discovery commands, in
+seconds, from one place.
+
+So the tracker counts **distinct** commands per **parent** in a sliding
+window (defaults: five distinct within one minute, `[detection]` in
+`agent.toml`). Both words carry weight:
+
+- *Distinct* — a script running `id` in a loop is not reconnaissance and
+  never trips this, no matter how many times it runs.
+- *Parent* — each `whoami` is its own short-lived pid; what ties a burst
+  together is the shell or script that ran them. Keying on the process
+  itself would make every burst a set of unrelated singletons.
+
+About fifty commands are recognised, grouped by the question they answer
+— who am I, where am I, who else is here, what is running, what can I
+reach, what is on disk, what is installed. Matching is on the basename,
+so the table holds bare command names.
+
+A burst reports **once** and then clears that parent's history, so a
+shell that keeps poking around produces one alert per window rather than
+one per command. The finding folds into the completing exec's verdict at
+0.75 rather than becoming its own alert, which means it arrives carrying
+the ancestry, cmdline and open files that say *who* was running it —
+context a standalone burst alert would not have.
+
+The tracker is bounded at 1024 parents and clears wholesale when full: a
+fork bomb should not be able to grow it without limit, and a cleared
+tracker re-learns within one window.
+
+### 28.5 The ATT&CK coverage map
+
+[`attack.rs`](crates/bowery-analysis/src/attack.rs) →
+[`docs/ATTACK-COVERAGE.md`](docs/ATTACK-COVERAGE.md).
+
+A coverage map that lives only in Markdown drifts the first time someone
+adds a rule and forgets to write it down, and it fails in the worst
+available direction: a document claiming coverage the code does not
+have. So the map is a table in code, and the document is generated from
+it (`BOWERY_UPDATE_DOCS=1 cargo test -p bowery-analysis`).
+
+Four tests hold it honest:
+
+- **Every rule the agent can fire appears on the map.** Each rule module
+  exposes `rule_ids()`, and the map's test unions them. Adding a
+  detection without placing it on a technique fails the build.
+- **The map names no rule that no longer exists.** A rename would
+  otherwise leave the map pointing at nothing while still claiming the
+  coverage. Four ids produced by subsystems rather than rule tables
+  (`baseline.rarity`, `yara.match`, `probe.sensor_blind`,
+  `corroborate.net_inbound_connect`) are exempted by an explicit,
+  reviewable list rather than by a wildcard.
+- **Every technique names its gap** — including the well-covered ones.
+  There is deliberately no grade above `Good`: no host sensor covers a
+  technique completely, and a map that says "complete" invites an
+  operator to stop looking.
+- **The checked-in document matches the table.**
+
+The `rule_ids()` accessors are themselves hand-maintained where the
+rules are `if` arms rather than table rows (lineage, setid, escalation),
+so each of those modules has a test that drives its classifier
+exhaustively over its own input sets and asserts the reachable ids equal
+the declared ones.
+
+Today: 12 good, 10 partial, 3 uncovered across 25 techniques. The
+uncovered rows — kernel modules, C2 beaconing, ransomware — are the
+useful half.
+
 ---
 
 ## 29. Reaching an operator who isn't watching

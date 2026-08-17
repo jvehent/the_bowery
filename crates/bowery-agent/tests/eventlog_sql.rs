@@ -85,6 +85,7 @@ fn build_config(dir: &Path, eventlog_path: PathBuf) -> Config {
         sql: bowery_agent::config::SqlConfig::default(),
         monitor: bowery_agent::config::MonitorConfig::default(),
         yara: bowery_agent::config::YaraConfig::default(),
+        detection: bowery_agent::config::DetectionConfig::default(),
         eventlog: EventLogConfig {
             enabled: true,
             path: eventlog_path,

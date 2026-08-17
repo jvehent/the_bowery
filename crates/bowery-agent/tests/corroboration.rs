@@ -105,6 +105,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>, cluster: 
         yara: bowery_agent::config::YaraConfig::default(),
         // The whole feature is answered out of this log, so unlike the
         // other fixtures it has to be on.
+        detection: bowery_agent::config::DetectionConfig::default(),
         eventlog: EventLogConfig {
             enabled: true,
             path: dir.join("events.db"),

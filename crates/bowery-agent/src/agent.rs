@@ -903,6 +903,11 @@ impl Agent {
             claims,
             config.whisper.corroboration.clone(),
             packages,
+            config.detection.clone(),
+            Arc::new(bowery_analysis::DiscoveryTracker::new(
+                config.detection.discovery_window,
+                config.detection.discovery_threshold,
+            )),
             shutdown_rx.clone(),
         );
 
@@ -3192,6 +3197,8 @@ fn spawn_pipeline_task(
     claims: Option<crate::corroboration::ClaimSink>,
     corroboration: crate::config::CorroborationConfig,
     packages: Arc<bowery_analysis::provenance::ProvenanceCache>,
+    detection: crate::config::DetectionConfig,
+    discovery: Arc<bowery_analysis::DiscoveryTracker>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -3226,6 +3233,8 @@ fn spawn_pipeline_task(
                         claims.as_ref(),
                         &corroboration,
                         &packages,
+                        &detection,
+                        &discovery,
                         event,
                     ).await;
                 }
@@ -3250,6 +3259,8 @@ fn spawn_pipeline_task(
                                 claims.as_ref(),
                                 &corroboration,
                                 &packages,
+                                &detection,
+                                &discovery,
                                 event,
                             ).await;
                         }
@@ -3280,6 +3291,8 @@ async fn process_event(
     claims: Option<&crate::corroboration::ClaimSink>,
     corroboration: &crate::config::CorroborationConfig,
     packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
+    detection: &crate::config::DetectionConfig,
+    discovery: &Arc<bowery_analysis::DiscoveryTracker>,
     event: Event,
 ) {
     // Record first, analyse second. Every event goes to the log
@@ -3310,6 +3323,8 @@ async fn process_event(
                 backend_label,
                 events_tx,
                 packages,
+                detection,
+                discovery,
                 exec,
             )
             .await;
@@ -3666,6 +3681,8 @@ async fn process_exec(
     backend_label: &str,
     events_tx: &broadcast::Sender<AgentEvent>,
     packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
+    detection: &crate::config::DetectionConfig,
+    discovery: &Arc<bowery_analysis::DiscoveryTracker>,
     exec: ProcessExec,
 ) {
     let Some(exe_path) = exec.exe_path.clone() else {
@@ -3742,8 +3759,12 @@ async fn process_exec(
     // becomes root. The distribution ships a short, known list of them;
     // one that arrived any other way is a foothold made permanent.
     // Composes with provenance, which is what tells the two apart.
+    let setid = exec
+        .exe_path
+        .as_ref()
+        .and_then(|exe| bowery_analysis::provenance::setid_bits(exe));
     if let Some(exe) = exec.exe_path.as_ref()
-        && let Some((setuid, setgid)) = bowery_analysis::provenance::setid_bits(exe)
+        && let Some((setuid, setgid)) = setid
         && let Some((rule_id, severity, why)) =
             bowery_analysis::provenance::setid_finding(setuid, setgid, exec_provenance)
     {
@@ -3756,6 +3777,68 @@ async fn process_exec(
             exe = %exe.display(),
             pid = exec.pid,
             "set-id binary finding"
+        );
+    }
+
+    // Privilege transition: did this process reach root, and if so, how?
+    //
+    // The uid on the event is the *real* uid — `bpf_get_current_uid_gid`
+    // returns `current_uid()`, not the effective one — which is the same
+    // thing `pid_uid` reads for the parent, so the two are comparable.
+    // That matters: a setuid binary changes the effective uid while the
+    // real one still names whoever ran it, and comparing across the two
+    // would call every `sudo` a transition and every real one nothing.
+    //
+    // Read *before* the parent can exit. Even so it is often gone, which
+    // is why an unknown parent reports nothing rather than guessing.
+    if detection.uid_transitions {
+        let parent_uid = bowery_events::enrich::pid_uid(exec.ppid);
+        if let Some(hit) = bowery_analysis::uid_transition(
+            exec.uid,
+            parent_uid,
+            exec_provenance,
+            setid.is_some_and(|(setuid, _)| setuid),
+        ) {
+            if hit.severity > verdict.suspicion {
+                verdict.suspicion = hit.severity;
+            }
+            verdict.score.reason = format!("{} | {}", verdict.score.reason, hit.why);
+            warn!(
+                rule = hit.rule_id,
+                pid = exec.pid,
+                ppid = exec.ppid,
+                parent_uid,
+                "privilege transition to root"
+            );
+        }
+    }
+
+    // Discovery: one recon command is nothing; five different ones from
+    // the same parent in a minute is someone working out where they are.
+    //
+    // Folded into this exec's verdict rather than emitted separately —
+    // the command that completes the burst is the one an operator wants
+    // to see, and it already carries the ancestry that says who ran it.
+    if detection.discovery_bursts
+        && let Some(name) = exec
+            .exe_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .or_else(|| (!exec.comm.is_empty()).then(|| exec.comm.clone()))
+        && let Some(burst) = discovery.observe(exec.ppid, &name, std::time::Instant::now())
+    {
+        let severity = 0.75;
+        if severity > verdict.suspicion {
+            verdict.suspicion = severity;
+        }
+        let why = bowery_analysis::escalation::discovery_rationale(&burst);
+        verdict.score.reason = format!("{} | {why}", verdict.score.reason);
+        warn!(
+            rule = bowery_analysis::escalation::DISCOVERY_RULE_ID,
+            pid = exec.pid,
+            ppid = exec.ppid,
+            commands = %burst.commands.join(","),
+            "reconnaissance burst"
         );
     }
 

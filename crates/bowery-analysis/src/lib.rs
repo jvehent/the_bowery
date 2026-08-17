@@ -13,7 +13,9 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod analyzer;
+pub mod attack;
 pub mod episode;
+pub mod escalation;
 pub mod file_watch;
 pub mod lineage;
 pub mod peer_select;
@@ -23,7 +25,9 @@ pub mod rule;
 pub mod score;
 
 pub use analyzer::{Analyzer, Verdict};
+pub use attack::{Coverage, TECHNIQUES, Technique};
 pub use episode::Episode;
+pub use escalation::{DiscoveryBurst, DiscoveryTracker, EscalationHit, uid_transition};
 pub use peer_select::{DEFAULT_FANOUT, DEFAULT_MIN_SIMILARITY, rank_by_similarity};
 pub use role::{ROLE_VECTOR_DIMS, RoleFeatures, RoleVector};
 pub use rule::{OperatorProcessRule, Rule, RuleHit, RuleSeverity};

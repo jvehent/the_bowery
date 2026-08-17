@@ -401,6 +401,19 @@ pub fn classify_read(path: &str) -> Option<FileWatchHit> {
         })
 }
 
+/// Every file-watch rule id, writes then reads.
+///
+/// Exists so the ATT&CK coverage map can be checked against the code
+/// rather than trusted. See [`crate::attack`].
+#[must_use]
+pub fn rule_ids() -> Vec<&'static str> {
+    RULES
+        .iter()
+        .chain(READ_RULES.iter())
+        .map(|r| r.id)
+        .collect()
+}
+
 /// Can this path be matched at all?
 ///
 /// Only absolute paths. A relative one came from an `openat` against a

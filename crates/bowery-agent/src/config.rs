@@ -66,6 +66,8 @@ pub struct Config {
     pub yara: YaraConfig,
     #[serde(default)]
     pub eventlog: EventLogConfig,
+    #[serde(default)]
+    pub detection: DetectionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -779,6 +781,58 @@ fn default_alert_threshold() -> f32 {
     0.7
 }
 
+/// Built-in behavioural detections that have knobs worth exposing.
+///
+/// Unlike [`MonitorConfig`], which is empty until an operator writes a
+/// rule, everything here is **on by default** — these are detections the
+/// agent should be running on a host nobody has configured. The keys
+/// exist to tune sensitivity, and to switch a detection off on a host
+/// where it is structurally noisy (a build box that runs `uname` in
+/// every script, say).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetectionConfig {
+    /// Alert when a process reaches uid 0 from a non-root parent without
+    /// going through a packaged, unmodified setuid helper.
+    #[serde(default = "default_true")]
+    pub uid_transitions: bool,
+    /// Alert when one parent runs several *different* reconnaissance
+    /// commands in quick succession.
+    #[serde(default = "default_true")]
+    pub discovery_bursts: bool,
+    /// How long a recon command stays counted against its parent.
+    #[serde(with = "humantime_serde", default = "default_discovery_window")]
+    pub discovery_window: Duration,
+    /// How many *distinct* recon commands within the window constitute a
+    /// burst. Distinct is the operative word: a script running `id` in a
+    /// loop is not reconnaissance, and never trips this no matter how
+    /// many times it runs.
+    ///
+    /// Five is deliberately above what an interactive human typically
+    /// runs in a minute while still well under what an enumeration
+    /// script does in seconds.
+    #[serde(default = "default_discovery_threshold")]
+    pub discovery_threshold: usize,
+}
+
+impl Default for DetectionConfig {
+    fn default() -> Self {
+        Self {
+            uid_transitions: true,
+            discovery_bursts: true,
+            discovery_window: default_discovery_window(),
+            discovery_threshold: default_discovery_threshold(),
+        }
+    }
+}
+
+fn default_discovery_window() -> Duration {
+    Duration::from_mins(1)
+}
+fn default_discovery_threshold() -> usize {
+    5
+}
+
 /// Operator-configurable monitoring: watch specific files (via userspace
 /// inotify) and add operator-defined process detections to the analyzer.
 /// Both lists default empty — the feature is off until the operator adds
@@ -1195,6 +1249,44 @@ suspicion      = 0.85
             "default window {half_ms}ms either side exceeds the responder's clamp"
         );
         assert!(c.queue_capacity > 0 && c.max_concurrent_rounds > 0);
+    }
+
+    /// The `[detection]` block exactly as `INSTALL.md` documents it.
+    ///
+    /// Same reason as the corroboration block above: `deny_unknown_fields`
+    /// turns a key that drifts from the docs into a refusal to start.
+    #[test]
+    fn parses_the_documented_detection_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        fs::write(
+            &path,
+            r#"
+[detection]
+uid_transitions     = true
+discovery_bursts    = true
+discovery_window    = "1m"
+discovery_threshold = 5
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("the documented block must parse");
+        assert!(cfg.detection.uid_transitions);
+        assert!(cfg.detection.discovery_bursts);
+        assert_eq!(cfg.detection.discovery_window, Duration::from_mins(1));
+        assert_eq!(cfg.detection.discovery_threshold, 5);
+    }
+
+    #[test]
+    fn detections_are_on_for_a_host_nobody_configured() {
+        // These are not operator rules like `[monitor]`; they are what
+        // the agent should be doing out of the box. A default of off
+        // would mean every host silently ships without them.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&dir.path().join("missing.toml")).unwrap();
+        assert!(cfg.detection.uid_transitions);
+        assert!(cfg.detection.discovery_bursts);
+        assert!(cfg.detection.discovery_threshold >= 2);
     }
 
     #[test]

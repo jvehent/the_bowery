@@ -63,13 +63,16 @@ now.
 | Initial access | nothing | nothing — no visibility into the vector |
 | Execution | partial | partial + provenance and lineage damp the noise |
 | **Persistence** | **nothing** | rules for units, cron, `authorized_keys`, `ld.so.preload`, PAM, udev, shell rc |
-| **Privilege escalation** | almost nothing | `sudoers`, set-id binaries no package owns; uid *transitions* open |
+| **Privilege escalation** | almost nothing | `sudoers`, set-id binaries no package owns, uid transitions to root outside the sanctioned path |
 | **Defense evasion** | **nothing** | auth/wtmp tampering; `comm`-keyed blocking still evadable |
-| **Credential access** | **nothing** | writes to `shadow`/`passwd`/SSH keys; **reads** still invisible |
-| Discovery | nothing | nothing — no recon-pattern analysis |
+| **Credential access** | **nothing** | writes *and* reads: `shadow`, SSH keys, `~/.aws`, `~/.kube`, `.pgpass`, and eleven more |
+| **Discovery** | **nothing** | recon bursts — five distinct discovery commands from one parent in a minute |
 | **Lateral movement** | partial, genuinely ahead | unchanged — the corroboration work |
 | Collection / exfil | partial | partial — destination rarity queryable, not alerting |
 | Impact (ransomware) | **nothing** | nothing — no mass-write rate signal |
+
+Per-technique detail, generated from the rule tables so it cannot drift
+from the code, is in [`docs/ATTACK-COVERAGE.md`](docs/ATTACK-COVERAGE.md).
 
 The pattern is stark. We have unusually good infrastructure for the one
 phase most products handle worst (lateral movement, because it needs two
@@ -82,8 +85,10 @@ passes through on one host.
 no file operations at all, and inotify covered only paths an operator
 listed in advance. This one gap was why persistence, credential access,
 defense evasion and impact were empty rows — they are overwhelmingly
-file-shaped. A `sys_enter_openat` probe now reports write-intent opens.
-Credential *reads* and mass-write rates remain unbuilt.
+file-shaped. A `sys_enter_openat` probe now reports write-intent opens,
+and credential *reads* alongside them (matched in the kernel by suffix).
+Mass-write rates remain unbuilt, which is why Impact is still an empty
+row.
 
 **Nothing reads the process tree.** *(closed in phase C.)*
 "`nginx` spawned `sh`" is the oldest detection in the book and needed no
@@ -192,7 +197,7 @@ off on Raspberry Pi kernels, so LSM-hook-based file monitoring won't run
 there. Prefer tracepoints/kprobes where possible and degrade explicitly
 where not — with Phase A making the degradation visible.*
 
-### Phase C — Detection content on data we already collect *(provenance + lineage BUILT)*
+### Phase C — Detection content on data we already collect *(BUILT)*
 
 No new sensors required:
 
@@ -208,11 +213,38 @@ No new sensors required:
   cannot fetch without the BTF Pi kernels lack. It is read from `/proc`
   at exec time instead. One hop only; deeper ancestry needs a process
   table that survives exits.
-- **uid-transition rules** *(open)*: setuid exec, a non-root process
-  becoming root, capability changes.
-- **Discovery patterns** *(open)*: the recon burst that precedes most
-  lateral movement.
-- **An ATT&CK coverage map** *(open)*, honestly scored, kept in-repo.
+- **uid-transition rules** *(built)* — a process running as root whose
+  parent was not. The *sanctioned* path has to be exempt or this fires
+  on every administrative action a human takes, and the exemption is
+  anchored on **package provenance, not on a name**: a binary called
+  `sudo` that no package owns is the finding, not the exemption. Both
+  uids are the **real** uid — `bpf_get_current_uid_gid` returns
+  `current_uid()`, and comparing a real uid against an effective one
+  would call every `sudo` a transition and every genuine one nothing.
+  An unknown parent reports nothing rather than guessing; on a booting
+  host most root processes have already lost their parent.
+  Capability changes remain unbuilt — there is no sensor for them.
+- **Discovery patterns** *(built)* — five *distinct* recon commands
+  (about fifty are recognised, from `whoami` to `getcap`) from one
+  parent inside a minute. Distinct is what makes it work: a script
+  running `id` in a loop never trips it. Keyed on the parent, because
+  each `whoami` is its own short-lived pid and what ties them together
+  is the shell that ran them. Reports once per window, not once per
+  command, and folds into the completing exec's verdict so the alert
+  arrives with the ancestry that says who ran it.
+- **An ATT&CK coverage map** *(built)* — [`docs/ATTACK-COVERAGE.md`],
+  generated from [`attack.rs`] rather than written, because a map that
+  lives only in Markdown drifts the first time someone adds a rule and
+  forgets to write it down — and the failure mode is the worst one
+  available: a document claiming coverage the code does not have. A
+  test asserts every rule the agent can fire appears on the map, that
+  the map names no rule that no longer exists, and that the checked-in
+  document matches the table. There is deliberately no grade above
+  "good": no host sensor covers a technique completely, and every
+  entry must name its gap. Today: 12 good, 10 partial, 3 uncovered.
+
+[`docs/ATTACK-COVERAGE.md`]: docs/ATTACK-COVERAGE.md
+[`attack.rs`]: crates/bowery-analysis/src/attack.rs
 
 ### Phase D — Make response worth arming
 

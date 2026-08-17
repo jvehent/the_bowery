@@ -90,6 +90,7 @@ fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: St
         yara: bowery_agent::config::YaraConfig::default(),
         // Disabled: these fixtures predate the event log and don't
         // need a writer task (the default path isn't writable in CI).
+        detection: bowery_agent::config::DetectionConfig::default(),
         eventlog: bowery_agent::config::EventLogConfig {
             enabled: false,
             ..Default::default()
@@ -456,6 +457,7 @@ async fn fanout_streams_rows_from_relay_and_peer() {
         yara: bowery_agent::config::YaraConfig::default(),
         // Disabled: these fixtures predate the event log and don't
         // need a writer task (the default path isn't writable in CI).
+        detection: bowery_agent::config::DetectionConfig::default(),
         eventlog: bowery_agent::config::EventLogConfig {
             enabled: false,
             ..Default::default()
@@ -507,6 +509,7 @@ async fn fanout_streams_rows_from_relay_and_peer() {
         yara: bowery_agent::config::YaraConfig::default(),
         // Disabled: these fixtures predate the event log and don't
         // need a writer task (the default path isn't writable in CI).
+        detection: bowery_agent::config::DetectionConfig::default(),
         eventlog: bowery_agent::config::EventLogConfig {
             enabled: false,
             ..Default::default()

@@ -478,6 +478,20 @@ retention = "72h"   # TTL on individual alerts (lazy sweep)
 [alerts]
 threshold = 0.7     # suspicion at which a verdict becomes an Alert
 
+# Built-in behavioural detections. Unlike [monitor] below, these are ON
+# for a host nobody configured — the block exists to tune them, and every
+# value shown is the default. Turn one off only where it is structurally
+# noisy (a build box whose every script runs `uname` and `dpkg`).
+[detection]
+uid_transitions     = true   # a process running as root whose parent was not,
+                             # outside the sanctioned sudo/su/pkexec path. The
+                             # exemption is anchored on package provenance, not
+                             # on a name — a binary *called* sudo that no
+                             # package owns is the finding, not the exemption.
+discovery_bursts    = true   # several DIFFERENT recon commands from one parent
+discovery_window    = "1m"
+discovery_threshold = 5      # distinct commands; `id` in a loop never trips it
+
 # Operator-configurable monitoring (both lists default empty = feature off).
 # Query the effective rules with: SELECT * FROM bowery_monitor_rules
 [monitor]
@@ -512,7 +526,11 @@ Notes:
   novelty and obey `[alerts] threshold` via their severity weight
   (high 0.9, medium 0.6, low 0.3, info 0.1). File rules bypass the
   threshold by design.
-- Rules are loaded once at startup; changing them needs a restart.
+- Rules are loaded once at startup; changing them needs a restart. The
+  same is true of `[detection]`.
+- **What the built-in detections do and do not cover** is in
+  [`docs/ATTACK-COVERAGE.md`](docs/ATTACK-COVERAGE.md), generated from
+  the rule tables so it cannot claim coverage the code does not have.
 
 ### Sizing notes
 

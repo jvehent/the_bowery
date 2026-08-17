@@ -359,3 +359,43 @@ mod context_tests {
         assert!(parse_hex_addr("XX:YY", false).is_none());
     }
 }
+
+/// Real UID of a process, from `/proc/<pid>/status`.
+///
+/// The `Uid:` line is `real  effective  saved  fs`. The **real** uid is
+/// the one that answers "who started this", which is what a privilege
+/// transition is measured against — a setuid binary changes the
+/// effective uid while the real one still names the user who ran it.
+#[must_use]
+pub fn pid_uid(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+#[cfg(test)]
+mod uid_tests {
+    use super::*;
+
+    #[test]
+    fn our_own_real_uid_is_readable_and_consistent() {
+        let uid = pid_uid(std::process::id()).expect("own uid");
+        // Cross-checked against pid 1, which is always root: if the
+        // parse were picking the wrong column these would not differ
+        // meaningfully on a normal test run.
+        assert_eq!(pid_uid(1), Some(0), "pid 1 runs as root");
+        if uid != 0 {
+            assert_ne!(uid, 0, "a non-root test process must not read as root");
+        }
+    }
+
+    #[test]
+    fn a_dead_pid_yields_none() {
+        assert!(pid_uid(u32::MAX).is_none());
+    }
+}

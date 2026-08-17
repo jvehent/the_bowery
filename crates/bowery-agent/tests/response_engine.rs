@@ -126,6 +126,7 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, response: ResponseConfig) -> 
         yara: bowery_agent::config::YaraConfig::default(),
         // Disabled: these fixtures predate the event log and don't
         // need a writer task (the default path isn't writable in CI).
+        detection: bowery_agent::config::DetectionConfig::default(),
         eventlog: bowery_agent::config::EventLogConfig {
             enabled: false,
             ..Default::default()
