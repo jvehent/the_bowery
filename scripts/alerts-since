@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Dump every alert in the fleet's inboxes newer than N hours, as JSON —
+# one object per line, with the agent name on each row.
+#
+#   alerts-since [hours] [--min-suspicion X]
+#
+# Reads ~/.bowery/peers.toml for the relay and the peer keys, so it needs
+# no arguments to work. Inbox retention (default 72h) is the hard limit
+# on how far back this can see.
+set -euo pipefail
+
+HOURS="${1:-12}"; shift || true
+MIN="0"
+[[ "${1:-}" == "--min-suspicion" ]] && { MIN="$2"; shift 2; }
+
+MANIFEST="${BOWERY_PEERS:-$HOME/.bowery/peers.toml}"
+KEY="${BOWERY_OPERATOR_KEY:-$HOME/.bowery/operator.key}"
+CUTOFF=$(( ($(date +%s) - HOURS * 3600) * 1000 ))
+
+# The relay is the first peer; every peer's pubkey must be registered or
+# its rows arrive unverifiable and get dropped as BadSignature.
+eval "$(python3 - "$MANIFEST" <<'PY'
+import re, sys, shlex
+t = open(sys.argv[1]).read()
+peers = [dict(re.findall(r'(\w+)\s*=\s*"([^"]+)"', b)) for b in t.split('[[peer]]')[1:]]
+if not peers:
+    sys.exit("no peers in manifest")
+r = peers[0]
+print(f"RELAY_ADDR={shlex.quote(r['addr'])}")
+print(f"RELAY_FP={shlex.quote(r['fp'])}")
+print(f"RELAY_PUB={shlex.quote(r['pubkey_b64'])}")
+print("PEER_ARGS=(" + " ".join(
+    f"--peer-pubkey-b64 {shlex.quote(p['pubkey_b64'])}" for p in peers) + ")")
+PY
+)"
+
+exec bowery exec sql \
+    --operator-key "$KEY" \
+    --agent-addr "$RELAY_ADDR" \
+    --agent-fp "$RELAY_FP" \
+    --agent-pubkey-b64 "$RELAY_PUB" \
+    --fanout "${PEER_ARGS[@]}" \
+    --timeout 120s --format json \
+    --sql "SELECT * FROM bowery_alerts
+           WHERE ts_unix_ms >= $CUTOFF AND suspicion >= $MIN
+           ORDER BY ts_unix_ms"

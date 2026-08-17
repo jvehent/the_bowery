@@ -159,6 +159,17 @@ const PASSWORD_TOOLS: &[&str] = &[
     "/usr/sbin/gdm3",
     "/usr/bin/polkit-agent-helper-1",
     "/usr/lib/policykit-1/polkit-agent-helper-1",
+    // Found by reading the fleet's inbox rather than by reasoning about
+    // it: `accounts-daemon` was the third-largest source of
+    // `/etc/shadow` alerts on a live host and had been missed. It is
+    // what backs org.freedesktop.Accounts, so it reads the password
+    // databases on every desktop and on anything running polkit.
+    // Ubuntu ships it under libexec, Debian under lib/accountsservice.
+    "/usr/libexec/accounts-daemon",
+    "/usr/lib/accountsservice/accounts-daemon",
+    "/usr/sbin/accounts-daemon",
+    "/usr/lib/polkit-1/polkitd",
+    "/usr/libexec/polkitd",
 ];
 
 /// The SSH daemon, which reads host keys at startup and
