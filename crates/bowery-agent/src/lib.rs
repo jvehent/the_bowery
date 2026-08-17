@@ -14,6 +14,7 @@ pub mod detection_stats;
 mod eventlog_writer;
 pub mod inbox;
 pub mod monitor;
+pub mod operator;
 pub mod peer_watchdog;
 pub mod pending_actions;
 pub mod pipeline;
