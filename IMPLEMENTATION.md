@@ -3274,6 +3274,51 @@ A blank `episode_id` is deliberately not an identity — those are distinct
 findings sharing an empty field, and keying on it would hide all but the
 last.
 
+### 28b.5a What that round could not answer, and why
+
+It ran 24 times on a live fleet and corroborated **nothing**. The
+downgrade path — the entire point of the kind — never once executed.
+
+The cause was in how a peer attributed an access to a binary.
+`file_open` rows carry `comm` and no `exe_path`, because resolving the
+exe for every write-intent open would put a readlink on the agent's
+hottest path, so the responder joined against the `exec` row for the
+same pid. That works only for a process the agent watched start. Every
+long-running daemon — `sshd`, `cron`, `systemd` — was running before the
+agent, so it has no exec row. And those daemons are exactly what reads
+credential files. The kind could not answer the question it was built to
+ask.
+
+The second half was worse than the first. Unable to attribute, the
+responder answered **Denied** — "I do not see that" — when the honest
+answer was "I cannot tell". That is the blind-peer problem in its third
+appearance: fixed for prevalence with `min_baseline_binaries`, fixed for
+`net_inbound` with `covers_since`, and reintroduced here because
+coverage was checked for the *time window* and not for *attribution
+capability*. It was harmless only by luck: `deny_quorum: 0` means the
+round cannot raise an alert, so a false denial cost a missed downgrade
+rather than a false accusation.
+
+Both halves are fixed:
+
+**Evidence has three states, not two.** `AccessEvidence::Seen` /
+`NotSeen` / `CannotAttribute`, and the last refuses. A host that has
+attributed no access at all in the window says so, because its silence
+is not evidence of anything.
+
+**Accesses are recorded with their binary.** When a path matches a watch
+rule, the agent already resolves the reader's exe — for the sanctioned
+check and for the alert. That resolution is now kept, as a `file_access`
+row. Only rule-matched paths are enriched, so the hot path is untouched
+and the rows that exist are exactly the ones a peer is ever asked about.
+
+Recorded **before** the sanctioned-reader check and regardless of
+whether an alert follows. The question a peer asks is "does this happen
+on your host", not "is it a finding there" — a host whose own `sshd` is
+sanctioned must still be able to say that its `sshd` reads host keys, or
+the only agents able to corroborate would be the ones with the same
+problem you are asking about.
+
 ### 28b.5 The mesh can now take a finding back
 
 Every corroboration kind until this one could only make things worse: the

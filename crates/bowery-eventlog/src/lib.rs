@@ -109,6 +109,20 @@ pub const KIND_EXIT: &str = "exit";
 pub const KIND_CONNECT: &str = "connect";
 pub const KIND_FILE_OPEN: &str = "file_open";
 pub const KIND_FILE_CHANGE: &str = "file_change";
+/// An access the agent both matched against a watch rule *and* managed
+/// to attribute to a binary.
+///
+/// Distinct from `file_open`, which carries `comm` and no `exe_path`:
+/// resolving the exe for every write-intent open on the host would put
+/// a readlink on the hottest path the agent has. Rule-matched accesses
+/// are rare enough to enrich, and they are the only ones a peer is ever
+/// asked about.
+///
+/// Recorded whether or not the access produced an alert. The
+/// corroboration question is "does this happen on your host", not "is
+/// it a finding there" — a peer whose own `sshd` is sanctioned must
+/// still be able to say that its `sshd` reads host keys.
+pub const KIND_FILE_ACCESS: &str = "file_access";
 
 /// Retention policy. Both bounds apply; whichever bites first wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +170,18 @@ pub struct ConnectionMatch {
     pub pid: u32,
     pub comm: String,
     pub exe_path: String,
+}
+
+/// What a host can say about one `(exe, path)` access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessEvidence {
+    /// This host recorded exactly that.
+    Seen,
+    /// This host attributes accesses, and has no record of this one.
+    NotSeen,
+    /// This host has attributed no access at all in the window, so its
+    /// silence is not evidence of anything.
+    CannotAttribute,
 }
 
 /// Append-only event store.
@@ -454,83 +480,97 @@ impl EventLog {
         Ok(found)
     }
 
-    /// Has *this* host seen `exe` touch `path` the same way, inside the
-    /// window?
+    /// What this host can honestly say about `exe` touching `path`.
     ///
-    /// Answers the `file.access` corroboration question: some binary
-    /// read a credential file over there — is that what this fleet looks
-    /// like, or is that host doing something the others are not?
+    /// Three answers, not two. The distinction is the whole point: a
+    /// host that cannot attribute file opens to a binary must not say
+    /// "that does not happen here", because it does not know. That is
+    /// the same rule `covers_since` applies to the time window, applied
+    /// to attribution.
     ///
-    /// # Why this joins rather than reading a column
-    ///
-    /// `file_open` rows carry `comm` but no `exe_path`: the sensor
-    /// reports every write-intent open on the host, and resolving
-    /// `/proc/<pid>/exe` for each one would put a readlink on the
-    /// hottest path the agent has. `comm` cannot stand in for it — it is
-    /// 16 bytes any process sets with `prctl`, so two hosts "agreeing"
-    /// about a process called `sshd` would agree about nothing.
-    ///
-    /// So the exe comes from the `exec` row for the same pid, which was
-    /// already recorded and already carries a resolved path. The cost
-    /// moves off the hot path and onto the rare question.
-    ///
-    /// **Pid reuse** is the known imprecision: over a long window a pid
-    /// can be recycled, and the wrong exec row could match. It biases
-    /// towards *corroborating* — that is, towards calling something
-    /// fleet-normal — so it is bounded by the responder's window clamp
-    /// and never allowed to be the only evidence: a corroboration
-    /// downgrades a finding that was already reported and can never
-    /// delete it.
-    pub fn file_access_seen(
+    /// # Errors
+    /// Propagates `SQLite` failures.
+    pub fn file_access_evidence(
         &self,
         exe: &str,
         path: &str,
         is_read: bool,
         window_start_unix_ms: u64,
         window_end_unix_ms: u64,
-    ) -> Result<bool> {
-        // Reconstruct write-intent from the raw openat flags, using the
-        // same test the probe applies in the kernel. Storing the
-        // decision would have been a second source of truth for one
-        // boolean.
-        const O_ACCMODE: i64 = 0o3;
-        const O_WRONLY: i64 = 0o1;
-        const O_RDWR: i64 = 0o2;
-        const CREATES: i64 = 0o100 | 0o1000 | 0o2000; // O_CREAT|O_TRUNC|O_APPEND
-
+    ) -> Result<AccessEvidence> {
         let conn = self.inner.lock().expect("event log mutex poisoned");
-        let write_intent = format!(
-            "((f.open_flags & {O_ACCMODE}) IN ({O_WRONLY}, {O_RDWR}) \
-              OR (f.open_flags & {CREATES}) != 0)"
-        );
-        let sql = format!(
-            "SELECT 1 FROM events f
-             WHERE f.kind = ?1 AND f.path = ?2
-               AND f.ts_unix_ms BETWEEN ?4 AND ?5
-               AND {} {write_intent}
-               AND EXISTS (
-                   SELECT 1 FROM events x
-                   WHERE x.kind = ?6 AND x.pid = f.pid AND x.exe_path = ?3
-                     AND x.ts_unix_ms <= f.ts_unix_ms
-               )
-             LIMIT 1",
-            if is_read { "NOT" } else { "" }
-        );
-        let found: Option<i64> = conn
+        let op = if is_read { "read" } else { "write" };
+        let start = i64::try_from(window_start_unix_ms).unwrap_or(0);
+        let end = i64::try_from(window_end_unix_ms).unwrap_or(i64::MAX);
+
+        let seen: Option<i64> = conn
             .query_row(
-                &sql,
-                params![
-                    KIND_FILE_OPEN,
-                    path,
-                    exe,
-                    i64::try_from(window_start_unix_ms).unwrap_or(0),
-                    i64::try_from(window_end_unix_ms).unwrap_or(i64::MAX),
-                    KIND_EXEC,
-                ],
+                "SELECT 1 FROM events
+                 WHERE kind = ?1 AND exe_path = ?2 AND path = ?3 AND file_op = ?4
+                   AND ts_unix_ms BETWEEN ?5 AND ?6
+                 LIMIT 1",
+                params![KIND_FILE_ACCESS, exe, path, op, start, end],
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(found.is_some())
+        if seen.is_some() {
+            return Ok(AccessEvidence::Seen);
+        }
+
+        // Can this host attribute accesses *at all* in this window? If
+        // it has attributed none, its silence says nothing about the
+        // question — an agent that started after every daemon it would
+        // need to name is exactly that case, and it is the common one.
+        let any: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE kind = ?1 AND ts_unix_ms BETWEEN ?2 AND ?3 LIMIT 1",
+                params![KIND_FILE_ACCESS, start, end],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(if any.is_some() {
+            AccessEvidence::NotSeen
+        } else {
+            AccessEvidence::CannotAttribute
+        })
+    }
+
+    /// Record an access that matched a watch rule and whose binary we
+    /// resolved.
+    ///
+    /// # Errors
+    /// Propagates `SQLite` failures.
+    pub fn record_file_access(
+        &self,
+        pid: u32,
+        comm: &str,
+        exe: &str,
+        path: &str,
+        is_read: bool,
+        ts: SystemTime,
+    ) -> Result<()> {
+        let ts_ms = i64::try_from(
+            ts.duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        let conn = self.inner.lock().expect("event log mutex poisoned");
+        conn.execute(
+            "INSERT INTO events (ts_unix_ms, kind, pid, comm, exe_path, path, file_op)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                ts_ms,
+                KIND_FILE_ACCESS,
+                i64::from(pid),
+                comm,
+                exe,
+                path,
+                if is_read { "read" } else { "write" },
+            ],
+        )?;
+        Ok(())
     }
 
     /// Checkpoint the WAL into the main file.
@@ -1106,106 +1146,125 @@ mod correlation_tests {
     }
 
     // -----------------------------------------------------------------
-    // file.access corroboration
+    // Attributed accesses: the three-state evidence
     // -----------------------------------------------------------------
-
-    fn sshd_reading_shadow(log: &EventLog, pid: u32, ts: SystemTime, exe: &str) {
-        log.append_batch(&[
-            Event::ProcessExec(ProcessExec {
-                pid,
-                ppid: 1,
-                parent_comm: String::new(),
-                uid: 0,
-                comm: "sshd".into(),
-                exe_path: Some(PathBuf::from(exe)),
-                args: Vec::new(),
-                ts,
-            }),
-            Event::FileOpen(bowery_events::FileOpen {
-                pid,
-                comm: "sshd".into(),
-                path: PathBuf::from("/etc/shadow"),
-                // O_RDONLY: a read, which is what the rule is about.
-                flags: 0,
-                truncated: false,
-                sensitive_read: true,
-                ts,
-            }),
-        ])
-        .unwrap();
-    }
 
     fn window() -> (u64, u64) {
         (0, u64::MAX / 2)
     }
 
-    /// The exe comes from the `exec` row for the same pid, because
-    /// `file_open` rows carry no `exe_path` — resolving one per open
-    /// would put a readlink on the agent's hottest path.
-    #[test]
-    fn a_matching_access_is_found_by_joining_through_the_exec_row() {
-        let log = EventLog::open_in_memory().unwrap();
-        sshd_reading_shadow(&log, 4242, SystemTime::now(), "/usr/sbin/sshd");
-        let (start, end) = window();
-        assert!(
-            log.file_access_seen("/usr/sbin/sshd", "/etc/shadow", true, start, end)
-                .unwrap()
-        );
+    fn record_access(log: &EventLog, exe: &str, path: &str, is_read: bool, ts: SystemTime) {
+        log.record_file_access(1234, "sshd", exe, path, is_read, ts)
+            .unwrap();
     }
 
-    /// A different binary reading the same file is not the same finding
-    /// — this is what stops a peer explaining away credential theft
-    /// because its own sshd happens to read shadow too.
     #[test]
-    fn a_different_exe_touching_the_same_path_does_not_match() {
+    fn an_attributed_access_is_seen() {
         let log = EventLog::open_in_memory().unwrap();
-        sshd_reading_shadow(&log, 4242, SystemTime::now(), "/usr/sbin/sshd");
-        let (start, end) = window();
-        assert!(
-            !log.file_access_seen("/tmp/harvest", "/etc/shadow", true, start, end)
-                .unwrap()
+        record_access(
+            &log,
+            "/usr/sbin/sshd",
+            "/etc/shadow",
+            true,
+            SystemTime::now(),
         );
-    }
-
-    /// Reading a file and writing it are different events, and a peer
-    /// must not corroborate one having seen the other.
-    #[test]
-    fn a_read_does_not_corroborate_a_write() {
-        let log = EventLog::open_in_memory().unwrap();
-        sshd_reading_shadow(&log, 4242, SystemTime::now(), "/usr/sbin/sshd");
-        let (start, end) = window();
-        assert!(
-            !log.file_access_seen("/usr/sbin/sshd", "/etc/shadow", false, start, end)
+        let (s, e) = window();
+        assert_eq!(
+            log.file_access_evidence("/usr/sbin/sshd", "/etc/shadow", true, s, e)
                 .unwrap(),
-            "an O_RDONLY open must not answer a question about writes"
+            AccessEvidence::Seen
         );
     }
 
+    /// The bug that made the whole `file.access` kind useless: a host
+    /// that has attributed nothing must REFUSE, not deny.
+    ///
+    /// Every long-running daemon — sshd, cron, systemd — started before
+    /// the agent, so nothing attributes their opens. On a live fleet
+    /// that was every round: 24 asked, 0 corroborated, because peers
+    /// were answering "I do not see that" about something they simply
+    /// could not see.
     #[test]
-    fn an_unrelated_path_does_not_match() {
+    fn a_host_that_has_attributed_nothing_cannot_answer() {
         let log = EventLog::open_in_memory().unwrap();
-        sshd_reading_shadow(&log, 4242, SystemTime::now(), "/usr/sbin/sshd");
-        let (start, end) = window();
-        assert!(
-            !log.file_access_seen("/usr/sbin/sshd", "/etc/gshadow", true, start, end)
-                .unwrap()
+        // Plenty of history, no attributed accesses.
+        log.append_batch(&[Event::ProcessExec(ProcessExec {
+            pid: 1,
+            ppid: 0,
+            parent_comm: String::new(),
+            uid: 0,
+            comm: "init".into(),
+            exe_path: Some(PathBuf::from("/sbin/init")),
+            args: Vec::new(),
+            ts: SystemTime::now(),
+        })])
+        .unwrap();
+        let (s, e) = window();
+        assert_eq!(
+            log.file_access_evidence("/usr/sbin/sshd", "/etc/shadow", true, s, e)
+                .unwrap(),
+            AccessEvidence::CannotAttribute,
+            "silence from a host that cannot attribute is not evidence"
         );
     }
 
-    /// An empty history answers "no" here; the responder is what turns
-    /// that into a *refusal* rather than evidence of absence, via
-    /// `covers_since`.
+    /// ...but a host that *does* attribute accesses and lacks this one
+    /// is genuinely saying no.
     #[test]
-    fn an_empty_log_reports_nothing_seen() {
+    fn a_host_that_attributes_others_but_not_this_one_denies() {
         let log = EventLog::open_in_memory().unwrap();
-        let (start, end) = window();
-        assert!(
-            !log.file_access_seen("/usr/sbin/sshd", "/etc/shadow", true, start, end)
-                .unwrap()
+        record_access(
+            &log,
+            "/usr/bin/sudo",
+            "/etc/sudoers",
+            true,
+            SystemTime::now(),
         );
-        assert!(
-            !log.covers_since(start).unwrap(),
-            "and covers_since must say the history cannot speak to the window"
+        let (s, e) = window();
+        assert_eq!(
+            log.file_access_evidence("/usr/sbin/sshd", "/etc/shadow", true, s, e)
+                .unwrap(),
+            AccessEvidence::NotSeen
+        );
+    }
+
+    /// A read must not answer a question about a write.
+    #[test]
+    fn direction_is_part_of_the_question() {
+        let log = EventLog::open_in_memory().unwrap();
+        record_access(
+            &log,
+            "/usr/sbin/sshd",
+            "/etc/shadow",
+            true,
+            SystemTime::now(),
+        );
+        let (s, e) = window();
+        assert_eq!(
+            log.file_access_evidence("/usr/sbin/sshd", "/etc/shadow", false, s, e)
+                .unwrap(),
+            AccessEvidence::NotSeen
+        );
+    }
+
+    /// A different binary touching the same file is a different fact —
+    /// this is what stops a peer explaining away credential theft
+    /// because its own sshd reads shadow too.
+    #[test]
+    fn a_different_exe_does_not_corroborate() {
+        let log = EventLog::open_in_memory().unwrap();
+        record_access(
+            &log,
+            "/usr/sbin/sshd",
+            "/etc/shadow",
+            true,
+            SystemTime::now(),
+        );
+        let (s, e) = window();
+        assert_eq!(
+            log.file_access_evidence("/tmp/harvest", "/etc/shadow", true, s, e)
+                .unwrap(),
+            AccessEvidence::NotSeen
         );
     }
 }

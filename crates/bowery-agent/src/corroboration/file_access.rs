@@ -204,24 +204,41 @@ impl super::CorroborationResponder for FileAccessResponder {
         let exe_owned = exe.to_string();
         let path_owned = path.to_string();
         let found = tokio::task::spawn_blocking(move || {
-            // Coverage before conclusion, exactly as the connection kind
-            // does it. "I have no record" and "I would not have recorded
-            // it either way" are opposite answers and only the first is
-            // evidence. A freshly-installed agent, or one whose
-            // retention has trimmed the window, must refuse rather than
-            // report absence — its silence would otherwise read as
-            // "nobody else does this", which is the finding.
+            // Coverage before conclusion, twice over.
+            //
+            // The window is the obvious half: a freshly-installed agent,
+            // or one whose retention has trimmed the period asked about,
+            // must refuse rather than report absence.
+            //
+            // Attribution is the half that was missing, and it made this
+            // whole kind unable to answer the question it exists for. A
+            // host attributes an access to a binary only when it saw
+            // that binary exec; every long-running daemon — sshd, cron,
+            // systemd — started before the agent did, and those are
+            // precisely what read credential files. Reporting "I do not
+            // see that" in such a case is a false denial, and on a live
+            // fleet it was every single one: 24 rounds, zero
+            // corroborations.
             if !log.covers_since(start).unwrap_or(false) {
                 return None;
             }
-            log.file_access_seen(&exe_owned, &path_owned, is_read, start, end)
+            log.file_access_evidence(&exe_owned, &path_owned, is_read, start, end)
                 .ok()
         })
         .await;
 
         match found {
-            Ok(Some(true)) => corroborate::answer(query, Corroboration::Corroborated, Vec::new()),
-            Ok(Some(false)) => corroborate::answer(query, Corroboration::Denied, Vec::new()),
+            Ok(Some(bowery_eventlog::AccessEvidence::Seen)) => {
+                corroborate::answer(query, Corroboration::Corroborated, Vec::new())
+            }
+            Ok(Some(bowery_eventlog::AccessEvidence::NotSeen)) => {
+                corroborate::answer(query, Corroboration::Denied, Vec::new())
+            }
+            Ok(Some(bowery_eventlog::AccessEvidence::CannotAttribute)) => corroborate::refuse(
+                query,
+                "this host has attributed no file access to a binary in that window, so \
+                 its silence is not evidence",
+            ),
             Ok(None) => corroborate::refuse(
                 query,
                 "history does not cover the requested window on this host",

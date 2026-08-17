@@ -971,6 +971,7 @@ impl Agent {
                     config.detection.mass_write_min_dirs,
                 ))
             }),
+            eventlog_store.clone(),
             shutdown_rx.clone(),
         );
 
@@ -3287,6 +3288,7 @@ fn spawn_pipeline_task(
     suppress_window: Duration,
     procs: Arc<crate::proc_table::ProcTable>,
     mass_writes: Option<Arc<bowery_analysis::MassWriteTracker>>,
+    eventlog_store: Option<Arc<bowery_eventlog::EventLog>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -3327,6 +3329,7 @@ fn spawn_pipeline_task(
                         suppress_window,
                         &procs,
                         mass_writes.as_ref(),
+                        eventlog_store.as_ref(),
                         event,
                     ).await;
                 }
@@ -3357,6 +3360,7 @@ fn spawn_pipeline_task(
                                 suppress_window,
                                 &procs,
                                 mass_writes.as_ref(),
+                                eventlog_store.as_ref(),
                                 event,
                             ).await;
                         }
@@ -3393,6 +3397,7 @@ async fn process_event(
     suppress_window: Duration,
     procs: &Arc<crate::proc_table::ProcTable>,
     mass_writes: Option<&Arc<bowery_analysis::MassWriteTracker>>,
+    eventlog_store: Option<&Arc<bowery_eventlog::EventLog>>,
     event: Event,
 ) {
     // Record first, analyse second. Every event goes to the log
@@ -3480,6 +3485,7 @@ async fn process_event(
                 corroboration,
                 procs,
                 mass_writes,
+                eventlog_store,
                 &open,
             )
             .await;
@@ -3594,6 +3600,7 @@ async fn process_file_open(
     corroboration: &crate::config::CorroborationConfig,
     procs: &Arc<crate::proc_table::ProcTable>,
     mass_writes: Option<&Arc<bowery_analysis::MassWriteTracker>>,
+    eventlog: Option<&Arc<bowery_eventlog::EventLog>>,
     open: &bowery_events::FileOpen,
 ) {
     let path = open.path.display().to_string();
@@ -3695,6 +3702,27 @@ async fn process_file_open(
         None => (None, bowery_analysis::provenance::Provenance::Unknown),
     };
     let exe_str = exe.as_ref().map(|p| p.display().to_string());
+
+    // Record the attributed access BEFORE the sanctioned check, and
+    // regardless of whether it becomes an alert.
+    //
+    // The corroboration question a peer asks is "does this happen on
+    // your host", not "is it a finding there". A host whose own sshd is
+    // sanctioned must still be able to say that its sshd reads host
+    // keys — otherwise the only agents able to corroborate are the ones
+    // with the same problem you are asking about.
+    if let (Some(log), Some(exe)) = (eventlog, exe_str.as_deref())
+        && let Err(e) = log.record_file_access(
+            open.pid,
+            &open.comm,
+            exe,
+            &path,
+            open.sensitive_read,
+            open.ts,
+        )
+    {
+        debug!(error = %e, "recording attributed file access failed");
+    }
 
     if bowery_analysis::file_watch::reader_is_sanctioned(&hit, exe_str.as_deref(), provenance) {
         debug!(
