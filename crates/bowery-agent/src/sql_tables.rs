@@ -466,6 +466,83 @@ fn collapse_superseded(alerts: Vec<bowery_proto::Alert>) -> Vec<bowery_proto::Al
 }
 
 // ---------------------------------------------------------------------------
+// bowery_detections — how often has each rule actually fired?
+// ---------------------------------------------------------------------------
+
+/// `bowery_detections` — one row per rule the agent knows how to fire,
+/// **including the ones that never have**.
+///
+/// The question this answers had to be answered six times in one day by
+/// grepping journals across three hosts, and twice it was nearly missed
+/// because a journal only holds whatever window it holds — an agent
+/// restarted five minutes ago looks exactly like one whose rule has
+/// never worked.
+///
+/// Both defect shapes are visible here and almost nowhere else. A rule
+/// stuck at zero is one that cannot fire: `file.access` ran 24 rounds
+/// and corroborated nothing because its responder could not attribute
+/// an access to a binary for any long-running daemon. A rule with an
+/// implausibly large count is one firing on the wrong thing: the
+/// uid-transition rule hit 78 times in a day because it exempted the
+/// executed binary rather than the parent, so every `sudo <command>`
+/// read as an escalation.
+///
+/// Fleet-wide with `--fanout`, which is where it earns its keep:
+///
+/// ```sql
+/// SELECT rule_id, SUM(fired) FROM bowery_detections
+/// GROUP BY rule_id ORDER BY 2
+/// ```
+///
+/// `since_unix_ms` is on every row on purpose. Counts reset when the
+/// agent restarts, and a zero means nothing without the window it was
+/// measured over.
+#[derive(Debug)]
+pub struct BoweryDetectionsTable {
+    stats: Arc<crate::detection_stats::DetectionStats>,
+}
+
+impl BoweryDetectionsTable {
+    pub fn new(stats: Arc<crate::detection_stats::DetectionStats>) -> Self {
+        Self { stats }
+    }
+}
+
+impl BoweryTable for BoweryDetectionsTable {
+    fn name(&self) -> &'static str {
+        "bowery_detections"
+    }
+
+    fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bowery_detections (
+                rule_id           TEXT,
+                fired             INTEGER,
+                last_fired_unix_ms INTEGER,
+                since_unix_ms     INTEGER
+            );",
+        )?;
+        let mut stmt = conn.prepare(
+            "INSERT INTO bowery_detections (rule_id, fired, last_fired_unix_ms, since_unix_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        let since = i64::try_from(self.stats.since_unix_ms()).unwrap_or(i64::MAX);
+        for (rule_id, stat) in self.stats.snapshot() {
+            stmt.execute(params![
+                rule_id,
+                i64::try_from(stat.fired).unwrap_or(i64::MAX),
+                // NULL, not 0: "never fired" and "fired at the epoch"
+                // are different facts, and only one of them is real.
+                stat.last_unix_ms
+                    .map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
+                since,
+            ])?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bowery_probe_status — is the kernel sensor actually watching?
 // ---------------------------------------------------------------------------
 

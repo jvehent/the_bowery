@@ -412,6 +412,24 @@ a clean result file.
 
 ## 8. Useful queries
 
+**Start here: has each detection ever actually fired?**
+
+```sql
+SELECT rule_id, fired, last_fired_unix_ms FROM bowery_detections ORDER BY fired
+```
+
+Every rule the agent knows is a row, including the ones at zero — a
+detection that has never fired is a visible `0`, not a missing row. Both
+failure shapes show up here and almost nowhere else. A rule stuck at zero
+is usually one that *cannot* fire; a rule with an implausibly large count
+is one firing on the wrong thing. Six defects were found this way in a
+single day, three of each kind.
+
+`since_unix_ms` is on every row because counts reset when the agent
+restarts, and a zero means nothing without the window it was measured
+over. Check it before concluding anything.
+
+
 | question | query |
 | --- | --- |
 | Is every host actually watching? | `SELECT probe, watching, emitted, kernel_drops FROM bowery_probe_status` |

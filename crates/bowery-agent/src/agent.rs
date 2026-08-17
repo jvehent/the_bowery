@@ -205,6 +205,7 @@ pub struct Agent {
     revocations: Arc<RevocationStore>,
     /// `None` when no file rules are configured (or inotify is unavailable).
     file_monitor_task: Option<JoinHandle<()>>,
+    detection_stats: Arc<crate::detection_stats::DetectionStats>,
     probe_watchdog_task: JoinHandle<()>,
     peer_watchdog_task: Option<JoinHandle<()>>,
     action_release_task: JoinHandle<()>,
@@ -633,6 +634,10 @@ impl Agent {
         let responders = Arc::new(responders);
         debug!(?responders, "corroboration responders registered");
 
+        // Seeded with every rule the agent knows, so a detection that
+        // has never fired is a visible zero rather than a missing row.
+        let detection_stats = Arc::new(crate::detection_stats::DetectionStats::new());
+
         let sql_engine = bowery_sql::Sql::new()
             .with_concurrency_cap(config.sql.max_concurrent_queries)
             .override_default_table("processes")
@@ -665,6 +670,9 @@ impl Agent {
             .with_extra_table(Arc::new(
                 crate::sql_tables::BoweryBaselineBinariesTable::new(baseline.clone()),
             ))
+            .with_extra_table(Arc::new(crate::sql_tables::BoweryDetectionsTable::new(
+                detection_stats.clone(),
+            )))
             .with_extra_table(Arc::new(crate::sql_tables::BoweryAlertsTable::new(
                 inbox.clone(),
             )))
@@ -959,6 +967,7 @@ impl Agent {
                 config.detection.discovery_window,
                 config.detection.discovery_threshold,
             )),
+            detection_stats.clone(),
             Arc::new(bowery_analysis::AlertSuppressor::new(
                 config.detection.repeat_window,
             )),
@@ -1045,6 +1054,7 @@ impl Agent {
             corroboration_task,
             revocations,
             file_monitor_task,
+            detection_stats,
             probe_watchdog_task,
             peer_watchdog_task,
             action_release_task,
@@ -1093,6 +1103,16 @@ impl Agent {
 
     pub fn inbox(&self) -> &Arc<AlertInbox> {
         &self.inbox
+    }
+
+    /// Per-rule fire counters, also exposed as `bowery_detections`.
+    ///
+    /// Public so an integration test can assert a rule that fired was
+    /// actually *counted* — the wiring, not just the counter. Six
+    /// separate things went wrong today by being correct in isolation
+    /// and connected to nothing.
+    pub fn detection_stats(&self) -> &Arc<crate::detection_stats::DetectionStats> {
+        &self.detection_stats
     }
 
     /// Pin store accessor — used by integration tests to seed peers
@@ -3284,6 +3304,7 @@ fn spawn_pipeline_task(
     packages: Arc<bowery_analysis::provenance::ProvenanceCache>,
     detection: crate::config::DetectionConfig,
     discovery: Arc<bowery_analysis::DiscoveryTracker>,
+    detections: Arc<crate::detection_stats::DetectionStats>,
     suppressor: Arc<bowery_analysis::AlertSuppressor>,
     suppress_window: Duration,
     procs: Arc<crate::proc_table::ProcTable>,
@@ -3325,6 +3346,7 @@ fn spawn_pipeline_task(
                         &packages,
                         &detection,
                         &discovery,
+                        &detections,
                         &suppressor,
                         suppress_window,
                         &procs,
@@ -3356,6 +3378,7 @@ fn spawn_pipeline_task(
                                 &packages,
                                 &detection,
                                 &discovery,
+                                &detections,
                                 &suppressor,
                                 suppress_window,
                                 &procs,
@@ -3393,6 +3416,7 @@ async fn process_event(
     packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
     detection: &crate::config::DetectionConfig,
     discovery: &Arc<bowery_analysis::DiscoveryTracker>,
+    detections: &Arc<crate::detection_stats::DetectionStats>,
     suppressor: &Arc<bowery_analysis::AlertSuppressor>,
     suppress_window: Duration,
     procs: &Arc<crate::proc_table::ProcTable>,
@@ -3454,6 +3478,7 @@ async fn process_event(
                 packages,
                 detection,
                 discovery,
+                detections,
                 exec,
             )
             .await;
@@ -3486,6 +3511,7 @@ async fn process_event(
                 procs,
                 mass_writes,
                 eventlog_store,
+                detections,
                 &open,
             )
             .await;
@@ -3601,6 +3627,7 @@ async fn process_file_open(
     procs: &Arc<crate::proc_table::ProcTable>,
     mass_writes: Option<&Arc<bowery_analysis::MassWriteTracker>>,
     eventlog: Option<&Arc<bowery_eventlog::EventLog>>,
+    detections: &Arc<crate::detection_stats::DetectionStats>,
     open: &bowery_events::FileOpen,
 ) {
     let path = open.path.display().to_string();
@@ -3615,6 +3642,7 @@ async fn process_file_open(
         && let Some(burst) = mass.observe(open.pid, &path, std::time::Instant::now())
     {
         let why = bowery_analysis::mass_write::rationale(&burst);
+        detections.record(bowery_analysis::mass_write::RULE_ID);
         warn!(
             rule = bowery_analysis::mass_write::RULE_ID,
             pid = burst.pid,
@@ -3798,6 +3826,7 @@ async fn process_file_open(
         // its ancestry and open handles travel with the alert.
         context: file_open_context(open, exe_str.as_deref()),
     };
+    detections.record(hit.rule_id);
     warn!(
         rule = hit.rule_id,
         path = %path,
@@ -4068,6 +4097,7 @@ async fn process_exec(
     packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
     detection: &crate::config::DetectionConfig,
     discovery: &Arc<bowery_analysis::DiscoveryTracker>,
+    detections: &Arc<crate::detection_stats::DetectionStats>,
     exec: ProcessExec,
 ) {
     let Some(exe_path) = exec.exe_path.clone() else {
@@ -4157,6 +4187,7 @@ async fn process_exec(
             verdict.suspicion = severity;
         }
         verdict.score.reason = format!("{} | {why}", verdict.score.reason);
+        detections.record(rule_id);
         warn!(
             rule = rule_id,
             exe = %exe.display(),
@@ -4200,6 +4231,7 @@ async fn process_exec(
                 verdict.suspicion = hit.severity;
             }
             verdict.score.reason = format!("{} | {}", verdict.score.reason, hit.why);
+            detections.record(hit.rule_id);
             warn!(
                 rule = hit.rule_id,
                 pid = exec.pid,
@@ -4230,6 +4262,7 @@ async fn process_exec(
         }
         let why = bowery_analysis::escalation::discovery_rationale(&burst);
         verdict.score.reason = format!("{} | {why}", verdict.score.reason);
+        detections.record(bowery_analysis::escalation::DISCOVERY_RULE_ID);
         warn!(
             rule = bowery_analysis::escalation::DISCOVERY_RULE_ID,
             pid = exec.pid,
@@ -4259,6 +4292,7 @@ async fn process_exec(
             "{} | {} spawned {}: {}",
             verdict.score.reason, exec.parent_comm, child, hit.why
         );
+        detections.record(hit.rule_id);
         warn!(
             rule = hit.rule_id,
             parent = %exec.parent_comm,

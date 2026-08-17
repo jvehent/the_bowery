@@ -461,6 +461,24 @@ pub fn markdown() -> String {
     out
 }
 
+/// Every rule id the agent can fire, table-backed and otherwise.
+///
+/// The map's test asserts this is exactly what the map covers; it is
+/// also what seeds the per-rule fire counters, so a detection that has
+/// never fired shows as a zero rather than as a missing row.
+#[must_use]
+pub fn all_rule_ids() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = crate::file_watch::rule_ids();
+    out.extend(crate::lineage::rule_ids());
+    out.extend(crate::provenance::rule_ids());
+    out.extend(crate::escalation::rule_ids());
+    out.extend(crate::mass_write::rule_ids());
+    out.extend(NON_TABLE_RULES);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Rule ids that are real but produced outside the rule tables — scores
 /// and subsystems rather than table entries.
 ///
@@ -496,11 +514,11 @@ mod tests {
     /// nothing. Both fail here instead.
     #[test]
     fn every_rule_appears_on_the_map() {
-        let mut real: HashSet<&str> = crate::file_watch::rule_ids().into_iter().collect();
-        real.extend(crate::lineage::rule_ids());
-        real.extend(crate::provenance::rule_ids());
-        real.extend(crate::escalation::rule_ids());
-        real.extend(crate::mass_write::rule_ids());
+        let exempt_ids: HashSet<&str> = NON_TABLE_RULES.iter().copied().collect();
+        let real: HashSet<&str> = all_rule_ids()
+            .into_iter()
+            .filter(|id| !exempt_ids.contains(id))
+            .collect();
 
         let mapped: HashSet<&str> = mapped_rule_ids().into_iter().collect();
 

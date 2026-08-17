@@ -10,6 +10,7 @@ pub mod agent;
 mod bloom_publisher;
 pub mod config;
 pub mod corroboration;
+pub mod detection_stats;
 mod eventlog_writer;
 pub mod inbox;
 pub mod monitor;

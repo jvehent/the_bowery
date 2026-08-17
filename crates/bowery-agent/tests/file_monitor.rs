@@ -430,3 +430,66 @@ async fn a_reader_that_already_exited_is_still_named_from_the_exec_record() {
 
     agent.shutdown().await.expect("shutdown");
 }
+
+/// The counter reflects a rule that actually fired, end to end.
+///
+/// Unit tests prove the counter counts. This proves it is *wired* to a
+/// real detection — which is exactly the property that was missing from
+/// six other things today, each of them correct in isolation and
+/// connected to nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fired_rule_shows_up_in_the_detection_counters() {
+    let workdir = TempDir::new().unwrap();
+    let cfg = build_config(workdir.path(), reserve_udp_port(), MonitorConfig::default());
+
+    let source = Box::new(MockEventSource::new(vec![Event::FileOpen(FileOpen {
+        pid: 4242,
+        comm: "curl".into(),
+        path: "/root/.ssh/authorized_keys".into(),
+        flags: 0o1101,
+        truncated: false,
+        sensitive_read: false,
+        ts: SystemTime::now(),
+    })]));
+
+    let identity = Arc::new(Identity::generate());
+    let agent = Agent::start(cfg, identity, source).await.expect("start");
+    let mut events = agent.subscribe();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for the alert");
+        if let Ok(Ok(AgentEvent::AlertEmitted { episode_id, .. })) =
+            tokio::time::timeout(left, events.recv()).await
+            && episode_id.starts_with("file-persist.authorized_keys-")
+        {
+            break;
+        }
+    }
+
+    let snap = agent.detection_stats().snapshot();
+    let fired = snap
+        .iter()
+        .find(|(id, _)| *id == "persist.authorized_keys")
+        .expect("the rule must have a row at all")
+        .1;
+    assert_eq!(
+        fired.fired, 1,
+        "the rule that just fired must be counted, not merely present"
+    );
+    assert!(fired.last_unix_ms.is_some());
+
+    // And a rule that did not fire is still a row, at zero — the whole
+    // reason the table is seeded from the registry rather than filled
+    // on first fire.
+    let never = snap
+        .iter()
+        .find(|(id, _)| *id == "impact.mass_write_new_extension")
+        .expect("a never-fired rule must still be a row")
+        .1;
+    assert_eq!(never.fired, 0);
+    assert_eq!(never.last_unix_ms, None);
+
+    agent.shutdown().await.expect("shutdown");
+}
