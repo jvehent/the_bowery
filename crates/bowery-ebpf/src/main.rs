@@ -440,45 +440,27 @@ pub struct PathScratch {
 #[map]
 static PATH_SCRATCH: PerCpuArray<PathScratch> = PerCpuArray::with_max_entries(1, 0);
 
-/// Longest basename compared against the secret-name table.
+/// Does the path end with `pat`?
 ///
-/// Every name of interest is far shorter; anything longer cannot match
-/// an entry anyway.
-pub const NAME_LEN: usize = 24;
-
-/// Compare a fixed-size stack copy of the basename against `pat`.
+/// **Suffix matching, with no scan for the last slash.** Finding the
+/// basename by scanning meant a 256-iteration loop over a map-backed
+/// buffer, and the verifier explores that one state per iteration: the
+/// program was rejected after eight seconds of analysis. Anchoring each
+/// pattern at the end of the string needs one computed offset per
+/// pattern and no loop over the path at all.
 ///
-/// The comparison works on a **stack array**, not on the map-backed
-/// path buffer, and that is not a style choice: comparing nineteen
-/// patterns directly against a masked map pointer produced a program
-/// the verifier rejected after eight seconds of analysis. Copying the
-/// basename out once, then comparing against plain stack memory, keeps
-/// the state space small enough to load.
+/// Patterns therefore begin with `/`, which makes them match a whole
+/// final path component — `/shadow` matches `/etc/shadow` but not
+/// `/var/lib/myshadow`.
 #[inline(always)]
-fn name_eq(name: &[u8; NAME_LEN], pat: &[u8]) -> bool {
-    if pat.len() >= NAME_LEN {
+fn ends_with(buf: &[u8; FILE_PATH_LEN], len: usize, pat: &[u8]) -> bool {
+    if len < pat.len() || len > FILE_PATH_LEN {
         return false;
     }
+    let start = len - pat.len();
     let mut i = 0;
     while i < pat.len() {
-        if name[i] != pat[i] {
-            return false;
-        }
-        i += 1;
-    }
-    // Exact, not prefix: `shadow` must not match `shadowsocks.conf`.
-    name[pat.len()] == 0
-}
-
-/// As [`name_eq`], but a prefix match — one entry covers a family.
-#[inline(always)]
-fn name_starts(name: &[u8; NAME_LEN], pat: &[u8]) -> bool {
-    if pat.len() >= NAME_LEN {
-        return false;
-    }
-    let mut i = 0;
-    while i < pat.len() {
-        if name[i] != pat[i] {
+        if buf[(start + i) & (FILE_PATH_LEN - 1)] != pat[i] {
             return false;
         }
         i += 1;
@@ -488,35 +470,34 @@ fn name_starts(name: &[u8; NAME_LEN], pat: &[u8]) -> bool {
 
 /// Is this the name of a file that holds a secret?
 ///
-/// Matched on the **basename only**, which is what makes this cheap
-/// enough to run on every `openat`. It is deliberately permissive —
-/// userspace sees the whole path and decides what actually warrants an
-/// alert, so a false positive here costs one ring slot rather than an
-/// operator's attention.
+/// Deliberately permissive: userspace sees the whole path and decides
+/// what warrants an alert, so a false positive here costs one ring slot
+/// rather than an operator's attention.
 #[inline(always)]
-fn is_secret_name(name: &[u8; NAME_LEN]) -> bool {
+fn is_secret_path(buf: &[u8; FILE_PATH_LEN], len: usize) -> bool {
     // Unix account and password databases.
-    name_eq(name, b"shadow")
-        || name_eq(name, b"shadow-")
-        || name_eq(name, b"gshadow")
-        || name_eq(name, b"opasswd")
-        || name_eq(name, b"sudoers")
-        // SSH: id_rsa, id_dsa, id_ecdsa, id_ed25519, and host keys.
-        || name_starts(name, b"id_")
-        || name_starts(name, b"ssh_host_")
-        || name_eq(name, b"authorized_keys")
+    ends_with(buf, len, b"/shadow")
+        || ends_with(buf, len, b"/gshadow")
+        || ends_with(buf, len, b"/opasswd")
+        || ends_with(buf, len, b"/sudoers")
+        // SSH private keys and host keys.
+        || ends_with(buf, len, b"/id_rsa")
+        || ends_with(buf, len, b"/id_dsa")
+        || ends_with(buf, len, b"/id_ecdsa")
+        || ends_with(buf, len, b"/id_ed25519")
+        || ends_with(buf, len, b"_key")
+        || ends_with(buf, len, b"/authorized_keys")
         // Cloud and cluster credentials.
-        || name_eq(name, b"credentials")
-        || name_eq(name, b"kubeconfig")
+        || ends_with(buf, len, b"/credentials")
+        || ends_with(buf, len, b"/kubeconfig")
         // Application and service credentials.
-        || name_eq(name, b".netrc")
-        || name_eq(name, b".pgpass")
-        || name_eq(name, b".my.cnf")
-        || name_eq(name, b".git-credentials")
-        || name_eq(name, b".htpasswd")
-        || name_eq(name, b".dockercfg")
-        || name_eq(name, b"secring.gpg")
-        || name_eq(name, b"master.key")
+        || ends_with(buf, len, b"/.netrc")
+        || ends_with(buf, len, b"/.pgpass")
+        || ends_with(buf, len, b"/.my.cnf")
+        || ends_with(buf, len, b"/.git-credentials")
+        || ends_with(buf, len, b"/.htpasswd")
+        || ends_with(buf, len, b"/.dockercfg")
+        || ends_with(buf, len, b"/secring.gpg")
 }
 
 #[tracepoint]
@@ -564,22 +545,7 @@ fn try_openat(ctx: &TracePointContext) -> Result<(), i64> {
         // Reads outnumber writes by orders of magnitude, so only the
         // ones whose name suggests a secret are shipped. Everything else
         // is dropped here, in the kernel, where it costs nothing.
-        let mut base = 0usize;
-        let mut i = 0usize;
-        while i < FILE_PATH_LEN && i < len {
-            if buf[i] == b'/' {
-                base = i + 1;
-            }
-            i += 1;
-        }
-        // Copy the basename to the stack once, then match against it.
-        let mut name = [0u8; NAME_LEN];
-        let mut j = 0usize;
-        while j < NAME_LEN {
-            name[j] = buf[(base + j) & (FILE_PATH_LEN - 1)];
-            j += 1;
-        }
-        if !is_secret_name(&name) {
+        if !is_secret_path(buf, len) {
             return Ok(());
         }
         ACCESS_SENSITIVE_READ
