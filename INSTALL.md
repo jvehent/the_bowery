@@ -533,6 +533,13 @@ uid_transitions     = true   # a process running as root whose parent was not,
 discovery_bursts    = true   # several DIFFERENT recon commands from one parent
 discovery_window    = "1m"
 discovery_threshold = 5      # distinct commands; `id` in a loop never trips it
+beacons             = true   # a process calling home on a timer to a destination this
+                             # host has not known long. Periodicity ALONE is not the
+                             # signal — NTP, package mirrors and monitoring agents all
+                             # beacon; novelty is what makes it readable.
+beacon_min_novelty_hours = 72  # below this a destination counts as new. On a fresh
+                             # agent everything is new, so beacons stay quiet until the
+                             # baseline has this much history.
 mass_writes         = true   # one process writing many files, across many dirs, that
                              # share an extension normal software does not produce. Volume
                              # alone is NOT the signal — that fires on every build, unpack

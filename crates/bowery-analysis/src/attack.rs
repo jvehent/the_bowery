@@ -328,10 +328,15 @@ pub const TECHNIQUES: &[Technique] = &[
         id: "T1071.001",
         name: "Application Layer Protocol: Web Protocols",
         tactic: "Command and Control",
-        coverage: Coverage::None,
-        rules: &[],
-        gap: "connection events are recorded but nothing scores them. There is no \
-              beaconing detection — no periodicity analysis, no destination rarity",
+        coverage: Coverage::Partial,
+        rules: &["c2.beacon_new_destination"],
+        gap: "catches a timer to a destination this host has not known long — periodicity \
+              alone would fire on NTP, package mirrors and every monitoring agent, so \
+              novelty is what makes it readable. A jittered beacon, which is what any \
+              serious implant uses, is indistinguishable from ordinary traffic by this \
+              measure; so is one multiplexed onto an existing TLS session, since the \
+              sensor sees connection setup and not messages; and a beacon slower than a \
+              few hours outruns the measurement window",
     },
     // -- Impact ---------------------------------------------------------
     Technique {
@@ -473,6 +478,7 @@ pub fn all_rule_ids() -> Vec<&'static str> {
     out.extend(crate::provenance::rule_ids());
     out.extend(crate::escalation::rule_ids());
     out.extend(crate::mass_write::rule_ids());
+    out.extend(crate::beacon::rule_ids());
     out.extend(NON_TABLE_RULES);
     out.sort_unstable();
     out.dedup();

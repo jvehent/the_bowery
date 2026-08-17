@@ -847,6 +847,23 @@ pub struct DetectionConfig {
     pub mass_write_min_files: usize,
     #[serde(default = "default_mass_write_min_dirs")]
     pub mass_write_min_dirs: usize,
+    /// Report a process calling home on a timer to a destination this
+    /// host has not known for long.
+    ///
+    /// Periodicity alone is not the signal — see
+    /// [`bowery_analysis::beacon`].
+    #[serde(default = "default_true")]
+    pub beacons: bool,
+    /// How long a destination must have been known before its
+    /// regularity stops being interesting.
+    ///
+    /// This is what excludes NTP and the package mirror without naming
+    /// them. On a freshly installed agent every destination is new, so
+    /// beacons are effectively suppressed until the baseline has this
+    /// much history — the same standing requirement peers have before
+    /// they may vote.
+    #[serde(default = "default_beacon_min_novelty_hours")]
+    pub beacon_min_novelty_hours: u64,
     /// Report a peer that stops gossiping while other peers remain
     /// visible.
     ///
@@ -885,6 +902,8 @@ impl Default for DetectionConfig {
             discovery_window: default_discovery_window(),
             discovery_threshold: default_discovery_threshold(),
             repeat_window: default_repeat_window(),
+            beacons: true,
+            beacon_min_novelty_hours: default_beacon_min_novelty_hours(),
             peer_liveness: true,
             peer_grace: default_peer_grace(),
             mass_writes: true,
@@ -909,6 +928,9 @@ fn default_mass_write_min_files() -> usize {
 }
 fn default_mass_write_min_dirs() -> usize {
     5
+}
+fn default_beacon_min_novelty_hours() -> u64 {
+    72
 }
 fn default_peer_grace() -> Duration {
     crate::peer_watchdog::DEFAULT_GRACE

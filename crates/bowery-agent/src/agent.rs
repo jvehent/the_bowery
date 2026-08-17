@@ -963,6 +963,15 @@ impl Agent {
             )),
             suppress_window: config.detection.repeat_window,
             procs: Arc::new(crate::proc_table::ProcTable::default()),
+            beacons: config.detection.beacons.then(|| {
+                Arc::new(bowery_analysis::BeaconTracker::new(
+                    // Long enough to hold several intervals of a slow
+                    // beacon without keeping a day of timestamps.
+                    Duration::from_hours(12),
+                    bowery_analysis::beacon::DEFAULT_MIN_SAMPLES,
+                    bowery_analysis::beacon::DEFAULT_MAX_JITTER,
+                ))
+            }),
             mass_writes: config.detection.mass_writes.then(|| {
                 Arc::new(bowery_analysis::MassWriteTracker::new(
                     config.detection.mass_write_window,

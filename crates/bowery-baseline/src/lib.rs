@@ -286,6 +286,41 @@ impl Baseline {
 
     /// Collect every recorded destination into a Vec.
     ///
+    /// How long this host has known one destination, and how often it
+    /// has contacted it.
+    ///
+    /// The novelty half of beacon scoring: regular outbound traffic is
+    /// what NTP, package mirrors and monitoring agents look like, so
+    /// periodicity alone is useless. What separates a beacon is that the
+    /// endpoint is *new* — and answering that from the baseline is why
+    /// no list of known-good destinations is needed, which would be both
+    /// endless and an evasion target.
+    ///
+    /// # Errors
+    /// Propagates `SQLite` failures.
+    pub fn net_destination(&self, addr: &str, port: u16) -> Result<Option<NetDestinationRecord>> {
+        let key = destination_key(addr, port);
+        let conn = self.inner.lock().expect("baseline mutex poisoned");
+        let rec = conn
+            .query_row(
+                "SELECT addr, port, first_seen, last_seen, seen_count
+                 FROM net_destinations WHERE dst_key = ?1",
+                params![key],
+                |row| {
+                    Ok(NetDestinationRecord {
+                        dst_key: key.clone(),
+                        addr: row.get(0)?,
+                        port: u16::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                        first_seen: secs_to_system_time(row.get::<_, i64>(2)?),
+                        last_seen: secs_to_system_time(row.get::<_, i64>(3)?),
+                        seen_count: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(rec)
+    }
+
     /// Preferred over [`Self::for_each_net_destination`] wherever the
     /// caller does real work per row: the visitor variant holds the
     /// baseline mutex for the whole walk, which is the shape of

@@ -86,6 +86,7 @@ pub(crate) struct PipelineContext {
     pub suppress_window: Duration,
     pub procs: Arc<ProcTable>,
     pub mass_writes: Option<Arc<MassWriteTracker>>,
+    pub beacons: Option<Arc<bowery_analysis::BeaconTracker>>,
 }
 
 impl std::fmt::Debug for PipelineContext {
@@ -232,6 +233,84 @@ async fn process_network_connect(ctx: &PipelineContext, conn: &bowery_events::Ne
     let port = conn.dport;
     // spawn_blocking: SQLite is synchronous, and connect events arrive
     // at a much higher rate than execs on a busy host.
+    // Beaconing, judged before the upsert so the destination's age is
+    // what it was *before* this connection.
+    //
+    // Periodicity alone is not the finding — NTP, package mirrors and
+    // monitoring agents all beacon, and a rule that fired on regularity
+    // would fire on every host forever. Novelty is what separates them,
+    // and it is answered from the baseline rather than from a list of
+    // known-good endpoints, which would be endless and an evasion
+    // target both.
+    if let Some(beacons) = ctx.beacons.as_ref()
+        && let Some(beacon) = beacons.observe(
+            &conn.daddr.to_string(),
+            conn.dport,
+            std::time::Instant::now(),
+        )
+    {
+        let known = ctx
+            .baseline
+            .net_destination(&beacon.dst_addr, beacon.dst_port)
+            .ok()
+            .flatten();
+        let age_hours = known.as_ref().and_then(|r| {
+            std::time::SystemTime::now()
+                .duration_since(r.first_seen)
+                .ok()
+                .map(|d| d.as_secs() / 3600)
+        });
+        // Established infrastructure: this host has been talking to it
+        // for long enough that its regularity says nothing. Forgotten
+        // rather than merely unreported, so the series does not sit in
+        // memory re-deciding the same thing.
+        let established = age_hours.is_some_and(|h| h >= ctx.detection.beacon_min_novelty_hours);
+        if established {
+            beacons.forget(&beacon.dst_addr, beacon.dst_port);
+        } else {
+            let why = bowery_analysis::beacon::rationale(&beacon, age_hours);
+            ctx.detections.record(bowery_analysis::beacon::RULE_ID);
+            warn!(
+                rule = bowery_analysis::beacon::RULE_ID,
+                dst = %beacon.dst_addr,
+                port = beacon.dst_port,
+                interval_s = beacon.interval.as_secs(),
+                "possible C2 beaconing"
+            );
+            let episode_id = format!("net-c2.beacon-{}", current_unix_ms());
+            let alert = Alert {
+                originator_fp: ctx.originator_fp.as_bytes().to_vec(),
+                episode_id: episode_id.clone(),
+                exe_sha256_hex: String::new(),
+                exe_path: format!("{}:{}", beacon.dst_addr, beacon.dst_port),
+                suspicion: 0.85,
+                rationale: why,
+                suggested_actions: Vec::new(),
+                ts_unix_ms: current_unix_ms(),
+                backend: ctx.backend_label.clone(),
+                confirmation: None,
+                context: vec![
+                    bowery_proto::Attribute::new("dst_addr", beacon.dst_addr.clone()),
+                    bowery_proto::Attribute::new("dst_port", beacon.dst_port.to_string()),
+                    bowery_proto::Attribute::new(
+                        "interval_s",
+                        beacon.interval.as_secs().to_string(),
+                    ),
+                    bowery_proto::Attribute::new(
+                        "jitter_pct",
+                        format!("{:.0}", beacon.jitter * 100.0),
+                    ),
+                    bowery_proto::Attribute::new("connections", beacon.samples.to_string()),
+                ],
+            };
+            ctx.inbox.append(alert);
+            let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+                episode_id,
+                suspicion: 0.85,
+            });
+        }
+    }
+
     let outcome =
         tokio::task::spawn_blocking(move || baseline.upsert_net_destination(&addr, port)).await;
     match outcome {

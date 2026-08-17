@@ -14,6 +14,7 @@
 
 pub mod analyzer;
 pub mod attack;
+pub mod beacon;
 pub mod episode;
 pub mod escalation;
 pub mod file_watch;
@@ -28,6 +29,7 @@ pub mod suppress;
 
 pub use analyzer::{Analyzer, Verdict};
 pub use attack::{Coverage, TECHNIQUES, Technique};
+pub use beacon::{Beacon, BeaconTracker};
 pub use episode::Episode;
 pub use escalation::{DiscoveryBurst, DiscoveryTracker, EscalationHit, uid_transition};
 pub use mass_write::{MassWriteBurst, MassWriteTracker};

@@ -17,7 +17,7 @@ that something fires?*
 - **partial** — one narrow variant fires; the common forms do not.
 - **none** — nothing fires. Listed anyway; the gaps are the useful half.
 
-Today: **12 good, 11 partial, 2 uncovered** across 25 techniques.
+Today: **12 good, 12 partial, 1 uncovered** across 25 techniques.
 
 ## Execution
 
@@ -249,12 +249,16 @@ a shell, or a transfer done in-process by an implant, is not seen.
 
 ### T1071.001 — Application Layer Protocol: Web Protocols
 
-**Coverage: none**
+**Coverage: partial**
 
-No rule fires.
+Rules: `c2.beacon_new_destination`
 
-Gap: connection events are recorded but nothing scores them. There is no beaconing
-detection — no periodicity analysis, no destination rarity.
+Gap: catches a timer to a destination this host has not known long — periodicity
+alone would fire on NTP, package mirrors and every monitoring agent, so novelty is
+what makes it readable. A jittered beacon, which is what any serious implant uses,
+is indistinguishable from ordinary traffic by this measure; so is one multiplexed
+onto an existing TLS session, since the sensor sees connection setup and not
+messages; and a beacon slower than a few hours outruns the measurement window.
 
 ## Impact
 

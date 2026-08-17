@@ -68,7 +68,7 @@ now.
 | **Credential access** | **nothing** | writes *and* reads: `shadow`, SSH keys, `~/.aws`, `~/.kube`, `.pgpass`, and eleven more |
 | **Discovery** | **nothing** | recon bursts — five distinct discovery commands from one parent in a minute |
 | **Lateral movement** | partial, genuinely ahead | unchanged — the corroboration work |
-| Collection / exfil | partial | partial — destination rarity queryable, not alerting |
+| Collection / exfil | partial | **C2 beaconing scored**: a timer to a destination this host has not known long |
 | **Impact (ransomware)** | **nothing** | write sweeps that rename what they encrypt; in-place encryption still invisible |
 
 Per-technique detail, generated from the rule tables so it cannot drift
