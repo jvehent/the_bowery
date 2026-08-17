@@ -117,8 +117,12 @@ fn blocking_an_inode_stops_that_file_executing_and_leaves_others_alone() {
         "this kernel has BTF, so offsets must have resolved"
     );
 
+    // The kernel's dev_t, not the one `stat` reports. These are two
+    // packings of the same major/minor pair, and using the wrong one
+    // fails silently: the map write succeeds and nothing ever matches.
     let md = std::fs::metadata(&victim).unwrap();
-    blocker.block_inode(md.dev(), md.ino()).expect("block");
+    let dev = bowery_response::action::kernel_dev_from_stat_dev(md.dev());
+    blocker.block_inode(dev, md.ino()).expect("block");
 
     assert!(
         !exec_allowed(&victim),
@@ -151,7 +155,7 @@ fn blocking_an_inode_stops_that_file_executing_and_leaves_others_alone() {
         "a copy has its own inode and must not inherit the block"
     );
 
-    assert!(blocker.unblock_inode(md.dev(), md.ino()).expect("unblock"));
+    assert!(blocker.unblock_inode(dev, md.ino()).expect("unblock"));
     assert!(exec_allowed(&renamed), "unblocking must restore execution");
 }
 

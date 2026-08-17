@@ -416,6 +416,7 @@ dependencies = [
  "aya",
  "aya-log",
  "bowery-events",
+ "bowery-response",
  "libc",
  "tempfile",
  "thiserror 2.0.18",

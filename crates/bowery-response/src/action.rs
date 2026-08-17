@@ -61,6 +61,9 @@ pub enum Action {
     /// `path` is carried for the audit trail only. It is what the
     /// inode was resolved *from*, never what the kernel matches on.
     BlockExecByInode {
+        /// The device as the **kernel** encodes it in
+        /// `super_block.s_dev`, which is not what `stat` reports to
+        /// userspace. Build it with [`kernel_dev_from_stat_dev`].
         dev: u64,
         ino: u64,
         path: String,
@@ -249,6 +252,30 @@ const PROTECTED_EXEC_PREFIXES: &[&str] = &[
     "/usr/bin/bowery",
 ];
 
+/// Re-encode a userspace `st_dev` into the `dev_t` the kernel holds in
+/// `super_block.s_dev`.
+///
+/// These are two different packings of the same major/minor pair, and
+/// conflating them is silent: the map write succeeds, the hook runs,
+/// the comparison simply never matches and the block does nothing.
+/// That is precisely what happened the first time this was tested on
+/// real hardware — a file on `/dev/nvme0n1p5` has `st_dev` 66309 while
+/// the kernel calls the same filesystem 271581189.
+///
+/// - glibc packs `st_dev` as
+///   `((major & ~0xfff) << 32) | ((major & 0xfff) << 8) | ((minor & ~0xff) << 12) | (minor & 0xff)`.
+/// - The kernel's own `dev_t` is `MKDEV(major, minor) = (major << 20) | minor`.
+///
+/// Done with bit arithmetic rather than `libc::major`/`minor` to keep
+/// this crate free of a libc dependency; the encoding is a stable part
+/// of the glibc ABI.
+#[must_use]
+pub const fn kernel_dev_from_stat_dev(st_dev: u64) -> u64 {
+    let major = ((st_dev >> 8) & 0x0fff) | ((st_dev >> 32) & !0x0fff);
+    let minor = (st_dev & 0xff) | ((st_dev >> 12) & !0xff);
+    (major << 20) | minor
+}
+
 /// Is this a path the agent must refuse to make unexecutable?
 #[must_use]
 pub fn is_protected_exec_path(path: &str) -> bool {
@@ -273,7 +300,9 @@ pub fn block_exec_by_inode_for(path: &str, episode_id: &str) -> Option<Action> {
         use std::os::unix::fs::MetadataExt as _;
         let md = std::fs::metadata(path).ok()?;
         Some(Action::BlockExecByInode {
-            dev: md.dev(),
+            // Kernel encoding, not the one `stat` hands userspace — see
+            // `kernel_dev_from_stat_dev`.
+            dev: kernel_dev_from_stat_dev(md.dev()),
             ino: md.ino(),
             path: path.to_string(),
             episode_id: episode_id.to_string(),
@@ -353,6 +382,35 @@ mod tests {
             }
             other => panic!("expected BlockExec, got {other:?}"),
         }
+    }
+
+    /// The bug the first hardware run found.
+    ///
+    /// Real numbers from otter1: a file on `/dev/nvme0n1p5` (major 259,
+    /// minor 5) has `st_dev` 66309, while the kernel calls that
+    /// filesystem 271581189. Passing the first where the second was
+    /// expected fails *silently* — the map write succeeds, the hook
+    /// runs, the comparison never matches, and the block does nothing.
+    #[test]
+    fn the_userspace_and_kernel_device_encodings_are_reconciled() {
+        assert_eq!(kernel_dev_from_stat_dev(66309), 271_581_189);
+        // major 259, minor 5 the long way round.
+        assert_eq!(kernel_dev_from_stat_dev(66309), (259 << 20) | 5);
+    }
+
+    /// Small-minor devices happen to agree in both encodings, which is
+    /// exactly why this can hide: a test on tmpfs would have passed.
+    #[test]
+    fn the_encodings_agree_for_major_zero_and_so_hide_the_bug() {
+        // major 0, minor 42 — e.g. a tmpfs mount.
+        assert_eq!(kernel_dev_from_stat_dev(42), 42);
+    }
+
+    #[test]
+    fn a_large_minor_is_not_truncated() {
+        // major 8, minor 300 — glibc splits the minor across two fields.
+        let st_dev: u64 = ((8u64 & 0xfff) << 8) | ((300u64 & !0xff) << 12) | (300u64 & 0xff);
+        assert_eq!(kernel_dev_from_stat_dev(st_dev), (8u64 << 20) | 300);
     }
 
     /// The inode key removes spoofing, not targeting. An attacker who

@@ -953,6 +953,13 @@ impl BpfBlocker {
 
     /// Block execution of the file at `(dev, ino)`.
     ///
+    /// `dev` must be the **kernel's** `dev_t` — what it stores in
+    /// `super_block.s_dev` — not the one `stat` reports to userspace.
+    /// They are different packings of the same major/minor pair, and
+    /// passing the wrong one fails silently: the insert succeeds, the
+    /// hook runs, and the comparison never matches. Convert with
+    /// `bowery_response::action::kernel_dev_from_stat_dev`.
+    ///
     /// # Errors
     /// When inode matching was never armed, or the map write fails.
     pub fn block_inode(&mut self, dev: u64, ino: u64) -> Result<(), LoaderError> {
