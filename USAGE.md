@@ -129,6 +129,14 @@ cargo build --release --workspace
 Binaries land in `target/release/`: `bowery` (operator CLI),
 `bowery-agent`, `bowery-console`.
 
+On a host that is *also* a monitored node, install them with
+`./scripts/build-install-operator` rather than by hand. It packages each
+binary and installs it with `dpkg`, which matters more than it sounds:
+a binary dropped into `/usr/bin` by `install` is owned by no package, so
+the agent's own provenance check scores it as an unpackaged newcomer and
+alerts on your own tooling. That is not a false positive — it is the
+detection working on a badly-deployed binary.
+
 ### The eBPF object — build once, ship everywhere
 
 The kernel sensor is a separate artifact. It targets

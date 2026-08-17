@@ -181,16 +181,95 @@ if [[ "$DO_AGENT" == 1 ]]; then smoke target/release/bowery-agent; fi
 if [[ "$DO_CONSOLE" == 1 ]]; then smoke target/release/bowery-console; fi
 
 # ---------------------------------------------------------------------------
-# Install.
+# Install, through dpkg where we can.
+#
+# `install`ing into /usr/bin leaves a binary owned by no package, and the
+# agent's own provenance check then scores it Unpackaged — which on this
+# very host made /usr/bin/bowery the single highest-suspicion thing the
+# fleet reported. The detection was right; a binary in /usr/bin that no
+# package owns genuinely is the shape it looks for. The deploy method was
+# wrong, and it was wrong here long after deploy/remote/ was fixed.
+#
+# ONE PACKAGE PER BINARY, deliberately. A single package whose contents
+# depend on --no-agent / --no-console would make dpkg *remove* whatever
+# this run didn't build: `--no-console` would silently uninstall the
+# console. Separate packages are each installed only when built, and
+# skipping one leaves it alone.
+#
+# The eBPF object is deliberately NOT packaged here, unlike the remote
+# path. It lives at /usr/local/lib/bowery, the loader searches there
+# first, and moving it would mean dancing around a stale copy shadowing
+# the new one — for no gain, since a data file in /usr/local was never
+# what triggered the alerts.
 # ---------------------------------------------------------------------------
+DEB_VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')~native"
+DEB_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+DEB_STAGE="target/deb"
+
+# make_deb <pkg> <summary> <src>...
+# Each <src> is installed to $BIN_DIR/<basename>.
+make_deb() {
+    local pkg="$1" summary="$2"; shift 2
+    local root="$DEB_STAGE/$pkg"
+    rm -rf "$root"
+    install -d -m0755 "$root/DEBIAN" "$root${BIN_DIR}"
+    local f
+    for f in "$@"; do
+        install -m0755 "$f" "$root${BIN_DIR}/$(basename "$f")"
+    done
+    cat > "$root/DEBIAN/control" <<EOF
+Package: $pkg
+Version: $DEB_VERSION
+Section: admin
+Priority: optional
+Architecture: $DEB_ARCH
+Maintainer: The Bowery <noreply@example.invalid>
+Description: $summary
+ Built on this host with -C target-cpu=native and therefore NOT
+ portable: llama.cpp's CPU dispatch can select an instruction path a
+ different core lacks and die with SIGILL. Do not copy this package to
+ another machine; use deploy/remote/package-agent.sh for those.
+EOF
+    # The whole point. dpkg installs this to /var/lib/dpkg/info/, which
+    # is exactly the file the agent's provenance index reads — so these
+    # binaries become PackagedIntact, and a *modified* copy of one
+    # becomes a finding.
+    ( cd "$root" && find . -type f -not -path "./DEBIAN/*" -printf "%P\0" \
+        | LC_ALL=C sort -z | xargs -0 md5sum > DEBIAN/md5sums )
+    dpkg-deb --root-owner-group --build "$root" "$DEB_STAGE/${pkg}_${DEB_VERSION}_${DEB_ARCH}.deb" >/dev/null
+    echo "$DEB_STAGE/${pkg}_${DEB_VERSION}_${DEB_ARCH}.deb"
+}
+
 echo
-echo "==> installing into $BIN_DIR (sudo)"
-run sudo install -m0755 target/release/bowery "$BIN_DIR/bowery"
-if [[ "$DO_CONSOLE" == 1 ]]; then
-    run sudo install -m0755 target/release/bowery-console "$BIN_DIR/bowery-console"
+if command -v dpkg-deb >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
+    echo "==> packaging + installing via dpkg (sudo)"
+    if [[ "$DRY_RUN" == 1 ]]; then
+        echo "  [dry-run] build .deb for bowery$([[ $DO_CONSOLE == 1 ]] && echo ', bowery-console')$([[ $DO_AGENT == 1 ]] && echo ', bowery-agent') and dpkg -i each"
+    else
+        DEBS=("$(make_deb bowery "The Bowery operator CLI" target/release/bowery)")
+        if [[ "$DO_CONSOLE" == 1 ]]; then
+            DEBS+=("$(make_deb bowery-console "The Bowery operator console" target/release/bowery-console)")
+        fi
+        if [[ "$DO_AGENT" == 1 ]]; then
+            DEBS+=("$(make_deb bowery-agent "The Bowery agent (llm-llama-cpp + yara)" target/release/bowery-agent)")
+        fi
+        sudo dpkg -i "${DEBS[@]}"
+    fi
+else
+    echo "==> installing into $BIN_DIR (sudo; dpkg not available)"
+    echo "    NOTE: without dpkg these binaries stay unowned by any package, so"
+    echo "          the agent will score them as unpackaged newcomers and alert"
+    echo "          on its own tooling."
+    run sudo install -m0755 target/release/bowery "$BIN_DIR/bowery"
+    if [[ "$DO_CONSOLE" == 1 ]]; then
+        run sudo install -m0755 target/release/bowery-console "$BIN_DIR/bowery-console"
+    fi
+    if [[ "$DO_AGENT" == 1 ]]; then
+        run sudo install -m0755 target/release/bowery-agent "$BIN_DIR/bowery-agent"
+    fi
 fi
+
 if [[ "$DO_AGENT" == 1 ]]; then
-    run sudo install -m0755 target/release/bowery-agent "$BIN_DIR/bowery-agent"
 
     # The eBPF object is loaded from disk at runtime, NOT embedded in the
     # binary, so installing the agent alone leaves the kernel program at
