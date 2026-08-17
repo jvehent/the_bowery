@@ -163,6 +163,14 @@ const PASSWORD_TOOLS: &[&str] = &[
     "/lib/systemd/systemd",
     "/usr/sbin/lightdm",
     "/usr/sbin/gdm3",
+    // The display manager's per-session auth helper, which is what
+    // actually runs PAM for a graphical login — `gdm3` itself does not
+    // read the password databases, this does. Caught on a desktop host;
+    // a headless fleet would never have shown it.
+    "/usr/libexec/gdm-session-worker",
+    "/usr/lib/gdm3/gdm-session-worker",
+    "/usr/libexec/lightdm-session",
+    "/usr/lib/lightdm/lightdm-session",
     "/usr/bin/polkit-agent-helper-1",
     "/usr/lib/policykit-1/polkit-agent-helper-1",
     // Found by reading the fleet's inbox rather than by reasoning about

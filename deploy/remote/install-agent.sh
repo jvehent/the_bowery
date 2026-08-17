@@ -82,9 +82,19 @@ if [[ -n "$DEB" && -f "$DEB" ]] && command -v dpkg >/dev/null 2>&1; then
         systemctl restart bowery-agent.service
     fi
     echo
-    echo "Installed from a package. /etc/bowery/agent.toml is NOT written by"
-    echo "the .deb — configure it as documented in USAGE.md, then:"
-    echo "  systemctl enable --now bowery-agent"
+    # An upgrade and a first install need opposite advice, and printing
+    # the first-install text on every upgrade taught the operator to
+    # ignore it: it says "configure this" about a file that already
+    # exists and "enable the service" about one already running.
+    if [[ "$was_active" == yes ]]; then
+        echo "Upgraded in place. /etc/bowery/agent.toml was left untouched"
+        echo "(the .deb does not ship it), and the service is running again:"
+        systemctl --no-pager --lines=0 status bowery-agent.service | head -3
+    else
+        echo "Installed from a package. /etc/bowery/agent.toml is NOT written"
+        echo "by the .deb — configure it as documented in USAGE.md, then:"
+        echo "  systemctl enable --now bowery-agent"
+    fi
     exit 0
 fi
 
