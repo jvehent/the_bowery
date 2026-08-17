@@ -409,8 +409,9 @@ mod tests {
     #[test]
     fn a_large_minor_is_not_truncated() {
         // major 8, minor 300 — glibc splits the minor across two fields.
-        let st_dev: u64 = ((8u64 & 0xfff) << 8) | ((300u64 & !0xff) << 12) | (300u64 & 0xff);
-        assert_eq!(kernel_dev_from_stat_dev(st_dev), (8u64 << 20) | 300);
+        let (major, minor) = (0x8u64, 0x12cu64); // 8 / 300
+        let st_dev: u64 = ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | (minor & 0xff);
+        assert_eq!(kernel_dev_from_stat_dev(st_dev), (major << 20) | minor);
     }
 
     /// The inode key removes spoofing, not targeting. An attacker who
