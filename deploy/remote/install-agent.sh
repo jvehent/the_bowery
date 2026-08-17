@@ -56,6 +56,38 @@ done
 
 [[ $EUID -eq 0 ]] || die "must run as root (use sudo)"
 
+# ---------------------------------------------------------------------------
+# Prefer the .deb when the tarball carries one.
+#
+# `install`ing into /usr/bin leaves a binary owned by no package, and the
+# agent's own provenance check then classifies it Unpackaged — which on
+# the live fleet made `/usr/bin/bowery`, our own CLI, the single
+# highest-suspicion alert on the host. The detection was right: a binary
+# in /usr/bin that no package owns genuinely is the shape it looks for.
+# Installing through dpkg registers the md5sums the check reads, so the
+# agent stops reporting its own deploy — and starts reporting a *modified*
+# copy of itself, which is the finding worth having.
+#
+# The tarball path below stays for hosts without dpkg.
+# ---------------------------------------------------------------------------
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEB="$(ls "$SRC_DIR"/bowery-agent_*.deb 2>/dev/null | head -1 || true)"
+if [[ -n "$DEB" && -f "$DEB" ]] && command -v dpkg >/dev/null 2>&1; then
+    echo "==> installing $DEB via dpkg"
+    was_active=no
+    systemctl is-active --quiet bowery-agent.service && was_active=yes
+    dpkg -i "$DEB"
+    if [[ "$was_active" == yes ]]; then
+        echo "==> restarting bowery-agent (upgrade over a running service)"
+        systemctl restart bowery-agent.service
+    fi
+    echo
+    echo "Installed from a package. /etc/bowery/agent.toml is NOT written by"
+    echo "the .deb — configure it as documented in USAGE.md, then:"
+    echo "  systemctl enable --now bowery-agent"
+    exit 0
+fi
+
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Two supported layouts:
 #   1. Packaged tarball  — every file sits next to this script.

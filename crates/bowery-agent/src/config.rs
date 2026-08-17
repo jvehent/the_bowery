@@ -441,6 +441,16 @@ pub struct CorroborationConfig {
     /// Suspicion stamped on an alert a round confirms.
     #[serde(default = "default_corroboration_suspicion")]
     pub suspicion: f32,
+    /// Suspicion for a finding the neighbourhood **explains**.
+    ///
+    /// When peers report the same binary touching the same file, the
+    /// behaviour is how this fleet is built rather than something one
+    /// host is doing alone, and a superseding alert re-scores it here.
+    /// Deliberately low but non-zero: the finding is downgraded, never
+    /// deleted, because "every host does this" is also what a fleet-wide
+    /// compromise looks like.
+    #[serde(default = "default_explained_suspicion")]
+    pub explained_suspicion: f32,
 }
 
 impl Default for CorroborationConfig {
@@ -454,6 +464,7 @@ impl Default for CorroborationConfig {
             dedup_entries: default_corroboration_dedup_entries(),
             half_window: default_corroboration_half_window(),
             suspicion: default_corroboration_suspicion(),
+            explained_suspicion: default_explained_suspicion(),
         }
     }
 }
@@ -484,6 +495,9 @@ fn default_corroboration_half_window() -> Duration {
 }
 /// High. A peer denying a connection it is the recorded source of means
 /// its agent is blind or the address was spoofed; neither is routine.
+fn default_explained_suspicion() -> f32 {
+    0.15
+}
 fn default_corroboration_suspicion() -> f32 {
     0.85
 }

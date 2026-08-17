@@ -117,6 +117,10 @@ pub fn claim_for(conn: &NetworkConnect, half_window: Duration, suspicion: f32) -
             conn.daddr, conn.local_addr, conn.local_port
         ),
         suspicion,
+        // A counterparty claim stands alone: there is no earlier alert
+        // to revise, because the inbound connection raised none.
+        supersedes: None,
+        explained_suspicion: 0.0,
     })
 }
 

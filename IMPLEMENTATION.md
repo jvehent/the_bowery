@@ -3123,6 +3123,155 @@ useful half.
 
 ---
 
+## 28b. Making the agent discard its own noise
+
+The fleet's inbox, pulled live: **63 alerts in 24 minutes, 61 of them
+`sshd` and `unix_chkpwd` doing their job.**
+
+| count | reader | suspicion | path |
+| --- | --- | --- | --- |
+| 12 | `sshd` | 0.85 | `/etc/ssh/ssh_host_rsa_key` |
+| 12 | `sshd` | 0.85 | `/etc/ssh/ssh_host_ecdsa_key` |
+| 12 | `sshd` | 0.85 | `/etc/ssh/ssh_host_ed25519_key` |
+| 12 | `sshd` | 0.90 | `/etc/shadow` |
+| 12 | `sshd` | 0.60 | `~/.ssh/authorized_keys` |
+| 1 | `unix_chkpwd` | 0.90 | `/etc/shadow` |
+| 2 | — | 1.00 | `/usr/bin/bowery` |
+
+Five distinct defects, not one.
+
+### 28b.1 The rule already knew
+
+`cred.read_ssh_host_key`'s own rationale reads *"an SSH host private key
+was read. sshd does this at startup; anything else can impersonate this
+host."* The exemption was written in English, shown to the operator, and
+implemented nowhere.
+
+Each rule now carries `sanctioned_readers`: absolute exe paths whose
+**job** requires that path. [`reader_is_sanctioned`] requires two things
+and both matter:
+
+1. The reader's resolved exe is one the rule names.
+2. Package provenance says [`PackagedIntact`].
+
+The second makes the first safe. A path list alone is defeated by
+writing to one of those paths; requiring the package to vouch for the
+contents means the exemption covers the distribution's `sshd` and not a
+trojanised one — the case that matters most, since a backdoored `sshd`
+reading every host key is exactly what this is supposed to catch.
+
+**Never keyed on `comm`.** The file-watch module already refused to
+suppress *writes* by process name, for a reason that applies with more
+force here: `comm` is 16 bytes any process sets with `prctl`, so a
+name-keyed allowlist would be a published recipe for reading every
+credential on the host in silence. The exe comes from
+`/proc/<pid>/exe`.
+
+**It fails closed**, which inverts the default used by the uid-transition
+rule. There, an unreadable parent reports *nothing*, because a transition
+could not be established. Here an unreadable exe reports the finding,
+because an exemption must be *earned* — and a detection that goes quiet
+whenever it cannot look is one an attacker only has to outrun.
+
+The reader sets were taken from the fleet rather than guessed, which
+caught something a plausible list would have missed: Debian 13 ships
+OpenSSH 9.8+, which splits per-connection work into `sshd-session` and
+`sshd-auth`, and Debian 12 does not. Omitting them would have left the
+newer hosts alerting on every login while the older ones went quiet —
+a detection that looks like it works until you notice *which* hosts are
+silent.
+
+### 28b.2 The same event, twice
+
+pid 410930 read `ssh_host_rsa_key` twice in the same second and produced
+two alerts; sshd opens each key more than once per connection.
+
+[`suppress.rs`](crates/bowery-analysis/src/suppress.rs) folds identical
+findings — same rule, same path, same **reader exe** — into one report
+per window (`[detection] repeat_window`, default 1h). The exe is part of
+the key so a noisy legitimate reader can never provide cover for a quiet
+illegitimate one.
+
+The count travels with the alert rather than being dropped. "`sshd` read
+a host key" and "`sshd` read a host key 4,000 times in the last hour" are
+different events, and the second is the interesting one.
+
+### 28b.3 Our own deploy was the loudest thing on the host
+
+`dpkg -S /usr/bin/bowery` → *no path found*. `deploy/remote/` `scp`s the
+binary, so provenance said `Unpackaged`, rarity stayed undamped, and the
+CLI scored **1.00** on every node.
+
+The detection was right. A binary in `/usr/bin` that no package owns
+genuinely is the shape it exists to find; the deploy method was wrong.
+`package-agent.sh` now builds a real `.deb` with `dpkg-deb` — no
+`cargo-deb` dependency, and cross-arch is one `Architecture:` line. What
+matters is `DEBIAN/md5sums`, which dpkg installs to
+`/var/lib/dpkg/info/`, the exact file `PackageIndex` reads. That is what
+makes the agent's own binaries `PackagedIntact`, and it is also what
+makes a *modified* copy of the agent a finding afterwards.
+
+One upgrade hazard is handled explicitly: the loader searches
+`/usr/local/lib/bowery` **before** `/usr/lib`, so an object left by an
+older tarball install would silently shadow the packaged one and the
+agent would keep running the old probe after an upgrade that appeared to
+succeed. The `postinst` moves it aside and says so.
+
+### 28b.4 One row per episode
+
+An episode produces several alerts as it is refined, each superseding the
+last. The console and `bowery notify` have always collapsed them;
+`bowery_alerts` did not, so the fleet reported `/usr/bin/bowery` twice
+for one finding and an operator comparing the two surfaces got different
+counts for the same inbox.
+
+A blank `episode_id` is deliberately not an identity — those are distinct
+findings sharing an empty field, and keying on it would hide all but the
+last.
+
+### 28b.5 The mesh can now take a finding back
+
+Every corroboration kind until this one could only make things worse: the
+round ran, the rule fired, an alert appeared. That shape cannot express
+the most useful answer a neighbourhood can give — *"we all do that"* —
+which is exactly what separates a management agent from credential
+theft.
+
+[`file_access.rs`](crates/bowery-agent/src/corroboration/file_access.rs)
+asks up to three peers whether the same binary touches the same file on
+their hosts. [`Claim`] gained `supersedes` + `explained_suspicion`, and a
+round that finds corroboration without confirming appends a superseding
+alert re-scored to 0.15. Since `bowery notify` keeps the newest alert per
+episode and filters by `min_suspicion`, the downgraded version is what
+reaches the operator — or nothing at all.
+
+Four properties keep it honest:
+
+- **The local finding is raised first and always.** A detection that
+  waits for the mesh says nothing on a single-node install, on a
+  partitioned network, or when every peer is down — the moments it
+  matters most. The round can only ever take a finding *back*.
+- **`deny_quorum: 0`.** This round can never raise an alert of its own.
+  A second alert saying "and nobody else does this" would double every
+  credential finding on the fleet rather than clarify it.
+- **Zero corroborating peers never downgrades anything.** The same rule
+  that stops a blind peer confirming an alert, applied in the other
+  direction: silence is not evidence, whichever way it would point.
+- **A peer answers only about paths its own watch set covers.** Without
+  that bound the query would be a filesystem-enumeration oracle — ask
+  about any path and learn from the answer whether it exists and who
+  touched it. Restricted to the watch set, a peer discloses only the same
+  class of fact the asker already observed for itself.
+
+The exe is recovered by joining `file_open` rows against the `exec` row
+for the same pid. `file_open` carries no `exe_path` and adding one would
+put a readlink on the agent's hottest path — the sensor reports *every*
+write-intent open on the host. Pid reuse is the known imprecision; it
+biases towards corroborating, which can only ever downgrade a finding
+that was already reported, never delete it.
+
+---
+
 ## 29. Reaching an operator who isn't watching
 
 ### 29.1 `bowery notify`

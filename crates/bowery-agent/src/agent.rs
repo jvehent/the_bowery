@@ -599,6 +599,12 @@ impl Agent {
                     mesh.peers_watcher(),
                 ),
             ));
+            // Same reasoning, same dependency: "no binary reads that
+            // file here" is only evidence from a host whose history
+            // covers the window.
+            responders = responders.with(Arc::new(
+                crate::corroboration::file_access::FileAccessResponder::new(log.clone()),
+            ));
         }
         let responders = Arc::new(responders);
         debug!(?responders, "corroboration responders registered");
@@ -3364,6 +3370,8 @@ async fn process_event(
                 packages,
                 suppressor,
                 suppress_window,
+                claims,
+                corroboration,
                 &open,
             )
             .await;
@@ -3465,7 +3473,7 @@ async fn process_network_connect(
 /// it would explain away — but the kind is not registered yet, and
 /// stamping an unconfirmed block on the alert would imply a check that
 /// never ran.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn process_file_open(
     inbox: &Arc<AlertInbox>,
     originator_fp: Fingerprint,
@@ -3474,6 +3482,8 @@ async fn process_file_open(
     packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
     suppressor: &Arc<bowery_analysis::AlertSuppressor>,
     suppress_window: Duration,
+    claims: Option<&crate::corroboration::ClaimSink>,
+    corroboration: &crate::config::CorroborationConfig,
     open: &bowery_events::FileOpen,
 ) {
     let path = open.path.display().to_string();
@@ -3599,9 +3609,31 @@ async fn process_file_open(
     );
     inbox.append(alert);
     let _ = events_tx.send(AgentEvent::AlertEmitted {
-        episode_id,
+        episode_id: episode_id.clone(),
         suspicion: hit.severity,
     });
+
+    // Ask the neighbourhood whether this is just what the fleet does.
+    //
+    // Raised *after* the alert, never instead of it. A detection that
+    // waits for the mesh says nothing on a single-node install, on a
+    // partitioned network, or when every peer is down — which are
+    // exactly the moments it matters most. The round can only supersede
+    // what was already reported, with a lower score, and only when peers
+    // actually answered.
+    if let Some(claims) = claims
+        && let Some(claim) = crate::corroboration::file_access::claim_for(
+            exe_str.as_deref(),
+            &path,
+            open.sensitive_read,
+            episode_id,
+            open.ts,
+            corroboration.half_window,
+            corroboration.explained_suspicion,
+        )
+    {
+        claims.raise(claim);
+    }
 }
 
 /// Everything an operator needs to judge an exec alert without logging

@@ -112,6 +112,20 @@ causes are now addressed: blind peers (phase A), young peers
 (phase C provenance, plus optional VirusTotal screening at the notify
 boundary).
 
+Then the credential-read rules shipped and the fleet produced **63
+alerts in 24 minutes, 61 of them `sshd` doing its job** — the same
+lesson in a new place. Four causes, all now fixed: rules that named
+their own exemption in prose and never applied it; every `open()`
+alerting separately; `bowery_alerts` counting superseding alerts twice;
+and our own installer dropping unpackaged binaries into `/usr/bin`,
+which made `/usr/bin/bowery` the highest-suspicion thing on the host.
+
+The recurring shape is worth naming, because it will happen again: a
+detection is written, it is correct, and the *benign* case that
+dominates real hosts was never enumerated. Shipping a rule now means
+pulling the fleet's inbox a day later and reading what it actually
+produced.
+
 What remains after all of it is a binary that is **rare here, owned by
 no package, and unknown to the industry** — a much shorter list, and the
 one worth reading. Keeping it that way is the standing constraint on
@@ -262,10 +276,16 @@ No new sensors required:
 Deliberately after the fundamentals, because a distributed detection
 built on a blind sensor is still blind.
 
-- **More corroboration kinds** — the substrate is generic and has one
-  registered kind. Destination rarity, persistence-file rarity, and
-  "did an operator really push you this rule?" all fit with no protocol
-  change.
+- **More corroboration kinds** — the substrate is generic and has two
+  registered kinds. `file.access` *(built)* asks "does this binary touch
+  this file on your host too?", and is the first round that can
+  **downgrade** rather than escalate: every earlier kind could only make
+  things worse, which could not express the most useful answer a
+  neighbourhood gives — *"we all do that"*. It supersedes the local
+  alert with a lower score, never raises one of its own, never runs
+  before the local finding, and treats corroboration from zero peers as
+  the non-evidence it is. Destination rarity and "did an operator really
+  push you this rule?" still fit with no protocol change.
 - **Peer-witnessed audit.** Root on a host means deleting the local
   audit log. Peers holding the chain head make deletion detectable — an
   attacker cannot retract hashes their neighbours already have.

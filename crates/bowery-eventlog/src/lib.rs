@@ -454,6 +454,85 @@ impl EventLog {
         Ok(found)
     }
 
+    /// Has *this* host seen `exe` touch `path` the same way, inside the
+    /// window?
+    ///
+    /// Answers the `file.access` corroboration question: some binary
+    /// read a credential file over there — is that what this fleet looks
+    /// like, or is that host doing something the others are not?
+    ///
+    /// # Why this joins rather than reading a column
+    ///
+    /// `file_open` rows carry `comm` but no `exe_path`: the sensor
+    /// reports every write-intent open on the host, and resolving
+    /// `/proc/<pid>/exe` for each one would put a readlink on the
+    /// hottest path the agent has. `comm` cannot stand in for it — it is
+    /// 16 bytes any process sets with `prctl`, so two hosts "agreeing"
+    /// about a process called `sshd` would agree about nothing.
+    ///
+    /// So the exe comes from the `exec` row for the same pid, which was
+    /// already recorded and already carries a resolved path. The cost
+    /// moves off the hot path and onto the rare question.
+    ///
+    /// **Pid reuse** is the known imprecision: over a long window a pid
+    /// can be recycled, and the wrong exec row could match. It biases
+    /// towards *corroborating* — that is, towards calling something
+    /// fleet-normal — so it is bounded by the responder's window clamp
+    /// and never allowed to be the only evidence: a corroboration
+    /// downgrades a finding that was already reported and can never
+    /// delete it.
+    pub fn file_access_seen(
+        &self,
+        exe: &str,
+        path: &str,
+        is_read: bool,
+        window_start_unix_ms: u64,
+        window_end_unix_ms: u64,
+    ) -> Result<bool> {
+        // Reconstruct write-intent from the raw openat flags, using the
+        // same test the probe applies in the kernel. Storing the
+        // decision would have been a second source of truth for one
+        // boolean.
+        const O_ACCMODE: i64 = 0o3;
+        const O_WRONLY: i64 = 0o1;
+        const O_RDWR: i64 = 0o2;
+        const CREATES: i64 = 0o100 | 0o1000 | 0o2000; // O_CREAT|O_TRUNC|O_APPEND
+
+        let conn = self.inner.lock().expect("event log mutex poisoned");
+        let write_intent = format!(
+            "((f.open_flags & {O_ACCMODE}) IN ({O_WRONLY}, {O_RDWR}) \
+              OR (f.open_flags & {CREATES}) != 0)"
+        );
+        let sql = format!(
+            "SELECT 1 FROM events f
+             WHERE f.kind = ?1 AND f.path = ?2
+               AND f.ts_unix_ms BETWEEN ?4 AND ?5
+               AND {} {write_intent}
+               AND EXISTS (
+                   SELECT 1 FROM events x
+                   WHERE x.kind = ?6 AND x.pid = f.pid AND x.exe_path = ?3
+                     AND x.ts_unix_ms <= f.ts_unix_ms
+               )
+             LIMIT 1",
+            if is_read { "NOT" } else { "" }
+        );
+        let found: Option<i64> = conn
+            .query_row(
+                &sql,
+                params![
+                    KIND_FILE_OPEN,
+                    path,
+                    exe,
+                    i64::try_from(window_start_unix_ms).unwrap_or(0),
+                    i64::try_from(window_end_unix_ms).unwrap_or(i64::MAX),
+                    KIND_EXEC,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Checkpoint the WAL into the main file.
     ///
     /// This is about bounding WAL growth, *not* visibility: a read-only
@@ -931,9 +1010,10 @@ mod migration_tests {
 
 #[cfg(test)]
 mod correlation_tests {
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use bowery_events::{Event, NetDirection, NetFamily, NetworkConnect};
+    use bowery_events::{Event, NetDirection, NetFamily, NetworkConnect, ProcessExec};
 
     use super::*;
 
@@ -1022,6 +1102,110 @@ mod correlation_tests {
                 .unwrap()
                 .is_none(),
             "direction must be part of the match"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // file.access corroboration
+    // -----------------------------------------------------------------
+
+    fn sshd_reading_shadow(log: &EventLog, pid: u32, ts: SystemTime, exe: &str) {
+        log.append_batch(&[
+            Event::ProcessExec(ProcessExec {
+                pid,
+                ppid: 1,
+                parent_comm: String::new(),
+                uid: 0,
+                comm: "sshd".into(),
+                exe_path: Some(PathBuf::from(exe)),
+                args: Vec::new(),
+                ts,
+            }),
+            Event::FileOpen(bowery_events::FileOpen {
+                pid,
+                comm: "sshd".into(),
+                path: PathBuf::from("/etc/shadow"),
+                // O_RDONLY: a read, which is what the rule is about.
+                flags: 0,
+                truncated: false,
+                sensitive_read: true,
+                ts,
+            }),
+        ])
+        .unwrap();
+    }
+
+    fn window() -> (u64, u64) {
+        (0, u64::MAX / 2)
+    }
+
+    /// The exe comes from the `exec` row for the same pid, because
+    /// `file_open` rows carry no `exe_path` — resolving one per open
+    /// would put a readlink on the agent's hottest path.
+    #[test]
+    fn a_matching_access_is_found_by_joining_through_the_exec_row() {
+        let log = EventLog::open_in_memory().unwrap();
+        sshd_reading_shadow(&log, 4242, SystemTime::now(), "/usr/sbin/sshd");
+        let (start, end) = window();
+        assert!(
+            log.file_access_seen("/usr/sbin/sshd", "/etc/shadow", true, start, end)
+                .unwrap()
+        );
+    }
+
+    /// A different binary reading the same file is not the same finding
+    /// — this is what stops a peer explaining away credential theft
+    /// because its own sshd happens to read shadow too.
+    #[test]
+    fn a_different_exe_touching_the_same_path_does_not_match() {
+        let log = EventLog::open_in_memory().unwrap();
+        sshd_reading_shadow(&log, 4242, SystemTime::now(), "/usr/sbin/sshd");
+        let (start, end) = window();
+        assert!(
+            !log.file_access_seen("/tmp/harvest", "/etc/shadow", true, start, end)
+                .unwrap()
+        );
+    }
+
+    /// Reading a file and writing it are different events, and a peer
+    /// must not corroborate one having seen the other.
+    #[test]
+    fn a_read_does_not_corroborate_a_write() {
+        let log = EventLog::open_in_memory().unwrap();
+        sshd_reading_shadow(&log, 4242, SystemTime::now(), "/usr/sbin/sshd");
+        let (start, end) = window();
+        assert!(
+            !log.file_access_seen("/usr/sbin/sshd", "/etc/shadow", false, start, end)
+                .unwrap(),
+            "an O_RDONLY open must not answer a question about writes"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_path_does_not_match() {
+        let log = EventLog::open_in_memory().unwrap();
+        sshd_reading_shadow(&log, 4242, SystemTime::now(), "/usr/sbin/sshd");
+        let (start, end) = window();
+        assert!(
+            !log.file_access_seen("/usr/sbin/sshd", "/etc/gshadow", true, start, end)
+                .unwrap()
+        );
+    }
+
+    /// An empty history answers "no" here; the responder is what turns
+    /// that into a *refusal* rather than evidence of absence, via
+    /// `covers_since`.
+    #[test]
+    fn an_empty_log_reports_nothing_seen() {
+        let log = EventLog::open_in_memory().unwrap();
+        let (start, end) = window();
+        assert!(
+            !log.file_access_seen("/usr/sbin/sshd", "/etc/shadow", true, start, end)
+                .unwrap()
+        );
+        assert!(
+            !log.covers_since(start).unwrap(),
+            "and covers_since must say the history cannot speak to the window"
         );
     }
 }

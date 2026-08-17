@@ -395,6 +395,7 @@ impl BoweryTable for BoweryAlertsTable {
             );",
         )?;
         let (alerts, _) = self.inbox.read_since(0, usize::MAX);
+        let alerts = collapse_superseded(alerts);
         let mut stmt = conn.prepare(
             "INSERT INTO bowery_alerts (originator_fp_hex, episode_id, exe_sha256_hex,
                                          exe_path, suspicion, rationale, ts_unix_ms, backend,
@@ -429,6 +430,39 @@ impl BoweryTable for BoweryAlertsTable {
         }
         Ok(())
     }
+}
+
+/// One row per episode, keeping the alert that superseded the others.
+///
+/// An episode can produce several alerts: the initial one, an
+/// LLM-refined one, and a quorum-confirmed one. The later ones
+/// **supersede** rather than accompany the first — the inbox has no
+/// update path, so a refinement arrives as a new alert rather than an
+/// edit. The console and `bowery notify` have always collapsed them;
+/// this view did not, so a fleet query counted the same finding two or
+/// three times and an operator comparing the two surfaces got different
+/// numbers for the same inbox.
+///
+/// Order is preserved and the newest wins: the inbox reads oldest-first,
+/// so a later entry always supersedes an earlier one. The surviving row
+/// keeps the *original* position so a query ordered by insertion still
+/// reads as a timeline.
+///
+/// An empty `episode_id` is never an identity. Alerts that carry no
+/// episode are distinct findings that happen to share a blank field, and
+/// treating that as a key would collapse all of them into one row.
+fn collapse_superseded(alerts: Vec<bowery_proto::Alert>) -> Vec<bowery_proto::Alert> {
+    let mut out: Vec<bowery_proto::Alert> = Vec::with_capacity(alerts.len());
+    for a in alerts {
+        match out
+            .iter_mut()
+            .find(|e| !a.episode_id.is_empty() && e.episode_id == a.episode_id)
+        {
+            Some(slot) => *slot = a,
+            None => out.push(a),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,5 +1190,86 @@ mod alerts_view_tests {
             .await
             .expect("query");
         assert_eq!(rows.len(), 1, "absent confirmation must render as NULL");
+    }
+
+    /// One row per episode, not one per alert.
+    ///
+    /// An episode produces several alerts as it is refined — the
+    /// pre-filter one, then the LLM's, then a quorum-confirmed one — and
+    /// each supersedes the last rather than accompanying it. The console
+    /// and `bowery notify` have always collapsed them; this view did not,
+    /// so the live fleet reported `/usr/bin/bowery` twice for a single
+    /// finding and an operator comparing the two surfaces got different
+    /// counts for the same inbox.
+    #[tokio::test]
+    async fn a_superseded_alert_does_not_get_its_own_row() {
+        let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
+        let base = |rationale: &str, suspicion: f32| Alert {
+            originator_fp: vec![0x11; 32],
+            episode_id: "ep-27234-refined".into(),
+            exe_sha256_hex: "ea7ac6f7".into(),
+            exe_path: "/usr/bin/bowery".into(),
+            suspicion,
+            rationale: rationale.into(),
+            suggested_actions: Vec::new(),
+            ts_unix_ms: crate::inbox::current_unix_ms(),
+            backend: "test".into(),
+            confirmation: None,
+            context: Vec::new(),
+        };
+        inbox.append(base("pre-filter score above threshold", 1.0));
+        inbox.append(base("the model looked and found nothing", 0.2));
+
+        let sql = bowery_sql::Sql::new().with_extra_table(Arc::new(BoweryAlertsTable::new(inbox)));
+        let rows = sql
+            .query(
+                "SELECT rationale FROM bowery_alerts WHERE episode_id = 'ep-27234-refined'",
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("query");
+        assert_eq!(rows.len(), 1, "two alerts for one episode must be one row");
+        // And the surviving row is the refinement, not the thing it
+        // replaced — keeping the older one would report a verdict that
+        // has already been overturned.
+        assert!(
+            format!("{:?}", rows[0].columns).contains("found nothing"),
+            "the newest alert must win: {:?}",
+            rows[0].columns
+        );
+    }
+
+    /// A blank episode is not an identity.
+    ///
+    /// Alerts carrying no episode are distinct findings that happen to
+    /// share an empty field; keying on it would collapse every one of
+    /// them into a single row and hide all but the last.
+    #[tokio::test]
+    async fn alerts_without_an_episode_never_collapse() {
+        let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
+        for path in ["/tmp/a", "/tmp/b", "/tmp/c"] {
+            inbox.append(Alert {
+                originator_fp: vec![0x22; 32],
+                episode_id: String::new(),
+                exe_sha256_hex: String::new(),
+                exe_path: path.into(),
+                suspicion: 0.9,
+                rationale: "x".into(),
+                suggested_actions: Vec::new(),
+                ts_unix_ms: crate::inbox::current_unix_ms(),
+                backend: "test".into(),
+                confirmation: None,
+                context: Vec::new(),
+            });
+        }
+        let sql = bowery_sql::Sql::new().with_extra_table(Arc::new(BoweryAlertsTable::new(inbox)));
+        let rows = sql
+            .query(
+                "SELECT exe_path FROM bowery_alerts WHERE episode_id = ''",
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("query");
+        assert_eq!(rows.len(), 3);
     }
 }

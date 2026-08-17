@@ -171,8 +171,10 @@ yet.
 
 Rules: `cred.read_shadow`, `cred.read_gshadow`, `cred.read_opasswd`, `cred.shadow`, `cred.passwd`
 
-Gap: a read performed by a process that legitimately reads shadow (sshd, su) is
-indistinguishable from one that does not.
+Gap: the sanctioned readers (a packaged, unmodified `sshd`, `su`, `login`, PAM) are
+exempt, so a compromise *of one of those binaries* that leaves the package hash
+intact — an injected library, a hijacked child process — reads shadow without a
+finding.
 
 ### T1552.001 — Unsecured Credentials: Credentials In Files
 
@@ -181,7 +183,8 @@ indistinguishable from one that does not.
 Rules: `cred.read_aws`, `cred.read_kube`, `cred.read_netrc`, `cred.read_pgpass`, `cred.read_mysql`, `cred.read_git`, `cred.read_docker`, `cred.read_rails_master_key`, `cred.read_htpasswd`
 
 Gap: a known list of well-known credential paths. Application-specific secret files
-nobody enumerated are not watched, and neither is a `.env`.
+nobody enumerated are not watched, and neither is a `.env`. No reader is sanctioned
+for these, so every access is a finding.
 
 ### T1552.004 — Unsecured Credentials: Private Keys
 
@@ -273,3 +276,4 @@ entry in the analyzer's rule lists:
 - `yara.match`
 - `probe.sensor_blind`
 - `corroborate.net_inbound_connect`
+- `corroborate.file_access`

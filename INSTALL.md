@@ -491,6 +491,10 @@ uid_transitions     = true   # a process running as root whose parent was not,
 discovery_bursts    = true   # several DIFFERENT recon commands from one parent
 discovery_window    = "1m"
 discovery_threshold = 5      # distinct commands; `id` in a loop never trips it
+repeat_window       = "1h"   # fold an identical file finding (same rule, same path,
+                             # same reader binary) into one alert per window. Repeats
+                             # are COUNTED, not dropped: the next report says how many
+                             # it stands for. "0s" reports every occurrence.
 
 # Operator-configurable monitoring (both lists default empty = feature off).
 # Query the effective rules with: SELECT * FROM bowery_monitor_rules

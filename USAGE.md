@@ -62,16 +62,26 @@ binary no package owns), **lineage** (a network service spawning a
 shell), **privilege transitions** (a process running as root whose
 parent was not, outside the sanctioned `sudo`/`su`/`pkexec` path), and
 **reconnaissance bursts** (five different discovery commands from one
-parent inside a minute). Two things damp
+parent inside a minute). Four things damp
 the noise: a binary the package manager installed and has not modified
-is not interesting on first run, and `sshd` starting a shell is a login.
+is not interesting on first run; `sshd` starting a shell is a login; a
+binary whose **job** is reading a credential file (a packaged, unmodified
+`sshd` reading host keys, `unix_chkpwd` reading `/etc/shadow`) is not a
+finding; and repeats of an identical finding fold into one alert that
+says how many it stands for.
+
+That third one is anchored on the reader's **exe path plus package
+provenance**, never on its process name — so a trojanised `sshd`, or
+something merely *called* `sshd` from `/tmp`, is still caught. If the exe
+cannot be read at all, the alert is raised: the exemption has to be
+earned.
 
 Per-technique detail, including what is *not* covered, is in
 [`docs/ATTACK-COVERAGE.md`](docs/ATTACK-COVERAGE.md). It is generated
 from the rule tables, so it cannot claim coverage the code does not
 have.
 
-**Whispering is what makes it more than N separate agents.** Two kinds
+**Whispering is what makes it more than N separate agents.** Three kinds
 run today:
 
 - *Prevalence* — "have you seen this binary?" A quorum of peers that
@@ -80,10 +90,16 @@ run today:
 - *Corroboration* — "did you connect to me?" An inbound connection the
   source host has no record of making is either a blind agent or a
   spoofed address. Neither is visible from one machine.
+- *Access shape* — "does this binary touch this file on your host too?"
+  Peers that see the same thing turn a local finding into how the fleet
+  is built, and the alert is **superseded by a downgraded one** rather
+  than a second alert. It can only ever take a finding back, never raise
+  one, and it never runs before the local alert.
 
-Both refuse to answer when they lack standing — a peer with an empty or
-young baseline says "I can't say" rather than voting. That distinction
-is load-bearing; see §9.
+All three refuse to answer when they lack standing — a peer with an
+empty or young baseline, or whose history does not cover the window
+asked about, says "I can't say" rather than voting. That distinction is
+load-bearing; see §9.
 
 ---
 
@@ -134,9 +150,18 @@ cargo install cross --git https://github.com/cross-rs/cross    # needs Docker
 ```
 
 The tarball carries the agent, the CLI, the systemd units, a config
-template, and the eBPF object. `package-agent.sh` refuses to build
-without the object, because a package that silently produces a blind
-agent is worse than one that fails.
+template, the eBPF object, and — where `dpkg-deb` is available on the
+build host — a **`.deb`**. `install-agent.sh` prefers the `.deb`, and you
+want it to: a binary dropped into `/usr/bin` by `install` is owned by no
+package, so the agent's own provenance check scores it as an unpackaged
+newcomer. That is not a false positive, it is the detection working on a
+badly-deployed binary — ours. Installed through dpkg, the agent stops
+reporting its own deploy and starts reporting a *modified* copy of
+itself, which is the finding worth having.
+
+`package-agent.sh` refuses to build without the eBPF object, because a
+package that silently produces a blind agent is worse than one that
+fails.
 
 > **Pi kernels have `CONFIG_BPF_LSM` off.** Process and network
 > monitoring work fine. Exec *blocking* cannot, so never set
@@ -216,7 +241,14 @@ uid_transitions     = true   # root whose parent was not, outside sudo/su/pkexec
 discovery_bursts    = true   # several different recon commands from one parent
 discovery_window    = "1m"
 discovery_threshold = 5      # DISTINCT commands; `id` in a loop never trips it
+repeat_window       = "1h"   # fold identical file findings into one alert
 ```
+
+`repeat_window` is what stops one process reading one file from alerting
+every time it does so. The repeats are **counted, not dropped**: the next
+report says how many it stands for, because "sshd read a host key" and
+"sshd read a host key 4,000 times in the last hour" are different events.
+Set it to `"0s"` to report every occurrence.
 
 Turn one off only on a host where it is structurally noisy — a build box
 whose every script runs `uname` and `dpkg`, say. Unlike `[monitor]`,

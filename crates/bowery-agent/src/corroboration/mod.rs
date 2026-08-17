@@ -48,6 +48,7 @@
 //! provides no default policy on purpose; see
 //! [`CorroborationResponder::respond`].
 
+pub mod file_access;
 pub mod net_inbound;
 
 use std::collections::HashMap;
@@ -114,6 +115,27 @@ pub struct Claim {
     pub summary: String,
     /// Suspicion to stamp on the alert if the rule fires.
     pub suspicion: f32,
+    /// An episode this round is allowed to **downgrade**.
+    ///
+    /// Every kind so far only ever made things worse: the round ran, the
+    /// rule fired, an alert appeared. That shape cannot express the most
+    /// useful answer a neighbourhood can give — *"we all do that"* —
+    /// which is precisely what turns a local finding into fleet-normal
+    /// behaviour.
+    ///
+    /// When set, and the round finds corroboration without confirming,
+    /// a superseding alert is appended for this episode with
+    /// [`Self::explained_suspicion`]. Superseding rather than editing
+    /// because the inbox has no update path and operators pull with a
+    /// monotonic cursor: mutating a delivered alert would be invisible
+    /// to anyone whose cursor had already passed it.
+    ///
+    /// `None` for claims that stand alone, which is every counterparty
+    /// claim — there is no earlier alert to revise.
+    pub supersedes: Option<String>,
+    /// Suspicion for the superseding alert when the fleet explains the
+    /// finding. Ignored unless [`Self::supersedes`] is set.
+    pub explained_suspicion: f32,
 }
 
 /// Which peers can speak to a claim.
@@ -671,6 +693,47 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
             suspicion: claim.suspicion,
         });
     }
+    // The neighbourhood explained it: same behaviour, other hosts.
+    //
+    // This is the answer that removes work rather than creating it, and
+    // it only means anything when peers actually spoke. Corroboration
+    // from zero peers is silence, and silence must never downgrade a
+    // finding — that is the same rule that stops a blind peer confirming
+    // an alert, applied in the other direction.
+    if !confirmed
+        && tally.corroborated > 0
+        && let Some(episode_id) = claim.supersedes.clone()
+    {
+        let alert = Alert {
+            originator_fp: ctx.originator_fp.as_bytes().to_vec(),
+            episode_id: episode_id.clone(),
+            exe_sha256_hex: String::new(),
+            exe_path: String::new(),
+            suspicion: claim.explained_suspicion,
+            rationale: format!(
+                "{} — but {} of {} peers asked report the same, so this is how this \
+                 fleet behaves rather than something this host is doing alone",
+                claim.summary, tally.corroborated, tally.asked
+            ),
+            suggested_actions: Vec::new(),
+            ts_unix_ms: current_unix_ms(),
+            backend: ctx.backend_label.clone(),
+            confirmation: Some(tally.to_confirmation(claim.rule, false)),
+            context: Vec::new(),
+        };
+        info!(
+            kind = claim.kind,
+            episode = %episode_id,
+            corroborated = tally.corroborated,
+            "the neighbourhood explains this finding; superseding with a lower score"
+        );
+        ctx.inbox.append(alert);
+        let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+            episode_id,
+            suspicion: claim.explained_suspicion,
+        });
+    }
+
     // The corroborating peer's evidence is logged where it arrives,
     // named with the peer that supplied it — see the ask loop above.
 
@@ -996,6 +1059,8 @@ mod tests {
     #[test]
     fn rationale_states_what_was_seen_and_what_the_mesh_said() {
         let claim = Claim {
+            supersedes: None,
+            explained_suspicion: 0.0,
             kind: "test.kind",
             subject: Vec::new(),
             window_start_unix_ms: 0,

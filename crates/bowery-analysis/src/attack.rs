@@ -232,8 +232,10 @@ pub const TECHNIQUES: &[Technique] = &[
             "cred.shadow",
             "cred.passwd",
         ],
-        gap: "a read performed by a process that legitimately reads shadow (sshd, su) \
-              is indistinguishable from one that does not",
+        gap: "the sanctioned readers (a packaged, unmodified `sshd`, `su`, `login`, PAM) \
+              are exempt, so a compromise *of one of those binaries* that leaves the \
+              package hash intact — an injected library, a hijacked child process — reads \
+              shadow without a finding",
     },
     Technique {
         id: "T1552.001",
@@ -252,7 +254,8 @@ pub const TECHNIQUES: &[Technique] = &[
             "cred.read_htpasswd",
         ],
         gap: "a known list of well-known credential paths. Application-specific secret \
-              files nobody enumerated are not watched, and neither is a `.env`",
+              files nobody enumerated are not watched, and neither is a `.env`. No reader \
+              is sanctioned for these, so every access is a finding",
     },
     Technique {
         id: "T1552.004",
@@ -467,8 +470,11 @@ pub const NON_TABLE_RULES: &[&str] = &[
     "yara.match",
     // The probe watchdog.
     "probe.sensor_blind",
-    // The corroboration engine's first claim kind.
+    // The corroboration engine's claim kinds.
     "corroborate.net_inbound_connect",
+    // "does this binary touch this file on your host too?" — a
+    // downgrade-only round, so it never appears as a finding of its own.
+    "corroborate.file_access",
 ];
 
 #[cfg(test)]
