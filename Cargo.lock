@@ -454,6 +454,7 @@ dependencies = [
  "async-trait",
  "bowery-analysis",
  "bowery-events",
+ "bowery-response",
  "llama-cpp-2",
  "serde",
  "serde_json",

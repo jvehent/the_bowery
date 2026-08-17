@@ -127,6 +127,16 @@ dominates real hosts was never enumerated. Shipping a rule now means
 pulling the fleet's inbox a day later and reading what it actually
 produced.
 
+The same shape has a second form, found while consolidating rather than
+building: a path that was never reachable at all. The LLM prompt
+advertised five action ids the engine does not implement and omitted
+the two it does, so no verdict could name an action the agent was able
+to carry out — 22 "unknown action id" skips in three hours on a live
+host, and the whole response path, dry-run included, unreachable by
+construction. The prompt is generated from the action registry now, with
+a test comparing the two. Worth asking of anything new: not just "is it
+correct" but "can it fire at all".
+
 What remains after all of it is a binary that is **rare here, owned by
 no package, and unknown to the industry** — a much shorter list, and the
 one worth reading. Keeping it that way is the standing constraint on

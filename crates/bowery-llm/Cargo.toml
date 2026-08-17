@@ -19,6 +19,7 @@ llama-cpp = ["dep:llama-cpp-2"]
 
 [dependencies]
 bowery-analysis = { workspace = true }
+bowery-response = { workspace = true }
 bowery-events = { workspace = true }
 
 async-trait = { workspace = true }

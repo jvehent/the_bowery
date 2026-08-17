@@ -84,7 +84,7 @@ fn sanitise(s: &str, max_len: usize) -> String {
     out
 }
 
-const SYSTEM_INSTRUCTIONS: &str = r#"You are the analyst component of The Bowery, a host-based EDR.
+const SYSTEM_INSTRUCTIONS_HEAD: &str = r#"You are the analyst component of The Bowery, a host-based EDR.
 You receive a structured incident summary and respond with a STRICT JSON object describing your assessment.
 
 Respond with EXACTLY this JSON shape (no surrounding prose, no code fences):
@@ -95,8 +95,37 @@ Respond with EXACTLY this JSON shape (no surrounding prose, no code fences):
   "whisper_query": "<short question to ask peer hosts, or empty string>"
 }
 
-Action ids you may use: "alert", "throttle_network", "quarantine_file_writes", "kill_process", "block_file", "kill_connection".
-Be concise. Do not invent fields. Do not output anything other than the JSON object."#;
+Action ids you may use (an empty list is a valid and common answer): "#;
+
+const SYSTEM_INSTRUCTIONS_TAIL: &str = ".
+Be concise. Do not invent fields. Do not output anything other than the JSON object.";
+
+/// The system prompt, with the action list taken from the response
+/// engine's own registry.
+///
+/// It used to be a hardcoded string, and it had drifted badly: it
+/// advertised `alert`, `throttle_network`, `quarantine_file_writes`,
+/// `block_file` and `kill_connection` — none of which the engine
+/// implements — while omitting `block_exec` and `block_exec_by_inode`,
+/// which it does. On a live fleet that produced 22 "unknown action id"
+/// skips in three hours and meant the entire response path was
+/// unreachable: the model could not name an action the agent was able
+/// to carry out.
+///
+/// Generated rather than written so the two cannot diverge again, and
+/// pinned by a test that compares the rendered prompt against
+/// [`bowery_response::Action::known_ids`].
+#[must_use]
+pub fn system_instructions() -> String {
+    let ids: Vec<String> = bowery_response::Action::known_ids()
+        .iter()
+        .map(|id| format!("\"{id}\""))
+        .collect();
+    format!(
+        "{SYSTEM_INSTRUCTIONS_HEAD}{}{SYSTEM_INSTRUCTIONS_TAIL}",
+        ids.join(", ")
+    )
+}
 
 /// Prompt format selector. Phase 4 ships chatml; later phases may add
 /// llama-3 or mistral variants.
@@ -125,7 +154,8 @@ fn render_qwen3_chat(ctx: &AnalysisContext) -> String {
     // System turn
     let _ = writeln!(
         prompt,
-        "<|im_start|>system\n{SYSTEM_INSTRUCTIONS}<|im_end|>"
+        "<|im_start|>system\n{}<|im_end|>",
+        system_instructions()
     );
 
     // User turn: the incident summary.
@@ -212,6 +242,47 @@ fn render_qwen3_chat(ctx: &AnalysisContext) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The prompt must advertise exactly the actions the engine can
+    /// carry out.
+    ///
+    /// It had drifted to naming five that do not exist while omitting
+    /// two that do, which made the entire response path unreachable —
+    /// the model could not name an action the agent was able to
+    /// perform. Generated from the registry now; this is what stops it
+    /// happening again.
+    #[test]
+    fn the_prompt_advertises_exactly_the_implemented_actions() {
+        let text = super::system_instructions();
+        for id in bowery_response::Action::known_ids() {
+            assert!(
+                text.contains(&format!("\"{id}\"")),
+                "prompt must offer the implemented action {id}: {text}"
+            );
+        }
+        // And nothing else. Every quoted token in the action sentence
+        // has to be a real id.
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("Action ids you may use"))
+            .expect("the action sentence must exist");
+        let advertised: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+        assert!(!advertised.is_empty(), "no ids advertised at all: {line}");
+        for id in &advertised {
+            assert!(
+                bowery_response::Action::known_ids().contains(id),
+                "prompt offers `{id}`, which the engine cannot perform"
+            );
+        }
+    }
+
+    /// An empty list has to read as acceptable, or a model told to pick
+    /// from a list of destructive verbs will pick one.
+    #[test]
+    fn the_prompt_says_doing_nothing_is_a_valid_answer() {
+        let text = super::system_instructions();
+        assert!(text.contains("empty list is a valid"), "{text}");
+    }
+
     use super::*;
     use bowery_analysis::{BinaryScore, RuleHit, RuleSeverity, Verdict};
 

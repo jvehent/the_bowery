@@ -168,7 +168,16 @@ async fn high_suspicion_exec_routes_to_llm_and_emits_verdict() {
     assert_eq!(v.backend, "mock/echo");
     // MockMode::Echo returns suspicion >= 0.6 for our suspicious exec.
     assert!(v.suspicion >= 0.6, "echoed suspicion {}", v.suspicion);
-    assert!(v.suggested_actions.contains(&"alert".to_string()));
+    // Whatever reaches the pipeline must be an action the response
+    // engine can perform. It used to be "alert", which the engine does
+    // not implement, so every verdict's suggestion was discarded as an
+    // unknown id and the enforcement path was never entered at all.
+    for a in &v.suggested_actions {
+        assert!(
+            bowery_response::Action::known_ids().contains(&a.as_str()),
+            "verdict proposed `{a}`, which the engine cannot perform"
+        );
+    }
 
     agent.shutdown().await.expect("shutdown");
 }

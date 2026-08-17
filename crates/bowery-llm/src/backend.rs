@@ -101,12 +101,19 @@ impl LlmAnalyzer for MockLlmAnalyzer {
         match self.mode {
             MockMode::Echo => {
                 let pre = ctx.pre_verdict.suspicion;
+                // Real action ids, so the response path is actually
+                // exercisable on a mock-backend fleet. These used to be
+                // "alert" and "throttle_network", neither of which the
+                // engine implements — so every suggestion was skipped as
+                // an unknown id and the whole enforcement path, dry-run
+                // included, was unreachable.
+                //
+                // Suggesting them is not the same as performing them:
+                // `[response] mode` still defaults to off, and the policy
+                // still defaults to deny-all.
                 let mut actions = Vec::new();
-                if pre >= 0.5 {
-                    actions.push("alert".to_string());
-                }
                 if pre >= 0.9 {
-                    actions.push("throttle_network".to_string());
+                    actions.push("kill_process".to_string());
                 }
                 Ok(LlmVerdict {
                     suspicion: pre,
@@ -178,10 +185,20 @@ mod tests {
         let m = MockLlmAnalyzer::new(MockMode::Echo);
         let v = m.analyze(&ctx_with_suspicion(0.95, 1)).await.unwrap();
         assert!((v.suspicion - 0.95).abs() < 1e-6);
-        assert!(v.suggested_actions.contains(&"alert".to_string()));
+        // Whatever the mock suggests must be an action the engine can
+        // actually perform, or the response path is unreachable and
+        // every suggestion is skipped as an unknown id — which is
+        // exactly what a live fleet was doing, 22 times in three hours.
+        for a in &v.suggested_actions {
+            assert!(
+                bowery_response::Action::known_ids().contains(&a.as_str()),
+                "mock suggested `{a}`, which the engine cannot perform"
+            );
+        }
         assert!(
+            v.suggested_actions.contains(&"kill_process".to_string()),
+            "a 0.95 verdict should propose something: {:?}",
             v.suggested_actions
-                .contains(&"throttle_network".to_string())
         );
         assert!(!v.whisper_query.is_empty());
     }
