@@ -908,6 +908,10 @@ impl Agent {
                 config.detection.discovery_window,
                 config.detection.discovery_threshold,
             )),
+            Arc::new(bowery_analysis::AlertSuppressor::new(
+                config.detection.repeat_window,
+            )),
+            config.detection.repeat_window,
             shutdown_rx.clone(),
         );
 
@@ -3199,6 +3203,8 @@ fn spawn_pipeline_task(
     packages: Arc<bowery_analysis::provenance::ProvenanceCache>,
     detection: crate::config::DetectionConfig,
     discovery: Arc<bowery_analysis::DiscoveryTracker>,
+    suppressor: Arc<bowery_analysis::AlertSuppressor>,
+    suppress_window: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -3235,6 +3241,8 @@ fn spawn_pipeline_task(
                         &packages,
                         &detection,
                         &discovery,
+                        &suppressor,
+                        suppress_window,
                         event,
                     ).await;
                 }
@@ -3261,6 +3269,8 @@ fn spawn_pipeline_task(
                                 &packages,
                                 &detection,
                                 &discovery,
+                                &suppressor,
+                                suppress_window,
                                 event,
                             ).await;
                         }
@@ -3293,6 +3303,8 @@ async fn process_event(
     packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
     detection: &crate::config::DetectionConfig,
     discovery: &Arc<bowery_analysis::DiscoveryTracker>,
+    suppressor: &Arc<bowery_analysis::AlertSuppressor>,
+    suppress_window: Duration,
     event: Event,
 ) {
     // Record first, analyse second. Every event goes to the log
@@ -3344,7 +3356,17 @@ async fn process_event(
             process_network_connect(baseline, claims, corroboration, &conn).await;
         }
         Event::FileOpen(open) => {
-            process_file_open(inbox, originator_fp, backend_label, events_tx, &open);
+            process_file_open(
+                inbox,
+                originator_fp,
+                backend_label,
+                events_tx,
+                packages,
+                suppressor,
+                suppress_window,
+                &open,
+            )
+            .await;
         }
         // Recorded to the event log above; no analyzer path yet.
         Event::ProcessExit(_) => {}
@@ -3415,17 +3437,43 @@ async fn process_network_connect(
 /// than configured, because an operator should not have to know in
 /// advance that `/etc/ld.so.preload` is how a host gets owned.
 ///
+/// # Two filters stand between a match and an operator
+///
+/// A live three-host fleet produced 63 alerts in 24 minutes, 61 of which
+/// were `sshd` and `unix_chkpwd` doing their job. Two different
+/// mechanisms produced that flood and they need different answers.
+///
+/// **The sanctioned reader.** `sshd` reads host keys and `/etc/shadow`
+/// because that is what it is for; the rule's own text already said so
+/// and alerted anyway. So the reader's exe is resolved from `/proc` and
+/// checked against the rule's sanctioned set — but only when package
+/// provenance vouches for that binary, so a trojanised or impostor
+/// `sshd` is not covered. Resolved from `/proc/<pid>/exe`, never from
+/// `comm`: `comm` is 16 bytes any process sets with `prctl`, so keying
+/// the exemption on it would be an instruction for reading every key on
+/// the host in silence.
+///
+/// **The repeat.** The same pid read the same host key twice in the same
+/// second and produced two alerts. Repeats inside a window are folded
+/// into the next report, which states how many it stands for — a
+/// suppressed run is counted, never discarded, because "read a host key"
+/// and "read a host key 4,000 times" are different events.
+///
 /// No whisper confirmation is attached. "Did anyone else write this
 /// file" is a question the corroboration substrate could answer — and a
 /// package upgrade writing the same unit on every host is exactly what
 /// it would explain away — but the kind is not registered yet, and
 /// stamping an unconfirmed block on the alert would imply a check that
 /// never ran.
-fn process_file_open(
+#[allow(clippy::too_many_arguments)]
+async fn process_file_open(
     inbox: &Arc<AlertInbox>,
     originator_fp: Fingerprint,
     backend_label: &str,
     events_tx: &broadcast::Sender<AgentEvent>,
+    packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
+    suppressor: &Arc<bowery_analysis::AlertSuppressor>,
+    suppress_window: Duration,
     open: &bowery_events::FileOpen,
 ) {
     let path = open.path.display().to_string();
@@ -3439,6 +3487,59 @@ fn process_file_open(
     let Some(hit) = hit else {
         return;
     };
+
+    // Who read it, and does a package vouch for them?
+    //
+    // Both answers are best-effort and both fail towards alerting: a
+    // process that exited before /proc could be read earns no exemption.
+    // That is the opposite default from the uid-transition rule, where an
+    // unreadable parent reports nothing — there a fact could not be
+    // established, here an exemption could not be earned, and a detection
+    // that goes quiet whenever it cannot look is one an attacker only has
+    // to outrun.
+    let exe = bowery_events::enrich::pid_exe_path(open.pid);
+    let (exe_sha, provenance) = match exe.clone() {
+        Some(exe) => {
+            let packages = packages.clone();
+            match tokio::task::spawn_blocking(move || {
+                let sha = enrich::sha256_file(&exe).ok()?;
+                let provenance = packages.classify(&exe, &sha);
+                Some((sha, provenance))
+            })
+            .await
+            {
+                Ok(Some((sha, provenance))) => (Some(sha), provenance),
+                _ => (None, bowery_analysis::provenance::Provenance::Unknown),
+            }
+        }
+        None => (None, bowery_analysis::provenance::Provenance::Unknown),
+    };
+    let exe_str = exe.as_ref().map(|p| p.display().to_string());
+
+    if bowery_analysis::file_watch::reader_is_sanctioned(&hit, exe_str.as_deref(), provenance) {
+        debug!(
+            rule = hit.rule_id,
+            path = %path,
+            exe = exe_str.as_deref().unwrap_or("<unresolved>"),
+            "sanctioned reader; not a finding"
+        );
+        return;
+    }
+
+    // Repeats of an identical finding are folded rather than restated.
+    let folded = match suppressor.observe(
+        hit.rule_id,
+        &path,
+        exe_str.as_deref(),
+        std::time::Instant::now(),
+    ) {
+        bowery_analysis::SuppressDecision::Suppress => {
+            debug!(rule = hit.rule_id, path = %path, "repeat folded into the open window");
+            return;
+        }
+        bowery_analysis::SuppressDecision::Report { folded } => folded,
+    };
+    let folded_note = bowery_analysis::suppress::folded_note(folded, suppress_window);
     // A truncated path may have matched a prefix rule on the part we
     // did see. Say so rather than quoting a path that is not the whole
     // one — an investigator matching against it needs to know.
@@ -3451,23 +3552,33 @@ fn process_file_open(
     let alert = Alert {
         originator_fp: originator_fp.as_bytes().to_vec(),
         episode_id: episode_id.clone(),
-        exe_sha256_hex: String::new(),
+        // The **reader's** hash, not the file's. It was empty until now,
+        // which meant VirusTotal screening could not see file alerts at
+        // all — every one of them bypassed the filter that exists to
+        // hold back the uninteresting. Hashing the file itself would be
+        // the wrong choice: nobody has a reputation record for a copy of
+        // `/etc/shadow`, and the binary that read it is the lead worth
+        // pursuing.
+        exe_sha256_hex: exe_sha.as_ref().map(sha_to_hex).unwrap_or_default(),
         // The path is the finding; the process that wrote it is the lead.
         exe_path: path.clone(),
         suspicion: hit.severity,
         rationale: format!(
-            "{} {} {path}{path_note} by {} (pid {}) — {}",
+            "{} {} {path}{path_note} by {} (pid {}) — {}{folded_note}",
             hit.category.label(),
             if open.sensitive_read {
                 "read of"
             } else {
                 "write to"
             },
-            if open.comm.is_empty() {
+            // The resolved binary, because `comm` is 16 bytes any
+            // process can set to whatever it likes. It is still reported
+            // in the context, where a human can weigh it.
+            exe_str.as_deref().unwrap_or(if open.comm.is_empty() {
                 "an unnamed process"
             } else {
                 open.comm.as_str()
-            },
+            }),
             open.pid,
             hit.why
         ),
@@ -3571,6 +3682,13 @@ fn file_open_context(open: &bowery_events::FileOpen) -> Vec<bowery_proto::Attrib
     use bowery_proto::Attribute;
 
     let mut ctx = vec![Attribute::new("pid", open.pid.to_string())];
+    // The resolved binary, which is what the sanctioned-reader check
+    // ran against. `comm` travels beside it rather than instead of it:
+    // a disagreement between the two ("comm sshd, exe /tmp/x") is itself
+    // the finding, and collapsing them would hide it.
+    if let Some(exe) = bowery_events::enrich::pid_exe_path(open.pid) {
+        ctx.push(Attribute::new("exe", exe.display().to_string()));
+    }
     if !open.comm.is_empty() {
         ctx.push(Attribute::new("comm", open.comm.clone()));
     }

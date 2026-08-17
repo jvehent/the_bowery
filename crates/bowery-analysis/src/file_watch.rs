@@ -68,6 +68,13 @@ pub struct FileWatchHit {
     pub why: &'static str,
     /// `[0,1]`, fed straight into the alert's suspicion.
     pub severity: f32,
+    /// Absolute exe paths that read this file **as their job**.
+    ///
+    /// Empty means no reader is sanctioned: every access is a finding.
+    /// Consult it through [`reader_is_sanctioned`] rather than directly —
+    /// membership alone is not enough, and treating it as an allowlist of
+    /// names is the mistake the function exists to prevent.
+    pub sanctioned_readers: &'static [&'static str],
 }
 
 /// How a rule matches a path.
@@ -89,6 +96,146 @@ struct Rule {
     category: FileWatchCategory,
     why: &'static str,
     severity: f32,
+    /// See [`FileWatchHit::sanctioned_readers`]. Defaults to `NOBODY` for
+    /// write rules: nothing has a *job* that requires writing
+    /// `/etc/ld.so.preload`.
+    readers: &'static [&'static str],
+}
+
+/// No reader of this path is sanctioned; every access is a finding.
+const NOBODY: &[&str] = &[];
+
+// ---------------------------------------------------------------------------
+// Sanctioned readers
+//
+// Paths, not names. `comm` is 16 bytes any process sets with `prctl`, so
+// an allowlist of names would be an evasion primitive: name your implant
+// `sshd` and read every key on the box in silence. These are resolved
+// from `/proc/<pid>/exe` and are only honoured for a binary a package
+// vouches for — see `reader_is_sanctioned`.
+//
+// Both `/bin/...` and `/usr/bin/...` spellings appear because a
+// non-merged-usr host resolves to the former. Listing a path that does
+// not exist on a given host costs nothing.
+// ---------------------------------------------------------------------------
+
+/// Everything that legitimately reads the password databases.
+///
+/// `sshd-session` and `sshd-auth` are OpenSSH 9.8+, which split the
+/// per-connection work out of `sshd`. Debian 13 ships them and Debian 12
+/// does not — omitting them would have left the newer hosts alerting on
+/// every login while the older ones went quiet, which reads as a
+/// detection working until you notice which hosts are silent.
+const PASSWORD_TOOLS: &[&str] = &[
+    "/usr/sbin/sshd",
+    "/usr/lib/openssh/sshd-session",
+    "/usr/lib/openssh/sshd-auth",
+    "/usr/sbin/unix_chkpwd",
+    "/usr/bin/unix_chkpwd",
+    "/usr/sbin/unix_update",
+    "/bin/su",
+    "/usr/bin/su",
+    "/bin/login",
+    "/usr/bin/login",
+    "/usr/bin/passwd",
+    "/usr/bin/sudo",
+    "/usr/bin/chsh",
+    "/usr/bin/chfn",
+    "/usr/bin/gpasswd",
+    "/usr/bin/newgrp",
+    "/usr/sbin/chpasswd",
+    "/usr/sbin/usermod",
+    "/usr/sbin/useradd",
+    "/usr/sbin/userdel",
+    "/usr/sbin/groupadd",
+    "/usr/sbin/groupdel",
+    "/usr/sbin/vipw",
+    "/usr/sbin/pwck",
+    "/usr/sbin/grpck",
+    "/usr/sbin/cron",
+    "/usr/bin/systemd-sysusers",
+    "/usr/lib/systemd/systemd-sysusers",
+    "/usr/sbin/lightdm",
+    "/usr/sbin/gdm3",
+    "/usr/bin/polkit-agent-helper-1",
+    "/usr/lib/policykit-1/polkit-agent-helper-1",
+];
+
+/// The SSH daemon, which reads host keys at startup and
+/// `authorized_keys` on every connection. That is the entire job.
+const SSH_DAEMON: &[&str] = &[
+    "/usr/sbin/sshd",
+    "/usr/lib/openssh/sshd-session",
+    "/usr/lib/openssh/sshd-auth",
+    "/usr/bin/ssh-keygen", // regenerates and fingerprints host keys
+];
+
+/// SSH client-side tools, which read *user* private keys to authenticate.
+const SSH_CLIENT: &[&str] = &[
+    "/usr/bin/ssh",
+    "/usr/bin/ssh-add",
+    "/usr/bin/ssh-keygen",
+    "/usr/bin/ssh-copy-id",
+    "/usr/bin/scp",
+    "/usr/bin/sftp",
+    "/usr/sbin/sshd",
+    "/usr/lib/openssh/sshd-session",
+];
+
+/// `sudo` reading its own policy is what `sudo` is.
+const SUDO_TOOLS: &[&str] = &[
+    "/usr/bin/sudo",
+    "/usr/sbin/visudo",
+    "/usr/bin/sudoedit",
+    "/usr/bin/sudoreplay",
+];
+
+/// GnuPG reading its own keyring.
+const GPG_TOOLS: &[&str] = &[
+    "/usr/bin/gpg",
+    "/usr/bin/gpg2",
+    "/usr/bin/gpg-agent",
+    "/usr/lib/gnupg/gpg-agent",
+    "/usr/bin/gpgconf",
+    "/usr/bin/gpgsm",
+    "/usr/bin/dirmngr",
+];
+
+/// Is this read the sanctioned one?
+///
+/// Two conditions, and **both** are required:
+///
+/// 1. The reader's resolved exe path is one the rule names.
+/// 2. Package provenance vouches for that binary — it is owned by an
+///    installed package and its contents still match what the package
+///    put there.
+///
+/// The second condition is what makes the first safe. On its own, a list
+/// of paths is defeated by writing to one of them; a list of *names*
+/// would be worse still, defeated by `prctl(PR_SET_NAME)`. Requiring
+/// [`Provenance::PackagedIntact`] means the exemption covers the
+/// distribution's `sshd` and nothing that merely resembles it — a
+/// trojanised `/usr/sbin/sshd` reads every host key and is **not**
+/// exempt, which is the case that matters most.
+///
+/// `exe` is `None` when `/proc/<pid>/exe` could not be read, which is
+/// usually a process that exited between the open and the lookup. That
+/// **is not** an exemption: the sanctioned path has to be demonstrated,
+/// not assumed, and a detection that goes quiet whenever it cannot look
+/// is one an attacker only has to outrun.
+#[must_use]
+pub fn reader_is_sanctioned(
+    hit: &FileWatchHit,
+    exe: Option<&str>,
+    provenance: crate::provenance::Provenance,
+) -> bool {
+    let Some(exe) = exe else {
+        return false;
+    };
+    if provenance != crate::provenance::Provenance::PackagedIntact {
+        return false;
+    }
+    hit.sanctioned_readers.contains(&exe)
 }
 
 /// The watch set.
@@ -105,6 +252,7 @@ const RULES: &[Rule] = &[
               before main() runs. Writing it is a whole-system code-injection primitive \
               and has almost no legitimate use",
         severity: 0.97,
+        readers: NOBODY,
     },
     Rule {
         id: "persist.systemd_unit",
@@ -113,6 +261,7 @@ const RULES: &[Rule] = &[
         why: "systemd units start at boot and can restart themselves. Also written by \
               package installs, so check the process and whether peers saw the same write",
         severity: 0.85,
+        readers: NOBODY,
     },
     Rule {
         id: "persist.systemd_unit_lib",
@@ -121,6 +270,7 @@ const RULES: &[Rule] = &[
         why: "distribution-owned systemd unit directory; normally only a package manager \
               writes here",
         severity: 0.85,
+        readers: NOBODY,
     },
     Rule {
         id: "persist.cron",
@@ -128,6 +278,7 @@ const RULES: &[Rule] = &[
         category: FileWatchCategory::Persistence,
         why: "cron re-executes on a schedule, which is the cheapest durable foothold there is",
         severity: 0.9,
+        readers: NOBODY,
     },
     Rule {
         id: "persist.authorized_keys",
@@ -136,6 +287,7 @@ const RULES: &[Rule] = &[
         why: "appending a public key here grants permanent passwordless login as that user, \
               and survives password changes",
         severity: 0.95,
+        readers: NOBODY,
     },
     Rule {
         id: "persist.pam",
@@ -144,6 +296,7 @@ const RULES: &[Rule] = &[
         why: "PAM decides how every authentication on the host succeeds; a module added \
               here can harvest or bypass credentials",
         severity: 0.93,
+        readers: NOBODY,
     },
     Rule {
         id: "persist.udev",
@@ -152,6 +305,7 @@ const RULES: &[Rule] = &[
         why: "udev rules can run programs on device events, which is execution that no \
               service list shows",
         severity: 0.8,
+        readers: NOBODY,
     },
     Rule {
         id: "persist.shell_profile",
@@ -159,6 +313,7 @@ const RULES: &[Rule] = &[
         category: FileWatchCategory::Persistence,
         why: "sourced by every interactive login shell on the host",
         severity: 0.8,
+        readers: NOBODY,
     },
     Rule {
         id: "persist.user_rc",
@@ -167,6 +322,7 @@ const RULES: &[Rule] = &[
         why: "sourced by every interactive shell that user opens, so a line here \
               re-executes on each login and survives reboots",
         severity: 0.7,
+        readers: NOBODY,
     },
     Rule {
         id: "persist.user_profile",
@@ -175,6 +331,7 @@ const RULES: &[Rule] = &[
         why: "sourced by that user's login shells; a common place to hide \
               re-execution that no service manager lists",
         severity: 0.7,
+        readers: NOBODY,
     },
     // -- privilege escalation -------------------------------------------
     Rule {
@@ -184,6 +341,7 @@ const RULES: &[Rule] = &[
         why: "defines who may become root and with what password prompt; a single line \
               here is a permanent privilege grant",
         severity: 0.95,
+        readers: NOBODY,
     },
     // -- credential access ----------------------------------------------
     Rule {
@@ -193,6 +351,7 @@ const RULES: &[Rule] = &[
         why: "the password hash database. A write is either a password change or an \
               account being added or backdoored",
         severity: 0.9,
+        readers: NOBODY,
     },
     Rule {
         id: "cred.passwd",
@@ -200,6 +359,7 @@ const RULES: &[Rule] = &[
         category: FileWatchCategory::Credential,
         why: "account database; a new uid-0 entry here is a classic backdoor",
         severity: 0.88,
+        readers: NOBODY,
     },
     Rule {
         id: "cred.ssh_private_key",
@@ -208,6 +368,7 @@ const RULES: &[Rule] = &[
         why: "an SSH private key being written — key replacement, or a stolen key being \
               staged for use",
         severity: 0.85,
+        readers: NOBODY,
     },
     // -- defense evasion -------------------------------------------------
     Rule {
@@ -217,6 +378,7 @@ const RULES: &[Rule] = &[
         why: "the authentication log. Writes from anything but the logging daemon suggest \
               the record of a login is being edited",
         severity: 0.85,
+        readers: NOBODY,
     },
     Rule {
         id: "evade.wtmp",
@@ -224,6 +386,7 @@ const RULES: &[Rule] = &[
         category: FileWatchCategory::DefenseEvasion,
         why: "login history; truncating it is how a session is removed from `last`",
         severity: 0.85,
+        readers: NOBODY,
     },
 ];
 
@@ -248,6 +411,7 @@ const READ_RULES: &[Rule] = &[
               and PAM; from anything else this is credential theft, and the hashes are \
               offline-crackable once taken",
         severity: 0.9,
+        readers: PASSWORD_TOOLS,
     },
     Rule {
         id: "cred.read_gshadow",
@@ -256,6 +420,7 @@ const READ_RULES: &[Rule] = &[
         why: "the group password database was read — the same exposure as /etc/shadow, \
               and rarer to touch legitimately",
         severity: 0.88,
+        readers: PASSWORD_TOOLS,
     },
     Rule {
         id: "cred.read_opasswd",
@@ -264,6 +429,7 @@ const READ_RULES: &[Rule] = &[
         why: "PAM's password-history file, which holds previous password hashes for \
               every user — a bonus for anyone cracking the current ones",
         severity: 0.9,
+        readers: PASSWORD_TOOLS,
     },
     Rule {
         id: "cred.read_ssh_host_key",
@@ -272,6 +438,7 @@ const READ_RULES: &[Rule] = &[
         why: "an SSH host private key was read. sshd does this at startup; anything \
               else can impersonate this host to every client that trusts it",
         severity: 0.85,
+        readers: SSH_DAEMON,
     },
     Rule {
         id: "cred.read_ssh_private_key",
@@ -280,6 +447,7 @@ const READ_RULES: &[Rule] = &[
         why: "an SSH private key was read — the credential that opens every host this \
               key is authorised on",
         severity: 0.9,
+        readers: SSH_CLIENT,
     },
     Rule {
         id: "cred.read_aws",
@@ -288,6 +456,7 @@ const READ_RULES: &[Rule] = &[
         why: "AWS access keys were read; these usually carry far more authority than \
               the host they were stored on",
         severity: 0.9,
+        readers: NOBODY,
     },
     Rule {
         id: "cred.read_kube",
@@ -295,6 +464,7 @@ const READ_RULES: &[Rule] = &[
         category: FileWatchCategory::Credential,
         why: "kubeconfig was read, which typically grants control of a whole cluster",
         severity: 0.88,
+        readers: NOBODY,
     },
     Rule {
         id: "cred.read_netrc",
@@ -303,6 +473,7 @@ const READ_RULES: &[Rule] = &[
         why: "a .netrc was read; it stores passwords in plain text for every host \
               listed in it",
         severity: 0.85,
+        readers: NOBODY,
     },
     Rule {
         id: "cred.read_pgpass",
@@ -310,6 +481,7 @@ const READ_RULES: &[Rule] = &[
         category: FileWatchCategory::Credential,
         why: "PostgreSQL passwords were read, in plain text",
         severity: 0.85,
+        readers: NOBODY,
     },
     Rule {
         id: "cred.read_mysql",
@@ -317,6 +489,7 @@ const READ_RULES: &[Rule] = &[
         category: FileWatchCategory::Credential,
         why: "MySQL client credentials were read, in plain text",
         severity: 0.85,
+        readers: NOBODY,
     },
     Rule {
         id: "cred.read_git",
@@ -325,6 +498,7 @@ const READ_RULES: &[Rule] = &[
         why: "stored Git credentials were read; these are often long-lived tokens with \
               write access to source",
         severity: 0.85,
+        readers: NOBODY,
     },
     Rule {
         id: "cred.read_docker",
@@ -333,6 +507,7 @@ const READ_RULES: &[Rule] = &[
         why: "container registry credentials were read, which can allow poisoning the \
               images this estate deploys",
         severity: 0.85,
+        readers: NOBODY,
     },
     Rule {
         id: "cred.read_gnupg",
@@ -341,6 +516,7 @@ const READ_RULES: &[Rule] = &[
         why: "a GnuPG secret keyring was read — signing and decryption authority for \
               whoever holds it",
         severity: 0.88,
+        readers: GPG_TOOLS,
     },
     Rule {
         id: "cred.read_rails_master_key",
@@ -349,6 +525,7 @@ const READ_RULES: &[Rule] = &[
         why: "an application master key was read, which decrypts that application's \
               stored secrets wholesale",
         severity: 0.85,
+        readers: NOBODY,
     },
     Rule {
         id: "cred.read_htpasswd",
@@ -357,6 +534,7 @@ const READ_RULES: &[Rule] = &[
         why: "an HTTP basic-auth password file was read; the hashes in it are \
               offline-crackable and often reused elsewhere",
         severity: 0.8,
+        readers: NOBODY,
     },
     Rule {
         id: "recon.read_sudoers",
@@ -365,6 +543,7 @@ const READ_RULES: &[Rule] = &[
         why: "the sudo policy was read — routine for `sudo` itself, and otherwise the \
               standard first step in working out how to become root here",
         severity: 0.7,
+        readers: SUDO_TOOLS,
     },
     Rule {
         id: "cred.read_authorized_keys",
@@ -373,6 +552,7 @@ const READ_RULES: &[Rule] = &[
         why: "the list of keys permitted to log in as this user was read; sshd does \
               this on every connection, anything else is enumerating access",
         severity: 0.6,
+        readers: SSH_DAEMON,
     },
 ];
 
@@ -398,6 +578,7 @@ pub fn classify_read(path: &str) -> Option<FileWatchHit> {
             category: r.category,
             why: r.why,
             severity: r.severity,
+            sanctioned_readers: r.readers,
         })
 }
 
@@ -442,12 +623,155 @@ pub fn classify(path: &str) -> Option<FileWatchHit> {
             category: r.category,
             why: r.why,
             severity: r.severity,
+            sanctioned_readers: r.readers,
         })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provenance::Provenance;
+
+    /// The alert that made this necessary.
+    ///
+    /// The live fleet produced 63 alerts in 24 minutes; 61 were `sshd`
+    /// and `unix_chkpwd` doing their job. The rule text already *said*
+    /// "sshd does this at startup" and alerted anyway.
+    #[test]
+    fn the_distributions_sshd_reading_a_host_key_is_not_a_finding() {
+        let hit = classify_read("/etc/ssh/ssh_host_rsa_key").expect("rule matches");
+        assert!(reader_is_sanctioned(
+            &hit,
+            Some("/usr/sbin/sshd"),
+            Provenance::PackagedIntact
+        ));
+    }
+
+    /// OpenSSH 9.8+ splits per-connection work into `sshd-session`.
+    /// Debian 13 ships it, Debian 12 does not — miss it and the newer
+    /// hosts alert on every login while the older ones stay quiet, which
+    /// looks like a working detection until you notice which hosts are
+    /// silent.
+    #[test]
+    fn the_split_sshd_helpers_are_sanctioned_too() {
+        let hit = classify_read("/etc/shadow").expect("rule matches");
+        for exe in [
+            "/usr/lib/openssh/sshd-session",
+            "/usr/lib/openssh/sshd-auth",
+        ] {
+            assert!(
+                reader_is_sanctioned(&hit, Some(exe), Provenance::PackagedIntact),
+                "{exe} must be sanctioned"
+            );
+        }
+    }
+
+    /// The whole point of anchoring on provenance.
+    #[test]
+    fn a_trojanised_sshd_is_not_sanctioned() {
+        let hit = classify_read("/etc/ssh/ssh_host_rsa_key").expect("rule matches");
+        for p in [
+            Provenance::PackagedModified,
+            Provenance::Unpackaged,
+            Provenance::Unknown,
+        ] {
+            assert!(
+                !reader_is_sanctioned(&hit, Some("/usr/sbin/sshd"), p),
+                "a binary at the right path but {p:?} must still alert"
+            );
+        }
+    }
+
+    /// A binary somewhere else is not `sshd` no matter what it is
+    /// called. `comm` never reaches this function precisely because it
+    /// is 16 bytes any process sets with `prctl` — an allowlist keyed on
+    /// it would be an instruction for reading every key on the box in
+    /// silence.
+    #[test]
+    fn an_impostor_elsewhere_on_disk_is_not_sanctioned() {
+        let hit = classify_read("/etc/shadow").expect("rule matches");
+        assert!(!reader_is_sanctioned(
+            &hit,
+            Some("/tmp/sshd"),
+            Provenance::PackagedIntact
+        ));
+    }
+
+    /// The exemption is per rule, not per binary. `sshd` has a job that
+    /// requires host keys; it has none that requires cloud credentials.
+    #[test]
+    fn a_sanctioned_reader_is_only_sanctioned_for_its_own_paths() {
+        let aws = classify_read("/home/julien/.aws/credentials").expect("rule matches");
+        assert!(!reader_is_sanctioned(
+            &aws,
+            Some("/usr/sbin/sshd"),
+            Provenance::PackagedIntact
+        ));
+    }
+
+    /// Fails **closed**, unlike the uid-transition rule.
+    ///
+    /// There, an unreadable parent reports nothing, because a transition
+    /// cannot be established. Here the default is the opposite: the
+    /// exemption must be earned. A detection that goes quiet whenever it
+    /// cannot look is one an attacker only has to outrun — exit fast
+    /// enough and `/proc/<pid>/exe` is gone.
+    #[test]
+    fn an_unreadable_exe_earns_no_exemption() {
+        let hit = classify_read("/etc/shadow").expect("rule matches");
+        assert!(!reader_is_sanctioned(
+            &hit,
+            None,
+            Provenance::PackagedIntact
+        ));
+    }
+
+    /// Nothing has a *job* that requires writing these.
+    #[test]
+    fn no_writer_is_ever_sanctioned() {
+        for path in ["/etc/ld.so.preload", "/etc/sudoers", "/etc/shadow"] {
+            let hit = classify(path).expect("rule matches");
+            assert!(
+                hit.sanctioned_readers.is_empty(),
+                "{path} must have no sanctioned writer"
+            );
+            assert!(!reader_is_sanctioned(
+                &hit,
+                Some("/usr/bin/dpkg"),
+                Provenance::PackagedIntact
+            ));
+        }
+    }
+
+    /// Secrets that belong to a person, not to a daemon, keep no
+    /// exemption: there is no packaged binary whose job is reading your
+    /// AWS keys.
+    #[test]
+    fn user_secrets_have_no_sanctioned_reader() {
+        for path in [
+            "/home/j/.aws/credentials",
+            "/home/j/.kube/config",
+            "/home/j/.pgpass",
+            "/home/j/.git-credentials",
+        ] {
+            let hit = classify_read(path).expect("rule matches");
+            assert!(
+                hit.sanctioned_readers.is_empty(),
+                "{path} must have no sanctioned reader"
+            );
+        }
+    }
+
+    /// Every sanctioned path must be absolute, or it can never match a
+    /// resolved `/proc/<pid>/exe` and the exemption is silently dead.
+    #[test]
+    fn sanctioned_reader_paths_are_absolute() {
+        for r in RULES.iter().chain(READ_RULES.iter()) {
+            for exe in r.readers {
+                assert!(exe.starts_with('/'), "{} lists a relative {exe}", r.id);
+            }
+        }
+    }
 
     #[test]
     fn catches_the_classic_persistence_paths() {

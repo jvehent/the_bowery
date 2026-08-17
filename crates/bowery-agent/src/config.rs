@@ -813,6 +813,19 @@ pub struct DetectionConfig {
     /// script does in seconds.
     #[serde(default = "default_discovery_threshold")]
     pub discovery_threshold: usize,
+    /// How long an identical file finding — same rule, same path, same
+    /// reader binary — is folded into one alert.
+    ///
+    /// A repeat is **counted, not discarded**: the next report states
+    /// how many occurrences it stands for, because "sshd read a host
+    /// key" and "sshd read a host key 4,000 times in the last hour" are
+    /// different events and the second is the interesting one.
+    ///
+    /// Set to zero to report every occurrence, which is what the agent
+    /// did before — and which produced 61 near-identical alerts in 24
+    /// minutes on a three-host fleet.
+    #[serde(with = "humantime_serde", default = "default_repeat_window")]
+    pub repeat_window: Duration,
 }
 
 impl Default for DetectionConfig {
@@ -822,6 +835,7 @@ impl Default for DetectionConfig {
             discovery_bursts: true,
             discovery_window: default_discovery_window(),
             discovery_threshold: default_discovery_threshold(),
+            repeat_window: default_repeat_window(),
         }
     }
 }
@@ -831,6 +845,9 @@ fn default_discovery_window() -> Duration {
 }
 fn default_discovery_threshold() -> usize {
     5
+}
+fn default_repeat_window() -> Duration {
+    Duration::from_hours(1)
 }
 
 /// Operator-configurable monitoring: watch specific files (via userspace

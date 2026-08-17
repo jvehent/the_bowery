@@ -283,3 +283,63 @@ async fn a_write_to_a_persistence_path_alerts_and_names_the_process() {
 
     agent.shutdown().await.expect("shutdown");
 }
+
+/// The same finding, twice, produces one alert.
+///
+/// This is the exact shape the live fleet produced: one pid read one
+/// host key twice in the same second, and the operator was told twice.
+/// Sixty-one of 63 alerts on a three-host fleet were restatements like
+/// this one.
+///
+/// The reader is unresolvable here (pid 4242 does not exist), which is
+/// deliberate — it is the case where the agent knows least, and it must
+/// still fold rather than restate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_identical_finding_repeated_is_folded_into_one_alert() {
+    let workdir = TempDir::new().unwrap();
+    let cfg = build_config(workdir.path(), reserve_udp_port(), MonitorConfig::default());
+
+    let dup = || {
+        Event::FileOpen(FileOpen {
+            pid: 4242,
+            comm: "curl".into(),
+            path: "/root/.ssh/authorized_keys".into(),
+            flags: 0o1101,
+            truncated: false,
+            sensitive_read: false,
+            ts: SystemTime::now(),
+        })
+    };
+    let source = Box::new(MockEventSource::new(vec![dup(), dup(), dup(), dup()]));
+
+    let identity = Arc::new(Identity::generate());
+    let agent = Agent::start(cfg, identity, source).await.expect("start");
+    let mut events = agent.subscribe();
+
+    // Wait for the first alert, then give the remaining three events
+    // room to be processed and folded.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for the first alert");
+        if let Ok(Ok(AgentEvent::AlertEmitted { episode_id, .. })) =
+            tokio::time::timeout(left, events.recv()).await
+            && episode_id.starts_with("file-persist.authorized_keys-")
+        {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (alerts, _) = agent.inbox().read_since(0, 100);
+    let raised = alerts
+        .iter()
+        .filter(|a| a.episode_id.starts_with("file-persist.authorized_keys-"))
+        .count();
+    assert_eq!(
+        raised, 1,
+        "four identical findings must produce one alert, got {raised}"
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}
