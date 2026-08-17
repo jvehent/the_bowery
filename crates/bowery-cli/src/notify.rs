@@ -62,14 +62,37 @@ use crate::virustotal::Verdict;
 /// SHA-256 (lowercase hex) → what `VirusTotal` said about it.
 pub type VerdictMap = std::collections::HashMap<String, Verdict>;
 
-/// Cap on any single field copied into the body.
-const FIELD_CAP: usize = 160;
+/// Cap on a short identifier-shaped field copied into the body —
+/// episode ids, hashes, paths. These have natural lengths well under
+/// this, so the cap only ever bites on something hostile.
+const FIELD_CAP: usize = 512;
 /// Cap on alerts enumerated in one email. Beyond this the digest says
 /// how many were omitted — a flood must not become a megabyte message.
 const MAX_ENUMERATED: usize = 25;
 /// Context values get more room than other fields: a command line is
 /// the single most useful thing in an alert and is routinely long.
-const CONTEXT_CAP: usize = 320;
+const CONTEXT_CAP: usize = 1024;
+/// The rationale is the whole reason the email exists, and it is
+/// **composed**, not fixed: provenance, set-id, lineage, discovery and
+/// the repeat-fold note each append a clause to the analyzer's own
+/// sentence, joined with ` | `. Chained, a real one runs past 800
+/// characters.
+///
+/// It was capped at 160 alongside the identifier fields, which cut every
+/// credential-read alert mid-sentence — the operator got as far as
+/// "Legitimate for `su`, `sudo`, `login` and PAM; from anything el…" and
+/// lost the half that says what to do about it.
+///
+/// Still bounded, because the rationale embeds strings the monitored
+/// host controls (an exe path, a command line), and a compromised agent
+/// must not be able to mail its operator a megabyte. Four thousand is
+/// several times the longest chain the agent can compose and still a
+/// hard ceiling.
+const RATIONALE_CAP: usize = 4096;
+/// Where wrapped body lines fold. Plain-text mail on a phone is the
+/// target: long enough not to fragment sentences, short enough not to
+/// wrap again in the client.
+const WRAP_COLS: usize = 78;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -326,7 +349,58 @@ pub fn sanitize(s: &str, cap: usize) -> String {
         return trimmed.to_string();
     }
     let kept: String = trimmed.chars().take(cap).collect();
-    format!("{kept}…")
+    // Say what was lost rather than trailing off. A bare ellipsis reads
+    // as "and so on"; this one means "go read the full alert", and the
+    // operator cannot tell the difference without being told.
+    let dropped = trimmed.chars().count() - cap;
+    format!("{kept}… [{dropped} more characters; see `bowery alerts`]")
+}
+
+/// One `  label     : value` block, wrapped and hanging-indented so a
+/// long value stays readable in plain-text mail.
+///
+/// The alternative was a single enormous line. Mail clients wrap it at
+/// their own width, mid-word, with no indent — which turns the one field
+/// an operator actually reads into a wall.
+#[must_use]
+pub fn labelled(label: &str, value: &str) -> String {
+    use std::fmt::Write as _;
+
+    const LABEL_W: usize = 10;
+    let indent = " ".repeat(2 + LABEL_W + 2);
+    let avail = WRAP_COLS.saturating_sub(indent.len()).max(24);
+    let mut out = String::new();
+    let mut line = String::new();
+    let mut first = true;
+    let flush = |line: &mut String, first: &mut bool, out: &mut String| {
+        if line.is_empty() {
+            return;
+        }
+        if *first {
+            let _ = writeln!(out, "  {label:<LABEL_W$}: {line}");
+            *first = false;
+        } else {
+            let _ = writeln!(out, "{indent}{line}");
+        }
+        line.clear();
+    };
+    for word in value.split_whitespace() {
+        // A single word longer than the column budget (a path, a hash)
+        // is emitted whole rather than broken: a split path is one an
+        // investigator cannot paste anywhere.
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > avail {
+            flush(&mut line, &mut first, &mut out);
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    flush(&mut line, &mut first, &mut out);
+    if out.is_empty() {
+        let _ = writeln!(out, "  {label:<LABEL_W$}:");
+    }
+    out
 }
 
 /// Subject line. Built only from host names and counts — never from
@@ -416,7 +490,11 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
                     sanitize(&a.exe_sha256_hex, FIELD_CAP)
                 );
             }
-            let _ = writeln!(out, "  why       : {}", sanitize(&a.rationale, FIELD_CAP));
+            let _ = write!(
+                out,
+                "{}",
+                labelled("why", &sanitize(&a.rationale, RATIONALE_CAP))
+            );
             // Per alert, not just as a digest total: an operator triaging
             // one finding needs the verdict for *that* binary.
             if let Some(v) = vt.get(&a.exe_sha256_hex.to_ascii_lowercase()) {
@@ -426,11 +504,13 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
             // the difference between "a rare binary ran" and something
             // an operator can actually judge from a phone.
             for attr in &a.context {
-                let _ = writeln!(
+                let _ = write!(
                     out,
-                    "  {:<10}: {}",
-                    sanitize(&attr.key, 16),
-                    sanitize(&attr.value, CONTEXT_CAP)
+                    "{}",
+                    labelled(
+                        &sanitize(&attr.key, 16),
+                        &sanitize(&attr.value, CONTEXT_CAP)
+                    )
                 );
             }
         }
@@ -944,11 +1024,109 @@ mod tests {
         );
     }
 
+    /// The complaint that prompted this: a real credential-read
+    /// rationale was cut mid-sentence at 160 characters, losing the half
+    /// that tells the operator what to do.
+    #[test]
+    fn a_real_rationale_survives_the_email_intact() {
+        let rationale = "credential-access read of /etc/shadow by /usr/sbin/sshd (pid 431853) \
+             — the password hash database was read. Legitimate for `su`, `sudo`, `login` \
+             and PAM; from anything else this is credential theft, and the hashes are \
+             offline-crackable once taken";
+        let out = labelled("why", &sanitize(rationale, RATIONALE_CAP));
+        let flat: String = out
+            .lines()
+            .map(|l| {
+                l.trim_start_matches(' ')
+                    .trim_start_matches("why")
+                    .trim_start_matches(':')
+                    .trim()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("offline-crackable once taken"),
+            "the tail of the rationale must reach the operator: {out}"
+        );
+        assert!(!out.contains('…'), "nothing this size should truncate");
+    }
+
+    /// The longest chain the agent can compose — analyzer verdict plus
+    /// provenance, set-id, lineage, discovery and the repeat-fold note,
+    /// each appending a clause.
+    #[test]
+    fn a_fully_chained_rationale_is_not_truncated() {
+        let chained = [
+            "pre-filter score above threshold (distro-packaged, unmodified)",
+            "a setuid-root binary that no package owns. Distributions ship a short, \
+             well-known set of these; one that arrived any other way is how a foothold \
+             becomes permanent root without touching a service file",
+            "nginx spawned /bin/sh: a network-facing service started an interactive shell \
+             — the shape of a webshell or an exploited service, and something almost no \
+             legitimate configuration does",
+            "reconnaissance: 4212 ran 5 different discovery commands in quick succession \
+             (whoami, id, uname, ss, netstat). Each is ordinary alone; together and this \
+             fast they are someone working out what this host is and what it can reach",
+        ]
+        .join(" | ");
+        assert!(
+            chained.chars().count() < RATIONALE_CAP,
+            "the cap must exceed the longest chain the agent composes ({} chars)",
+            chained.chars().count()
+        );
+        assert!(!sanitize(&chained, RATIONALE_CAP).contains('…'));
+    }
+
+    /// Bounded is not the same as uncapped. The rationale embeds strings
+    /// the monitored host controls, so a compromised agent must not be
+    /// able to mail its operator a megabyte.
+    #[test]
+    fn a_hostile_rationale_is_still_bounded() {
+        let hostile = "A".repeat(5_000_000);
+        let out = sanitize(&hostile, RATIONALE_CAP);
+        assert!(out.chars().count() < RATIONALE_CAP + 64);
+        assert!(out.contains("more characters"));
+    }
+
+    /// Wrapped lines are indented under the label rather than starting
+    /// at column 0, so a continuation cannot be misread as a new field.
+    #[test]
+    fn wrapped_lines_are_indented_under_their_label() {
+        let out = labelled("why", &"word ".repeat(80));
+        let mut lines = out.lines();
+        let first = lines.next().expect("a first line");
+        assert!(first.starts_with("  why       : "), "{first}");
+        for l in lines {
+            assert!(
+                l.starts_with("              ") && !l.trim_start().starts_with("why"),
+                "continuation must be indented, got {l:?}"
+            );
+        }
+        assert!(
+            out.lines().all(|l| l.chars().count() <= WRAP_COLS),
+            "no line may exceed the wrap column"
+        );
+    }
+
+    /// A path or hash longer than the column budget is emitted whole: a
+    /// split path is one an investigator cannot paste anywhere.
+    #[test]
+    fn an_overlong_single_token_is_not_broken() {
+        let path = format!("/{}", "a".repeat(200));
+        let out = labelled("exe", &path);
+        assert!(out.contains(&path), "the token must survive unbroken");
+    }
+
     #[test]
     fn sanitize_caps_length() {
         let long = "a".repeat(5000);
         let clean = sanitize(&long, 160);
-        assert_eq!(clean.chars().count(), 161, "160 + ellipsis");
+        assert!(clean.starts_with(&"a".repeat(160)));
+        assert!(!clean.contains(&"a".repeat(161)), "must not exceed the cap");
+        // And it says how much was lost, so a bare "…" is never mistaken
+        // for "and so on".
+        assert!(clean.contains("4840 more characters"), "{clean}");
+        assert!(clean.contains("bowery alerts"), "{clean}");
     }
 
     #[test]
@@ -956,7 +1134,8 @@ mod tests {
         // Truncating by bytes would split a multi-byte char and panic.
         let s = "é".repeat(300);
         let clean = sanitize(&s, 10);
-        assert_eq!(clean.chars().count(), 11);
+        assert!(clean.starts_with(&"é".repeat(10)));
+        assert!(clean.contains("290 more characters"), "{clean}");
     }
 
     #[test]

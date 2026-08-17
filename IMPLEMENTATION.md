@@ -3287,6 +3287,34 @@ filtered-for. The body carries triage detail with control characters
 flattened and fields capped, and says plainly that those fields came
 from the monitored host.
 
+### 29.1a Caps that bound hostility, not caps that tidy output
+
+Every field is capped, because the body is assembled from strings the
+monitored host controls. But the caps were one number, 160, applied
+uniformly — and the rationale is not like the other fields. It is
+*composed*: the analyzer's sentence plus a clause each from provenance,
+set-id, lineage, discovery and the repeat-fold note, joined with ` | `.
+A real credential-read rationale is ~240 characters and a fully chained
+exec rationale runs past 800.
+
+So every one of them arrived cut mid-sentence. The operator read as far
+as "Legitimate for `su`, `sudo`, `login` and PAM; from anything el…" and
+lost exactly the half that says what to do about it — in the one field
+the email exists to deliver.
+
+The rationale now has its own cap (4096) chosen against the longest
+chain the agent can compose rather than against a line width, and long
+values **wrap with a hanging indent** instead of truncating, so a
+continuation cannot be misread as a new field. A single overlong token —
+a path, a hash — is emitted whole rather than broken, because a split
+path is one an investigator cannot paste anywhere.
+
+Bounded is still not uncapped: a compromised agent must not be able to
+mail its operator a megabyte, and `MAX_ENUMERATED` still holds the alert
+count. When a cap *is* reached the text now names how many characters
+were dropped and points at `bowery alerts` — a bare ellipsis reads as
+"and so on" when what it means is "go and look".
+
 Cursors advance only after a successful send; one unreachable agent does
 not suppress the rest; a failed run exits non-zero.
 
