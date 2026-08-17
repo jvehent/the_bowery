@@ -166,9 +166,23 @@ attached (fixed with a startup grace that applies only to a source that
 might still come up), and a missing object correctly alerts immediately
 because nothing is coming.
 
-**Still open from this phase:** peers noticing for each other. A
-neighbour that stops answering, or refuses everything, is visible in the
-corroboration tallies already on the wire but nothing acts on it.
+**Closed since:** peers noticing for each other. `peer_watchdog` reports
+a neighbour that stops gossiping while other peers remain visible — the
+one failure a host cannot report about itself, and the cheapest way to
+defeat every other detection at once. The mesh had known within seconds
+all along: chitchat's failure detector drops the node, `bowery-mesh`
+republishes the set, and that fact was consumed in six places, every one
+of them routing and none of them as a finding.
+
+The care is in the negative case. When *every* peer vanishes the cause
+is almost always this host's own network, so the finding is raised about
+**this** agent rather than as N accusations against neighbours who are
+fine — the same rule the corroboration engine applies in the other
+direction, that silence is not evidence whichever way it points.
+
+Still open: an agent left *running* but tampered with still gossips, so
+it looks alive to every peer watching for silence. That needs attested
+liveness, not observed liveness — Phase F.
 
 ### Phase B — Close the file gap *(BUILT: sensor + persistence/credential rules)*
 
@@ -286,6 +300,8 @@ built on a blind sensor is still blind.
   before the local finding, and treats corroboration from zero peers as
   the non-evidence it is. Destination rarity and "did an operator really
   push you this rule?" still fit with no protocol change.
+- **Peer-witnessed liveness** *(built)* — see Phase A. A stopped agent
+  is now an event on its neighbours.
 - **Peer-witnessed audit.** Root on a host means deleting the local
   audit log. Peers holding the chain head make deletion detectable — an
   attacker cannot retract hashes their neighbours already have.

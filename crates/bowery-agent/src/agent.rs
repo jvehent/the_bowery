@@ -206,6 +206,7 @@ pub struct Agent {
     /// `None` when no file rules are configured (or inotify is unavailable).
     file_monitor_task: Option<JoinHandle<()>>,
     probe_watchdog_task: JoinHandle<()>,
+    peer_watchdog_task: Option<JoinHandle<()>>,
     role_publisher_task: JoinHandle<()>,
     bloom_publisher_task: JoinHandle<()>,
     llm_outcomes_task: JoinHandle<()>,
@@ -922,6 +923,21 @@ impl Agent {
             shutdown_rx.clone(),
         );
 
+        // A neighbour that stops talking is a finding here, because it
+        // cannot be one there. Started after the pipeline so this
+        // agent's own startup is already past.
+        let peer_watchdog_task = config.detection.peer_liveness.then(|| {
+            crate::peer_watchdog::spawn(
+                mesh.peers_watcher(),
+                inbox.clone(),
+                fingerprint,
+                llm.name().to_string(),
+                config.detection.peer_grace,
+                events_tx.clone(),
+                shutdown_rx.clone(),
+            )
+        });
+
         // Blindness reaches an operator the same way any finding does.
         // Started after the pipeline so a source that fails immediately
         // has already recorded why.
@@ -978,6 +994,7 @@ impl Agent {
             revocations,
             file_monitor_task,
             probe_watchdog_task,
+            peer_watchdog_task,
             role_publisher_task,
             bloom_publisher_task,
             llm_outcomes_task,
@@ -1058,6 +1075,9 @@ impl Agent {
             let _ = task.await;
         }
         let _ = self.probe_watchdog_task.await;
+        if let Some(t) = self.peer_watchdog_task {
+            let _ = t.await;
+        }
         let _ = self.role_publisher_task.await;
         let _ = self.bloom_publisher_task.await;
         let _ = self.llm_outcomes_task.await;

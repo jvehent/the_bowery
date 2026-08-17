@@ -213,11 +213,12 @@ pub const TECHNIQUES: &[Technique] = &[
         name: "Impair Defenses: Disable or Modify Tools",
         tactic: "Defense Evasion",
         coverage: Coverage::Partial,
-        rules: &["probe.sensor_blind"],
-        gap: "the agent reports its own blindness — a killed probe, a ring buffer \
-              dropping events — but an attacker who stops the whole agent process \
-              stops the thing that would have said so. Only a peer noticing the \
-              silence closes that, and nothing does yet",
+        rules: &["probe.sensor_blind", "peer.silent"],
+        gap: "the agent reports its own blindness, and its neighbours now report it \
+              going silent altogether — a host cannot witness its own death. What \
+              remains uncovered is the quieter attack: an agent left running but \
+              tampered with, which still gossips and so still looks alive to every \
+              peer watching for silence",
     },
     // -- Credential Access ----------------------------------------------
     Technique {
@@ -470,6 +471,8 @@ pub const NON_TABLE_RULES: &[&str] = &[
     "yara.match",
     // The probe watchdog.
     "probe.sensor_blind",
+    // The peer-liveness watchdog: a neighbour that stops gossiping.
+    "peer.silent",
     // The corroboration engine's claim kinds.
     "corroborate.net_inbound_connect",
     // "does this binary touch this file on your host too?" — a

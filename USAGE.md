@@ -81,8 +81,8 @@ Per-technique detail, including what is *not* covered, is in
 from the rule tables, so it cannot claim coverage the code does not
 have.
 
-**Whispering is what makes it more than N separate agents.** Three kinds
-run today:
+**The mesh is what makes it more than N separate agents.** Three whisper
+kinds run today, plus one thing that needs no question asked at all:
 
 - *Prevalence* — "have you seen this binary?" A quorum of peers that
   have **never** seen it confirms an alert, because a binary none of
@@ -95,11 +95,20 @@ run today:
   is built, and the alert is **superseded by a downgraded one** rather
   than a second alert. It can only ever take a finding back, never raise
   one, and it never runs before the local alert.
+- *Liveness* — not a question but an observation: a peer that stops
+  gossiping while others remain visible is reported by its neighbours.
+  An agent that is not running detects nothing, so stopping it is the
+  cheapest way to defeat everything else — and it is the one failure a
+  host cannot report about itself. If *every* peer vanishes at once the
+  finding is raised about **this** host instead, because that is what a
+  lost network looks like and accusing the whole fleet would be N false
+  findings.
 
-All three refuse to answer when they lack standing — a peer with an
-empty or young baseline, or whose history does not cover the window
-asked about, says "I can't say" rather than voting. That distinction is
-load-bearing; see §9.
+Every one of them refuses rather than guesses when it lacks standing — a
+peer with an empty or young baseline, or whose history does not cover
+the window asked about, says "I can't say" rather than voting; and an
+agent that can see no peers at all reports its own isolation rather than
+accusing the fleet. That distinction is load-bearing; see §9.
 
 ---
 
@@ -242,6 +251,8 @@ discovery_bursts    = true   # several different recon commands from one parent
 discovery_window    = "1m"
 discovery_threshold = 5      # DISTINCT commands; `id` in a loop never trips it
 repeat_window       = "1h"   # fold identical file findings into one alert
+peer_liveness       = true   # neighbours report an agent that goes silent
+peer_grace          = "5m"   # ...after this long, to survive reboots and upgrades
 ```
 
 `repeat_window` is what stops one process reading one file from alerting

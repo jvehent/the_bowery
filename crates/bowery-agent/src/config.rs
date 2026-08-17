@@ -827,6 +827,21 @@ pub struct DetectionConfig {
     /// script does in seconds.
     #[serde(default = "default_discovery_threshold")]
     pub discovery_threshold: usize,
+    /// Report a peer that stops gossiping while other peers remain
+    /// visible.
+    ///
+    /// A host cannot report its own death; its neighbours can. Every
+    /// other detection is void on an agent that is not running, and
+    /// stopping it is the first thing an attacker who finds it does.
+    #[serde(default = "default_true")]
+    pub peer_liveness: bool,
+    /// How long a peer may be missing before it is a finding.
+    ///
+    /// Sits on top of chitchat's own failure detector, and is sized to
+    /// cover the two ordinary reasons a healthy peer disappears: a
+    /// reboot and an agent upgrade.
+    #[serde(with = "humantime_serde", default = "default_peer_grace")]
+    pub peer_grace: Duration,
     /// How long an identical file finding — same rule, same path, same
     /// reader binary — is folded into one alert.
     ///
@@ -850,6 +865,8 @@ impl Default for DetectionConfig {
             discovery_window: default_discovery_window(),
             discovery_threshold: default_discovery_threshold(),
             repeat_window: default_repeat_window(),
+            peer_liveness: true,
+            peer_grace: default_peer_grace(),
         }
     }
 }
@@ -859,6 +876,9 @@ fn default_discovery_window() -> Duration {
 }
 fn default_discovery_threshold() -> usize {
     5
+}
+fn default_peer_grace() -> Duration {
+    crate::peer_watchdog::DEFAULT_GRACE
 }
 fn default_repeat_window() -> Duration {
     Duration::from_hours(1)

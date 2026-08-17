@@ -156,12 +156,12 @@ not, because the exec sensor does not capture the environment.
 
 **Coverage: partial**
 
-Rules: `probe.sensor_blind`
+Rules: `probe.sensor_blind`, `peer.silent`
 
-Gap: the agent reports its own blindness — a killed probe, a ring buffer dropping
-events — but an attacker who stops the whole agent process stops the thing that
-would have said so. Only a peer noticing the silence closes that, and nothing does
-yet.
+Gap: the agent reports its own blindness, and its neighbours now report it going
+silent altogether — a host cannot witness its own death. What remains uncovered is
+the quieter attack: an agent left running but tampered with, which still gossips and
+so still looks alive to every peer watching for silence.
 
 ## Credential Access
 
@@ -275,5 +275,6 @@ entry in the analyzer's rule lists:
 - `baseline.rarity`
 - `yara.match`
 - `probe.sensor_blind`
+- `peer.silent`
 - `corroborate.net_inbound_connect`
 - `corroborate.file_access`

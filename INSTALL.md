@@ -491,6 +491,13 @@ uid_transitions     = true   # a process running as root whose parent was not,
 discovery_bursts    = true   # several DIFFERENT recon commands from one parent
 discovery_window    = "1m"
 discovery_threshold = 5      # distinct commands; `id` in a loop never trips it
+peer_liveness       = true   # report a peer that stops gossiping while others remain
+                             # visible. A host cannot report its own death; its
+                             # neighbours can, and `systemctl stop bowery-agent`
+                             # otherwise defeats every detection silently.
+peer_grace          = "5m"   # how long a peer may be missing first. Sits on top of
+                             # chitchat's failure detector and is sized to cover a
+                             # reboot and an agent upgrade.
 repeat_window       = "1h"   # fold an identical file finding (same rule, same path,
                              # same reader binary) into one alert per window. Repeats
                              # are COUNTED, not dropped: the next report says how many
