@@ -3405,6 +3405,21 @@ restores execution. It skips — loudly — on a host without BPF-LSM, BTF
 or root, because Pi kernels have none of them and a red build for a
 legitimate cannot-run-here teaches people to ignore it.
 
+It passes on otter1 (6.8.0, `lsm=bpf`, BTF present). It did not pass the
+first time, and what it caught is the reason the test runs a real binary
+instead of checking that the map has an entry: `stat` reports `st_dev`
+in glibc's packing, the kernel stores `super_block.s_dev` in its own,
+and the two are different numbers for the same filesystem. The insert
+succeeded, the hook ran, the comparison never matched, and nothing was
+blocked — with no error anywhere, because a map insert cannot tell you
+its key means something else.
+
+It hides unusually well. For major 0 the two encodings coincide, and a
+tempdir on tmpfs has major 0 — so on most hosts this test would have
+gone green over a feature that did nothing. otter1's `/tmp` is ext4.
+`kernel_dev_from_stat_dev` reconciles them, and the tmpfs case is now
+its own test named for the fact that it hides the bug.
+
 ---
 
 ## 29. Reaching an operator who isn't watching

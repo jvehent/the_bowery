@@ -127,6 +127,17 @@ dominates real hosts was never enumerated. Shipping a rule now means
 pulling the fleet's inbox a day later and reading what it actually
 produced.
 
+A third form is worth recording separately, because no amount of
+reading would have caught it. Inode blocking was built, reviewed, and
+silently did nothing: `stat` reports `st_dev` in glibc's packing while
+the kernel stores `super_block.s_dev` in its own, so the map key never
+matched. A BPF map insert cannot report that a key means something
+else, so the only symptom was an exec that should not have happened.
+And for major 0 — a tmpfs mount, where a tempdir usually lands — the
+two encodings are identical, so the test would have passed on most
+hosts. otter1's `/tmp` is on ext4, which is the only reason it
+surfaced.
+
 The same shape has a second form, found while consolidating rather than
 building: a path that was never reachable at all. The LLM prompt
 advertised five action ids the engine does not implement and omitted
@@ -307,7 +318,7 @@ No new sensors required:
   cannot be armed by naming an engine: an upgrade must never arm
   enforcement on an operator's behalf.
 
-- **Inode-keyed `block_exec`** *(built; needs hardware verification)* —
+- **Inode-keyed `block_exec`** *(BUILT and verified on hardware)* —
   replaces the `comm` key, which was both bypassable (rename yourself)
   and weaponisable (name yourself `sshd` and the agent locks the real
   one out). A `(dev, ino)` pair names the file: a rename keeps it, a
@@ -336,6 +347,12 @@ No new sensors required:
   Pi kernels ship neither BTF nor `CONFIG_BPF_LSM`, so this is a
   capability that degrades explicitly: those hosts keep comm-keyed
   blocking and say so.
+
+  Verified on otter1 (6.8.0, BPF-LSM active): the blocked file does not
+  execute, an unrelated file still does, **renaming does not escape the
+  block**, a **copy does run** because it is a different inode, and
+  unblocking restores execution. The first run failed, which is the
+  point of having written it — see the `dev_t` note below.
 - **Network isolation** as an action.
 - **Quorum-gated enforcement** *(built)* — `DESIGN.md` specified from the
   start that a hard action needs standing authorization *or* k-of-n peer
