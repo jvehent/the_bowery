@@ -500,11 +500,15 @@ fn collapse_superseded(alerts: Vec<bowery_proto::Alert>) -> Vec<bowery_proto::Al
 #[derive(Debug)]
 pub struct BoweryDetectionsTable {
     stats: Arc<crate::detection_stats::DetectionStats>,
+    baseline: Arc<Baseline>,
 }
 
 impl BoweryDetectionsTable {
-    pub fn new(stats: Arc<crate::detection_stats::DetectionStats>) -> Self {
-        Self { stats }
+    pub fn new(
+        stats: Arc<crate::detection_stats::DetectionStats>,
+        baseline: Arc<Baseline>,
+    ) -> Self {
+        Self { stats, baseline }
     }
 }
 
@@ -516,21 +520,37 @@ impl BoweryTable for BoweryDetectionsTable {
     fn register(&self, conn: &Connection) -> Result<(), TableError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS bowery_detections (
-                rule_id           TEXT,
-                fired             INTEGER,
+                rule_id            TEXT,
+                fired              INTEGER,
+                fired_since_install INTEGER,
                 last_fired_unix_ms INTEGER,
-                since_unix_ms     INTEGER
+                since_unix_ms      INTEGER
             );",
         )?;
         let mut stmt = conn.prepare(
-            "INSERT INTO bowery_detections (rule_id, fired, last_fired_unix_ms, since_unix_ms)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO bowery_detections
+                (rule_id, fired, fired_since_install, last_fired_unix_ms, since_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
         let since = i64::try_from(self.stats.since_unix_ms()).unwrap_or(i64::MAX);
+        // Durable totals, which is the number that answers "has this
+        // ever fired here" rather than "since the last restart". The
+        // in-memory count is kept alongside rather than replaced: a rule
+        // that fired long ago and has gone quiet since is a different
+        // fact from one firing now.
+        let durable: std::collections::HashMap<String, u64> = self
+            .baseline
+            .detection_counts()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, n, _)| (id, n))
+            .collect();
         for (rule_id, stat) in self.stats.snapshot() {
+            let total = durable.get(rule_id).copied().unwrap_or(0) + stat.fired;
             stmt.execute(params![
                 rule_id,
                 i64::try_from(stat.fired).unwrap_or(i64::MAX),
+                i64::try_from(total).unwrap_or(i64::MAX),
                 // NULL, not 0: "never fired" and "fired at the epoch"
                 // are different facts, and only one of them is real.
                 stat.last_unix_ms

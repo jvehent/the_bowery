@@ -48,6 +48,24 @@ CREATE INDEX IF NOT EXISTS idx_lineage_child ON process_lineage(child_sha);
 -- Keyed on the canonical addr:port text rather than a parsed tuple so
 -- v4 and v6 share one table and the key is directly greppable by an
 -- operator reading the SQL surface.
+-- How often each detection rule has fired, across the life of this
+-- install rather than since the last restart.
+--
+-- The in-memory counters answer only for the current process, and that
+-- window misled twice in one session: a zero was read as a rule that had
+-- never worked when the agent had simply restarted minutes earlier.
+-- Whether a rule has ever fired since install is the question worth
+-- asking, and it has to outlive the process.
+--
+-- CREATE TABLE IF NOT EXISTS means an existing baseline gains this table
+-- on next start, with no migration step and no data loss.
+CREATE TABLE IF NOT EXISTS detection_stats (
+    rule_id    TEXT PRIMARY KEY,
+    fired      INTEGER NOT NULL DEFAULT 0,
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS net_destinations (
     dst_key    TEXT PRIMARY KEY,
     addr       TEXT NOT NULL,
@@ -286,6 +304,73 @@ impl Baseline {
 
     /// Collect every recorded destination into a Vec.
     ///
+    /// Fold in-memory fire counts into the durable totals.
+    ///
+    /// Called periodically and at shutdown rather than on every fire:
+    /// a rule can fire thousands of times a day and a write per fire
+    /// would put `SQLite` on the alert path for no benefit. Losing the
+    /// last interval's counts on a hard kill is an acceptable trade for
+    /// keeping detection off the disk.
+    ///
+    /// # Errors
+    /// Propagates `SQLite` failures.
+    pub fn add_detection_counts(&self, counts: &[(&str, u64, Option<u64>)]) -> Result<()> {
+        if counts.is_empty() {
+            return Ok(());
+        }
+        let now = system_time_to_secs(SystemTime::now());
+        let conn = self.inner.lock().expect("baseline mutex poisoned");
+        let tx = conn.unchecked_transaction()?;
+        for (rule_id, delta, last_ms) in counts {
+            if *delta == 0 {
+                // Still ensure the row exists: a rule that has never
+                // fired must be a visible zero, not a missing row.
+                tx.execute(
+                    "INSERT OR IGNORE INTO detection_stats (rule_id, fired, first_seen, last_seen)
+                     VALUES (?1, 0, ?2, ?2)",
+                    params![rule_id, now],
+                )?;
+                continue;
+            }
+            let last = last_ms.map_or(now, |ms| i64::try_from(ms / 1000).unwrap_or(now));
+            tx.execute(
+                "INSERT INTO detection_stats (rule_id, fired, first_seen, last_seen)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(rule_id) DO UPDATE SET
+                     fired = fired + excluded.fired,
+                     last_seen = MAX(last_seen, excluded.last_seen)",
+                params![
+                    rule_id,
+                    i64::try_from(*delta).unwrap_or(i64::MAX),
+                    now,
+                    last
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Durable per-rule totals: `(rule_id, fired, last_seen_unix_secs)`.
+    ///
+    /// # Errors
+    /// Propagates `SQLite` failures.
+    pub fn detection_counts(&self) -> Result<Vec<(String, u64, u64)>> {
+        let conn = self.inner.lock().expect("baseline mutex poisoned");
+        let mut stmt =
+            conn.prepare("SELECT rule_id, fired, last_seen FROM detection_stats ORDER BY rule_id")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
+                    u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// How long this host has known one destination, and how often it
     /// has contacted it.
     ///
@@ -715,5 +800,77 @@ mod tests {
         let baseline = Baseline::open(&path).unwrap();
         baseline.upsert_binary(&sha(7)).unwrap();
         assert!(path.exists());
+    }
+
+    // -----------------------------------------------------------------
+    // Durable detection counters
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn counts_accumulate_across_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Baseline::open(dir.path().join("b.db")).unwrap();
+        b.add_detection_counts(&[("cred.read_shadow", 3, None)])
+            .unwrap();
+        b.add_detection_counts(&[("cred.read_shadow", 2, None)])
+            .unwrap();
+        let got = b.detection_counts().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, 5, "a second flush must add, not replace");
+    }
+
+    /// The whole reason this is on disk: a restart must not reset the
+    /// answer to whether a rule has ever fired here.
+    #[test]
+    fn counts_survive_reopening_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        {
+            let b = Baseline::open(&path).unwrap();
+            b.add_detection_counts(&[("c2.beacon_new_destination", 4, None)])
+                .unwrap();
+        }
+        let b = Baseline::open(&path).unwrap();
+        assert_eq!(b.detection_counts().unwrap()[0].1, 4);
+    }
+
+    /// A rule that has never fired still gets a row, so its zero is
+    /// visible rather than absent.
+    #[test]
+    fn a_never_fired_rule_is_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Baseline::open(dir.path().join("b.db")).unwrap();
+        b.add_detection_counts(&[("impact.mass_write_new_extension", 0, None)])
+            .unwrap();
+        let got = b.detection_counts().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, 0);
+    }
+
+    /// ...and a later zero must not wipe a real count.
+    #[test]
+    fn a_zero_flush_does_not_reset_an_existing_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Baseline::open(dir.path().join("b.db")).unwrap();
+        b.add_detection_counts(&[("lineage.service_spawned_shell", 7, None)])
+            .unwrap();
+        b.add_detection_counts(&[("lineage.service_spawned_shell", 0, None)])
+            .unwrap();
+        assert_eq!(b.detection_counts().unwrap()[0].1, 7);
+    }
+
+    #[test]
+    fn a_destination_lookup_reports_what_it_knows() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Baseline::open(dir.path().join("b.db")).unwrap();
+        assert!(b.net_destination("10.0.0.9", 443).unwrap().is_none());
+        b.upsert_net_destination("10.0.0.9", 443).unwrap();
+        b.upsert_net_destination("10.0.0.9", 443).unwrap();
+        let rec = b
+            .net_destination("10.0.0.9", 443)
+            .unwrap()
+            .expect("known now");
+        assert_eq!(rec.seen_count, 2);
+        assert_eq!(rec.port, 443);
     }
 }

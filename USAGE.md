@@ -427,9 +427,12 @@ is usually one that *cannot* fire; a rule with an implausibly large count
 is one firing on the wrong thing. Six defects were found this way in a
 single day, three of each kind.
 
-`since_unix_ms` is on every row because counts reset when the agent
-restarts, and a zero means nothing without the window it was measured
-over. Check it before concluding anything.
+Two counts, because they answer different questions. `fired` is since
+this agent started; `fired_since_install` is the durable total, folded
+into the baseline every five minutes and at shutdown. The second is the
+one that answers *has this ever fired here* — the first misled twice in
+one session, reading as a dead rule when the agent had simply restarted
+minutes earlier. `since_unix_ms` says which window `fired` covers.
 
 
 | question | query |

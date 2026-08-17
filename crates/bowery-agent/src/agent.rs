@@ -203,6 +203,7 @@ pub struct Agent {
     /// `None` when no file rules are configured (or inotify is unavailable).
     file_monitor_task: Option<JoinHandle<()>>,
     detection_stats: Arc<crate::detection_stats::DetectionStats>,
+    detection_flush_task: JoinHandle<()>,
     probe_watchdog_task: JoinHandle<()>,
     peer_watchdog_task: Option<JoinHandle<()>>,
     action_release_task: JoinHandle<()>,
@@ -634,6 +635,37 @@ impl Agent {
         // Seeded with every rule the agent knows, so a detection that
         // has never fired is a visible zero rather than a missing row.
         let detection_stats = Arc::new(crate::detection_stats::DetectionStats::new());
+        // Fold the counters into the baseline on a slow cadence and at
+        // shutdown. Not per fire: a rule can fire thousands of times a
+        // day and a write per fire would put SQLite on the alert path
+        // for no benefit. Losing the last interval on a hard kill is the
+        // right trade for keeping detection off the disk.
+        let detection_flush_task = {
+            let stats = detection_stats.clone();
+            let baseline = baseline.clone();
+            let mut shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_mins(5));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    let stopping = tokio::select! {
+                        _ = tick.tick() => false,
+                        _ = shutdown.changed() => true,
+                    };
+                    let counts = stats.drain();
+                    let refs: Vec<(&str, u64, Option<u64>)> = counts
+                        .iter()
+                        .map(|(id, n, last)| (*id, *n, *last))
+                        .collect();
+                    if let Err(e) = baseline.add_detection_counts(&refs) {
+                        warn!(error = %e, "persisting detection counts failed");
+                    }
+                    if stopping {
+                        break;
+                    }
+                }
+            })
+        };
 
         let sql_engine = bowery_sql::Sql::new()
             .with_concurrency_cap(config.sql.max_concurrent_queries)
@@ -669,6 +701,7 @@ impl Agent {
             ))
             .with_extra_table(Arc::new(crate::sql_tables::BoweryDetectionsTable::new(
                 detection_stats.clone(),
+                baseline.clone(),
             )))
             .with_extra_table(Arc::new(crate::sql_tables::BoweryAlertsTable::new(
                 inbox.clone(),
@@ -1058,6 +1091,7 @@ impl Agent {
             revocations,
             file_monitor_task,
             detection_stats,
+            detection_flush_task,
             probe_watchdog_task,
             peer_watchdog_task,
             action_release_task,
@@ -1150,6 +1184,7 @@ impl Agent {
         if let Some(task) = self.file_monitor_task.take() {
             let _ = task.await;
         }
+        let _ = self.detection_flush_task.await;
         let _ = self.probe_watchdog_task.await;
         let _ = self.action_release_task.await;
         if let Some(t) = self.peer_watchdog_task {

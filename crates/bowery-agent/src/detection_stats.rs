@@ -125,6 +125,23 @@ impl DetectionStats {
     pub fn since_unix_ms(&self) -> u64 {
         self.since_unix_ms
     }
+
+    /// Take everything counted since the last drain.
+    ///
+    /// Resets the counters, so repeated calls accumulate into the
+    /// durable store rather than re-adding the same totals. Returns
+    /// every rule, including the zeros, so a never-fired rule gets a row
+    /// on disk too — the whole point is that its absence is visible.
+    pub fn drain(&self) -> Vec<(&'static str, u64, Option<u64>)> {
+        self.rules
+            .iter()
+            .map(|(id, (count, last))| {
+                let fired = count.swap(0, Ordering::Relaxed);
+                let last = last.load(Ordering::Relaxed);
+                (*id, fired, (last > 0).then_some(last))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
