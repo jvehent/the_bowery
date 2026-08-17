@@ -1249,9 +1249,23 @@ outage, an unparseable response, a hash VT has never seen — every one of
 those sends the alert anyway. A monitoring system must not go quiet
 because a third-party API had a bad day.
 
-Every digest states what screening did (`3 hash(es) checked, 2 held back
-as known-clean`), so a filter that removes alerts is never invisible,
-and held-back alerts stay readable with `bowery alerts`.
+Each alert carries its own verdict:
+
+```
+  suspicion : 1.00
+  exe       : /usr/local/bin/updater
+  sha256    : 7947969…
+  why       : exec from world-writable path
+  vt        : VirusTotal: 41/62 engines flag this
+```
+
+A flagged binary **leads its host's list and the subject line**
+(`[1 VT-FLAGGED]`), so the worst thing is visible without scrolling.
+
+Every digest also states what screening did as a whole — including how
+many hashes VirusTotal had never seen, because `2 hash(es) checked` on
+its own reads as "checked and fine" when it may mean the opposite.
+Held-back alerts stay readable with `bowery alerts`.
 
 Verdicts are cached for a week in `~/.bowery/vt-cache.json` to stay
 inside the quota. Failures are never cached — that would turn one outage

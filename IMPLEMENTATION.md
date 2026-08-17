@@ -3001,8 +3001,15 @@ VT for their own samples.
 open.** Missing key, spent quota, API outage, unparseable response,
 zero-engine result, or an unknown hash all send the alert anyway.
 `Verdict::may_suppress` encodes it and a test asserts no malformed body
-can reach a suppressing state. Every digest reports what screening did,
-so the filter is never invisible.
+can reach a suppressing state.
+
+Verdicts are rendered **per alert**, not only as a digest total: an
+operator triaging one finding needs the verdict for *that* binary, and
+the first version reported just "2 hash(es) checked", which said nothing
+about either. A flagged hash sorts to the front of its host's list and
+into the subject line, and unknown hashes are counted separately —
+"2 checked" with no further detail reads as reassurance when it may mean
+VirusTotal has never seen either one.
 
 ### 29.3 `--verbose-whisper`
 

@@ -57,6 +57,10 @@ use bowery_proto::Alert;
 use serde::{Deserialize, Serialize};
 
 use crate::peers::Manifest;
+use crate::virustotal::Verdict;
+
+/// SHA-256 (lowercase hex) → what `VirusTotal` said about it.
+pub type VerdictMap = std::collections::HashMap<String, Verdict>;
 
 /// Cap on any single field copied into the body.
 const FIELD_CAP: usize = 160;
@@ -306,7 +310,7 @@ pub fn sanitize(s: &str, cap: usize) -> String {
 /// alert content, so header injection is impossible by construction
 /// rather than by escaping.
 #[must_use]
-pub fn subject(hosts: &[HostAlerts]) -> String {
+pub fn subject(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
     let total: usize = hosts.iter().map(|h| h.alerts.len()).sum();
     let confirmed: usize = hosts
         .iter()
@@ -324,7 +328,19 @@ pub fn subject(hosts: &[HostAlerts]) -> String {
         2 => format!(" on {}, {}", names[0], names[1]),
         n => format!(" on {}, {} +{}", names[0], names[1], n - 2),
     };
-    let confirmed_note = if confirmed > 0 {
+    let flagged = hosts
+        .iter()
+        .flat_map(|h| &h.alerts)
+        .filter(|a| {
+            vt.get(&a.exe_sha256_hex.to_ascii_lowercase())
+                .is_some_and(Verdict::is_malicious)
+        })
+        .count();
+    // A VirusTotal hit is the loudest thing a digest can carry, so it
+    // leads the subject rather than hiding in the body.
+    let confirmed_note = if flagged > 0 {
+        format!(" [{flagged} VT-FLAGGED]")
+    } else if confirmed > 0 {
         format!(" [{confirmed} confirmed]")
     } else {
         String::new()
@@ -339,7 +355,7 @@ pub fn subject(hosts: &[HostAlerts]) -> String {
 
 /// Plain-text digest body.
 #[must_use]
-pub fn body(hosts: &[HostAlerts]) -> String {
+pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let total: usize = hosts.iter().map(|h| h.alerts.len()).sum();
@@ -377,6 +393,11 @@ pub fn body(hosts: &[HostAlerts]) -> String {
                 );
             }
             let _ = writeln!(out, "  why       : {}", sanitize(&a.rationale, FIELD_CAP));
+            // Per alert, not just as a digest total: an operator triaging
+            // one finding needs the verdict for *that* binary.
+            if let Some(v) = vt.get(&a.exe_sha256_hex.to_ascii_lowercase()) {
+                let _ = writeln!(out, "  vt        : {}", v.summary());
+            }
         }
         if host.alerts.len() > MAX_ENUMERATED {
             let _ = writeln!(
@@ -449,6 +470,9 @@ pub struct VtOutcome {
     pub looked_up: usize,
     pub suppressed: usize,
     pub flagged: usize,
+    /// Hashes `VirusTotal` has never seen. Not reassuring, and counted
+    /// separately so a digest cannot imply otherwise.
+    pub unknown: usize,
     /// Lookups that could not be made — no key, quota spent, API down.
     /// These suppress nothing, and their count is stated so an operator
     /// can tell "nothing was malicious" from "nothing was checked".
@@ -466,6 +490,12 @@ impl VtOutcome {
         let mut s = format!("VirusTotal: {} hash(es) checked", self.looked_up);
         if self.flagged > 0 {
             let _ = write!(s, ", {} FLAGGED", self.flagged);
+        }
+        if self.unknown > 0 {
+            // Without this, "2 checked" and nothing else reads as
+            // "checked and fine", when it may mean VT has never seen
+            // either hash — which is not reassurance.
+            let _ = write!(s, ", {} unknown to VT", self.unknown);
         }
         if self.suppressed > 0 {
             let _ = write!(s, ", {} alert(s) held back as known-clean", self.suppressed);
@@ -600,7 +630,7 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     // VirusTotal screening. Only ever removes alerts on a positive
     // clean verdict; a missing key, a spent quota or an API outage
     // leaves the digest exactly as it was.
-    let vt = screen_with_virustotal(&cfg, &mut hosts).await;
+    let (vt, verdicts) = screen_with_virustotal(&cfg, &mut hosts).await;
     if hosts.iter().all(|h| h.alerts.is_empty()) {
         for (fp, cursor) in advanced {
             cursors.by_fp.insert(fp, cursor);
@@ -612,10 +642,10 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         return Ok(());
     }
 
-    let subject = subject(&hosts);
+    let subject = subject(&hosts, &verdicts);
     let body = format!(
         "{}{}",
-        body(&hosts),
+        body(&hosts, &verdicts),
         vt.line()
             .map(|l| format!("\n{l}\nHeld-back alerts remain readable with `bowery alerts`.\n"))
             .unwrap_or_default()
@@ -653,27 +683,31 @@ pub async fn run(args: &RunArgs) -> Result<()> {
 /// Returns what happened, for the digest to report. Never returns an
 /// error: a failure here must leave the alerts alone rather than
 /// abort the run.
-async fn screen_with_virustotal(cfg: &NotifyConfig, hosts: &mut [HostAlerts]) -> VtOutcome {
+async fn screen_with_virustotal(
+    cfg: &NotifyConfig,
+    hosts: &mut [HostAlerts],
+) -> (VtOutcome, VerdictMap) {
     use crate::virustotal::{VtCache, VtClient, default_cache_path, now_unix_s, read_api_key};
 
     let mut outcome = VtOutcome::default();
+    let mut verdicts = VerdictMap::new();
     if !cfg.virustotal.enabled {
-        return outcome;
+        return (outcome, verdicts);
     }
     let Some(key_path) = cfg.virustotal.api_key_file.as_ref() else {
         eprintln!("notify: [virustotal] enabled but no api_key_file; skipping screening");
-        return outcome;
+        return (outcome, verdicts);
     };
     let key = match read_api_key(&expand_tilde(key_path)) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("notify: VirusTotal key unusable ({e}); sending unscreened");
-            return outcome;
+            return (outcome, verdicts);
         }
     };
     let Ok(client) = VtClient::new(key) else {
         eprintln!("notify: could not build the VirusTotal client; sending unscreened");
-        return outcome;
+        return (outcome, verdicts);
     };
 
     let cache_path = cfg
@@ -709,21 +743,32 @@ async fn screen_with_virustotal(cfg: &NotifyConfig, hosts: &mut [HostAlerts]) ->
             if verdict.is_malicious() {
                 outcome.flagged += 1;
             }
-            if matches!(verdict, crate::virustotal::Verdict::Unavailable(_)) {
-                outcome.unavailable += 1;
+            match &verdict {
+                Verdict::Unavailable(_) => outcome.unavailable += 1,
+                Verdict::Unknown => outcome.unknown += 1,
+                _ => {}
             }
+            verdicts.insert(alert.exe_sha256_hex.to_ascii_lowercase(), verdict.clone());
             if vt_decision(&verdict, cfg.virustotal.suppress_known_clean) {
                 kept.push(alert);
             } else {
                 outcome.suppressed += 1;
             }
         }
+        // A VirusTotal hit leads the host's list. An operator reading
+        // on a phone should not have to scroll past clean findings to
+        // reach the one an engine flagged.
+        kept.sort_by_key(|a| {
+            !verdicts
+                .get(&a.exe_sha256_hex.to_ascii_lowercase())
+                .is_some_and(Verdict::is_malicious)
+        });
         host.alerts = kept;
     }
     if let Err(e) = cache.save(&cache_path) {
         eprintln!("notify: could not save the VirusTotal cache: {e}");
     }
-    outcome
+    (outcome, verdicts)
 }
 
 async fn send_email(cfg: &NotifyConfig, subject: &str, body: &str) -> Result<()> {
@@ -887,7 +932,7 @@ mod tests {
             host: "otter1".into(),
             alerts: vec![alert("ep-1\nSubject: spoofed", 0.99, true)],
         }];
-        let s = subject(&hosts);
+        let s = subject(&hosts, &VerdictMap::new());
         assert!(!s.contains('\n'));
         assert!(!s.contains("spoofed"), "{s}");
         assert!(s.contains("otter1"));
@@ -904,7 +949,7 @@ mod tests {
                 alerts: vec![alert("ep", 0.95, false)],
             })
             .collect();
-        let s = subject(&hosts);
+        let s = subject(&hosts, &VerdictMap::new());
         assert!(s.contains("4 alerts"), "{s}");
         assert!(s.contains("+2"), "{s}");
     }
@@ -915,7 +960,7 @@ mod tests {
             host: "otter1".into(),
             alerts: vec![alert("ep-1", 0.99, true)],
         }];
-        let b = body(&hosts);
+        let b = body(&hosts, &VerdictMap::new());
         assert!(
             b.contains("/tmp/payload"),
             "operator needs the path to triage"
@@ -935,7 +980,7 @@ mod tests {
             host: "noisy".into(),
             alerts,
         }];
-        let b = body(&hosts);
+        let b = body(&hosts, &VerdictMap::new());
         assert!(b.contains("and 475 more"), "{}", &b[b.len() - 400..]);
         assert!(
             b.len() < 100_000,
@@ -979,6 +1024,46 @@ mod tests {
             (out[0].suspicion - 0.99).abs() < f32::EPSILON,
             "worst first, so a phone screen shows it"
         );
+    }
+
+    #[test]
+    fn a_flagged_hash_is_shown_per_alert_and_leads_the_subject() {
+        // The digest previously reported only a total ("2 hash(es)
+        // checked"), which told an operator nothing about any specific
+        // finding — and a VirusTotal hit had no more prominence than a
+        // clean one.
+        let a = alert("ep-1", 0.95, false);
+        let sha = a.exe_sha256_hex.to_ascii_lowercase();
+        let hosts = vec![HostAlerts {
+            host: "web-1".into(),
+            alerts: vec![a],
+        }];
+        let mut vt = VerdictMap::new();
+        vt.insert(
+            sha,
+            Verdict::Malicious {
+                malicious: 41,
+                total: 62,
+            },
+        );
+
+        let b = body(&hosts, &vt);
+        assert!(b.contains("41/62"), "the verdict belongs on the alert: {b}");
+        let s = subject(&hosts, &vt);
+        assert!(s.contains("VT-FLAGGED"), "{s}");
+    }
+
+    #[test]
+    fn an_unknown_hash_is_counted_so_the_total_is_not_misread() {
+        // "2 checked" with nothing else reads as "checked and fine",
+        // when it may mean VT has never seen either hash.
+        let outcome = VtOutcome {
+            looked_up: 2,
+            unknown: 2,
+            ..VtOutcome::default()
+        };
+        let line = outcome.line().unwrap();
+        assert!(line.contains("2 unknown to VT"), "{line}");
     }
 
     #[test]
