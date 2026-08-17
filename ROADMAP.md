@@ -127,6 +127,15 @@ dominates real hosts was never enumerated. Shipping a rule now means
 pulling the fleet's inbox a day later and reading what it actually
 produced.
 
+A fourth form is the mirror image and the only one that was *loud*: a
+detection that fired constantly and correctly on the wrong thing. The
+uid-transition rule exempted the executed binary when it should have
+exempted the parent, so every `sudo <command>` read as an escalation —
+78 in a day, at 0.9, above the notification threshold. It was invisible
+because the fleet's inbox is cleared on restart and every sample landed
+in a quiet window. Found by asking each detection how often it had
+fired, and noticing one answer was far too large rather than zero.
+
 A third form is worth recording separately, because no amount of
 reading would have caught it. Inode blocking was built, reviewed, and
 silently did nothing: `stat` reports `st_dev` in glibc's packing while

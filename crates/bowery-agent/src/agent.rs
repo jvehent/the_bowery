@@ -3834,6 +3834,40 @@ async fn process_file_open(
     }
 }
 
+/// Is this pid a packaged, unmodified setuid-root privilege helper?
+///
+/// Answers "did this root process come through the sanctioned path",
+/// which is a question about the **parent**: `sudo` execs the command
+/// *as root* while the forked `sudo` that waits for it keeps the
+/// invoking user's real uid. Checking the executed binary instead made
+/// every `sudo <command>` a 0.9 finding — 78 in one day on a live host.
+///
+/// `false` whenever the parent cannot be resolved, which fails towards
+/// alerting: an exemption has to be demonstrated.
+async fn parent_privilege_helper(
+    ppid: u32,
+    packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
+) -> bool {
+    let Some(exe) = bowery_events::enrich::pid_exe_path(ppid) else {
+        return false;
+    };
+    let Some((setuid, _)) = bowery_analysis::provenance::setid_bits(&exe) else {
+        return false;
+    };
+    if !setuid {
+        return false;
+    }
+    let packages = packages.clone();
+    tokio::task::spawn_blocking(move || {
+        let Ok(sha) = enrich::sha256_file(&exe) else {
+            return false;
+        };
+        bowery_analysis::provenance::is_privilege_helper(true, packages.classify(&exe, &sha))
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Everything an operator needs to judge an exec alert without logging
 /// in to the host.
 ///
@@ -4142,13 +4176,25 @@ async fn process_exec(
     //
     // Read *before* the parent can exit. Even so it is often gone, which
     // is why an unknown parent reports nothing rather than guessing.
-    if detection.uid_transitions {
+    if detection.uid_transitions && exec.uid == 0 {
         let parent_uid = bowery_events::enrich::pid_uid(exec.ppid);
+        // Resolving the parent's provenance costs a sha256 and a package
+        // lookup, so it is done only once the cheap preconditions hold:
+        // a root process whose parent is not root. That is rare — on an
+        // ordinary host it is `sudo` and little else — so the expensive
+        // half runs only where an alert was otherwise about to be
+        // raised.
+        let parent_is_helper = if parent_uid.is_some_and(|u| u != 0) {
+            parent_privilege_helper(exec.ppid, packages).await
+        } else {
+            false
+        };
         if let Some(hit) = bowery_analysis::uid_transition(
             exec.uid,
             parent_uid,
             exec_provenance,
             setid.is_some_and(|(setuid, _)| setuid),
+            parent_is_helper,
         ) {
             if hit.severity > verdict.suspicion {
                 verdict.suspicion = hit.severity;

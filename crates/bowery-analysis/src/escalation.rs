@@ -16,6 +16,14 @@
 //! name, because a name is attacker-controlled. A binary called `sudo`
 //! that no package owns is the thing this is looking for, not the thing
 //! it should ignore.
+//!
+//! And it keys on the **parent**, which is not where the first version
+//! looked. `sudo`'s own exec never trips this rule — setuid changes the
+//! effective uid while the real one stays the invoking user — so the
+//! transition happens on the *next* exec, when sudo runs the command as
+//! root. Checking the executed binary instead exempted nothing that
+//! mattered and made every `sudo <command>` a 0.9 finding: 78 in a day
+//! on a live host, above the notification threshold.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -47,6 +55,7 @@ pub fn uid_transition(
     parent_uid: Option<u32>,
     provenance: Provenance,
     exe_is_setuid: bool,
+    parent_is_privilege_helper: bool,
 ) -> Option<EscalationHit> {
     // Only a transition *to* root is interesting. Dropping privileges is
     // what well-behaved daemons do on startup.
@@ -61,11 +70,37 @@ pub fn uid_transition(
         return None;
     }
 
-    // The sanctioned path: a setuid-root binary the distribution ships.
-    // `sudo`, `su`, `pkexec`, `newgrp`, `doas`. Anchored on provenance,
-    // not on the name, because the name is attacker-controlled — a
-    // binary *called* sudo that no package owns is the finding, not the
-    // exemption.
+    // The sanctioned path, and it is the PARENT that establishes it.
+    //
+    // This was originally checked on the executed binary, which is the
+    // wrong process and made the rule fire on every `sudo <command>` —
+    // 78 times in a day on a live host. `sudo`'s own exec never trips
+    // this rule: setuid changes the *effective* uid while the real one
+    // stays the invoking user, so the child_uid check above already
+    // excludes it. The transition happens on the *next* exec, when sudo
+    // has become root and runs the command — and there the helper is
+    // the parent:
+    //
+    //     476350  /usr/bin/sudo     (real uid 1000, no finding)
+    //     476351  fork of sudo      (real uid 1000)
+    //       476352  /usr/bin/install  running as root  <- the transition
+    //
+    // So a root process whose parent is a packaged, unmodified
+    // setuid-root helper came through the sanctioned path.
+    //
+    // Anchored on provenance rather than on a name, because a name is
+    // attacker-controlled: a binary *called* sudo that no package owns
+    // is the finding, not the exemption.
+    //
+    // Known limitation, stated rather than hidden: an attacker who
+    // exploits `sudo` itself is exempted by this, because from here a
+    // legitimate sudo and a subverted one are indistinguishable.
+    if parent_is_privilege_helper {
+        return None;
+    }
+    // The other shape: executing a setuid-root binary the distribution
+    // ships. Kept for a direct exec of such a helper that does reach
+    // this point.
     if exe_is_setuid && provenance == Provenance::PackagedIntact {
         return None;
     }
@@ -285,7 +320,7 @@ mod tests {
             Provenance::Unknown,
         ] {
             for setuid in [true, false] {
-                if let Some(hit) = uid_transition(0, Some(1000), provenance, setuid) {
+                if let Some(hit) = uid_transition(0, Some(1000), provenance, setuid, false) {
                     reachable.insert(hit.rule_id);
                 }
             }
@@ -295,9 +330,38 @@ mod tests {
         assert_eq!(reachable, declared);
     }
 
+    /// The false positive a live host produced 78 times in a day.
+    ///
+    /// `sudo install …` looks exactly like an escalation from here: the
+    /// command runs as root and its parent — the forked `sudo` that
+    /// waits for it — still has the invoking user's real uid. The
+    /// exemption has to key on the *parent* being the sanctioned
+    /// helper, because `sudo`'s own exec never reaches this rule.
+    #[test]
+    fn sudo_running_a_command_is_not_an_escalation() {
+        assert!(
+            uid_transition(0, Some(1000), Provenance::PackagedIntact, false, true).is_none(),
+            "every `sudo <command>` would otherwise be a 0.9 finding"
+        );
+        // The executed command is ordinary and unpackaged — `sudo make
+        // install` running something from a build tree, say. Still not a
+        // finding, because the parent establishes the path.
+        assert!(uid_transition(0, Some(1000), Provenance::Unpackaged, false, true).is_none());
+    }
+
+    /// ...but only a *real* helper exempts. The caller decides that from
+    /// package provenance, so a parent merely named `sudo` never does.
+    #[test]
+    fn a_root_process_whose_parent_is_not_a_helper_still_alerts() {
+        let hit =
+            uid_transition(0, Some(1000), Provenance::Unpackaged, false, false).expect("alert");
+        assert_eq!(hit.rule_id, "privesc.uid_transition_no_helper");
+    }
+
     #[test]
     fn reaching_root_without_a_helper_is_a_finding() {
-        let hit = uid_transition(0, Some(1000), Provenance::Unpackaged, false).expect("alert");
+        let hit =
+            uid_transition(0, Some(1000), Provenance::Unpackaged, false, false).expect("alert");
         assert_eq!(hit.rule_id, "privesc.uid_transition_no_helper");
         assert!(hit.why.contains("uid 1000"));
     }
@@ -307,32 +371,33 @@ mod tests {
         // The sanctioned path. Alerting here would fire on every
         // administrative action a human performs and teach them to
         // ignore the rule.
-        assert!(uid_transition(0, Some(1000), Provenance::PackagedIntact, true).is_none());
+        assert!(uid_transition(0, Some(1000), Provenance::PackagedIntact, true, false).is_none());
     }
 
     #[test]
     fn a_setuid_binary_no_package_owns_is_not_exempt() {
         // The exemption is anchored on provenance, not on a name, so a
         // binary *called* sudo that arrived some other way is caught.
-        let hit = uid_transition(0, Some(1000), Provenance::Unpackaged, true).expect("alert");
+        let hit =
+            uid_transition(0, Some(1000), Provenance::Unpackaged, true, false).expect("alert");
         assert_eq!(hit.rule_id, "privesc.uid_transition_untrusted_setuid");
         assert!(hit.severity > 0.9);
     }
 
     #[test]
     fn a_modified_packaged_setuid_helper_is_not_exempt_either() {
-        assert!(uid_transition(0, Some(1000), Provenance::PackagedModified, true).is_some());
+        assert!(uid_transition(0, Some(1000), Provenance::PackagedModified, true, false).is_some());
     }
 
     #[test]
     fn root_starting_root_is_not_a_transition() {
-        assert!(uid_transition(0, Some(0), Provenance::Unpackaged, false).is_none());
+        assert!(uid_transition(0, Some(0), Provenance::Unpackaged, false, false).is_none());
     }
 
     #[test]
     fn dropping_privileges_is_not_a_transition() {
         // Daemons do this on startup; it is the opposite of escalation.
-        assert!(uid_transition(1000, Some(0), Provenance::Unpackaged, false).is_none());
+        assert!(uid_transition(1000, Some(0), Provenance::Unpackaged, false, false).is_none());
     }
 
     #[test]
@@ -340,7 +405,7 @@ mod tests {
         // The parent exited before it could be read. Alerting anyway
         // would fire on every root process whose parent is gone, which
         // on a booting host is most of them.
-        assert!(uid_transition(0, None, Provenance::Unpackaged, false).is_none());
+        assert!(uid_transition(0, None, Provenance::Unpackaged, false, false).is_none());
     }
 
     #[test]

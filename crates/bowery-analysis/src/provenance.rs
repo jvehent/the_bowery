@@ -415,6 +415,17 @@ pub const fn rule_ids() -> &'static [&'static str] {
     ]
 }
 
+/// Is this binary a privilege helper the distribution vouches for?
+///
+/// The sanctioned path to root: `sudo`, `su`, `pkexec`, `newgrp`,
+/// `doas`. Both halves are required — setuid-root *and* owned by a
+/// package whose contents still match — so a binary merely *named*
+/// `sudo`, or a trojanised real one, is not a helper.
+#[must_use]
+pub fn is_privilege_helper(setuid: bool, provenance: Provenance) -> bool {
+    setuid && provenance == Provenance::PackagedIntact
+}
+
 /// Does a set-id binary at this provenance warrant an alert?
 ///
 /// A setuid-root binary is how an unprivileged process becomes root, so
