@@ -240,6 +240,7 @@ async fn process_kill_engine_actually_kills_a_real_child() {
         workdir.path(),
         reserve_udp_port(),
         ResponseConfig {
+            mode: bowery_agent::config::ResponseMode::Enforce,
             policy_path: Some(policy_path),
             engine: ResponseEngineKind::ProcessKill,
             audit_log_path: None,
@@ -302,6 +303,7 @@ async fn permissive_policy_routes_through_observe_only_engine() {
     std::fs::write(&policy_path, r#"allowed_actions = ["kill_process"]"#).unwrap();
 
     let response = ResponseConfig {
+        mode: bowery_agent::config::ResponseMode::Enforce,
         policy_path: Some(policy_path),
         engine: ResponseEngineKind::Noop,
         audit_log_path: None,
@@ -335,6 +337,7 @@ async fn audit_log_records_signed_envelope_per_action() {
     let vk = identity.verifying_key();
 
     let response = ResponseConfig {
+        mode: bowery_agent::config::ResponseMode::Enforce,
         policy_path: None,
         engine: ResponseEngineKind::Noop,
         audit_log_path: Some(audit_path.clone()),

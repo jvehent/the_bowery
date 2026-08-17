@@ -1097,6 +1097,20 @@ pub struct ResponseConfig {
     pub policy_path: Option<PathBuf>,
     #[serde(default)]
     pub engine: ResponseEngineKind,
+    /// Whether the engine may actually touch the host.
+    ///
+    /// Separate from `engine`, and deliberately so. `engine` says *how*
+    /// a host would be acted on; this says *whether*. Conflating them
+    /// meant the only way to find out what enforcement would do was to
+    /// turn it on, so the honest choice was between running blind and
+    /// running armed — and most operators sensibly choose blind
+    /// forever.
+    ///
+    /// Defaults to [`ResponseMode::Off`]. Arming a host is an explicit
+    /// act, and an upgrade must never perform it on an operator's
+    /// behalf.
+    #[serde(default)]
+    pub mode: ResponseMode,
     /// Phase-7 slice 4: signed audit-envelope log. When set, every
     /// `execute(&action)` call produces an Ed25519-signed
     /// [`AuditEnvelope`](bowery_response::AuditEnvelope) appended to
@@ -1155,6 +1169,32 @@ fn default_max_concurrent_queries() -> usize {
 
 fn default_sql_max_timeout() -> Duration {
     Duration::from_secs(30)
+}
+
+/// Whether the response engine may change the host.
+///
+/// Separate from which engine is configured, and deliberately so:
+/// `engine` says *how* a host would be acted on, this says *whether*.
+/// Collapsing them meant the only way to learn what enforcement would do
+/// was to turn it on, so the real choice was between running blind and
+/// running armed — and most operators sensibly choose blind forever.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResponseMode {
+    /// Nothing is decided and nothing is done. The default; arming a
+    /// host is an explicit act and an upgrade must never do it for you.
+    #[default]
+    Off,
+    /// Every gate runs and only the final effect is skipped. The audit
+    /// log records what arming this host *would* have done, against
+    /// this host's real traffic.
+    ///
+    /// Recorded as `would_execute`, never `suppressed` — those are
+    /// opposite facts, and reading an approved action as a policy
+    /// refusal is exactly what would make a dry run worse than useless.
+    DryRun,
+    /// Armed. The engine acts.
+    Enforce,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1338,6 +1378,55 @@ discovery_threshold = 5
         assert!(cfg.detection.uid_transitions);
         assert!(cfg.detection.discovery_bursts);
         assert!(cfg.detection.discovery_threshold >= 2);
+    }
+
+    /// Arming a host must be an explicit act. An upgrade that silently
+    /// started killing processes because a default changed is the
+    /// failure this pins.
+    #[test]
+    fn response_is_off_unless_an_operator_says_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&dir.path().join("missing.toml")).unwrap();
+        assert_eq!(cfg.response.mode, ResponseMode::Off);
+        // And the historical switch still defaults to observe-only, so
+        // neither knob alone can arm anything.
+        assert_eq!(cfg.response.engine, ResponseEngineKind::Noop);
+    }
+
+    /// The `[response]` block exactly as `INSTALL.md` documents it.
+    #[test]
+    fn parses_the_documented_response_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        fs::write(
+            &path,
+            r#"
+[response]
+mode   = "dry-run"
+engine = "process-kill"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("the documented block must parse");
+        assert_eq!(cfg.response.mode, ResponseMode::DryRun);
+        assert_eq!(cfg.response.engine, ResponseEngineKind::ProcessKill);
+    }
+
+    /// `mode` and `engine` answer different questions — *whether* and
+    /// *how* — so choosing a real engine must not by itself arm the
+    /// host.
+    #[test]
+    fn naming_an_engine_does_not_arm_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        fs::write(&path, "[response]\nengine = \"process-kill\"\n").unwrap();
+        let cfg = Config::load(&path).expect("parses");
+        assert_eq!(cfg.response.engine, ResponseEngineKind::ProcessKill);
+        assert_eq!(
+            cfg.response.mode,
+            ResponseMode::Off,
+            "an engine choice alone must never arm enforcement"
+        );
     }
 
     #[test]

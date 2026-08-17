@@ -274,12 +274,35 @@ No new sensors required:
 [`docs/ATTACK-COVERAGE.md`]: docs/ATTACK-COVERAGE.md
 [`attack.rs`]: crates/bowery-analysis/src/attack.rs
 
-### Phase D — Make response worth arming
+### Phase D — Make response worth arming *(dry-run + mode gate BUILT)*
 
-- **Inode/sha-keyed `block_exec`** replacing the `comm` key (already
-  scoped as P9-2). Until then, blocking is theatre.
-- **Network isolation** as an action, and **dry-run mode** so an operator
-  can watch what enforcement *would* have done.
+- **Dry-run mode** *(built)* — the missing middle. Arming an EDR is a
+  step operators are right to be slow about, and nothing in an
+  observe-only deployment told you what *would* have happened, so the
+  real choice was between running blind and running armed. Most people
+  sensibly choose blind forever. Now every gate runs, only the final
+  effect is skipped, and the audit log holds exactly the actions arming
+  this host would have taken against its real traffic.
+
+  It reports `would_execute`, deliberately **not** `suppressed`. Those
+  are opposite facts: a suppression means a gate said no, and reading
+  approved actions as policy refusals would tell an operator their
+  policy was working when it had in fact approved every one — which
+  would make a dry run worse than no dry run.
+
+- **A `mode` separate from `engine`** *(built)* — `engine` says *how* a
+  host would be acted on, `mode` says *whether*. Conflating them was
+  what made the middle step impossible. `off` is the default, and a host
+  cannot be armed by naming an engine: an upgrade must never arm
+  enforcement on an operator's behalf.
+
+- **Inode/sha-keyed `block_exec`** *(open)* replacing the `comm` key
+  (already scoped as P9-2). Until then, blocking is theatre — and
+  weaponisable. Needs the LSM hook to read `bprm->file->f_inode` via
+  CO-RE, which needs BTF, which Pi kernels do not ship; those hosts
+  cannot run BPF-LSM at all, so this lands as a capability that degrades
+  explicitly rather than one that works fleet-wide.
+- **Network isolation** as an action.
 - **Quorum-gated enforcement**: `DESIGN.md` has always specified hard
   actions requiring standing authorization *or* k-of-n peer agreement.
   The quorum signal now exists and is trustworthy; the response engine

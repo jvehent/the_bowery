@@ -99,6 +99,16 @@ pub enum ActionOutcome {
     /// suppression (in `bowery_audit` this is `outcome_kind = "failed"`),
     /// or a silently-failing kill reads as successful containment.
     Failed { reason: String },
+    /// Dry run: the action passed every gate and **would** have been
+    /// executed, but enforcement is not armed.
+    ///
+    /// Deliberately not `Suppressed`. Those are opposite facts: a
+    /// suppression means a gate said no, and reading a dry run as one
+    /// would tell an operator evaluating enforcement that their policy
+    /// rejected the action when in fact it approved it. `would` names
+    /// the engine that was standing by, so the audit trail says what
+    /// arming the host would actually have done.
+    WouldExecute { would: String, at_unix_ms: u64 },
 }
 
 impl ActionOutcome {
@@ -121,6 +131,27 @@ impl ActionOutcome {
         Self::Failed {
             reason: reason.into(),
         }
+    }
+
+    pub fn would_execute(would: impl Into<String>) -> Self {
+        let at_unix_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_millis()).ok())
+            .unwrap_or(0);
+        Self::WouldExecute {
+            would: would.into(),
+            at_unix_ms,
+        }
+    }
+
+    /// Did the host actually change?
+    ///
+    /// The question an operator reading an audit trail is really
+    /// asking, and one that four of five variants answer "no" to.
+    #[must_use]
+    pub fn changed_the_host(&self) -> bool {
+        matches!(self, Self::Executed { .. })
     }
 }
 

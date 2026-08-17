@@ -383,41 +383,63 @@ impl Agent {
                 "[response] allowed_actions entry doesn't match any known action id; ignored"
             );
         }
-        let response_engine: Arc<dyn ResponseEngine> = match config.response.engine {
-            ResponseEngineKind::Noop => Arc::new(NoopEngine::new(response_policy)),
-            ResponseEngineKind::ProcessKill => Arc::new(ProcessKillEngine::new(response_policy)),
-            ResponseEngineKind::BpfLsm => {
-                // Find the BPF object via the same search path as the
-                // event source — env var, /usr/local/lib/bowery/, the
-                // in-tree dev build dir. Operators turning on
-                // `engine = bpf-lsm` are explicit about wanting it,
-                // so a missing BPF object or insufficient
-                // capabilities is a startup error rather than a
-                // silent fall-back to noop.
-                let obj_path = bowery_ebpf_loader::BpfEventSource::from_default_locations()
-                    .map_err(|e| {
+        // `mode` gates whether the host may be touched at all; `engine`
+        // only says how. Off is the default and short-circuits before
+        // any engine is constructed — a host that is not meant to act
+        // should not be loading a BPF blocker or asking for CAP_KILL to
+        // do nothing with them.
+        let build_engine = |policy: ResponsePolicy| -> Result<Box<dyn ResponseEngine>, AgentError> {
+            Ok(match config.response.engine {
+                ResponseEngineKind::Noop => Box::new(NoopEngine::new(policy)),
+                ResponseEngineKind::ProcessKill => Box::new(ProcessKillEngine::new(policy)),
+                ResponseEngineKind::BpfLsm => {
+                    // Find the BPF object via the same search path as the
+                    // event source — env var, /usr/local/lib/bowery/, the
+                    // in-tree dev build dir. Operators turning on
+                    // `engine = bpf-lsm` are explicit about wanting it,
+                    // so a missing BPF object or insufficient
+                    // capabilities is a startup error rather than a
+                    // silent fall-back to noop.
+                    let obj_path = bowery_ebpf_loader::BpfEventSource::from_default_locations()
+                        .map_err(|e| {
+                            AgentError::Config(format!(
+                                "[response] engine = bpf-lsm but the BPF object isn't loadable: {e}"
+                            ))
+                        })?
+                        .obj_path()
+                        .to_path_buf();
+                    let blocker = bowery_ebpf_loader::BpfBlocker::load(&obj_path).map_err(|e| {
                         AgentError::Config(format!(
-                            "[response] engine = bpf-lsm but the BPF object isn't loadable: {e}"
+                            "loading BPF blocker from {}: {e}",
+                            obj_path.display()
                         ))
-                    })?
-                    .obj_path()
-                    .to_path_buf();
-                let blocker = bowery_ebpf_loader::BpfBlocker::load(&obj_path).map_err(|e| {
-                    AgentError::Config(format!(
-                        "loading BPF blocker from {}: {e}",
-                        obj_path.display()
-                    ))
-                })?;
-                Arc::new(crate::response_bpf::BpfLsmEngine::new(
-                    response_policy,
-                    blocker,
-                ))
-            }
+                    })?;
+                    Box::new(crate::response_bpf::BpfLsmEngine::new(policy, blocker))
+                }
+            })
+        };
+        let response_engine: Arc<dyn ResponseEngine> = match config.response.mode {
+            // Nothing is decided and nothing is done. Reported as a
+            // policy suppression, which is what it is.
+            crate::config::ResponseMode::Off => Arc::new(NoopEngine::new(response_policy)),
+            crate::config::ResponseMode::DryRun => Arc::from(bowery_response::DryRunEngine::new(
+                build_engine(response_policy)?,
+            )),
+            crate::config::ResponseMode::Enforce => Arc::from(build_engine(response_policy)?),
         };
         info!(
             engine = response_engine.name(),
+            mode = ?config.response.mode,
             "response engine initialised"
         );
+        if config.response.mode == crate::config::ResponseMode::Enforce {
+            // Loud on purpose. This is the line an operator greps for
+            // after something on this host died unexpectedly.
+            warn!(
+                engine = response_engine.name(),
+                "response enforcement is ARMED — this agent may kill or block on this host"
+            );
+        }
         info!(
             deny_list = ?response_engine.policy().effective_block_exec_deny_list(),
             "block_exec deny-list (defaults + operator additions)"

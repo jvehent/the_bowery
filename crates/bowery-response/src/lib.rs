@@ -28,6 +28,7 @@
 
 pub mod action;
 pub mod audit;
+pub mod dry_run;
 pub mod engine;
 pub mod policy;
 pub mod process_kill;
@@ -36,6 +37,7 @@ pub use action::{Action, ActionError, ActionOutcome};
 pub use audit::{
     AUDIT_SIG_DOMAIN, AuditEnvelope, AuditError, AuditRecord, AuditSink, JsonlFileSink, NoopSink,
 };
+pub use dry_run::DryRunEngine;
 pub use engine::{NoopEngine, ResponseEngine};
 pub use policy::ResponsePolicy;
 pub use process_kill::ProcessKillEngine;

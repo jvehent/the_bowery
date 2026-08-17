@@ -9,8 +9,10 @@
 > distributed YARA rules, and surfaces alerts to roaming operators over
 > a signed `Subscribe` flow. A response engine exists (`block_exec` /
 > `kill_process`); enforcement is opt-in and off by default —
-> `[response] engine = "noop"` ships as the default, so an agent is
-> observe-only until you turn it on.
+> `[response] mode = "off"` ships as the default, so an agent is
+> observe-only until you turn it on. `mode = "dry-run"` is the middle
+> step: every gate runs, nothing touches the host, and the audit log
+> records what arming it *would* have done.
 
 ---
 
@@ -477,6 +479,24 @@ retention = "72h"   # TTL on individual alerts (lazy sweep)
 
 [alerts]
 threshold = 0.7     # suspicion at which a verdict becomes an Alert
+
+# Response. Two separate questions, deliberately not one knob:
+#   mode   — WHETHER this agent may change the host
+#   engine — HOW it would, if it may
+# Naming an engine does not arm anything. An upgrade must never arm
+# enforcement on your behalf, so `off` is the default.
+[response]
+mode   = "off"          # off | dry-run | enforce
+engine = "noop"         # noop | process-kill | bpf-lsm
+# policy_path    = "/etc/bowery/response-policy.toml"   # deny-all by default
+# audit_log_path = "/var/log/bowery/actions.jsonl"      # signed, one line per action
+#
+# `dry-run` is the step to take before `enforce`: every gate runs, the
+# host is never touched, and each action is recorded as `would_execute`
+# — NOT as `suppressed`, which means a gate refused it. Read the audit
+# log (or `SELECT * FROM bowery_audit`) for a week; if it names nothing
+# you would not have wanted done, arming is an informed decision rather
+# than a leap.
 
 # Built-in behavioural detections. Unlike [monitor] below, these are ON
 # for a host nobody configured — the block exists to tune them, and every
