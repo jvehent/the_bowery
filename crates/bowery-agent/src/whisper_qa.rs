@@ -682,6 +682,7 @@ fn finish_round(
             ts_unix_ms: crate::inbox::current_unix_ms(),
             backend: confirm.backend_label.clone(),
             confirmation: Some(verdict),
+            context: Vec::new(),
         };
         info!(
             episode = %context.episode_id,

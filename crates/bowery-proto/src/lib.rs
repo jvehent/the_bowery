@@ -465,6 +465,22 @@ pub struct Alert {
     /// arrives as a second, superseding alert for the same `episode_id`.
     #[prost(message, optional, tag = "10")]
     pub confirmation: Option<AlertConfirmation>,
+
+    /// Everything an operator needs to judge the alert without logging
+    /// in: full command line, uid, working directory, the process
+    /// ancestry, and what the process had open.
+    ///
+    /// Untyped key/value rather than named fields, reusing
+    /// [`Attribute`], because what is worth attaching differs per
+    /// detection — an exec alert wants the ancestry, a file alert wants
+    /// the writing process — and the alert path should not gain a field
+    /// every time a detection wants to say something new.
+    ///
+    /// **Attacker-influenced, all of it.** A command line is whatever
+    /// somebody chose to run. Renderers sanitise and cap it, and say so
+    /// to the reader.
+    #[prost(message, repeated, tag = "11")]
+    pub context: Vec<Attribute>,
 }
 
 /// What the neighbourhood said when asked about an alert.
@@ -1337,6 +1353,7 @@ mod tests {
                 quorum: 2,
                 confirmed: true,
             }),
+            context: Vec::new(),
         };
         let original = WhisperPayload::alert(alert.clone());
         let bytes = original.encode_to_vec();
@@ -1365,6 +1382,7 @@ mod tests {
             ts_unix_ms: 1_730_000_000_001,
             backend: "old/backend".into(),
             confirmation: None,
+            context: Vec::new(),
         };
         // `None` encodes to no tag-10 bytes at all, which is exactly the
         // wire image an older agent produces.
@@ -1403,6 +1421,7 @@ mod tests {
                 ts_unix_ms: 7,
                 backend: "test".into(),
                 confirmation: None,
+                context: Vec::new(),
             }],
             cursor_unix_ms: 8,
             end: true,

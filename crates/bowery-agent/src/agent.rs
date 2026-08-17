@@ -2436,6 +2436,7 @@ async fn handle_yara_push(
             // A YARA hit is a direct content match; there is nothing for
             // the neighbourhood to corroborate.
             confirmation: None,
+            context: Vec::new(),
         };
         let episode_id = alert.episode_id.clone();
         warn!(rule = %m.rule_name, path = %m.path, "YARA MATCH");
@@ -3459,6 +3460,9 @@ fn process_file_open(
         ts_unix_ms: current_unix_ms(),
         backend: backend_label.to_string(),
         confirmation: None,
+        // The process that touched the file is the lead to follow, so
+        // its ancestry and open handles travel with the alert.
+        context: file_open_context(open),
     };
     warn!(
         rule = hit.rule_id,
@@ -3472,6 +3476,111 @@ fn process_file_open(
         episode_id,
         suspicion: hit.severity,
     });
+}
+
+/// Everything an operator needs to judge an exec alert without logging
+/// in to the host.
+///
+/// "A rare binary ran" is not actionable. "`sshd → bash → curl`, run by
+/// uid 1000 from /tmp, with `curl -s http://…/x.sh | sh`, holding a
+/// socket to 203.0.113.9:80" is. The pieces are cheap — most are
+/// already on the event, the rest are one `/proc` read each — and
+/// without them the operator's next step is always the same manual
+/// investigation.
+///
+/// Best-effort throughout. A short-lived process is gone before the
+/// `/proc` reads happen, so anything unavailable is **omitted rather
+/// than reported as empty**: "no open files" and "the process had
+/// already exited" must not look the same.
+fn exec_context(exec: &ProcessExec) -> Vec<bowery_proto::Attribute> {
+    use bowery_proto::Attribute;
+
+    let mut ctx = Vec::new();
+    ctx.push(Attribute::new("uid", exec.uid.to_string()));
+    if !exec.args.is_empty() {
+        // The full command line, not the first argument. Arguments are
+        // where the intent usually is — a downloader's URL, an
+        // interpreter's inline script.
+        ctx.push(Attribute::new("cmdline", exec.args.join(" ")));
+    }
+    if let Some(cwd) = bowery_events::enrich::pid_cwd(exec.pid) {
+        ctx.push(Attribute::new("cwd", cwd.display().to_string()));
+    }
+
+    // Ancestry, nearest first. Depth 6 reaches init on any normal tree
+    // and bounds the walk on a pathological one.
+    let chain = bowery_events::enrich::pid_ancestry(exec.pid, 6);
+    if !chain.is_empty() {
+        let rendered: Vec<String> = std::iter::once(format!("{}[{}]", exec.comm, exec.pid))
+            .chain(chain.iter().map(|(pid, comm)| format!("{comm}[{pid}]")))
+            .collect();
+        // Root-first reads the way an operator thinks about it.
+        ctx.push(Attribute::new(
+            "ancestry",
+            rendered.into_iter().rev().collect::<Vec<_>>().join(" → "),
+        ));
+    }
+
+    // What the process had open at this instant. Distinguishing "could
+    // not look" from "had nothing open" is the whole reason this is an
+    // Option.
+    match bowery_events::enrich::pid_open_files(exec.pid, 12) {
+        Some((paths, sockets)) => {
+            if !paths.is_empty() {
+                let listed: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                ctx.push(Attribute::new("open_files", listed.join(", ")));
+            }
+            // Resolving the inode is what turns "held 3 sockets" into
+            // somewhere to look next.
+            let peers = bowery_events::enrich::resolve_tcp_sockets(&sockets, 8);
+            if !peers.is_empty() {
+                ctx.push(Attribute::new("connections", peers.join(", ")));
+            } else if !sockets.is_empty() {
+                ctx.push(Attribute::new(
+                    "connections",
+                    format!("{} socket(s), none resolvable to a TCP peer", sockets.len()),
+                ));
+            }
+        }
+        None => ctx.push(Attribute::new(
+            "open_files",
+            "not sampled — the process had already exited",
+        )),
+    }
+    ctx
+}
+
+/// Context for a file-watch alert: who touched it, and what else they
+/// had open at the time.
+fn file_open_context(open: &bowery_events::FileOpen) -> Vec<bowery_proto::Attribute> {
+    use bowery_proto::Attribute;
+
+    let mut ctx = vec![Attribute::new("pid", open.pid.to_string())];
+    if !open.comm.is_empty() {
+        ctx.push(Attribute::new("comm", open.comm.clone()));
+    }
+    if let Some(cmdline) = bowery_events::enrich::pid_cmdline(open.pid)
+        && !cmdline.is_empty()
+    {
+        ctx.push(Attribute::new("cmdline", cmdline.join(" ")));
+    }
+    let chain = bowery_events::enrich::pid_ancestry(open.pid, 6);
+    if !chain.is_empty() {
+        let mut rendered: Vec<String> = chain
+            .iter()
+            .map(|(pid, comm)| format!("{comm}[{pid}]"))
+            .collect();
+        rendered.reverse();
+        rendered.push(format!("{}[{}]", open.comm, open.pid));
+        ctx.push(Attribute::new("ancestry", rendered.join(" → ")));
+    }
+    if let Some((_, sockets)) = bowery_events::enrich::pid_open_files(open.pid, 0) {
+        let peers = bowery_events::enrich::resolve_tcp_sockets(&sockets, 8);
+        if !peers.is_empty() {
+            ctx.push(Attribute::new("connections", peers.join(", ")));
+        }
+    }
+    ctx
 }
 
 /// Emit an alert for a change to an operator-watched file.
@@ -3532,6 +3641,7 @@ async fn process_file_change(
         // the neighbourhood about, and the operator asked to be told
         // regardless of what peers think.
         confirmation: None,
+        context: Vec::new(),
     };
     let episode_id = alert.episode_id.clone();
     info!(rule = %rule.id, path = %change.path.display(), op, "file monitor alert");
@@ -3700,10 +3810,23 @@ async fn process_exec(
     // whisper_qa_task) consume the same shape; whisper_qa_task
     // additionally injects neighborhood sightings into `ctx.extra`
     // before submitting.
+    // Sampled once, here, while the process is most likely still alive.
+    // Both the alert and the LLM-refined alert reuse it rather than
+    // re-reading /proc: by the time inference returns the process is
+    // usually gone, and a second sample would report "already exited"
+    // for something that was running when it mattered.
+    let context = exec_context(&exec);
+
     let mut ctx = AnalysisContext::new(verdict.clone())
         .with_exe_sha256(&sha)
         .with_exe_pid(exec.pid)
         .with_exe_comm(exec.comm.clone());
+    // The same context the alert carries, so the model sees the command
+    // line and ancestry too — that is most of what a human would use to
+    // judge this, and it was previously invisible to the LLM as well.
+    for a in &context {
+        ctx.extra.push((a.key.clone(), a.value.clone()));
+    }
     if let Some(p) = exec.exe_path.as_ref() {
         ctx = ctx.with_exe_path(p.clone());
     }
@@ -3762,6 +3885,7 @@ async fn process_exec(
             // First alert for this episode. A whisper round may follow and
             // append a confirmed, superseding alert.
             confirmation: None,
+            context: context.clone(),
         };
         let episode_id = alert.episode_id.clone();
         let suspicion = alert.suspicion;
@@ -3832,6 +3956,7 @@ fn spawn_llm_outcomes_task(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // one linear outcome path
 fn handle_llm_outcome(
     events_tx: &broadcast::Sender<AgentEvent>,
     inbox: &Arc<AlertInbox>,
@@ -3878,6 +4003,15 @@ fn handle_llm_outcome(
                     // round's outcome; confirmation arrives on its own
                     // superseding alert from `finish_round`.
                     confirmation: None,
+                    // Recovered from the analysis context, which carries what
+                    // was sampled at exec time. Re-reading /proc now would
+                    // report "already exited" for a process that was alive
+                    // when the sample that matters was taken.
+                    context: ctx
+                        .extra
+                        .iter()
+                        .map(|(k, v)| bowery_proto::Attribute::new(k, v))
+                        .collect(),
                 };
                 inbox.append(alert);
                 let _ = events_tx.send(AgentEvent::AlertEmitted {
@@ -4353,6 +4487,7 @@ mod alert_chunk_tests {
             ts_unix_ms: i,
             backend: "test".to_string(),
             confirmation: None,
+            context: Vec::new(),
         }
     }
 

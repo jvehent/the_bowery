@@ -209,6 +209,16 @@ impl AlertsPane {
         if !alert.suggested_actions.is_empty() {
             lines.push(kv("suggested", alert.suggested_actions.join(", ")));
         }
+        // Command line, ancestry, cwd, open handles. This is what turns
+        // "a rare binary ran" into something judgeable without leaving
+        // the console.
+        if !alert.context.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("context", theme::detail_label())));
+            for attr in &alert.context {
+                lines.push(kv(&format!("  {}", attr.key), attr.value.clone()));
+            }
+        }
         if let Some(c) = alert.confirmation {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -469,6 +479,7 @@ mod render_tests {
                 ts_unix_ms: 1_786_622_341_123 + i as u64,
                 backend: "llama-cpp/qwen3-0.6b".into(),
                 confirmation: None,
+                context: Vec::new(),
             })
             .collect()
     }

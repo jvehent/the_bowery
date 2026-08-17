@@ -657,6 +657,7 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
             ts_unix_ms: current_unix_ms(),
             backend: ctx.backend_label.clone(),
             confirmation: Some(confirmation),
+            context: Vec::new(),
         };
         warn!(
             kind = claim.kind,

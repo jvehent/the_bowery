@@ -249,6 +249,7 @@ pub fn spawn(
                 // host, not a claim peers can corroborate. Asking the
                 // neighbourhood whether we are blind would be absurd.
                 confirmation: None,
+                context: Vec::new(),
             });
             let _ = events_tx.send(AgentEvent::AlertEmitted {
                 episode_id,

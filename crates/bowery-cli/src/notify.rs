@@ -67,6 +67,9 @@ const FIELD_CAP: usize = 160;
 /// Cap on alerts enumerated in one email. Beyond this the digest says
 /// how many were omitted — a flood must not become a megabyte message.
 const MAX_ENUMERATED: usize = 25;
+/// Context values get more room than other fields: a command line is
+/// the single most useful thing in an alert and is routinely long.
+const CONTEXT_CAP: usize = 320;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -287,6 +290,26 @@ pub struct HostAlerts {
     pub alerts: Vec<Alert>,
 }
 
+/// `2026-08-17 01:25:01 UTC`, or the raw value if it is not a sane time.
+#[must_use]
+pub fn format_ts(ms: u64) -> String {
+    let secs = i64::try_from(ms / 1000).unwrap_or(0);
+    time::OffsetDateTime::from_unix_timestamp(secs).map_or_else(
+        |_| ms.to_string(),
+        |t| {
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                t.year(),
+                u8::from(t.month()),
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second()
+            )
+        },
+    )
+}
+
 /// Strip anything that could break out of a plain-text line, and bound
 /// the length.
 ///
@@ -381,6 +404,7 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
                     None => String::new(),
                 }
             );
+            let _ = writeln!(out, "  when      : {}", format_ts(a.ts_unix_ms));
             let _ = writeln!(out, "  episode   : {}", sanitize(&a.episode_id, FIELD_CAP));
             if !a.exe_path.is_empty() {
                 let _ = writeln!(out, "  exe       : {}", sanitize(&a.exe_path, FIELD_CAP));
@@ -397,6 +421,17 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
             // one finding needs the verdict for *that* binary.
             if let Some(v) = vt.get(&a.exe_sha256_hex.to_ascii_lowercase()) {
                 let _ = writeln!(out, "  vt        : {}", v.summary());
+            }
+            // Command line, ancestry, working directory, open handles —
+            // the difference between "a rare binary ran" and something
+            // an operator can actually judge from a phone.
+            for attr in &a.context {
+                let _ = writeln!(
+                    out,
+                    "  {:<10}: {}",
+                    sanitize(&attr.key, 16),
+                    sanitize(&attr.value, CONTEXT_CAP)
+                );
             }
         }
         if host.alerts.len() > MAX_ENUMERATED {
@@ -890,6 +925,7 @@ mod tests {
                 quorum: 2,
                 confirmed: true,
             }),
+            context: Vec::new(),
         }
     }
 

@@ -184,3 +184,178 @@ mod parent_tests {
         assert!(pid_comm(u32::MAX).is_none());
     }
 }
+
+/// Current working directory of a process.
+#[must_use]
+pub fn pid_cwd(pid: u32) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// Walk up the process tree, nearest ancestor first.
+///
+/// Bounded, and stops at pid 1 or the first unreadable parent. An
+/// alert that says only "bash ran curl" is much harder to judge than
+/// one showing `sshd → bash → curl`: the chain is usually what tells an
+/// operator whether a human did this.
+///
+/// Racy by nature — a parent may exit mid-walk — so a short chain is a
+/// normal outcome, not an error.
+#[must_use]
+pub fn pid_ancestry(pid: u32, max_depth: usize) -> Vec<(u32, String)> {
+    let mut chain = Vec::new();
+    let mut current = pid;
+    for _ in 0..max_depth {
+        let Some(parent) = pid_ppid(current) else {
+            break;
+        };
+        if parent == 0 {
+            break;
+        }
+        let comm = pid_comm(parent).unwrap_or_else(|| "?".to_string());
+        chain.push((parent, comm));
+        if parent == 1 {
+            break;
+        }
+        current = parent;
+    }
+    chain
+}
+
+/// Files a process currently has open, and how many sockets.
+///
+/// Returns `(paths, socket_inodes)`. Best-effort and a *snapshot*: a
+/// short-lived process is already gone by the time this runs, which is
+/// why the caller must distinguish "nothing open" from "could not look"
+/// rather than presenting an empty list as a finding.
+#[must_use]
+pub fn pid_open_files(pid: u32, cap: usize) -> Option<(Vec<PathBuf>, Vec<u64>)> {
+    let entries = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    let mut paths = Vec::new();
+    let mut sockets = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(target) = fs::read_link(entry.path()) else {
+            continue;
+        };
+        let s = target.to_string_lossy();
+        if let Some(inode) = s.strip_prefix("socket:[").and_then(|r| r.strip_suffix(']')) {
+            if let Ok(n) = inode.parse() {
+                sockets.push(n);
+            }
+        } else if s.starts_with('/') && paths.len() < cap {
+            // Skip the noise every process has open.
+            if !s.starts_with("/dev/") && !s.starts_with("/proc/") && !s.starts_with("/sys/") {
+                paths.push(target);
+            }
+        }
+    }
+    Some((paths, sockets))
+}
+
+/// Resolve socket inodes to `local -> remote` pairs via `/proc/net/tcp`.
+///
+/// This is what makes an open-socket count into something an operator
+/// can act on: "held 3 sockets" says nothing, "connected to
+/// 203.0.113.9:443" says where to look next.
+#[must_use]
+pub fn resolve_tcp_sockets(inodes: &[u64], cap: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for (file, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
+        let Ok(text) = fs::read_to_string(file) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            if out.len() >= cap {
+                return out;
+            }
+            let f: Vec<&str> = line.split_whitespace().collect();
+            // local_address(1) rem_address(2) … inode(9)
+            if f.len() < 10 {
+                continue;
+            }
+            let Ok(inode) = f[9].parse::<u64>() else {
+                continue;
+            };
+            if !inodes.contains(&inode) {
+                continue;
+            }
+            if let (Some(l), Some(r)) = (parse_hex_addr(f[1], v6), parse_hex_addr(f[2], v6)) {
+                out.push(format!("{l} -> {r}"));
+            }
+        }
+    }
+    out
+}
+
+/// `0100007F:1F90` → `127.0.0.1:8080`. Kernel writes the address in
+/// host byte order per 32-bit word, which is why the octets reverse.
+fn parse_hex_addr(s: &str, v6: bool) -> Option<String> {
+    let (addr, port) = s.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    if v6 {
+        if addr.len() != 32 {
+            return None;
+        }
+        let mut groups = Vec::new();
+        for word in 0..4 {
+            let w = &addr[word * 8..word * 8 + 8];
+            let n = u32::from_str_radix(w, 16).ok()?.swap_bytes();
+            groups.push(format!("{:x}:{:x}", n >> 16, n & 0xffff));
+        }
+        return Some(format!("[{}]:{port}", groups.join(":")));
+    }
+    if addr.len() != 8 {
+        return None;
+    }
+    let n = u32::from_str_radix(addr, 16).ok()?;
+    let o = n.to_le_bytes();
+    Some(format!("{}.{}.{}.{}:{port}", o[0], o[1], o[2], o[3]))
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn our_own_ancestry_is_readable_and_bounded() {
+        let chain = pid_ancestry(std::process::id(), 6);
+        assert!(!chain.is_empty(), "a test process always has a parent");
+        assert!(chain.len() <= 6, "depth must be bounded");
+    }
+
+    #[test]
+    fn a_dead_pid_yields_an_empty_chain_rather_than_panicking() {
+        assert!(pid_ancestry(u32::MAX, 6).is_empty());
+        assert!(pid_open_files(u32::MAX, 10).is_none());
+    }
+
+    #[test]
+    fn open_files_distinguishes_nothing_from_could_not_look() {
+        // `None` means the process was gone; `Some(empty)` means it had
+        // nothing interesting open. Collapsing those would present a
+        // dead process as one that opened nothing.
+        let (paths, _) = pid_open_files(std::process::id(), 32).expect("our own fds are readable");
+        assert!(paths.iter().all(|p| p.is_absolute()));
+    }
+
+    #[test]
+    fn ipv4_addresses_decode_in_the_kernel_byte_order() {
+        // /proc/net/tcp writes each 32-bit word host-ordered, so the
+        // octets appear reversed. Getting this backwards would report a
+        // completely different peer.
+        assert_eq!(
+            parse_hex_addr("0100007F:1F90", false).unwrap(),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            parse_hex_addr("00000000:0016", false).unwrap(),
+            "0.0.0.0:22"
+        );
+    }
+
+    #[test]
+    fn malformed_addresses_are_skipped_not_guessed() {
+        assert!(parse_hex_addr("garbage", false).is_none());
+        assert!(parse_hex_addr("0100007F", false).is_none());
+        assert!(parse_hex_addr("XX:YY", false).is_none());
+    }
+}

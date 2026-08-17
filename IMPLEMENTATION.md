@@ -3035,6 +3035,30 @@ from the monitored host.
 Cursors advance only after a successful send; one unreachable agent does
 not suppress the rest; a failed run exits non-zero.
 
+### 29.1.1 Alert context
+
+An alert saying "a rare binary ran" sends an operator to the host to
+find out the same five things every time. `Alert.context` carries them:
+timestamp (always present, and previously just not rendered), full
+command line, uid, cwd, process ancestry, open files, and TCP peers
+resolved from `/proc/net/tcp` — because "held 3 sockets" is not
+actionable and "connected to 198.51.100.7:80" is.
+
+Untyped key/value pairs reusing `Attribute`, so a detection can attach
+what it needs without the alert path gaining a field each time an
+exec alert wants ancestry and a file alert wants the writing process.
+
+**Sampled once, at exec time.** The LLM-refined alert reuses that
+sample rather than re-reading `/proc`, because by the time inference
+returns the process is usually gone and a second read would report
+"already exited" for something that was alive when it mattered. The
+same context is pushed onto the analysis context, so the model sees the
+command line and ancestry too — previously invisible to it as well.
+
+Anything unavailable is **omitted rather than reported as empty**: a
+short-lived process is gone before its file descriptors can be read, and
+"opened nothing" must not look like "could not look".
+
 ### 29.2 VirusTotal screening
 
 [`virustotal.rs`](crates/bowery-cli/src/virustotal.rs). Operator-side

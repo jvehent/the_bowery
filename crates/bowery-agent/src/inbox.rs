@@ -160,6 +160,7 @@ mod tests {
             ts_unix_ms: ts_ms,
             backend: "test".into(),
             confirmation: None,
+            context: Vec::new(),
         }
     }
 

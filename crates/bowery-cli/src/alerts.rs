@@ -210,6 +210,9 @@ fn print_human(alert: &Alert) {
         println!("    sha : {}", alert.exe_sha256_hex);
     }
     println!("    why : {}", alert.rationale);
+    for attr in &alert.context {
+        println!("    {:<4}: {}", attr.key, attr.value);
+    }
     if !alert.suggested_actions.is_empty() {
         println!("    sug : {}", alert.suggested_actions.join(", "));
     }
@@ -322,6 +325,7 @@ mod json_tests {
             ts_unix_ms: 1_786_622_341_123,
             backend: "llama-cpp/qwen3".into(),
             confirmation: None,
+            context: Vec::new(),
         }
     }
 

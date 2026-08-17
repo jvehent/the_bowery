@@ -1101,6 +1101,7 @@ mod alerts_view_tests {
                 quorum: 1,
                 confirmed: true,
             }),
+            context: Vec::new(),
         });
 
         let sql = bowery_sql::Sql::new().with_extra_table(Arc::new(BoweryAlertsTable::new(inbox)));
@@ -1144,6 +1145,7 @@ mod alerts_view_tests {
             ts_unix_ms: crate::inbox::current_unix_ms(),
             backend: "test".into(),
             confirmation: None,
+            context: Vec::new(),
         });
         let sql = bowery_sql::Sql::new().with_extra_table(Arc::new(BoweryAlertsTable::new(inbox)));
         let rows = sql
