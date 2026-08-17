@@ -55,6 +55,8 @@ use std::time::{Duration, Instant};
 use bowery_crypto::Fingerprint;
 use bowery_mesh::PeerInfo;
 use bowery_proto::{Alert, Attribute};
+
+use crate::alert_builder::AlertBuilder;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -220,43 +222,38 @@ fn missing_alert(
     still_visible: usize,
     grace: Duration,
 ) -> Alert {
-    Alert {
-        originator_fp: originator_fp.as_bytes().to_vec(),
+    AlertBuilder::new(
+        originator_fp,
+        backend_label,
         // `peer.silent` on the ATT&CK map.
-        episode_id: format!("peer-silent-{peer}-{}", current_unix_ms()),
-        exe_sha256_hex: String::new(),
-        exe_path: String::new(),
+        format!("peer-silent-{peer}-{}", current_unix_ms()),
         // High, and deliberately so. Every other detection this agent
         // makes is void on a host whose agent is not running, and
         // stopping it is the first thing an attacker who finds it does.
-        suspicion: 0.9,
-        rationale: format!(
+        0.9,
+        format!(
             "peer {peer} stopped gossiping more than {}m ago while {still_visible} other \
              peer(s) remain visible from here, so this is that host rather than this \
              one. An agent that is not running detects nothing and answers no \
              corroboration query — check whether it was stopped, and by whom",
             grace.as_secs() / 60
         ),
-        suggested_actions: Vec::new(),
-        ts_unix_ms: current_unix_ms(),
-        backend: backend_label.to_string(),
-        confirmation: None,
-        context: vec![
-            Attribute::new("peer_fp", peer.to_string()),
-            Attribute::new("peers_still_visible", still_visible.to_string()),
-            Attribute::new("silent_for_at_least", format!("{}m", grace.as_secs() / 60)),
-        ],
-    }
+    )
+    .context(vec![
+        Attribute::new("peer_fp", peer.to_string()),
+        Attribute::new("peers_still_visible", still_visible.to_string()),
+        Attribute::new("silent_for_at_least", format!("{}m", grace.as_secs() / 60)),
+    ])
+    .build()
 }
 
 fn isolated_alert(originator_fp: Fingerprint, backend_label: &str, known: usize) -> Alert {
-    Alert {
-        originator_fp: originator_fp.as_bytes().to_vec(),
-        episode_id: format!("peer-isolated-{}", current_unix_ms()),
-        exe_sha256_hex: String::new(),
-        exe_path: String::new(),
-        suspicion: 0.8,
-        rationale: format!(
+    AlertBuilder::new(
+        originator_fp,
+        backend_label,
+        format!("peer-isolated-{}", current_unix_ms()),
+        0.8,
+        format!(
             "this agent can no longer see any of the {known} peer(s) it had been \
              gossiping with. That is reported about this host rather than about them: \
              when every peer disappears at once the usual cause is this machine's own \
@@ -264,12 +261,9 @@ fn isolated_alert(originator_fp: Fingerprint, backend_label: &str, known: usize)
              While isolated this agent cannot corroborate anything, so its alerts carry \
              no neighbourhood evidence"
         ),
-        suggested_actions: Vec::new(),
-        ts_unix_ms: current_unix_ms(),
-        backend: backend_label.to_string(),
-        confirmation: None,
-        context: vec![Attribute::new("peers_known", known.to_string())],
-    }
+    )
+    .context(vec![Attribute::new("peers_known", known.to_string())])
+    .build()
 }
 
 /// Watch the mesh's live set and report neighbours that go silent.
