@@ -3413,7 +3413,14 @@ fn process_file_open(
     open: &bowery_events::FileOpen,
 ) {
     let path = open.path.display().to_string();
-    let Some(hit) = bowery_analysis::file_watch::classify(&path) else {
+    // The same path means different things read and written: reading
+    // /etc/shadow is credential theft, writing it is an account change.
+    let hit = if open.sensitive_read {
+        bowery_analysis::file_watch::classify_read(&path)
+    } else {
+        bowery_analysis::file_watch::classify(&path)
+    };
+    let Some(hit) = hit else {
         return;
     };
     // A truncated path may have matched a prefix rule on the part we
@@ -3433,8 +3440,13 @@ fn process_file_open(
         exe_path: path.clone(),
         suspicion: hit.severity,
         rationale: format!(
-            "{} write to {path}{path_note} by {} (pid {}) — {}",
+            "{} {} {path}{path_note} by {} (pid {}) — {}",
             hit.category.label(),
+            if open.sensitive_read {
+                "read of"
+            } else {
+                "write to"
+            },
             if open.comm.is_empty() {
                 "an unnamed process"
             } else {
@@ -3594,11 +3606,13 @@ async fn process_exec(
     // hash is memoised per path, so the cost after warm-up is a map
     // lookup.
     let mut verdict = verdict;
+    let mut exec_provenance = bowery_analysis::provenance::Provenance::Unknown;
     if let Some(exe) = exec.exe_path.clone() {
         let index = packages.clone();
         if let Ok(provenance) =
             tokio::task::spawn_blocking(move || index.classify(&exe, &sha)).await
         {
+            exec_provenance = provenance;
             let (adjusted, why) =
                 bowery_analysis::provenance::adjust_score(verdict.suspicion, provenance);
             if (adjusted - verdict.suspicion).abs() > f32::EPSILON {
@@ -3614,6 +3628,27 @@ async fn process_exec(
             verdict.score.reason = format!("{} ({why})", verdict.score.reason);
         }
     }
+    // Set-id: a setuid-root binary is how an unprivileged process
+    // becomes root. The distribution ships a short, known list of them;
+    // one that arrived any other way is a foothold made permanent.
+    // Composes with provenance, which is what tells the two apart.
+    if let Some(exe) = exec.exe_path.as_ref()
+        && let Some((setuid, setgid)) = bowery_analysis::provenance::setid_bits(exe)
+        && let Some((rule_id, severity, why)) =
+            bowery_analysis::provenance::setid_finding(setuid, setgid, exec_provenance)
+    {
+        if severity > verdict.suspicion {
+            verdict.suspicion = severity;
+        }
+        verdict.score.reason = format!("{} | {why}", verdict.score.reason);
+        warn!(
+            rule = rule_id,
+            exe = %exe.display(),
+            pid = exec.pid,
+            "set-id binary finding"
+        );
+    }
+
     // Lineage: who asked for this?
     //
     // Every binary a lineage rule names is legitimate somewhere — `sh`

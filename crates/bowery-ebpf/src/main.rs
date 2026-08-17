@@ -111,6 +111,13 @@ pub struct ConnectEvent {
     pub comm: [u8; 16],
 }
 
+/// The open asked for write intent.
+pub const ACCESS_WRITE: u8 = 0;
+/// A read of a path whose *name* suggests it holds a secret. The kernel
+/// filter is deliberately permissive — userspace has the full path and
+/// decides what actually matters.
+pub const ACCESS_SENSITIVE_READ: u8 = 1;
+
 /// Longest path captured for a file event.
 ///
 /// Paths can reach `PATH_MAX` (4096), but a 4 KiB record per open would
@@ -129,7 +136,8 @@ pub struct FileEvent {
     pub flags: u32,
     /// 1 when the path did not fit in `path` and was cut short.
     pub truncated: u8,
-    pub _pad0: u8,
+    /// [`ACCESS_WRITE`] or [`ACCESS_SENSITIVE_READ`].
+    pub access: u8,
     pub _pad1: u16,
     pub comm: [u8; 16],
     /// NUL-terminated where it fits. May be a *relative* path: `openat`
@@ -421,6 +429,86 @@ const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 
+/// Scratch for the path, because 256 bytes will not fit on the 512-byte
+/// BPF stack alongside everything else. Per-CPU, so there is no sharing
+/// and no lock.
+#[repr(C)]
+pub struct PathScratch {
+    pub buf: [u8; FILE_PATH_LEN],
+}
+
+#[map]
+static PATH_SCRATCH: PerCpuArray<PathScratch> = PerCpuArray::with_max_entries(1, 0);
+
+/// Does the basename at `base` equal `pat`, exactly?
+///
+/// `FILE_PATH_LEN` is a power of two so the index mask satisfies the
+/// verifier without a branch.
+#[inline(always)]
+fn base_eq(buf: &[u8; FILE_PATH_LEN], base: usize, pat: &[u8]) -> bool {
+    let mut i = 0;
+    while i < pat.len() {
+        if buf[(base + i) & (FILE_PATH_LEN - 1)] != pat[i] {
+            return false;
+        }
+        i += 1;
+    }
+    // Exact, not prefix: `shadow` must not match `shadowsocks.conf`.
+    buf[(base + pat.len()) & (FILE_PATH_LEN - 1)] == 0
+}
+
+/// Does the basename at `base` start with `pat`?
+///
+/// Used where one prefix covers a family — `id_` for every SSH private
+/// key type, `ssh_host_` for every host key.
+#[inline(always)]
+fn base_starts(buf: &[u8; FILE_PATH_LEN], base: usize, pat: &[u8]) -> bool {
+    let mut i = 0;
+    while i < pat.len() {
+        if buf[(base + i) & (FILE_PATH_LEN - 1)] != pat[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Is this the name of a file that holds a secret?
+///
+/// Matched on the **basename only**, which is what makes this cheap
+/// enough to run on every `openat`: one forward scan for the last
+/// slash, then a handful of fixed comparisons. It is deliberately
+/// permissive — userspace sees the whole path and decides what actually
+/// warrants an alert, so a false positive here costs one ring slot
+/// rather than an operator's attention.
+#[inline(always)]
+fn is_secret_name(buf: &[u8; FILE_PATH_LEN], base: usize) -> bool {
+    // Unix account and password databases.
+    base_eq(buf, base, b"shadow")
+        || base_eq(buf, base, b"shadow-")
+        || base_eq(buf, base, b"gshadow")
+        || base_eq(buf, base, b"gshadow-")
+        || base_eq(buf, base, b"opasswd")
+        || base_eq(buf, base, b"sudoers")
+        // SSH: id_rsa, id_dsa, id_ecdsa, id_ed25519, and host keys.
+        || base_starts(buf, base, b"id_")
+        || base_starts(buf, base, b"ssh_host_")
+        || base_eq(buf, base, b"authorized_keys")
+        // Cloud and cluster credentials.
+        || base_eq(buf, base, b"credentials")
+        || base_eq(buf, base, b"kubeconfig")
+        // Application and service credentials.
+        || base_eq(buf, base, b".netrc")
+        || base_eq(buf, base, b".pgpass")
+        || base_eq(buf, base, b".my.cnf")
+        || base_eq(buf, base, b".git-credentials")
+        || base_eq(buf, base, b".htpasswd")
+        || base_eq(buf, base, b".dockercfg")
+        // GnuPG secret keyrings.
+        || base_eq(buf, base, b"secring.gpg")
+        || base_eq(buf, base, b"master.key")
+}
+
 #[tracepoint]
 pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
     match try_openat(&ctx) {
@@ -431,23 +519,54 @@ pub fn sys_enter_openat(ctx: TracePointContext) -> u32 {
 
 fn try_openat(ctx: &TracePointContext) -> Result<(), i64> {
     let flags: u64 = unsafe { ctx.read_at(OPENAT_ARG_FLAGS)? };
-
-    // Filter in the kernel, not userspace. Reads outnumber writes by
-    // orders of magnitude on any real host, and shipping all of them
-    // would saturate the ring and force the very drops the loss counter
-    // exists to report. Write intent is what persistence, tampering and
-    // ransomware all have in common.
-    let accmode = flags & O_ACCMODE;
-    let writes = accmode == O_WRONLY || accmode == O_RDWR;
-    let creates = flags & (O_CREAT | O_TRUNC | O_APPEND) != 0;
-    if !writes && !creates {
-        return Ok(());
-    }
-
     let filename_ptr: u64 = unsafe { ctx.read_at(OPENAT_ARG_FILENAME)? };
     if filename_ptr == 0 {
         return Ok(());
     }
+
+    // Write intent is what persistence, tampering and ransomware have in
+    // common, and it is cheap to test.
+    let accmode = flags & O_ACCMODE;
+    let writes = accmode == O_WRONLY || accmode == O_RDWR;
+    let creates = flags & (O_CREAT | O_TRUNC | O_APPEND) != 0;
+    let write_intent = writes || creates;
+
+    let Some(scratch) = PATH_SCRATCH.get_ptr_mut(0) else {
+        return Ok(());
+    };
+    // SAFETY: per-CPU slot, so this CPU is its only writer.
+    let buf = unsafe { &mut (*scratch).buf };
+
+    // The filename is in *user* memory and may be paged out or racing a
+    // rename; a failed read means we emit nothing rather than a wrong
+    // path. `_str_bytes` stops at the NUL, so a typical 30-byte path
+    // costs 30 bytes and not 256 — which is what makes reading on every
+    // openat affordable.
+    let Ok(read) = (unsafe { bpf_probe_read_user_str_bytes(filename_ptr as *const u8, buf) })
+    else {
+        return Ok(());
+    };
+    let len = read.len();
+
+    let access = if write_intent {
+        ACCESS_WRITE
+    } else {
+        // Reads outnumber writes by orders of magnitude, so only the
+        // ones whose name suggests a secret are shipped. Everything else
+        // is dropped here, in the kernel, where it costs nothing.
+        let mut base = 0usize;
+        let mut i = 0usize;
+        while i < FILE_PATH_LEN && i < len {
+            if buf[i] == b'/' {
+                base = i + 1;
+            }
+            i += 1;
+        }
+        if !is_secret_name(buf, base) {
+            return Ok(());
+        }
+        ACCESS_SENSITIVE_READ
+    };
 
     let Some(mut entry) = FILE_EVENTS.reserve::<FileEvent>(0) else {
         count_drop(DROP_FILE);
@@ -463,25 +582,11 @@ fn try_openat(ctx: &TracePointContext) -> Result<(), i64> {
     unsafe {
         (*event).pid = (pid_tgid >> 32) as u32;
         (*event).flags = flags as u32;
-        (*event)._pad0 = 0;
+        (*event).access = access;
         (*event)._pad1 = 0;
         (*event).comm = comm;
-        (*event).path = [0u8; FILE_PATH_LEN];
-
-        // The filename lives in *user* memory and may be paged out or
-        // concurrently modified; a failed read is not fatal, it just
-        // means we emit an empty path rather than a wrong one.
-        let read = bpf_probe_read_user_str_bytes(
-            filename_ptr as *const u8,
-            &mut (*event).path,
-        );
-        (*event).truncated = match read {
-            Ok(bytes) => u8::from(bytes.len() >= FILE_PATH_LEN - 1),
-            Err(_) => {
-                entry.discard(0);
-                return Err(-1);
-            }
-        };
+        (*event).truncated = u8::from(len >= FILE_PATH_LEN - 1);
+        (*event).path = *buf;
     }
     entry.submit(0);
     Ok(())

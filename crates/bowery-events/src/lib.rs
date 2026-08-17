@@ -75,6 +75,10 @@ pub struct FileOpen {
     /// Carried rather than hidden: a silently shortened path is one that
     /// quietly stops matching a rule.
     pub truncated: bool,
+    /// This was a **read** of a file whose name suggests it holds a
+    /// secret, not a write. The kernel filter that selected it is
+    /// deliberately permissive; the rules decide what matters.
+    pub sensitive_read: bool,
     pub ts: SystemTime,
 }
 

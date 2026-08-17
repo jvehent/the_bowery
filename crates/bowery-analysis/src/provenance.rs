@@ -335,6 +335,71 @@ impl ProvenanceCache {
     }
 }
 
+/// Is this file setuid- or setgid-root?
+///
+/// Returns `(setuid, setgid)`. `None` when the file cannot be stat'd,
+/// which is not evidence of anything.
+#[must_use]
+pub fn setid_bits(path: &Path) -> Option<(bool, bool)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let md = std::fs::metadata(path).ok()?;
+    let mode = md.mode();
+    // Only root-owned set-id matters here. A setuid binary owned by an
+    // unprivileged user grants that user's own authority, which is not
+    // an escalation.
+    let root_owned = md.uid() == 0;
+    Some((
+        root_owned && mode & 0o4000 != 0,
+        root_owned && mode & 0o2000 != 0,
+    ))
+}
+
+/// Does a set-id binary at this provenance warrant an alert?
+///
+/// A setuid-root binary is how an unprivileged process becomes root, so
+/// the distribution ships a short, well-known list of them: `sudo`,
+/// `su`, `passwd`, `mount`, `ping`. Those are expected and silent.
+///
+/// One that **no package owns**, or one that a package owns but no
+/// longer matches, is a different thing entirely: it is the classic way
+/// a foothold is made permanent, and it survives every reboot without
+/// touching a service file.
+///
+/// Returns `None` when there is nothing to say.
+#[must_use]
+pub fn setid_finding(
+    setuid: bool,
+    setgid: bool,
+    provenance: Provenance,
+) -> Option<(&'static str, f32, &'static str)> {
+    if !setuid && !setgid {
+        return None;
+    }
+    match provenance {
+        // The distro's own sudo/su/passwd. Expected, and saying so on
+        // every invocation would bury everything else.
+        Provenance::PackagedIntact => None,
+        Provenance::PackagedModified => Some((
+            "privesc.setid_packaged_modified",
+            1.0,
+            "a setuid-root binary that a package owns no longer matches what the package              installed — a backdoored privilege-escalation path that looks legitimate in              any file listing",
+        )),
+        Provenance::Unpackaged => Some((
+            "privesc.setid_unpackaged",
+            0.95,
+            "a setuid-root binary that no package owns. Distributions ship a short,              well-known set of these; one that arrived any other way is how a foothold              becomes permanent root without touching a service file",
+        )),
+        // Cannot establish provenance, so cannot say whether this is
+        // `sudo` or a backdoor. Silence here would hide the finding on
+        // any host without a package manager, so it is reported quietly.
+        Provenance::Unknown => Some((
+            "privesc.setid_unknown_provenance",
+            0.6,
+            "a setuid-root binary whose provenance could not be established; confirm it              is one your distribution ships",
+        )),
+    }
+}
+
 /// How provenance changes a rarity score.
 ///
 /// Rarity asks "has this host run this before". Provenance answers a
@@ -504,6 +569,56 @@ mod tests {
         // carry an episode on their own.
         let (score, _) = adjust_score(1.0, Provenance::PackagedIntact);
         assert!(score > 0.0, "must not erase the signal entirely");
+    }
+
+    #[test]
+    fn a_packaged_setuid_binary_is_silent() {
+        // sudo, su, passwd and mount are setuid-root by design. Alerting
+        // on them would fire on every privilege escalation a human
+        // performs and bury everything else.
+        assert!(setid_finding(true, false, Provenance::PackagedIntact).is_none());
+    }
+
+    #[test]
+    fn an_unpackaged_setuid_binary_is_a_finding() {
+        let (id, severity, why) =
+            setid_finding(true, false, Provenance::Unpackaged).expect("must alert");
+        assert_eq!(id, "privesc.setid_unpackaged");
+        assert!(severity > 0.9);
+        assert!(why.contains("no package owns"));
+    }
+
+    #[test]
+    fn a_modified_packaged_setuid_binary_is_the_worst_case() {
+        // Looks legitimate in any listing, and is root.
+        let (_, severity, _) =
+            setid_finding(true, false, Provenance::PackagedModified).expect("must alert");
+        assert!((severity - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_binary_with_no_setid_bits_says_nothing() {
+        for p in [
+            Provenance::Unpackaged,
+            Provenance::PackagedIntact,
+            Provenance::PackagedModified,
+            Provenance::Unknown,
+        ] {
+            assert!(setid_finding(false, false, p).is_none());
+        }
+    }
+
+    #[test]
+    fn setgid_counts_too_but_only_when_root_owned() {
+        assert!(setid_finding(false, true, Provenance::Unpackaged).is_some());
+        // The root-owned check lives in `setid_bits`; a setuid binary
+        // owned by an unprivileged user grants only that user's own
+        // authority, which is not an escalation.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("plain");
+        std::fs::write(&f, b"x").unwrap();
+        assert_eq!(setid_bits(&f), Some((false, false)));
+        assert_eq!(setid_bits(Path::new("/nonexistent/binary")), None);
     }
 
     #[test]

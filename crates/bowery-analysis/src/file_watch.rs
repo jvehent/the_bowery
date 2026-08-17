@@ -227,6 +227,180 @@ const RULES: &[Rule] = &[
     },
 ];
 
+/// Rules for *reads* of files that hold secrets.
+///
+/// The kernel ships only opens whose basename looks like a credential
+/// (`shadow`, `id_*`, `credentials`, `.pgpass`, …), which is
+/// deliberately permissive — it costs one ring slot to be wrong there,
+/// and an operator's attention to be wrong here. These rules see the
+/// whole path and decide what actually warrants an alert.
+///
+/// Reads are noisier than writes by nature: `sshd` reads host keys at
+/// every startup, `sudo` reads `/etc/sudoers` on every invocation. The
+/// severities below reflect that — a host key read is ordinary, and an
+/// `/etc/shadow` read by something that is not a password tool is not.
+const READ_RULES: &[Rule] = &[
+    Rule {
+        id: "cred.read_shadow",
+        m: Match::Prefix("/etc/shadow"),
+        category: FileWatchCategory::Credential,
+        why: "the password hash database was read. Legitimate for `su`, `sudo`, `login` \
+              and PAM; from anything else this is credential theft, and the hashes are \
+              offline-crackable once taken",
+        severity: 0.9,
+    },
+    Rule {
+        id: "cred.read_gshadow",
+        m: Match::Prefix("/etc/gshadow"),
+        category: FileWatchCategory::Credential,
+        why: "the group password database was read — the same exposure as /etc/shadow, \
+              and rarer to touch legitimately",
+        severity: 0.88,
+    },
+    Rule {
+        id: "cred.read_opasswd",
+        m: Match::Exact("/etc/security/opasswd"),
+        category: FileWatchCategory::Credential,
+        why: "PAM's password-history file, which holds previous password hashes for \
+              every user — a bonus for anyone cracking the current ones",
+        severity: 0.9,
+    },
+    Rule {
+        id: "cred.read_ssh_host_key",
+        m: Match::Prefix("/etc/ssh/ssh_host_"),
+        category: FileWatchCategory::Credential,
+        why: "an SSH host private key was read. sshd does this at startup; anything \
+              else can impersonate this host to every client that trusts it",
+        severity: 0.85,
+    },
+    Rule {
+        id: "cred.read_ssh_private_key",
+        m: Match::Suffix("/.ssh/id_rsa"),
+        category: FileWatchCategory::Credential,
+        why: "an SSH private key was read — the credential that opens every host this \
+              key is authorised on",
+        severity: 0.9,
+    },
+    Rule {
+        id: "cred.read_aws",
+        m: Match::Suffix("/.aws/credentials"),
+        category: FileWatchCategory::Credential,
+        why: "AWS access keys were read; these usually carry far more authority than \
+              the host they were stored on",
+        severity: 0.9,
+    },
+    Rule {
+        id: "cred.read_kube",
+        m: Match::Suffix("/.kube/config"),
+        category: FileWatchCategory::Credential,
+        why: "kubeconfig was read, which typically grants control of a whole cluster",
+        severity: 0.88,
+    },
+    Rule {
+        id: "cred.read_netrc",
+        m: Match::Suffix("/.netrc"),
+        category: FileWatchCategory::Credential,
+        why: "a .netrc was read; it stores passwords in plain text for every host \
+              listed in it",
+        severity: 0.85,
+    },
+    Rule {
+        id: "cred.read_pgpass",
+        m: Match::Suffix("/.pgpass"),
+        category: FileWatchCategory::Credential,
+        why: "PostgreSQL passwords were read, in plain text",
+        severity: 0.85,
+    },
+    Rule {
+        id: "cred.read_mysql",
+        m: Match::Suffix("/.my.cnf"),
+        category: FileWatchCategory::Credential,
+        why: "MySQL client credentials were read, in plain text",
+        severity: 0.85,
+    },
+    Rule {
+        id: "cred.read_git",
+        m: Match::Suffix("/.git-credentials"),
+        category: FileWatchCategory::Credential,
+        why: "stored Git credentials were read; these are often long-lived tokens with \
+              write access to source",
+        severity: 0.85,
+    },
+    Rule {
+        id: "cred.read_docker",
+        m: Match::Suffix("/.dockercfg"),
+        category: FileWatchCategory::Credential,
+        why: "container registry credentials were read, which can allow poisoning the \
+              images this estate deploys",
+        severity: 0.85,
+    },
+    Rule {
+        id: "cred.read_gnupg",
+        m: Match::Suffix("/secring.gpg"),
+        category: FileWatchCategory::Credential,
+        why: "a GnuPG secret keyring was read — signing and decryption authority for \
+              whoever holds it",
+        severity: 0.88,
+    },
+    Rule {
+        id: "cred.read_rails_master_key",
+        m: Match::Suffix("/master.key"),
+        category: FileWatchCategory::Credential,
+        why: "an application master key was read, which decrypts that application's \
+              stored secrets wholesale",
+        severity: 0.85,
+    },
+    Rule {
+        id: "cred.read_htpasswd",
+        m: Match::Suffix("/.htpasswd"),
+        category: FileWatchCategory::Credential,
+        why: "an HTTP basic-auth password file was read; the hashes in it are \
+              offline-crackable and often reused elsewhere",
+        severity: 0.8,
+    },
+    Rule {
+        id: "recon.read_sudoers",
+        m: Match::Prefix("/etc/sudoers"),
+        category: FileWatchCategory::PrivilegeEscalation,
+        why: "the sudo policy was read — routine for `sudo` itself, and otherwise the \
+              standard first step in working out how to become root here",
+        severity: 0.7,
+    },
+    Rule {
+        id: "cred.read_authorized_keys",
+        m: Match::Suffix("/.ssh/authorized_keys"),
+        category: FileWatchCategory::Credential,
+        why: "the list of keys permitted to log in as this user was read; sshd does \
+              this on every connection, anything else is enumerating access",
+        severity: 0.6,
+    },
+];
+
+/// Classify a **read** of a sensitive-looking path.
+///
+/// Separate from [`classify`] because the same path means different
+/// things read and written: reading `/etc/shadow` is credential theft,
+/// writing it is an account change.
+#[must_use]
+pub fn classify_read(path: &str) -> Option<FileWatchHit> {
+    if !is_matchable(path) {
+        return None;
+    }
+    READ_RULES
+        .iter()
+        .find(|r| match r.m {
+            Match::Prefix(p) => path.starts_with(p),
+            Match::Exact(p) => path == p,
+            Match::Suffix(p) => path.ends_with(p),
+        })
+        .map(|r| FileWatchHit {
+            rule_id: r.id,
+            category: r.category,
+            why: r.why,
+            severity: r.severity,
+        })
+}
+
 /// Can this path be matched at all?
 ///
 /// Only absolute paths. A relative one came from an `openat` against a
@@ -329,6 +503,81 @@ mod tests {
             classify("/etc/ld.so.preload").unwrap().rule_id,
             "persist.ld_preload"
         );
+    }
+
+    #[test]
+    fn credential_reads_are_caught_across_a_broad_set() {
+        for (path, id) in [
+            ("/etc/shadow", "cred.read_shadow"),
+            ("/etc/gshadow", "cred.read_gshadow"),
+            ("/etc/security/opasswd", "cred.read_opasswd"),
+            ("/etc/ssh/ssh_host_ed25519_key", "cred.read_ssh_host_key"),
+            ("/home/julien/.ssh/id_rsa", "cred.read_ssh_private_key"),
+            ("/root/.aws/credentials", "cred.read_aws"),
+            ("/home/deploy/.kube/config", "cred.read_kube"),
+            ("/home/ci/.netrc", "cred.read_netrc"),
+            ("/var/lib/postgresql/.pgpass", "cred.read_pgpass"),
+            ("/root/.my.cnf", "cred.read_mysql"),
+            ("/home/dev/.git-credentials", "cred.read_git"),
+            ("/root/.dockercfg", "cred.read_docker"),
+            ("/home/a/.gnupg/secring.gpg", "cred.read_gnupg"),
+            ("/srv/app/config/master.key", "cred.read_rails_master_key"),
+            ("/etc/sudoers", "recon.read_sudoers"),
+        ] {
+            let hit = classify_read(path).unwrap_or_else(|| panic!("{path} should match"));
+            assert_eq!(hit.rule_id, id, "{path}");
+        }
+    }
+
+    #[test]
+    fn reading_and_writing_the_same_path_are_different_findings() {
+        // Reading /etc/shadow is credential theft; writing it is an
+        // account change. Same path, different rule, different wording.
+        let read = classify_read("/etc/shadow").unwrap();
+        let write = classify("/etc/shadow").unwrap();
+        assert_ne!(read.rule_id, write.rule_id);
+        assert!(read.why.contains("read"));
+    }
+
+    #[test]
+    fn ordinary_reads_do_not_match() {
+        for path in [
+            "/etc/passwd",
+            "/etc/hosts",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+            "/home/julien/.ssh/known_hosts",
+            "/home/julien/notes.md",
+        ] {
+            assert!(classify_read(path).is_none(), "{path} should not match");
+        }
+    }
+
+    #[test]
+    fn routine_reads_rank_below_theft() {
+        // sshd reads authorized_keys on every connection and sudo reads
+        // the policy on every invocation. Both are worth recording and
+        // neither should outrank an /etc/shadow read.
+        let shadow = classify_read("/etc/shadow").unwrap();
+        for routine in ["/home/x/.ssh/authorized_keys", "/etc/sudoers"] {
+            let hit = classify_read(routine).unwrap();
+            assert!(
+                hit.severity < shadow.severity,
+                "{routine} must rank below an /etc/shadow read"
+            );
+        }
+    }
+
+    #[test]
+    fn read_rules_explain_themselves_too() {
+        for r in READ_RULES {
+            assert!(r.why.len() > 40, "{} needs a real explanation", r.id);
+            assert!((0.0..=1.0).contains(&r.severity));
+        }
+        let mut ids: Vec<&str> = READ_RULES.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        let n = ids.len();
+        ids.dedup();
+        assert_eq!(n, ids.len(), "duplicate read rule id");
     }
 
     #[test]

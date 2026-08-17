@@ -240,6 +240,7 @@ async fn a_write_to_a_persistence_path_alerts_and_names_the_process() {
         path: "/root/.ssh/authorized_keys".into(),
         flags: 0o1101,
         truncated: false,
+        sensitive_read: false,
         ts: SystemTime::now(),
     })]));
 

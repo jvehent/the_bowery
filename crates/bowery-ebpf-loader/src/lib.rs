@@ -90,7 +90,8 @@ struct RawFileEvent {
     pid: u32,
     flags: u32,
     truncated: u8,
-    _pad0: u8,
+    /// Mirrors `bowery_ebpf::ACCESS_*`.
+    access: u8,
     _pad1: u16,
     comm: [u8; 16],
     path: [u8; FILE_PATH_LEN],
@@ -653,6 +654,8 @@ fn parse_file(bytes: &[u8]) -> Option<Event> {
         path: PathBuf::from(path),
         flags: raw.flags,
         truncated: raw.truncated != 0,
+        // 1 == ACCESS_SENSITIVE_READ in the BPF program.
+        sensitive_read: raw.access == 1,
         ts: std::time::SystemTime::now(),
     }))
 }
