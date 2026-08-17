@@ -62,7 +62,9 @@ binary no package owns), **lineage** (a network service spawning a
 shell), **privilege transitions** (a process running as root whose
 parent was not, outside the sanctioned `sudo`/`su`/`pkexec` path), and
 **reconnaissance bursts** (five different discovery commands from one
-parent inside a minute). Four things damp
+parent inside a minute), and **ransomware-shaped write sweeps** (many
+files, many directories, one extension normal software does not
+produce). Four things damp
 the noise: a binary the package manager installed and has not modified
 is not interesting on first run; `sshd` starting a shell is a login; a
 binary whose **job** is reading a credential file (a packaged, unmodified
@@ -251,6 +253,7 @@ discovery_bursts    = true   # several different recon commands from one parent
 discovery_window    = "1m"
 discovery_threshold = 5      # DISTINCT commands; `id` in a loop never trips it
 repeat_window       = "1h"   # fold identical file findings into one alert
+mass_writes         = true   # ransomware-shaped write sweeps
 peer_liveness       = true   # neighbours report an agent that goes silent
 peer_grace          = "5m"   # ...after this long, to survive reboots and upgrades
 ```

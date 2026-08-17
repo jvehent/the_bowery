@@ -17,7 +17,7 @@ that something fires?*
 - **partial** — one narrow variant fires; the common forms do not.
 - **none** — nothing fires. Listed anyway; the gaps are the useful half.
 
-Today: **12 good, 10 partial, 3 uncovered** across 25 techniques.
+Today: **12 good, 11 partial, 2 uncovered** across 25 techniques.
 
 ## Execution
 
@@ -260,12 +260,15 @@ detection — no periodicity analysis, no destination rarity.
 
 ### T1486 — Data Encrypted for Impact
 
-**Coverage: none**
+**Coverage: partial**
 
-No rule fires.
+Rules: `impact.mass_write_new_extension`
 
-Gap: no mass-write or write-rate detection. Ransomware encrypting a home directory
-produces file events the agent records and nothing scores.
+Gap: needs the sweep to *rename* what it encrypts, which most families do but not
+all — in-place encryption that keeps the filename is invisible here. The sensor
+reports write intent only: no renames, no unlinks, no contents, so there is no
+entropy check and a family that writes everything as a common extension evades the
+test that makes the rule usable at all.
 
 ## Rules that are not table entries
 

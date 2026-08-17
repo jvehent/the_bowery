@@ -69,7 +69,7 @@ now.
 | **Discovery** | **nothing** | recon bursts — five distinct discovery commands from one parent in a minute |
 | **Lateral movement** | partial, genuinely ahead | unchanged — the corroboration work |
 | Collection / exfil | partial | partial — destination rarity queryable, not alerting |
-| Impact (ransomware) | **nothing** | nothing — no mass-write rate signal |
+| **Impact (ransomware)** | **nothing** | write sweeps that rename what they encrypt; in-place encryption still invisible |
 
 Per-technique detail, generated from the rule tables so it cannot drift
 from the code, is in [`docs/ATTACK-COVERAGE.md`](docs/ATTACK-COVERAGE.md).
@@ -87,8 +87,9 @@ listed in advance. This one gap was why persistence, credential access,
 defense evasion and impact were empty rows — they are overwhelmingly
 file-shaped. A `sys_enter_openat` probe now reports write-intent opens,
 and credential *reads* alongside them (matched in the kernel by suffix).
-Mass-write rates remain unbuilt, which is why Impact is still an empty
-row.
+Mass-write sweeps are now scored too — but on the *shape* rather than
+the rate, because a rate rule fires on every build, unpack and backup
+and would have been the loudest wrong rule in the agent.
 
 **Nothing reads the process tree.** *(closed in phase C.)*
 "`nginx` spawned `sh`" is the oldest detection in the book and needed no

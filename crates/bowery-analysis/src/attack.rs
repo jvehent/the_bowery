@@ -338,10 +338,13 @@ pub const TECHNIQUES: &[Technique] = &[
         id: "T1486",
         name: "Data Encrypted for Impact",
         tactic: "Impact",
-        coverage: Coverage::None,
-        rules: &[],
-        gap: "no mass-write or write-rate detection. Ransomware encrypting a home \
-              directory produces file events the agent records and nothing scores",
+        coverage: Coverage::Partial,
+        rules: &["impact.mass_write_new_extension"],
+        gap: "needs the sweep to *rename* what it encrypts, which most families do but \
+              not all — in-place encryption that keeps the filename is invisible here. \
+              The sensor reports write intent only: no renames, no unlinks, no contents, \
+              so there is no entropy check and a family that writes everything as a \
+              common extension evades the test that makes the rule usable at all",
     },
 ];
 
@@ -497,6 +500,7 @@ mod tests {
         real.extend(crate::lineage::rule_ids());
         real.extend(crate::provenance::rule_ids());
         real.extend(crate::escalation::rule_ids());
+        real.extend(crate::mass_write::rule_ids());
 
         let mapped: HashSet<&str> = mapped_rule_ids().into_iter().collect();
 

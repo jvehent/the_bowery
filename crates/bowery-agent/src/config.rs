@@ -805,6 +805,10 @@ fn default_alert_threshold() -> f32 {
 /// every script, say).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+// Six independent on/off switches, one per detection. Clippy would
+// prefer a bitflags-style type; an operator editing agent.toml would
+// not, and this struct's whole job is to be a readable TOML block.
+#[allow(clippy::struct_excessive_bools)]
 pub struct DetectionConfig {
     /// Alert when a process reaches uid 0 from a non-root parent without
     /// going through a packaged, unmodified setuid helper.
@@ -827,6 +831,22 @@ pub struct DetectionConfig {
     /// script does in seconds.
     #[serde(default = "default_discovery_threshold")]
     pub discovery_threshold: usize,
+    /// Report one process writing many files, across many directories,
+    /// that share an extension normal software does not produce.
+    ///
+    /// Volume alone is deliberately not the signal — that fires on every
+    /// build, unpack and backup. See [`bowery_analysis::mass_write`].
+    #[serde(default = "default_true")]
+    pub mass_writes: bool,
+    /// Window a mass-write burst is measured over.
+    #[serde(with = "humantime_serde", default = "default_mass_write_window")]
+    pub mass_write_window: Duration,
+    /// Distinct files, and distinct directories, needed before the
+    /// extension test is even applied.
+    #[serde(default = "default_mass_write_min_files")]
+    pub mass_write_min_files: usize,
+    #[serde(default = "default_mass_write_min_dirs")]
+    pub mass_write_min_dirs: usize,
     /// Report a peer that stops gossiping while other peers remain
     /// visible.
     ///
@@ -867,6 +887,10 @@ impl Default for DetectionConfig {
             repeat_window: default_repeat_window(),
             peer_liveness: true,
             peer_grace: default_peer_grace(),
+            mass_writes: true,
+            mass_write_window: default_mass_write_window(),
+            mass_write_min_files: default_mass_write_min_files(),
+            mass_write_min_dirs: default_mass_write_min_dirs(),
         }
     }
 }
@@ -875,6 +899,15 @@ fn default_discovery_window() -> Duration {
     Duration::from_mins(1)
 }
 fn default_discovery_threshold() -> usize {
+    5
+}
+fn default_mass_write_window() -> Duration {
+    Duration::from_mins(1)
+}
+fn default_mass_write_min_files() -> usize {
+    50
+}
+fn default_mass_write_min_dirs() -> usize {
     5
 }
 fn default_peer_grace() -> Duration {

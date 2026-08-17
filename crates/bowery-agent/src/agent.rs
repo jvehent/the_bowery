@@ -964,6 +964,13 @@ impl Agent {
             )),
             config.detection.repeat_window,
             Arc::new(crate::proc_table::ProcTable::default()),
+            config.detection.mass_writes.then(|| {
+                Arc::new(bowery_analysis::MassWriteTracker::new(
+                    config.detection.mass_write_window,
+                    config.detection.mass_write_min_files,
+                    config.detection.mass_write_min_dirs,
+                ))
+            }),
             shutdown_rx.clone(),
         );
 
@@ -3279,6 +3286,7 @@ fn spawn_pipeline_task(
     suppressor: Arc<bowery_analysis::AlertSuppressor>,
     suppress_window: Duration,
     procs: Arc<crate::proc_table::ProcTable>,
+    mass_writes: Option<Arc<bowery_analysis::MassWriteTracker>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -3318,6 +3326,7 @@ fn spawn_pipeline_task(
                         &suppressor,
                         suppress_window,
                         &procs,
+                        mass_writes.as_ref(),
                         event,
                     ).await;
                 }
@@ -3347,6 +3356,7 @@ fn spawn_pipeline_task(
                                 &suppressor,
                                 suppress_window,
                                 &procs,
+                                mass_writes.as_ref(),
                                 event,
                             ).await;
                         }
@@ -3382,6 +3392,7 @@ async fn process_event(
     suppressor: &Arc<bowery_analysis::AlertSuppressor>,
     suppress_window: Duration,
     procs: &Arc<crate::proc_table::ProcTable>,
+    mass_writes: Option<&Arc<bowery_analysis::MassWriteTracker>>,
     event: Event,
 ) {
     // Record first, analyse second. Every event goes to the log
@@ -3409,7 +3420,12 @@ async fn process_event(
         }
         // Close the pid-reuse window as soon as the kernel tells us,
         // rather than waiting out the TTL.
-        Event::ProcessExit(e) => procs.forget(e.pid),
+        Event::ProcessExit(e) => {
+            procs.forget(e.pid);
+            if let Some(m) = mass_writes {
+                m.forget(e.pid);
+            }
+        }
         _ => {}
     }
 
@@ -3463,6 +3479,7 @@ async fn process_event(
                 claims,
                 corroboration,
                 procs,
+                mass_writes,
                 &open,
             )
             .await;
@@ -3576,9 +3593,55 @@ async fn process_file_open(
     claims: Option<&crate::corroboration::ClaimSink>,
     corroboration: &crate::config::CorroborationConfig,
     procs: &Arc<crate::proc_table::ProcTable>,
+    mass_writes: Option<&Arc<bowery_analysis::MassWriteTracker>>,
     open: &bowery_events::FileOpen,
 ) {
     let path = open.path.display().to_string();
+
+    // Mass writes are scored before rule matching, because a ransomware
+    // sweep touches files no watch rule names — the whole point is that
+    // it goes after a user's documents, not `/etc/ld.so.preload`. Every
+    // write-intent open feeds the tracker; only the conjunction it
+    // looks for produces an alert.
+    if !open.sensitive_read
+        && let Some(mass) = mass_writes
+        && let Some(burst) = mass.observe(open.pid, &path, std::time::Instant::now())
+    {
+        let why = bowery_analysis::mass_write::rationale(&burst);
+        warn!(
+            rule = bowery_analysis::mass_write::RULE_ID,
+            pid = burst.pid,
+            files = burst.files,
+            dirs = burst.dirs,
+            extension = %burst.extension,
+            "possible ransomware"
+        );
+        let episode_id = format!("file-impact.mass_write-{}", current_unix_ms());
+        let alert = Alert {
+            originator_fp: originator_fp.as_bytes().to_vec(),
+            episode_id: episode_id.clone(),
+            exe_sha256_hex: String::new(),
+            exe_path: path.clone(),
+            suspicion: 0.95,
+            rationale: why,
+            suggested_actions: Vec::new(),
+            ts_unix_ms: current_unix_ms(),
+            backend: backend_label.to_string(),
+            confirmation: None,
+            context: file_open_context(
+                open,
+                bowery_events::enrich::pid_exe_path(open.pid)
+                    .map(|p| p.display().to_string())
+                    .as_deref(),
+            ),
+        };
+        inbox.append(alert);
+        let _ = events_tx.send(AgentEvent::AlertEmitted {
+            episode_id,
+            suspicion: 0.95,
+        });
+    }
+
     // The same path means different things read and written: reading
     // /etc/shadow is credential theft, writing it is an account change.
     let hit = if open.sensitive_read {

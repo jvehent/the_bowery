@@ -521,6 +521,13 @@ uid_transitions     = true   # a process running as root whose parent was not,
 discovery_bursts    = true   # several DIFFERENT recon commands from one parent
 discovery_window    = "1m"
 discovery_threshold = 5      # distinct commands; `id` in a loop never trips it
+mass_writes         = true   # one process writing many files, across many dirs, that
+                             # share an extension normal software does not produce. Volume
+                             # alone is NOT the signal — that fires on every build, unpack
+                             # and backup. All three conditions must hold.
+mass_write_window   = "1m"
+mass_write_min_files = 50
+mass_write_min_dirs  = 5
 peer_liveness       = true   # report a peer that stops gossiping while others remain
                              # visible. A host cannot report its own death; its
                              # neighbours can, and `systemctl stop bowery-agent`
