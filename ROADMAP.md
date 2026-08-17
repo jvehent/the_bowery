@@ -63,7 +63,7 @@ now.
 | Initial access | nothing | nothing — no visibility into the vector |
 | Execution | partial | partial + provenance and lineage damp the noise |
 | **Persistence** | **nothing** | rules for units, cron, `authorized_keys`, `ld.so.preload`, PAM, udev, shell rc |
-| **Privilege escalation** | almost nothing | `sudoers` writes; uid *transitions* still unanalysed |
+| **Privilege escalation** | almost nothing | `sudoers`, set-id binaries no package owns; uid *transitions* open |
 | **Defense evasion** | **nothing** | auth/wtmp tampering; `comm`-keyed blocking still evadable |
 | **Credential access** | **nothing** | writes to `shadow`/`passwd`/SSH keys; **reads** still invisible |
 | Discovery | nothing | nothing — no recon-pattern analysis |
@@ -179,9 +179,9 @@ bytes and flagged when truncated, and relative paths (an `openat`
 against a dirfd the probe cannot resolve) are stored but never matched,
 because guessing would attribute a write to a file nobody touched.
 
-**Still open in this phase:** credential *reads* (`/etc/shadow` being
-read rather than written) need a read-side filter, and mass-write rate
-detection for ransomware is unbuilt. Package-manager writes will produce
+**Still open in this phase:** mass-write rate detection for ransomware.
+Credential reads landed — matched in the kernel by path suffix, since
+scanning for the basename produced a program the verifier rejected. Package-manager writes will produce
 hits — deliberately not suppressed by process name, since `comm` is
 attacker-controlled and a suppression list is an evasion recipe. Fleet
 corroboration is the right answer there and the substrate already

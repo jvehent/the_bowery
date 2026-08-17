@@ -56,7 +56,10 @@ alerts and run queries. There is no password anywhere.
 path, suspicious arguments), rarity (a binary this host has not run
 before), **file writes to paths that matter** (`ld.so.preload`, systemd
 units, cron, `authorized_keys`, PAM, `sudoers`, `shadow`, auth logs),
-and **lineage** (a network service spawning a shell). Two things damp
+**reads of credentials** (`/etc/shadow`, SSH private keys, `~/.aws`,
+`~/.kube`, `.pgpass`, `.netrc`), **set-id backdoors** (a setuid-root
+binary no package owns), and **lineage** (a network service spawning a
+shell). Two things damp
 the noise: a binary the package manager installed and has not modified
 is not interesting on first run, and `sshd` starting a shell is a login.
 

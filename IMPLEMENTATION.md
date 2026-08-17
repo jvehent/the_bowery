@@ -2895,6 +2895,51 @@ instruction for how to evade the rule. Package writes produce hits; the
 honest fix is fleet corroboration (a write every host makes at the same
 moment is an upgrade), and that substrate exists, unwired.
 
+### 27.5 Credential-access reads
+
+The probe originally shipped only write-intent opens, which left reading
+`/etc/shadow` or an SSH key invisible — a whole ATT&CK phase at zero.
+
+Reads are now shipped too, but only where the path **ends in** a
+credential name. The suffix anchoring is not a style choice: finding the
+basename by scanning for the last slash is a 256-iteration loop over a
+map-backed buffer, and the verifier explores one state per iteration —
+the program was rejected after eight seconds of analysis, with the log
+showing it unrolling that loop byte by byte. Anchoring each pattern at
+the end of the string needs one computed offset per pattern and no loop
+over the path at all. Patterns begin with `/` so they match a whole
+final component: `/shadow` matches `/etc/shadow`, not `/var/lib/myshadow`.
+
+The kernel filter is deliberately permissive and userspace decides: a
+false positive in the kernel costs one ring slot, a false positive in
+the rules costs an operator's attention.
+
+Sixteen read rules, ranked by how routine the read is. `sshd` reads host
+keys at every startup and `sudo` reads its own policy on every
+invocation, so those sit well below an `/etc/shadow` read by something
+that is not a password tool. Reading and writing the same path are
+separate rules with separate wording, because they mean different
+things — reading `/etc/shadow` is credential theft, writing it is an
+account change.
+
+Verified on hardware: `cat /etc/shadow` and `cat ~/.ssh/id_rsa` both
+alerted, `unix_chkpwd` and `sudo` were caught and correctly ranked as
+routine, and `/etc/hosts` produced nothing.
+
+### 27.6 Set-id binaries
+
+A setuid-root binary is how an unprivileged process becomes root, and
+distributions ship a short well-known list of them. One that **no
+package owns**, or that a package owns but no longer matches, is how a
+foothold becomes permanent root without touching a service file.
+
+This is provenance and file metadata composed: the set-id bits come from
+a `stat`, the judgement comes from the package index. `sudo`, `su` and
+`passwd` are packaged and intact, so they stay silent — alerting on them
+would fire on every privilege escalation a human performs. Only
+root-owned set-id counts; a setuid binary owned by an unprivileged user
+grants only that user's own authority.
+
 ---
 
 ## 28. Provenance and lineage (roadmap phase C)
