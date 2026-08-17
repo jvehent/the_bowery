@@ -155,6 +155,12 @@ const PASSWORD_TOOLS: &[&str] = &[
     "/usr/sbin/cron",
     "/usr/bin/systemd-sysusers",
     "/usr/lib/systemd/systemd-sysusers",
+    // pid 1 itself. It resolves `User=` for every unit it starts, so on
+    // a host with any such unit it reads the password databases at boot
+    // and on every restart. Caught on legolas an hour after the first
+    // pass shipped.
+    "/usr/lib/systemd/systemd",
+    "/lib/systemd/systemd",
     "/usr/sbin/lightdm",
     "/usr/sbin/gdm3",
     "/usr/bin/polkit-agent-helper-1",
