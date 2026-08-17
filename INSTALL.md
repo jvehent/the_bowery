@@ -488,6 +488,18 @@ threshold = 0.7     # suspicion at which a verdict becomes an Alert
 [response]
 mode   = "off"          # off | dry-run | enforce
 engine = "noop"         # noop | process-kill | bpf-lsm
+#
+# Action ids for the policy's allowed_actions:
+#   kill_process         (process-kill engine)
+#   block_exec           (bpf-lsm) — keyed on `comm`, which any process can
+#                        set with prctl. Bypassable and weaponisable; kept
+#                        for kernels that cannot do better.
+#   block_exec_by_inode  (bpf-lsm) — keyed on the file's (dev, ino). Needs a
+#                        kernel with BTF so the agent can resolve the exec
+#                        struct layout at load time. Where it cannot, the
+#                        action is REFUSED rather than quietly downgraded to
+#                        a comm block: containment you do not have must not
+#                        look like containment you do.
 # policy_path    = "/etc/bowery/response-policy.toml"   # deny-all by default
 # audit_log_path = "/var/log/bowery/actions.jsonl"      # signed, one line per action
 #

@@ -48,9 +48,26 @@ pub enum Action {
         comm: String,
         episode_id: String,
     },
+    /// Forbid execution of a specific **file**, identified by the
+    /// `(dev, ino)` pair the kernel knows it by.
+    ///
+    /// What `BlockExec` should always have been. `comm` is 16 bytes any
+    /// process sets with `prctl`, so a comm blocklist is bypassable by
+    /// renaming yourself and *weaponisable* by naming yourself `sshd` —
+    /// the agent then locks out the real one. An inode names the file:
+    /// a rename keeps it, a copy gets a new one, and neither is under
+    /// the attacker's control after the fact.
+    ///
+    /// `path` is carried for the audit trail only. It is what the
+    /// inode was resolved *from*, never what the kernel matches on.
+    BlockExecByInode {
+        dev: u64,
+        ino: u64,
+        path: String,
+        episode_id: String,
+    },
     // Future variants — keep this comment up to date as Phase 7
     // progresses:
-    //   BlockExecBySha { sha256: [u8; 32], ttl: Duration }   // CO-RE
     //   BlockOpen      { path: PathBuf,    ttl: Duration }
     //   BlockConnect   { addr: IpAddr,     port: u16, ttl: Duration }
     //   QuarantineHost { ttl: Duration }
@@ -64,13 +81,14 @@ impl Action {
         match self {
             Action::KillProcess { .. } => "kill_process",
             Action::BlockExec { .. } => "block_exec",
+            Action::BlockExecByInode { .. } => "block_exec_by_inode",
         }
     }
 
     /// All action ids the engine knows how to execute today. Used by
     /// policy parsing to reject typos in `allowed_actions` early.
     pub fn known_ids() -> &'static [&'static str] {
-        &["kill_process", "block_exec"]
+        &["kill_process", "block_exec", "block_exec_by_inode"]
     }
 }
 
@@ -190,7 +208,81 @@ pub fn from_id(id: &str, episode_id: &str, pid: Option<u32>, comm: Option<&str>)
             comm: comm?.to_string(),
             episode_id: episode_id.to_string(),
         }),
+        // `block_exec_by_inode` is deliberately absent: it needs a path
+        // to stat, and resolving one here would mean trusting whatever
+        // string reached this function. Callers build it with
+        // `block_exec_by_inode_for`, which is where the refusal to
+        // unexecutable a critical system binary lives.
         _ => None,
+    }
+}
+
+/// Paths whose execution must never be blocked, whatever a verdict
+/// says.
+///
+/// The inode key removes the *spoofing* problem — an attacker cannot
+/// make their file share `sshd`'s inode — but it does not remove the
+/// *targeting* one: a verdict that names `/usr/sbin/sshd` would block
+/// the real `sshd`, and now unspoofably. This is the same protection
+/// `DEFAULT_BLOCK_EXEC_DENY_LIST` gives the comm path, keyed on the
+/// thing that actually gets resolved.
+///
+/// Prefix-matched so a distribution's own layout variations
+/// (`/usr/lib/systemd/systemd` and friends) are covered without
+/// enumerating every helper.
+const PROTECTED_EXEC_PREFIXES: &[&str] = &[
+    "/usr/sbin/sshd",
+    "/usr/lib/openssh/",
+    "/usr/bin/sudo",
+    "/usr/bin/su",
+    "/bin/su",
+    "/usr/bin/login",
+    "/bin/login",
+    "/usr/lib/systemd/",
+    "/lib/systemd/",
+    "/usr/bin/systemctl",
+    "/sbin/init",
+    "/usr/sbin/init",
+    // The agent itself. Blocking your own binary means no restart and
+    // no way to undo the block without single-user mode.
+    "/usr/bin/bowery-agent",
+    "/usr/bin/bowery",
+];
+
+/// Is this a path the agent must refuse to make unexecutable?
+#[must_use]
+pub fn is_protected_exec_path(path: &str) -> bool {
+    PROTECTED_EXEC_PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
+/// Build a [`Action::BlockExecByInode`] for `path`, resolving the inode
+/// the kernel knows it by.
+///
+/// Deliberately not reachable from [`from_id`]: it needs a real path to
+/// `stat`, and this is where the refusal to unexecutable a critical
+/// binary lives. Returns `None` when the path is protected or cannot be
+/// stat'd — a block that cannot be resolved must not become a block on
+/// something else.
+#[must_use]
+pub fn block_exec_by_inode_for(path: &str, episode_id: &str) -> Option<Action> {
+    if is_protected_exec_path(path) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let md = std::fs::metadata(path).ok()?;
+        Some(Action::BlockExecByInode {
+            dev: md.dev(),
+            ino: md.ino(),
+            path: path.to_string(),
+            episode_id: episode_id.to_string(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, episode_id);
+        None
     }
 }
 
@@ -230,7 +322,7 @@ mod tests {
                 assert_eq!(pid, 42);
                 assert_eq!(episode_id, "ep-x");
             }
-            other @ Action::BlockExec { .. } => panic!("expected KillProcess, got {other:?}"),
+            other => panic!("expected KillProcess, got {other:?}"),
         }
     }
 
@@ -259,8 +351,77 @@ mod tests {
                 assert_eq!(comm, "nc");
                 assert_eq!(episode_id, "ep-y");
             }
-            other @ Action::KillProcess { .. } => panic!("expected BlockExec, got {other:?}"),
+            other => panic!("expected BlockExec, got {other:?}"),
         }
+    }
+
+    /// The inode key removes spoofing, not targeting. An attacker who
+    /// can influence a verdict could name sshd and now block it
+    /// *unspoofably*, which is strictly worse than the comm path it
+    /// replaces.
+    #[test]
+    fn critical_binaries_can_never_be_made_unexecutable() {
+        for p in [
+            "/usr/sbin/sshd",
+            "/usr/lib/openssh/sshd-session",
+            "/usr/bin/sudo",
+            "/bin/su",
+            "/usr/lib/systemd/systemd",
+            "/usr/bin/bowery-agent",
+        ] {
+            assert!(is_protected_exec_path(p), "{p} must be protected");
+            assert!(
+                block_exec_by_inode_for(p, "ep-1").is_none(),
+                "{p} must never yield a block action"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_binary_resolves_to_its_inode() {
+        // Resolve something that certainly exists and is not protected.
+        let tmp = std::env::temp_dir().join("bowery-block-inode-test");
+        std::fs::write(&tmp, b"x").unwrap();
+        let path = tmp.display().to_string();
+        let action = block_exec_by_inode_for(&path, "ep-1").expect("resolves");
+        match action {
+            Action::BlockExecByInode {
+                dev, ino, path: p, ..
+            } => {
+                assert!(ino > 0, "a real file has a real inode");
+                assert!(dev > 0);
+                assert_eq!(p, path, "the path is carried for the audit trail");
+                assert_eq!(
+                    action_id_of(&Action::BlockExecByInode {
+                        dev,
+                        ino,
+                        path: p,
+                        episode_id: "e".into()
+                    }),
+                    "block_exec_by_inode"
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    fn action_id_of(a: &Action) -> &'static str {
+        a.id()
+    }
+
+    /// A path that does not exist must yield nothing. Resolving it to
+    /// some fallback inode would block an unrelated file.
+    #[test]
+    fn an_unresolvable_path_yields_no_action() {
+        assert!(block_exec_by_inode_for("/definitely/not/here", "ep-1").is_none());
+    }
+
+    /// It cannot be built from an id alone — there is no path to stat,
+    /// and inventing one would skip the protection above.
+    #[test]
+    fn it_is_not_constructible_from_an_id() {
+        assert!(from_id("block_exec_by_inode", "ep", Some(1), Some("x")).is_none());
     }
 
     #[test]

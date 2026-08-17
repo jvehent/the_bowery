@@ -54,9 +54,9 @@ fn arb_record(host_fp_hex: String) -> impl Strategy<Value = AuditRecord> {
             // The record's episode_id mirrors the action's so the
             // shape matches what the agent actually emits.
             let record_episode = match &action {
-                Action::KillProcess { episode_id, .. } | Action::BlockExec { episode_id, .. } => {
-                    episode_id.clone()
-                }
+                Action::KillProcess { episode_id, .. }
+                | Action::BlockExec { episode_id, .. }
+                | Action::BlockExecByInode { episode_id, .. } => episode_id.clone(),
             };
             AuditRecord {
                 version: AuditRecord::VERSION,

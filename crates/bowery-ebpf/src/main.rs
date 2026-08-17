@@ -38,10 +38,10 @@
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_probe_read_user_str_bytes,
+        bpf_probe_read_kernel, bpf_probe_read_user_str_bytes,
     },
     macros::{lsm, map, tracepoint},
-    maps::{LruHashMap, PerCpuArray, RingBuf},
+    maps::{Array, LruHashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, TracePointContext},
 };
 
@@ -233,6 +233,50 @@ static FILE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 /// with no eviction).
 #[map]
 static BLOCKED_COMMS: LruHashMap<[u8; 16], u8> = LruHashMap::with_max_entries(4096, 0);
+
+/// Kernel struct field offsets, resolved by userspace from the running
+/// kernel's BTF and written here before the blocker is armed.
+///
+/// aya has no eBPF-side CO-RE — its loader can apply
+/// `BPF_CORE_FIELD_BYTE_OFFSET` relocations but nothing in `aya-ebpf`
+/// emits them for a Rust field access — so the offsets have to arrive
+/// out of band. See `bowery-ebpf-loader`'s `btf` module for why
+/// hardcoding them was never an option: this hook denies execs, so a
+/// wrong offset reads an arbitrary kernel address and blocks arbitrary
+/// binaries as root.
+///
+/// Slot 0 is the **arming word** and the rest are offsets. The layout is
+/// duplicated in the loader and the two must not drift.
+#[map]
+static EXEC_OFFSETS: Array<u32> = Array::with_max_entries(OFF_COUNT, 0);
+
+const OFF_COUNT: u32 = 6;
+/// Slot 0. Anything else — including the zero an unpopulated map holds —
+/// means "not armed", and [`block_exec`] allows every exec.
+///
+/// This is the property that makes the whole design safe: an object
+/// loaded without userspace resolving offsets cannot deny anything, so
+/// the dangerous state is unreachable by accident rather than merely
+/// avoided by convention.
+const OFF_ARMED_MAGIC: u32 = 0xB0_9E_00_01;
+const OFF_ARMED: u32 = 0;
+const OFF_BINPRM_FILE: u32 = 1;
+const OFF_FILE_INODE: u32 = 2;
+const OFF_INODE_INO: u32 = 3;
+const OFF_INODE_SB: u32 = 4;
+const OFF_SB_DEV: u32 = 5;
+
+/// Blocklist keyed by the identity of the *file being executed*:
+/// `[dev, ino]`.
+///
+/// This is what `BLOCKED_COMMS` should always have been. `comm` is 16
+/// bytes any process sets with `prctl`, so a comm blocklist is both
+/// bypassable (rename yourself) and weaponisable (name yourself `sshd`
+/// and the agent locks the real one out). A (dev, ino) pair names the
+/// file itself: a copy gets a new inode and a rename keeps the old one,
+/// which is the correct behaviour in both cases.
+#[map]
+static BLOCKED_INODES: LruHashMap<[u64; 2], u8> = LruHashMap::with_max_entries(4096, 0);
 
 // ---------------------------------------------------------------------------
 // Programs.
@@ -595,14 +639,78 @@ fn try_openat(ctx: &TracePointContext) -> Result<(), i64> {
 /// map lookup so both `echo "x" > /proc/<pid>/comm` and
 /// `printf "x" > /proc/<pid>/comm` produce the same key.
 #[lsm(hook = "bprm_check_security")]
-pub fn block_exec(_ctx: LsmContext) -> i32 {
+pub fn block_exec(ctx: LsmContext) -> i32 {
+    // Identity of the binary being exec'd, when userspace has armed us
+    // with resolved offsets. Checked first because it is the one that
+    // cannot be spoofed.
+    if let Some(key) = exec_inode(&ctx) {
+        // SAFETY: aya-ebpf's lookup helper; the kernel enforces no
+        // aliasing. The borrowed pointer is discriminated immediately.
+        if unsafe { BLOCKED_INODES.get(&key) }.is_some() {
+            return -1;
+        }
+    }
+
     let mut comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
     normalise_comm(&mut comm);
-    // SAFETY: `BLOCKED_COMMS.get` reads through aya-ebpf's lookup
-    // helper; kernel side enforces no aliasing for us. Returning a
-    // borrowed pointer that we immediately discriminate on is safe.
+    // SAFETY: as above.
     let blocked = unsafe { BLOCKED_COMMS.get(&comm) }.is_some();
     if blocked { -1 } else { 0 }
+}
+
+/// `[dev, ino]` of the file this exec is about, or `None`.
+///
+/// # Every failure path returns `None`, which means *allow*
+///
+/// This runs inside a hook whose return value denies execution, so the
+/// bias has to be absolute: not armed, an offset missing, any
+/// `bpf_probe_read_kernel` failing, a null pointer anywhere in the
+/// chain — all of them yield `None` and the exec proceeds. The worst
+/// outcome of a bug here is a missed block. Denying on a failed read
+/// would make a transient kernel-memory read failure into an
+/// unbootable host.
+#[inline(always)]
+fn exec_inode(ctx: &LsmContext) -> Option<[u64; 2]> {
+    if *EXEC_OFFSETS.get(OFF_ARMED)? != OFF_ARMED_MAGIC {
+        return None;
+    }
+    let off_binprm_file = *EXEC_OFFSETS.get(OFF_BINPRM_FILE)? as usize;
+    let off_file_inode = *EXEC_OFFSETS.get(OFF_FILE_INODE)? as usize;
+    let off_inode_ino = *EXEC_OFFSETS.get(OFF_INODE_INO)? as usize;
+    let off_inode_sb = *EXEC_OFFSETS.get(OFF_INODE_SB)? as usize;
+    let off_sb_dev = *EXEC_OFFSETS.get(OFF_SB_DEV)? as usize;
+
+    // Argument 0 of bprm_check_security is `struct linux_binprm *`.
+    // SAFETY: the LSM hook's own argument, as the kernel passed it.
+    let bprm: *const u8 = unsafe { ctx.arg(0) };
+    if bprm.is_null() {
+        return None;
+    }
+
+    // SAFETY: every read goes through bpf_probe_read_kernel, which is
+    // fault-tolerant by design — it returns an error rather than
+    // faulting, and `?` turns each error into "allow".
+    let file = unsafe { read_ptr(bprm.add(off_binprm_file))? };
+    let inode = unsafe { read_ptr(file.add(off_file_inode))? };
+    let ino: u64 = unsafe { bpf_probe_read_kernel(inode.add(off_inode_ino).cast()).ok()? };
+    let sb = unsafe { read_ptr(inode.add(off_inode_sb))? };
+    let dev: u32 = unsafe { bpf_probe_read_kernel(sb.add(off_sb_dev).cast()).ok()? };
+
+    Some([u64::from(dev), ino])
+}
+
+/// Read a kernel pointer, rejecting null.
+///
+/// # Safety
+/// `at` must be an address the kernel may legitimately hold a pointer
+/// at; `bpf_probe_read_kernel` tolerates it not being readable.
+#[inline(always)]
+unsafe fn read_ptr(at: *const u8) -> Option<*const u8> {
+    let p: u64 = unsafe { bpf_probe_read_kernel(at.cast()).ok()? };
+    if p == 0 {
+        return None;
+    }
+    Some(p as *const u8)
 }
 
 /// Zero trailing ASCII whitespace bytes (`\n`, `\r`, `\t`, space).

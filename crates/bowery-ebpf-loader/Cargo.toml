@@ -21,6 +21,7 @@ tokio = { workspace = true, features = ["sync", "rt", "macros", "net"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time", "sync"] }

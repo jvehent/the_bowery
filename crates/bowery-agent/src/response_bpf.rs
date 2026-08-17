@@ -96,6 +96,46 @@ impl ResponseEngine for BpfLsmEngine {
                     }
                 }
             }
+            Action::BlockExecByInode {
+                dev,
+                ino,
+                path,
+                episode_id,
+            } => {
+                let mut blocker = self.blocker.lock().await;
+                // Refused rather than downgraded to a comm block. A
+                // caller that asked to block a *file* and silently got a
+                // spoofable name-match would believe it had containment
+                // it does not have.
+                if !blocker.inode_matching_armed() {
+                    warn!(
+                        episode = %episode_id,
+                        path = %path,
+                        "bpf-lsm: inode matching not armed on this kernel; refusing"
+                    );
+                    return Ok(ActionOutcome::suppressed(
+                        "inode matching is not armed on this kernel (no BTF, or the exec \
+                         struct layout could not be resolved); refusing to substitute a \
+                         spoofable comm block",
+                    ));
+                }
+                match blocker.block_inode(*dev, *ino) {
+                    Ok(()) => {
+                        info!(
+                            episode = %episode_id,
+                            path = %path,
+                            dev, ino,
+                            "bpf-lsm: file added to BLOCKED_INODES"
+                        );
+                        Ok(ActionOutcome::executed_now())
+                    }
+                    Err(e) => {
+                        warn!(episode = %episode_id, path = %path, error = %e,
+                              "bpf-lsm: BLOCKED_INODES insert failed");
+                        Err(ActionError::Invalid(format!("block_inode: {e}")))
+                    }
+                }
+            }
             Action::KillProcess { .. } => Ok(ActionOutcome::suppressed(
                 "bpf-lsm engine doesn't implement kill_process; switch to process-kill",
             )),

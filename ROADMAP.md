@@ -297,12 +297,35 @@ No new sensors required:
   cannot be armed by naming an engine: an upgrade must never arm
   enforcement on an operator's behalf.
 
-- **Inode/sha-keyed `block_exec`** *(open)* replacing the `comm` key
-  (already scoped as P9-2). Until then, blocking is theatre — and
-  weaponisable. Needs the LSM hook to read `bprm->file->f_inode` via
-  CO-RE, which needs BTF, which Pi kernels do not ship; those hosts
-  cannot run BPF-LSM at all, so this lands as a capability that degrades
-  explicitly rather than one that works fleet-wide.
+- **Inode-keyed `block_exec`** *(built; needs hardware verification)* —
+  replaces the `comm` key, which was both bypassable (rename yourself)
+  and weaponisable (name yourself `sshd` and the agent locks the real
+  one out). A `(dev, ino)` pair names the file: a rename keeps it, a
+  copy gets a new one.
+
+  CO-RE turned out to be unavailable. aya implements the loader half —
+  `aya-obj` applies `BPF_CORE_FIELD_BYTE_OFFSET` and rewrites
+  instructions — but neither `aya-ebpf` 0.1.1 nor 0.2.1 provides a
+  `bpf_core_read!`, so a Rust field access emits no relocation for it to
+  apply. Half the machinery, unusable.
+
+  Hardcoding offsets was never acceptable: this hook denies execs, so a
+  wrong offset reads an arbitrary kernel address and blocks arbitrary
+  binaries, as root, on a live host. Offsets are therefore resolved at
+  load time from `/sys/kernel/btf/vmlinux` and written into a map, the
+  arming word last — the same shape `sys_enter_openat` already uses for
+  its argument offsets. An unarmed map means the hook never blocks by
+  inode, so the dangerous state is *unreachable* rather than merely
+  avoided, and an inode block on a kernel that could not arm is
+  **refused** rather than downgraded to a spoofable comm block.
+
+  The inode key removes spoofing, not targeting, so a protected-path
+  list still refuses to make `sshd`, `sudo`, `systemd` or the agent
+  itself unexecutable — now unspoofably, which would have been worse.
+
+  Pi kernels ship neither BTF nor `CONFIG_BPF_LSM`, so this is a
+  capability that degrades explicitly: those hosts keep comm-keyed
+  blocking and say so.
 - **Network isolation** as an action.
 - **Quorum-gated enforcement** *(built)* — `DESIGN.md` specified from the
   start that a hard action needs standing authorization *or* k-of-n peer

@@ -47,7 +47,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aya::Ebpf;
 use aya::maps::PerCpuArray;
 use aya::maps::ring_buf::RingBuf;
-use aya::maps::{HashMap as AyaHashMap, MapData};
+use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData};
 use aya::programs::{Lsm, TracePoint};
 use aya::{Btf, BtfError};
 use bowery_events::source::{
@@ -826,7 +826,22 @@ pub struct BpfBlocker {
     // The Ebpf instance owns the program + maps; dropping it drops the
     // attach link and removes the kernel-side state.
     ebpf: Ebpf,
+    /// Whether `EXEC_OFFSETS` holds offsets resolved from this kernel's
+    /// BTF. False means the hook cannot match on the executed file and
+    /// an inode block must be refused rather than silently downgraded.
+    inode_armed: bool,
 }
+
+/// `EXEC_OFFSETS` slot layout. Duplicated in `bowery-ebpf`'s
+/// `main.rs`; the two must not drift.
+const OFF_ARMED: u32 = 0;
+const OFF_BINPRM_FILE: u32 = 1;
+const OFF_FILE_INODE: u32 = 2;
+const OFF_INODE_INO: u32 = 3;
+const OFF_INODE_SB: u32 = 4;
+const OFF_SB_DEV: u32 = 5;
+/// Written to slot 0 only after every offset is in place.
+const OFF_ARMED_MAGIC: u32 = 0xB09E_0001;
 
 impl std::fmt::Debug for BpfBlocker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -866,7 +881,113 @@ impl BpfBlocker {
             .map_err(|e| LoaderError::Aya(e.to_string()))?;
         info!("attached lsm/bprm_check_security");
 
-        Ok(Self { ebpf })
+        let mut blocker = Self {
+            ebpf,
+            inode_armed: false,
+        };
+        // Arm inode matching if — and only if — every offset resolves
+        // against the kernel actually running. A failure here is not
+        // fatal: the comm blocklist still works, and the hook is written
+        // so that an unarmed offsets map means "never block by inode".
+        // See `btf` for why a guess would be unacceptable.
+        match blocker.arm_inode_matching() {
+            Ok(off) => {
+                blocker.inode_armed = true;
+                info!(?off, "inode matching armed from kernel BTF");
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "inode matching NOT armed; block_exec_by_inode will be refused. \
+                     comm-keyed blocking is unaffected but remains spoofable"
+                );
+            }
+        }
+        Ok(blocker)
+    }
+
+    /// Resolve the offsets from the running kernel's BTF and write them
+    /// into `EXEC_OFFSETS`, arming word last.
+    ///
+    /// The ordering is the safety property: the offsets are in place
+    /// before the magic that tells the hook to trust them, so a partial
+    /// write can only ever leave the hook disarmed.
+    fn arm_inode_matching(&mut self) -> Result<crate::btf::ExecInodeOffsets, LoaderError> {
+        let kbtf = crate::btf::Btf::from_running_kernel()
+            .map_err(|e| LoaderError::Aya(format!("kernel BTF: {e}")))?;
+        let off = crate::btf::ExecInodeOffsets::resolve(&kbtf)
+            .map_err(|e| LoaderError::Aya(format!("resolving exec-inode offsets: {e}")))?;
+
+        let map = self
+            .ebpf
+            .map_mut("EXEC_OFFSETS")
+            .ok_or_else(|| LoaderError::Aya("EXEC_OFFSETS map not found".into()))?;
+        let mut arr: AyaArray<&mut MapData, u32> =
+            AyaArray::try_from(map).map_err(|e| LoaderError::Aya(e.to_string()))?;
+        for (idx, val) in [
+            (OFF_BINPRM_FILE, off.binprm_file),
+            (OFF_FILE_INODE, off.file_inode),
+            (OFF_INODE_INO, off.inode_ino),
+            (OFF_INODE_SB, off.inode_sb),
+            (OFF_SB_DEV, off.sb_dev),
+        ] {
+            arr.set(idx, val, 0)
+                .map_err(|e| LoaderError::Aya(format!("EXEC_OFFSETS[{idx}]: {e}")))?;
+        }
+        // Last, deliberately.
+        arr.set(OFF_ARMED, OFF_ARMED_MAGIC, 0)
+            .map_err(|e| LoaderError::Aya(format!("EXEC_OFFSETS arming word: {e}")))?;
+        Ok(off)
+    }
+
+    /// Can this host block by the identity of the executed file?
+    ///
+    /// `false` on a kernel whose BTF is absent or whose layout could not
+    /// be resolved. Callers must refuse an inode block rather than
+    /// silently falling back to `comm`, which would substitute a
+    /// spoofable check for an unspoofable one without saying so.
+    #[must_use]
+    pub fn inode_matching_armed(&self) -> bool {
+        self.inode_armed
+    }
+
+    /// Block execution of the file at `(dev, ino)`.
+    ///
+    /// # Errors
+    /// When inode matching was never armed, or the map write fails.
+    pub fn block_inode(&mut self, dev: u64, ino: u64) -> Result<(), LoaderError> {
+        if !self.inode_armed {
+            return Err(LoaderError::Aya(
+                "inode matching is not armed on this kernel; refusing to pretend a \
+                 block was installed"
+                    .into(),
+            ));
+        }
+        let mut map = self.blocked_inodes_mut()?;
+        map.insert([dev, ino], 1u8, 0)
+            .map_err(|e| LoaderError::Aya(format!("BLOCKED_INODES insert: {e}")))?;
+        debug!(dev, ino, "added to BLOCKED_INODES");
+        Ok(())
+    }
+
+    /// Remove `(dev, ino)`. `Ok(false)` when it wasn't present.
+    pub fn unblock_inode(&mut self, dev: u64, ino: u64) -> Result<bool, LoaderError> {
+        let mut map = self.blocked_inodes_mut()?;
+        match map.remove(&[dev, ino]) {
+            Ok(()) => Ok(true),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(false),
+            Err(e) => Err(LoaderError::Aya(format!("BLOCKED_INODES remove: {e}"))),
+        }
+    }
+
+    fn blocked_inodes_mut(
+        &mut self,
+    ) -> Result<AyaHashMap<&mut MapData, [u64; 2], u8>, LoaderError> {
+        let map = self
+            .ebpf
+            .map_mut("BLOCKED_INODES")
+            .ok_or_else(|| LoaderError::Aya("BLOCKED_INODES map not found".into()))?;
+        AyaHashMap::try_from(map).map_err(|e| LoaderError::Aya(e.to_string()))
     }
 
     /// Add `comm` to the blocklist. Truncates / null-pads to 16 bytes

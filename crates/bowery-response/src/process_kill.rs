@@ -145,9 +145,11 @@ impl ResponseEngine for ProcessKillEngine {
                     }
                 }
             }
-            Action::BlockExec { .. } => Ok(ActionOutcome::suppressed(
-                "process-kill engine doesn't implement block_exec; switch to bpf-lsm",
-            )),
+            Action::BlockExec { .. } | Action::BlockExecByInode { .. } => {
+                Ok(ActionOutcome::suppressed(
+                    "process-kill engine doesn't implement exec blocking; switch to bpf-lsm",
+                ))
+            }
         }
     }
 

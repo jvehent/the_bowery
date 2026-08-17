@@ -3317,6 +3317,96 @@ that was already reported, never delete it.
 
 ---
 
+## 28c. Blocking a file rather than a name
+
+`block_exec` keyed on `comm` — 16 bytes any process sets with
+`prctl(PR_SET_NAME)`. That is bypassable by renaming yourself and, worse,
+*weaponisable*: name a process `sshd` and the agent adds `sshd` to the
+kernel blocklist, locking out the real one. The roadmap called it theatre
+and it was right.
+
+The fix is to key on the file: `(dev, ino)`. A rename keeps the inode so
+the block follows the file; a copy gets a new one so the block does not
+follow content it was never about.
+
+### 28c.1 CO-RE was unavailable, and the workaround had to be safe
+
+Reading `bprm->file->f_inode` inside `bprm_check_security` needs field
+offsets that differ per kernel build. The portable answer is CO-RE.
+
+aya implements the *loader* half: `aya-obj` handles
+`BPF_CORE_FIELD_BYTE_OFFSET`, resolves against the target kernel's BTF,
+and rewrites instructions. It does not implement the *compiler* half —
+checked in both releases, neither `aya-ebpf` 0.1.1 nor 0.2.1 provides a
+`bpf_core_read!`, and a plain Rust field access emits no `bpf_core_relo`
+record. Half the machinery, and the half that is present cannot be used
+without the half that is not.
+
+Hardcoding offsets was never an option, and the reason is the asymmetry
+of this particular hook. Elsewhere a wrong offset costs a missed
+detection. Here the return value **denies an exec**, so a wrong offset
+means reading an arbitrary kernel address and denying arbitrary
+binaries, as root, on a running host — the failure mode is bricking the
+machine the agent exists to protect.
+
+So offsets are resolved at load time from `/sys/kernel/btf/vmlinux` by
+[`btf.rs`](crates/bowery-ebpf-loader/src/btf.rs) and written into an
+`EXEC_OFFSETS` map. This is the shape `sys_enter_openat` already uses —
+verify against the kernel's own metadata, refuse on a proven mismatch.
+`aya-obj` keeps its BTF members `pub(crate)`, so the offsets cannot be
+borrowed from it; this is a small parser of the type section that skips
+every kind it does not need by size. It agrees with `bpftool btf dump
+format raw` on all five offsets.
+
+### 28c.2 The dangerous state is unreachable, not merely avoided
+
+Two orderings carry the safety, and both are structural:
+
+**Slot 0 is an arming word, written last.** The hook reads it first and
+returns "no opinion" unless it holds the magic. An object loaded without
+userspace resolving offsets — an old object, a kernel with no BTF, a
+partial map write — cannot block by inode at all. Not "should not":
+cannot.
+
+**Every failure path allows.** Not armed, an offset missing, any
+`bpf_probe_read_kernel` failing, a null pointer anywhere in the chain —
+each yields `None` and the exec proceeds. The worst outcome of a bug in
+the walk is a missed block. Denying on a failed read would turn a
+transient kernel-memory read failure into an unbootable host.
+
+And when the kernel cannot arm, an inode block is **refused** rather
+than downgraded to a comm block. A caller that asked to block a file and
+silently got a spoofable name match would believe it had containment it
+does not have.
+
+### 28c.3 The inode key removes spoofing, not targeting
+
+An attacker cannot make their file share `sshd`'s inode. They can still
+try to get a verdict to *name* `sshd`, and the block would then be
+unspoofable — strictly worse than the comm path it replaces. So the
+protected-path list survives, keyed on what actually gets resolved:
+`sshd` and its OpenSSH 9.8+ helpers, `sudo`, `su`, `login`, systemd, and
+the agent's own binaries. Blocking your own agent means no restart and
+no way to undo the block short of single-user mode.
+
+For the same reason `block_exec_by_inode` is deliberately **not**
+constructible from `action::from_id`: it needs a real path to `stat`,
+and resolving one there would mean trusting whatever string reached the
+function and skipping the guard.
+
+### 28c.4 What proves it
+
+Offsets resolving and maps existing prove nothing about whether the
+kernel actually denies the right file. A root-gated integration test
+does: it blocks a temp script's inode and asserts the kernel refuses it,
+that an unrelated file still runs, that renaming the blocked file does
+not escape the block, that a *copy* does run, and that unblocking
+restores execution. It skips — loudly — on a host without BPF-LSM, BTF
+or root, because Pi kernels have none of them and a red build for a
+legitimate cannot-run-here teaches people to ignore it.
+
+---
+
 ## 29. Reaching an operator who isn't watching
 
 ### 29.1 `bowery notify`
