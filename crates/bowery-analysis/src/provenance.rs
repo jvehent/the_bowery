@@ -96,7 +96,50 @@ fn is_executable_path(rel: &str) -> bool {
         // e.g. usr/lib/systemd/systemd or usr/lib/openssh/sftp-server.
         // Shared objects are mapped, not exec'd, and they are the bulk
         // of usr/lib. Excluding them is what keeps the index small.
-        || (rel.starts_with("usr/lib/") && !rel.contains(".so"))
+        // Helper binaries under a package's own lib directory, in both
+        // spellings: dpkg records `lib/systemd/systemd` on a merged-/usr
+        // host and `usr/lib/openssh/sftp-server` on the same one, because
+        // it writes whatever the package shipped. Dropping the aliased
+        // form here would discard the entry before `merged_usr_alias`
+        // ever saw it.
+        || ((rel.starts_with("usr/lib/") || rel.starts_with("lib/")) && !rel.contains(".so"))
+}
+
+/// The `/usr`-prefixed spelling of a path dpkg recorded under an
+/// aliased directory, or `None` when there is no alias.
+///
+/// # Why this is necessary rather than cosmetic
+///
+/// On a merged-`/usr` system — every current Debian and Ubuntu —
+/// `/bin`, `/sbin` and `/lib` are symlinks into `/usr`. dpkg records
+/// paths **as the package shipped them**, so `systemd` appears in
+/// `md5sums` as `lib/systemd/systemd`. But provenance looks a binary up
+/// by the path `/proc/<pid>/exe` reports, and that is the *resolved*
+/// real path: `/usr/lib/systemd/systemd`. The two spellings name one
+/// file and never compare equal, so every such binary classified as
+/// `Unpackaged`.
+///
+/// That was not a rare corner. On a live Debian 12 host, **16,975 of
+/// 146,517** `md5sums` entries — 12% — are recorded under the aliased
+/// directories, and the misclassification is silent and expensive in
+/// both directions: rarity damping never applies, and worse,
+/// [`setid_finding`] reports `privesc.setid_unpackaged` at 0.95 for a
+/// setuid binary the distribution itself installed under `/sbin`.
+///
+/// Found by a live agent alerting on `/usr/lib/systemd/systemd` reading
+/// `/etc/shadow` *after* that path had been added to the sanctioned
+/// readers — the exemption also requires `PackagedIntact`, so the
+/// provenance bug kept the finding alive and made itself visible.
+///
+/// Both spellings are inserted rather than one rewritten: on a system
+/// that has *not* merged `/usr`, the two are genuinely different files
+/// and the alias simply never matches anything.
+fn merged_usr_alias(rel: &str) -> Option<PathBuf> {
+    const ALIASED: [&str; 3] = ["bin/", "sbin/", "lib/"];
+    ALIASED
+        .iter()
+        .any(|d| rel.starts_with(d))
+        .then(|| PathBuf::from("/usr").join(rel))
 }
 
 impl PackageIndex {
@@ -152,6 +195,11 @@ impl PackageIndex {
                     continue;
                 };
                 by_path.insert(PathBuf::from("/").join(rel), md5);
+                // ...and again under merged-`/usr`, which is how the
+                // file will actually be named when we look it up.
+                if let Some(alias) = merged_usr_alias(rel) {
+                    by_path.insert(alias, md5);
+                }
             }
         }
         Self {
@@ -467,6 +515,84 @@ mod tests {
         .collect();
         let declared: HashSet<&str> = rule_ids().iter().copied().collect();
         assert_eq!(reachable, declared);
+    }
+
+    /// The merged-`/usr` bug, in the exact shape a live agent hit it.
+    ///
+    /// dpkg records `lib/systemd/systemd`; `/proc/<pid>/exe` reports
+    /// `/usr/lib/systemd/systemd`, because `/lib` is a symlink into
+    /// `/usr`. Before this, that binary — and 12% of every packaged file
+    /// on a Debian host — classified as `Unpackaged`.
+    #[test]
+    fn a_binary_dpkg_recorded_under_aliased_lib_is_found_by_its_usr_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_md5sums(
+            dir.path(),
+            "systemd",
+            &[&format!("{NICE_MD5}  lib/systemd/systemd")],
+        );
+        let idx = PackageIndex::load_dpkg(dir.path());
+        assert_eq!(
+            idx.classify(Path::new("/usr/lib/systemd/systemd"), Some(nice_bytes())),
+            Provenance::PackagedIntact,
+            "the resolved merged-/usr path must resolve to the package"
+        );
+        // And the spelling dpkg recorded, for a host that never merged.
+        assert_eq!(
+            idx.classify(Path::new("/lib/systemd/systemd"), Some(nice_bytes())),
+            Provenance::PackagedIntact
+        );
+    }
+
+    /// `/sbin` aliases the same way, and this is the expensive case: a
+    /// packaged setuid binary misread as unpackaged is not a missed
+    /// suppression but a fabricated 0.95 finding.
+    #[test]
+    fn an_aliased_sbin_binary_does_not_fabricate_a_setid_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        write_md5sums(
+            dir.path(),
+            "shadow",
+            &[&format!("{NICE_MD5}  sbin/unix_chkpwd")],
+        );
+        let idx = PackageIndex::load_dpkg(dir.path());
+        let provenance = idx.classify(Path::new("/usr/sbin/unix_chkpwd"), Some(nice_bytes()));
+        assert_eq!(provenance, Provenance::PackagedIntact);
+        assert!(
+            setid_finding(true, false, provenance).is_none(),
+            "the distribution's own setuid helper must stay silent"
+        );
+    }
+
+    /// The alias must not launder a modified file into an intact one.
+    #[test]
+    fn the_alias_still_compares_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        write_md5sums(
+            dir.path(),
+            "systemd",
+            &[&format!("{NICE_MD5}  lib/systemd/systemd")],
+        );
+        let idx = PackageIndex::load_dpkg(dir.path());
+        assert_eq!(
+            idx.classify(Path::new("/usr/lib/systemd/systemd"), Some([0xab; 16])),
+            Provenance::PackagedModified,
+            "a rewritten binary must be a finding, whichever spelling found it"
+        );
+    }
+
+    #[test]
+    fn only_the_aliased_directories_gain_a_usr_prefix() {
+        assert_eq!(
+            merged_usr_alias("sbin/unix_chkpwd"),
+            Some(PathBuf::from("/usr/sbin/unix_chkpwd"))
+        );
+        assert_eq!(
+            merged_usr_alias("bin/su"),
+            Some(PathBuf::from("/usr/bin/su"))
+        );
+        assert_eq!(merged_usr_alias("usr/bin/sudo"), None, "no double /usr");
+        assert_eq!(merged_usr_alias("etc/passwd"), None);
     }
 
     fn write_md5sums(dir: &Path, pkg: &str, lines: &[&str]) {
