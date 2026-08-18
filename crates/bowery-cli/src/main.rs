@@ -544,6 +544,37 @@ enum AlertsCommand {
         #[arg(long, default_value = "10s", value_parser = parse_duration)]
         timeout: Duration,
     },
+    /// Stop a silence suppressing anything, by its id.
+    ///
+    /// Re-issues the same pattern at full weight rather than deleting a
+    /// record: agents converge on the newest record for an id, so a
+    /// statement that something is no longer suppressed propagates where
+    /// an absence would not.
+    Unsilence {
+        /// Silence id, as shown by `bowery_silences`.
+        silence_id: String,
+        #[arg(long)]
+        operator_key: PathBuf,
+        #[arg(long)]
+        agent_addr: SocketAddr,
+        #[arg(long)]
+        agent_fp: String,
+        #[arg(long)]
+        agent_pubkey_b64: String,
+        #[arg(long = "peer-pubkey-b64")]
+        peer_pubkeys_b64: Vec<String>,
+        #[arg(long)]
+        cluster_id: String,
+        /// Why it is being revoked, for the audit trail.
+        #[arg(long, default_value = "revoked by operator")]
+        reason: String,
+        #[arg(long)]
+        fanout: bool,
+        #[arg(long, default_value_t = 3)]
+        ttl: u32,
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        timeout: Duration,
+    },
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -663,6 +694,43 @@ impl Cli {
                 Ok(ExitCode::SUCCESS)
             }
             Command::Doctor { json } => doctor_cmd(json),
+            Command::Alerts {
+                sub:
+                    AlertsCommand::Unsilence {
+                        silence_id,
+                        operator_key,
+                        agent_addr,
+                        agent_fp,
+                        agent_pubkey_b64,
+                        peer_pubkeys_b64,
+                        cluster_id,
+                        reason,
+                        fanout,
+                        ttl,
+                        timeout,
+                    },
+            } => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building tokio runtime")?;
+                runtime.block_on(bowery_cli::silence::unsilence_by_id(
+                    bowery_cli::silence::Target {
+                        operator_key,
+                        addr: agent_addr,
+                        fp_hex: agent_fp,
+                        pubkey_b64: agent_pubkey_b64,
+                        peer_pubkeys_b64,
+                        timeout,
+                    },
+                    cluster_id,
+                    silence_id,
+                    reason,
+                    fanout,
+                    ttl,
+                ))?;
+                Ok(ExitCode::SUCCESS)
+            }
             Command::Alerts {
                 sub:
                     AlertsCommand::Silence {

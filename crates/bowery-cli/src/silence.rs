@@ -196,9 +196,60 @@ pub async fn silence_alert(
     crate::exec::silence_push(&target, &silence, fanout, ttl).await
 }
 
+/// Revoke a silence by id.
+///
+/// Looks the record up in `bowery_silences` to recover the pattern it
+/// covers, because a silence id is a hash and nothing can be derived
+/// back out of it. Re-issues that pattern at full weight rather than
+/// deleting anything: agents converge on the newest record for an id, so
+/// a record saying "no longer suppressed" propagates where an absence
+/// would not.
+pub async fn unsilence_by_id(
+    target: Target,
+    cluster_id: String,
+    silence_id: String,
+    reason: String,
+    fanout: bool,
+    ttl: u32,
+) -> Result<()> {
+    let quoted = silence_id.replace('\'', "''");
+    let mut sink = Collect::default();
+    crate::exec::sql(
+        target.operator_key.clone(),
+        target.addr,
+        target.fp_hex.clone(),
+        target.pubkey_b64.clone(),
+        target.peer_pubkeys_b64.clone(),
+        format!(
+            "SELECT rule_id, exe_sha256_hex, exe_path, host_fp_hex \
+             FROM bowery_silences WHERE id = '{quoted}' LIMIT 1"
+        ),
+        target.timeout,
+        false,
+        false,
+        &mut sink,
+    )
+    .await
+    .context("looking up the silence")?;
+
+    let Some(row) = sink.rows.first() else {
+        bail!(
+            "no silence with id {silence_id:?} on that agent. It may have expired, which \
+             needs no revoking, or never reached this host."
+        );
+    };
+    let spec = SilenceSpec {
+        rule_id: sink.get(row, "rule_id").cloned().unwrap_or_default(),
+        exe_sha256_hex: sink.get(row, "exe_sha256_hex").cloned().unwrap_or_default(),
+        exe_path: sink.get(row, "exe_path").cloned().unwrap_or_default(),
+        host_fp_hex: sink.get(row, "host_fp_hex").cloned().unwrap_or_default(),
+    };
+    println!("revoking {silence_id} ({})", spec.rule_id);
+    unsilence(target, cluster_id, spec, reason, fanout, ttl).await
+}
+
 /// Re-issue a silence at full weight, which stops it suppressing
 /// anything without leaving a hole where a record used to be.
-#[allow(clippy::too_many_arguments)]
 pub async fn unsilence(
     target: Target,
     cluster_id: String,
