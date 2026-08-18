@@ -1,0 +1,12 @@
+[package]
+name = "bowery-prove"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bowery-analysis = { path = "../bowery-analysis" }
+
+[lints]
+workspace = true

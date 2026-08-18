@@ -12,6 +12,7 @@ members = [
     "crates/bowery-eventlog",
     "crates/bowery-llm",
     "crates/bowery-mesh",
+    "crates/bowery-prove",
     "crates/bowery-proto",
     "crates/bowery-response",
     "crates/bowery-sql",

@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# prove-detections — make each detection fire, then check that it did.
+#
+#   scripts/prove-detections [peer-name]
+#
+# Reads `bowery_detections` from the local agent, provokes each rule with
+# `bowery-prove`, reads the counters again, and reports which rules moved.
+#
+# WHY THIS EXISTS
+#
+# A rule at zero is either watching for something rare or unable to fire
+# at all, and this codebase has found eight of the latter — every one with
+# passing unit tests, because a unit test exercises the rule against an
+# input the sensor may never deliver. Only the counter on a live host can
+# tell the two apart.
+#
+# WHERE TO RUN IT
+#
+# On the host being provoked, and nowhere else: the provocations are local
+# syscalls, so the agent that must see them is the local one. It needs the
+# operator key and manifest (see deploy/remote/README.md).
+#
+# SAFETY
+#
+# `bowery-prove list` prints every action first. The write provocations
+# open paths with neither O_CREAT nor O_TRUNC — the tracepoint fires on
+# syscall entry, so intent is enough and nothing is created, truncated or
+# written. Rules that cannot be provoked safely are named as such rather
+# than skipped quietly.
+set -euo pipefail
+
+MANIFEST="${BOWERY_PEERS:-$HOME/.bowery/peers.toml}"
+KEY="${BOWERY_OPERATOR_KEY:-$HOME/.bowery/operator.key}"
+WANT_PEER="${1:-}"
+SETTLE="${BOWERY_PROVE_SETTLE:-8}"
+
+[[ -r "$MANIFEST" ]] || { echo "no peer manifest at $MANIFEST" >&2; exit 2; }
+[[ -r "$KEY" ]] || { echo "no operator key at $KEY" >&2; exit 2; }
+
+eval "$(python3 - "$MANIFEST" "$WANT_PEER" <<'PY'
+import re, sys, shlex
+text = open(sys.argv[1]).read()
+want = sys.argv[2]
+peers = [dict(re.findall(r'(\w+)\s*=\s*"([^"]+)"', b)) for b in text.split('[[peer]]')[1:]]
+if not peers:
+    sys.exit("no peers in manifest")
+chosen = next((p for p in peers if p.get('name') == want), None) if want else peers[0]
+if chosen is None:
+    sys.exit(f"no peer named {want!r} in the manifest")
+print(f"AGENT_NAME={shlex.quote(chosen.get('name','?'))}")
+print(f"AGENT_ADDR={shlex.quote(chosen['addr'])}")
+print(f"AGENT_FP={shlex.quote(chosen['fp'])}")
+print(f"AGENT_PUB={shlex.quote(chosen['pubkey_b64'])}")
+PY
+)"
+
+counters() {
+    bowery exec sql --operator-key "$KEY" \
+        --agent-addr "$AGENT_ADDR" --agent-fp "$AGENT_FP" --agent-pubkey-b64 "$AGENT_PUB" \
+        --sql 'SELECT rule_id, fired_since_install FROM bowery_detections ORDER BY rule_id' \
+        | tail -n +2
+}
+
+echo "==> agent: $AGENT_NAME ($AGENT_ADDR)"
+echo "    provocations run locally, so this must be the local agent."
+echo
+
+before=$(mktemp); after=$(mktemp)
+trap 'rm -f "$before" "$after"' EXIT
+
+counters > "$before"
+echo "==> provoking"
+"${BOWERY_PROVE:-bowery-prove}" run
+echo
+echo "==> waiting ${SETTLE}s for the pipeline"
+sleep "$SETTLE"
+counters > "$after"
+
+python3 - "$before" "$after" <<'PY'
+import subprocess, sys
+
+def load(path):
+    out = {}
+    for line in open(path):
+        c = line.rstrip("\n").split("\t")
+        if len(c) >= 2:
+            try:
+                out[c[-2]] = int(c[-1])
+            except ValueError:
+                pass
+    return out
+
+before, after = load(sys.argv[1]), load(sys.argv[2])
+
+listing = subprocess.run(["bowery-prove", "list"], capture_output=True, text=True).stdout
+expected, unprovable = [], []
+for line in listing.splitlines():
+    parts = line.split(None, 1)
+    if len(parts) != 2 or not parts[0].count("."):
+        continue
+    (unprovable if "NOT PROVABLE" in parts[1] else expected).append(parts[0])
+
+fired = [r for r in expected if after.get(r, 0) > before.get(r, 0)]
+quiet = [r for r in expected if r not in fired]
+
+print(f"FIRED ({len(fired)}/{len(expected)}):")
+for r in fired:
+    print(f"   {r:38} {before.get(r,0)} -> {after.get(r,0)}")
+if quiet:
+    print(f"\nDID NOT FIRE ({len(quiet)}) — each is a rule that may be unable to:")
+    for r in quiet:
+        print(f"   {r:38} still {after.get(r,0)}")
+if unprovable:
+    print(f"\nNOT PROVABLE HERE ({len(unprovable)}) — stated, not skipped:")
+    for r in unprovable:
+        print(f"   {r}")
+
+# A rule that did not move is the finding this exists to surface.
+sys.exit(1 if quiet else 0)
+PY

@@ -488,6 +488,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bowery-prove"
+version = "0.0.1"
+dependencies = [
+ "bowery-analysis",
+]
+
+[[package]]
 name = "bowery-response"
 version = "0.0.1"
 dependencies = [
