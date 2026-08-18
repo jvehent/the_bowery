@@ -76,7 +76,7 @@ echo "==> waiting ${SETTLE}s for the pipeline"
 sleep "$SETTLE"
 counters > "$after"
 
-python3 - "$before" "$after" <<'PY'
+python3 - "$before" "$after" "${BOWERY_PROVE:-bowery-prove}" <<'PY'
 import subprocess, sys
 
 def load(path):
@@ -92,7 +92,7 @@ def load(path):
 
 before, after = load(sys.argv[1]), load(sys.argv[2])
 
-listing = subprocess.run(["bowery-prove", "list"], capture_output=True, text=True).stdout
+listing = subprocess.run([sys.argv[3], "list"], capture_output=True, text=True).stdout
 expected, unprovable = [], []
 for line in listing.splitlines():
     parts = line.split(None, 1)
