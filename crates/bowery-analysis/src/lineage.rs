@@ -125,6 +125,24 @@ pub const fn rule_ids() -> &'static [&'static str] {
     ]
 }
 
+/// Judge an exec by its parent, matching the child under every name it
+/// answers to.
+///
+/// `/proc/<pid>/exe` resolves symlinks, so `nc` arrives as `nc.openbsd`
+/// and `python3` as `python3.12`; see [`crate::invocation`]. Callers
+/// holding the argument vector should prefer this over [`classify`],
+/// which sees only the resolved path.
+#[must_use]
+pub fn classify_exec(
+    parent_comm: &str,
+    child_exe: &str,
+    child_args: &[String],
+) -> Option<LineageHit> {
+    crate::invocation::names(child_exe, child_args)
+        .into_iter()
+        .find_map(|name| classify(parent_comm, name))
+}
+
 /// Judge a parent→child pair.
 ///
 /// `child` may be a full path or a bare comm; only the final component
@@ -218,6 +236,25 @@ mod tests {
                 "{child}"
             );
         }
+    }
+
+    /// `nc` is an alternatives symlink to `nc.openbsd` on Debian, so the
+    /// resolved path alone never matched the downloader list — the same
+    /// mechanism that hid a firewall flush and a python interpreter.
+    #[test]
+    fn a_downloader_reached_through_an_alternatives_symlink_is_still_one() {
+        let argv = vec!["nc".to_string(), "-e".to_string(), "/bin/sh".to_string()];
+        assert_eq!(
+            classify_exec("nginx", "/usr/bin/nc.openbsd", &argv).map(|h| h.rule_id),
+            Some("lineage.service_spawned_downloader")
+        );
+        // And the resolved path still matches on its own, so renaming
+        // argv[0] hides nothing.
+        let argv = vec!["harmless".to_string()];
+        assert_eq!(
+            classify_exec("nginx", "/usr/bin/curl", &argv).map(|h| h.rule_id),
+            Some("lineage.service_spawned_downloader")
+        );
     }
 
     /// Only trailing digits and dots are a version. A name that merely

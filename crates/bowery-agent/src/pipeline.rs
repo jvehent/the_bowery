@@ -1195,7 +1195,8 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
     // when nginx started it.
     if !exec.parent_comm.is_empty()
         && let Some(child) = exec.exe_path.as_ref().map(|p| p.display().to_string())
-        && let Some(hit) = bowery_analysis::lineage::classify(&exec.parent_comm, &child)
+        && let Some(hit) =
+            bowery_analysis::lineage::classify_exec(&exec.parent_comm, &child, &exec.args)
     {
         warn!(
             rule = hit.rule_id,

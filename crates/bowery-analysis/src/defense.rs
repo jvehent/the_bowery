@@ -119,11 +119,6 @@ fn unit_stem(unit: &str) -> &str {
     }
 }
 
-/// The command's own name, without its directory.
-fn base_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
 /// Read an exec as an attempt to switch a defence off.
 ///
 /// `program` is the resolved executable path or the command name; `args`
@@ -133,17 +128,25 @@ fn base_name(path: &str) -> &str {
 pub fn classify(program: &str, args: &[String]) -> Option<DefenseHit> {
     // argv[0] is the program itself; the operands are what follow.
     let operands: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
-    let name = base_name(program);
+    // Every name it answers to, because `/usr/sbin/iptables` resolves to
+    // `xtables-nft-multi` and only argv[0] still says which tool that
+    // is. See `crate::invocation`.
+    crate::invocation::names(program, args)
+        .into_iter()
+        .find_map(|name| classify_named(name, &operands))
+}
+
+fn classify_named(name: &str, operands: &[&str]) -> Option<DefenseHit> {
     match name {
         // Note `iptables-restore` is deliberately absent: it reloads a
         // saved ruleset, which is how a firewall is *applied*, not torn
         // down. It falls through to the catch-all below.
-        "iptables" | "ip6tables" | "iptables-legacy" | "ip6tables-legacy" => iptables(&operands),
-        "nft" => nft(&operands),
-        "ufw" => ufw(&operands),
-        "firewall-cmd" => firewall_cmd(&operands),
-        "systemctl" | "service" => service_control(name, &operands),
-        "setenforce" => setenforce(&operands),
+        "iptables" | "ip6tables" | "iptables-legacy" | "ip6tables-legacy" => iptables(operands),
+        "nft" => nft(operands),
+        "ufw" => ufw(operands),
+        "firewall-cmd" => firewall_cmd(operands),
+        "systemctl" | "service" => service_control(name, operands),
+        "setenforce" => setenforce(operands),
         "aa-disable" | "aa-teardown" => Some(DefenseHit {
             rule_id: MAC_RULE_ID,
             why: format!(
@@ -430,6 +433,39 @@ mod tests {
         assert_eq!(
             hit("/usr/sbin/aa-teardown", &["aa-teardown"]).map(|h| h.rule_id),
             Some(MAC_RULE_ID)
+        );
+    }
+
+    /// The case this rule shipped broken on. Debian points `iptables`
+    /// at `xtables-nft-multi` through `/etc/alternatives`, and
+    /// `/proc/<pid>/exe` resolves all of it — so the only place the word
+    /// "iptables" survives is argv[0].
+    #[test]
+    fn a_flush_through_an_alternatives_symlink_is_still_a_flush() {
+        assert_eq!(
+            hit("/usr/sbin/xtables-nft-multi", &["iptables", "-F"]).map(|h| h.rule_id),
+            Some(FIREWALL_RULE_ID)
+        );
+        assert_eq!(
+            hit("/usr/sbin/xtables-nft-multi", &["ip6tables", "-F"]).map(|h| h.rule_id),
+            Some(FIREWALL_RULE_ID)
+        );
+        // And the targeted form still is not a finding through the same
+        // symlink.
+        assert_eq!(
+            hit("/usr/sbin/xtables-nft-multi", &["iptables", "-F", "DOCKER"]),
+            None
+        );
+    }
+
+    /// argv[0] is attacker-controlled, so it may only ever *add* a
+    /// match. Lying about it to hide is still caught by the resolved
+    /// path.
+    #[test]
+    fn renaming_argv0_does_not_hide_the_real_program() {
+        assert_eq!(
+            hit("/usr/sbin/iptables", &["definitely-not-iptables", "-F"]).map(|h| h.rule_id),
+            Some(FIREWALL_RULE_ID)
         );
     }
 

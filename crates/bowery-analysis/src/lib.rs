@@ -20,6 +20,7 @@ pub mod episode;
 pub mod escalation;
 pub mod file_watch;
 pub mod injection;
+pub mod invocation;
 pub mod kmod;
 pub mod lineage;
 pub mod mass_write;
