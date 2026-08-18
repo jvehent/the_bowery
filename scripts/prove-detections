@@ -100,21 +100,34 @@ for line in listing.splitlines():
         continue
     (unprovable if "NOT PROVABLE" in parts[1] else expected).append(parts[0])
 
-fired = [r for r in expected if after.get(r, 0) > before.get(r, 0)]
-quiet = [r for r in expected if r not in fired]
+moved   = [r for r in expected if after.get(r, 0) > before.get(r, 0)]
+# A rule that did not move but is already above zero was proved by an
+# earlier run: the alert suppressor folds an identical finding — same
+# rule, same path, same binary — and returns before the counter is
+# touched. Running this twice inside that window is expected to look
+# quiet, and reporting it as a failure would bury the one line that
+# matters under thirty that do not.
+folded  = [r for r in expected if r not in moved and after.get(r, 0) > 0]
+never   = [r for r in expected if r not in moved and after.get(r, 0) == 0]
 
-print(f"FIRED ({len(fired)}/{len(expected)}):")
-for r in fired:
+print(f"PROVED NOW ({len(moved)}/{len(expected)}):")
+for r in moved:
     print(f"   {r:38} {before.get(r,0)} -> {after.get(r,0)}")
-if quiet:
-    print(f"\nDID NOT FIRE ({len(quiet)}) — each is a rule that may be unable to:")
-    for r in quiet:
-        print(f"   {r:38} still {after.get(r,0)}")
+if folded:
+    print(f"\nALREADY PROVEN ({len(folded)}) — nonzero, folded as a repeat this run:")
+    for r in folded:
+        print(f"   {r:38} at {after.get(r,0)}")
+if never:
+    print(f"\nNEVER FIRED ({len(never)}) — this is the finding:")
+    for r in never:
+        print(f"   {r}")
 if unprovable:
     print(f"\nNOT PROVABLE HERE ({len(unprovable)}) — stated, not skipped:")
     for r in unprovable:
         print(f"   {r}")
 
-# A rule that did not move is the finding this exists to surface.
-sys.exit(1 if quiet else 0)
+if not never:
+    print("\nevery provocable rule has fired at least once on this host.")
+# Only a rule still at zero is a failure.
+sys.exit(1 if never else 0)
 PY

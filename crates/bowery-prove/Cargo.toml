@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 bowery-analysis = { path = "../bowery-analysis" }
+libc = { workspace = true }
 
 [lints]
 workspace = true

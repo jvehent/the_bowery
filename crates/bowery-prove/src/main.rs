@@ -61,6 +61,8 @@ enum Act {
     Exec(&'static str, &'static [&'static str]),
     /// Write real files under a temporary directory.
     TempFiles(TempShape),
+    /// Take control of a child of our own with `ptrace`.
+    PtraceOwnChild,
     /// Known to be unprovable safely, with the reason.
     Unsupported(&'static str),
 }
@@ -179,9 +181,13 @@ fn provocations() -> Vec<Provocation> {
             ),
         },
         // -- process injection ----------------------------------------
+        //
+        // Not `strace`: the rule exempts packaged debuggers, so proving
+        // it that way proves the exemption instead. This binary is not
+        // packaged, which is exactly the case the rule is for.
         Provocation {
             rule: bowery_analysis::injection::RULE_ID,
-            act: Act::Exec("strace", &["-f", "-o", "/dev/null", "true"]),
+            act: Act::PtraceOwnChild,
         },
         // -- what cannot be proved safely -----------------------------
         Provocation {
@@ -237,6 +243,7 @@ fn list(all: &[Provocation]) {
             Act::TempFiles(TempShape::EncryptionSweep) => {
                 "write 60 temp files sharing an odd extension".into()
             }
+            Act::PtraceOwnChild => "PTRACE_ATTACH to a child of our own".into(),
             Act::Unsupported(why) => format!("NOT PROVABLE — {why}"),
         };
         if !matches!(p.act, Act::Unsupported(_)) {
@@ -307,6 +314,7 @@ fn perform(act: &Act) -> io::Result<()> {
             .status()
             .map(drop),
         Act::TempFiles(shape) => temp_files(shape),
+        Act::PtraceOwnChild => ptrace_own_child(),
         Act::Unsupported(_) => Ok(()),
     }
 }
@@ -346,6 +354,42 @@ fn encryption_sweep(root: &Path) -> io::Result<()> {
         let dir = root.join(format!("sweep{}", i % 6));
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join(format!("doc{i}.docx.bowerylocked")), b"x")?;
+    }
+    Ok(())
+}
+
+/// Fork a child that does nothing, seize it, release it, reap it.
+///
+/// The whole exchange is between this process and a child it created, so
+/// nothing else on the host is touched. `PTRACE_ATTACH` is one of the
+/// requests the probe ships, and this binary is not packaged — which is
+/// the case the rule exists for, and the reason a packaged debugger
+/// cannot be used to prove it.
+#[allow(unsafe_code)] // the only way to ask the kernel for this
+fn ptrace_own_child() -> io::Result<()> {
+    // Safe to fork: this program is single-threaded, and the child calls
+    // only async-signal-safe functions before exiting.
+    unsafe {
+        let child = libc::fork();
+        if child < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if child == 0 {
+            // Wait to be attached to; killed by the parent below.
+            libc::pause();
+            libc::_exit(0);
+        }
+        let attached = libc::ptrace(libc::PTRACE_ATTACH, child, 0, 0);
+        let mut status = 0;
+        if attached == 0 {
+            libc::waitpid(child, &raw mut status, 0);
+            libc::ptrace(libc::PTRACE_DETACH, child, 0, 0);
+        }
+        libc::kill(child, libc::SIGKILL);
+        libc::waitpid(child, &raw mut status, 0);
+        if attached != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }

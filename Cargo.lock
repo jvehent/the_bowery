@@ -492,6 +492,7 @@ name = "bowery-prove"
 version = "0.0.1"
 dependencies = [
  "bowery-analysis",
+ "libc",
 ]
 
 [[package]]
