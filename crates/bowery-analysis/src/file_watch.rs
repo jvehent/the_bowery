@@ -278,6 +278,86 @@ pub fn reader_is_sanctioned(
     hit.sanctioned_readers.contains(&exe)
 }
 
+/// The suffixes the kernel probe ships a *read* for.
+///
+/// Mirrors `is_secret_path` in `bowery-ebpf`, which is the authority.
+/// Duplicated because the two crates build for different targets and
+/// cannot share a constant; kept honest by
+/// [`tests::every_read_rule_is_reachable_through_the_kernel_filter`],
+/// which compares them.
+///
+/// The comparison is not academic. Reads are the *filtered* direction —
+/// writes ship unconditionally, but a read is dropped in the kernel
+/// unless its path ends with one of these. Three read rules were correct,
+/// registered, on the ATT&CK map, counted in `bowery_detections`, and
+/// could never fire, because nothing had ever put the two lists side by
+/// side: `~/.kube/config` (the kernel looked for `/kubeconfig`),
+/// `master.key` (the kernel's `_key` has an underscore), and every
+/// drop-in under `/etc/sudoers.d/`.
+const KERNEL_SECRET_SUFFIXES: &[&str] = &[
+    "/shadow",
+    "/gshadow",
+    "/opasswd",
+    "/sudoers",
+    "/id_rsa",
+    "/id_dsa",
+    "/id_ecdsa",
+    "/id_ed25519",
+    "_key",
+    "/authorized_keys",
+    "/credentials",
+    "/kubeconfig",
+    "/.kube/config",
+    "/master.key",
+    "/.netrc",
+    "/.pgpass",
+    "/.my.cnf",
+    "/.git-credentials",
+    "/.htpasswd",
+    "/.dockercfg",
+    "/secring.gpg",
+];
+
+/// A path each read rule is meant to fire on, as a real host spells it.
+///
+/// Serves two purposes, which is why it is written out rather than
+/// generated. As a test fixture it proves each rule is reachable — a
+/// synthesised path cannot do that, because a prefix rule like
+/// `/etc/ssh/ssh_host_` names a *stem* and the file that matters is
+/// `ssh_host_ed25519_key`. As a fixture for the detection prover it is
+/// the list of reads to perform on a live host to make each rule fire.
+///
+/// Every read rule must appear here; a test enforces it, so a new rule
+/// arrives with the evidence that it can fire.
+pub const READ_RULE_EXAMPLES: &[(&str, &str)] = &[
+    ("cred.read_shadow", "/etc/shadow"),
+    ("cred.read_gshadow", "/etc/gshadow"),
+    ("cred.read_opasswd", "/etc/security/opasswd"),
+    ("cred.read_ssh_host_key", "/etc/ssh/ssh_host_ed25519_key"),
+    ("cred.read_ssh_private_key", "/home/someone/.ssh/id_rsa"),
+    (
+        "cred.read_authorized_keys",
+        "/home/someone/.ssh/authorized_keys",
+    ),
+    ("cred.read_aws", "/home/someone/.aws/credentials"),
+    ("cred.read_kube", "/home/someone/.kube/config"),
+    ("cred.read_netrc", "/home/someone/.netrc"),
+    ("cred.read_pgpass", "/home/someone/.pgpass"),
+    ("cred.read_mysql", "/home/someone/.my.cnf"),
+    ("cred.read_git", "/home/someone/.git-credentials"),
+    ("cred.read_docker", "/home/someone/.dockercfg"),
+    ("cred.read_gnupg", "/home/someone/.gnupg/secring.gpg"),
+    ("cred.read_rails_master_key", "/srv/app/config/master.key"),
+    ("cred.read_htpasswd", "/var/www/.htpasswd"),
+    ("recon.read_sudoers", "/etc/sudoers"),
+];
+
+/// Would the kernel probe ship a read of this path to userspace?
+#[must_use]
+pub fn kernel_ships_read(path: &str) -> bool {
+    KERNEL_SECRET_SUFFIXES.iter().any(|s| path.ends_with(s))
+}
+
 /// The watch set.
 ///
 /// Ordered most-specific first: `/etc/ld.so.preload` before any broader
@@ -598,7 +678,9 @@ const READ_RULES: &[Rule] = &[
         m: Match::Prefix("/etc/sudoers"),
         category: FileWatchCategory::PrivilegeEscalation,
         why: "the sudo policy was read — routine for `sudo` itself, and otherwise the \
-              standard first step in working out how to become root here",
+              standard first step in working out how to become root here (reads of drop-ins under /etc/sudoers.d/ are \
+              *not* seen: the kernel ships a read only when the path ends in a known \
+              suffix, and drop-in names are arbitrary — writes to them are seen)",
         severity: 0.7,
         readers: SUDO_TOOLS,
     },
@@ -856,6 +938,66 @@ mod tests {
             Some("/usr/lib/git-core/git-remote-http"),
             crate::provenance::Provenance::PackagedIntact,
         ));
+    }
+
+    /// A read rule the kernel never ships a read for cannot fire.
+    ///
+    /// Reads are the filtered direction: writes reach userspace
+    /// unconditionally, but a read is dropped in the probe unless its
+    /// path ends with one of `is_secret_path`'s suffixes. A rule can
+    /// therefore be correct, registered, mapped to a technique and
+    /// counted, and still be unreachable — which three of them were,
+    /// because nothing compared the two lists.
+    ///
+    /// If this fails, the fix is in `bowery-ebpf`'s `is_secret_path`
+    /// first and in [`KERNEL_SECRET_SUFFIXES`] second. Changing only the
+    /// mirror makes the test pass and leaves the rule as dead as it was.
+    #[test]
+    fn every_read_rule_is_reachable_through_the_kernel_filter() {
+        for (id, example) in READ_RULE_EXAMPLES {
+            assert!(
+                kernel_ships_read(example),
+                "{id}: the kernel drops reads of `{example}`, so the rule can never fire"
+            );
+            assert_eq!(
+                classify_read(example).map(|h| h.rule_id),
+                Some(*id),
+                "`{example}` is meant to be {id}"
+            );
+        }
+
+        // And no read rule may sit outside that list, or it arrives with
+        // no evidence that it can fire at all.
+        for rule in READ_RULES {
+            assert!(
+                READ_RULE_EXAMPLES.iter().any(|(id, _)| *id == rule.id),
+                "{} has no example path — add one, and check the kernel ships it",
+                rule.id
+            );
+        }
+    }
+
+    /// A prefix rule for reads only ever sees the file it names.
+    ///
+    /// `recon.read_sudoers` is spelled as a prefix, which suggests it
+    /// covers `/etc/sudoers.d/` too. It does not: drop-in filenames are
+    /// arbitrary, the kernel matcher is suffix-only — a basename scan is
+    /// what the verifier rejected — and so no suffix can catch them.
+    /// Writes to those paths *are* seen, because writes are unfiltered.
+    /// Pinned so the limit is a stated fact rather than a surprise.
+    #[test]
+    fn sudoers_drop_ins_are_visible_as_writes_but_not_as_reads() {
+        assert!(kernel_ships_read("/etc/sudoers"));
+        assert!(
+            !kernel_ships_read("/etc/sudoers.d/90-cloud-init-users"),
+            "if this starts passing, the drop-in gap has closed and the \
+             rule text should stop disclaiming it"
+        );
+        // The write path has no such filter.
+        assert_eq!(
+            classify("/etc/sudoers.d/90-cloud-init-users").map(|h| h.rule_id),
+            Some("privesc.sudoers"),
+        );
     }
 
     /// Every sanctioned path must be absolute, or it can never match a

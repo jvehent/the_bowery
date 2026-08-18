@@ -599,6 +599,14 @@ fn is_secret_path(buf: &[u8; FILE_PATH_LEN], len: usize) -> bool {
         // Cloud and cluster credentials.
         || ends_with(buf, len, b"/credentials")
         || ends_with(buf, len, b"/kubeconfig")
+        // `~/.kube/config`, which is where kubeconfig actually lives.
+        // `/kubeconfig` never matched it — the userspace rule looked for
+        // `/.kube/config` and the two lists were never compared, so the
+        // rule could not fire on any real host.
+        || ends_with(buf, len, b"/.kube/config")
+        // Rails' `master.key`. The `_key` pattern above catches
+        // `ssh_host_ed25519_key`; this one has a dot, so it did not.
+        || ends_with(buf, len, b"/master.key")
         // Application and service credentials.
         || ends_with(buf, len, b"/.netrc")
         || ends_with(buf, len, b"/.pgpass")
