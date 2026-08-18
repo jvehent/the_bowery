@@ -311,13 +311,16 @@ protocols.
 
 **Coverage: partial**
 
-Rules: `impact.mass_write_new_extension`
+Rules: `impact.mass_write_new_extension`, `impact.ransom_note_fanout`
 
-Gap: needs the sweep to *rename* what it encrypts, which most families do but not
-all — in-place encryption that keeps the filename is invisible here. The sensor
-reports write intent only: no renames, no unlinks, no contents, so there is no
-entropy check and a family that writes everything as a common extension evades the
-test that makes the rule usable at all.
+Gap: two independent shapes, and neither reads a byte of content. The extension rule
+needs the sweep to *rename* what it encrypts, which most families do but not all.
+The note fan-out covers the rest from the other side — the ransom note has to be
+written wherever the victim will look, whether or not anything was renamed — but it
+is evaded by a family that varies the note's filename per directory, or writes no
+note at all because payment is arranged some other way. The sensor still reports
+write intent only: no renames, no unlinks, no contents, so there is no entropy check
+anywhere here.
 
 ## Rules that are not table entries
 

@@ -227,20 +227,7 @@ async fn process_event(ctx: &PipelineContext, event: Event) {
 /// here, on a syscall the kernel filter has already made rare.
 async fn process_ptrace(ctx: &PipelineContext, t: &bowery_events::Ptrace) {
     let exe = bowery_events::enrich::pid_exe_path(t.pid).or_else(|| ctx.procs.exe_at(t.pid, t.ts));
-    let provenance = match exe.clone() {
-        Some(exe) => {
-            let packages = ctx.packages.clone();
-            tokio::task::spawn_blocking(move || {
-                enrich::sha256_file(&exe)
-                    .map_or(bowery_analysis::provenance::Provenance::Unknown, |sha| {
-                        packages.classify(&exe, &sha)
-                    })
-            })
-            .await
-            .unwrap_or(bowery_analysis::provenance::Provenance::Unknown)
-        }
-        None => bowery_analysis::provenance::Provenance::Unknown,
-    };
+    let (_, provenance) = hash_and_classify(ctx, exe.as_ref()).await;
     let exe_str = exe.as_ref().map(|p| p.display().to_string());
     if bowery_analysis::injection::is_sanctioned_debugger(exe_str.as_deref(), provenance) {
         debug!(
@@ -507,6 +494,90 @@ async fn process_network_connect(ctx: &PipelineContext, conn: &bowery_events::Ne
 /// it would explain away — but the kind is not registered yet, and
 /// stamping an unconfirmed block on the alert would imply a check that
 /// never ran.
+/// Turn an impact finding into the rule and rationale to report, or
+/// `None` when it should not be reported at all.
+///
+/// The exemption lives here rather than in the tracker because it costs a
+/// sha256: the writer's provenance is resolved only once a finding has
+/// already been produced, which on an ordinary host is close to never.
+/// The same shape the privilege-transition rule uses — the cheap
+/// conjunction first, the expensive check only where an alert was about
+/// to be raised.
+async fn impact_finding_to_report(
+    ctx: &PipelineContext,
+    open: &bowery_events::FileOpen,
+    finding: &bowery_analysis::mass_write::ImpactFinding,
+) -> Option<(&'static str, String)> {
+    use bowery_analysis::mass_write;
+    match finding {
+        mass_write::ImpactFinding::Sweep(burst) => {
+            warn!(
+                rule = mass_write::RULE_ID,
+                pid = burst.pid,
+                files = burst.files,
+                dirs = burst.dirs,
+                extension = %burst.extension,
+                "possible ransomware"
+            );
+            Some((mass_write::RULE_ID, mass_write::rationale(burst)))
+        }
+        mass_write::ImpactFinding::Note(note) => {
+            let exe = bowery_events::enrich::pid_exe_path(open.pid);
+            let exe_str = exe.as_ref().map(|p| p.display().to_string());
+            let (_, provenance) = hash_and_classify(ctx, exe.as_ref()).await;
+            if mass_write::writer_is_package_tool(exe_str.as_deref(), provenance) {
+                debug!(
+                    rule = mass_write::NOTE_RULE_ID,
+                    exe = exe_str.as_deref().unwrap_or("?"),
+                    name = %note.name,
+                    "fan-out by a package tool, not reported"
+                );
+                return None;
+            }
+            warn!(
+                rule = mass_write::NOTE_RULE_ID,
+                pid = note.pid,
+                name = %note.name,
+                dirs = note.dirs,
+                ancestor = %note.common_ancestor,
+                "possible ransom note"
+            );
+            Some((mass_write::NOTE_RULE_ID, mass_write::note_rationale(note)))
+        }
+    }
+}
+
+/// Hash a binary and classify it against the package database.
+///
+/// Returns the hash too, because two of the three callers want it and
+/// recomputing would double the cost of the expensive half. Runs on a
+/// blocking thread: it reads the whole file, and the pipeline it is
+/// called from is what the sensor feeds.
+///
+/// Extracted at the third copy. Provenance is the exemption every rule
+/// anchors on — a binary a package vouches for and has not changed — so
+/// the number of places computing it only grows, and three hand-written
+/// versions is where that becomes a liability rather than a repetition.
+async fn hash_and_classify(
+    ctx: &PipelineContext,
+    exe: Option<&std::path::PathBuf>,
+) -> (Option<[u8; 32]>, bowery_analysis::provenance::Provenance) {
+    let unknown = bowery_analysis::provenance::Provenance::Unknown;
+    let Some(exe) = exe.cloned() else {
+        return (None, unknown);
+    };
+    let packages = ctx.packages.clone();
+    tokio::task::spawn_blocking(move || {
+        let sha = enrich::sha256_file(&exe).ok()?;
+        let provenance = packages.classify(&exe, &sha);
+        Some((sha, provenance))
+    })
+    .await
+    .ok()
+    .flatten()
+    .map_or((None, unknown), |(sha, p)| (Some(sha), p))
+}
+
 #[allow(clippy::too_many_lines)] // one linear scoring path
 async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen) {
     let path = open.path.display().to_string();
@@ -518,19 +589,11 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
     // looks for produces an alert.
     if !open.sensitive_read
         && let Some(mass) = ctx.mass_writes.as_ref()
-        && let Some(burst) = mass.observe(open.pid, &path, std::time::Instant::now())
+        && let Some(finding) = mass.observe(open.pid, &path, std::time::Instant::now())
+        && let Some((rule_id, why)) = impact_finding_to_report(ctx, open, &finding).await
     {
-        let why = bowery_analysis::mass_write::rationale(&burst);
-        ctx.detections.record(bowery_analysis::mass_write::RULE_ID);
-        warn!(
-            rule = bowery_analysis::mass_write::RULE_ID,
-            pid = burst.pid,
-            files = burst.files,
-            dirs = burst.dirs,
-            extension = %burst.extension,
-            "possible ransomware"
-        );
-        let episode_id = format!("file-impact.mass_write-{}", current_unix_ms());
+        ctx.detections.record(rule_id);
+        let episode_id = format!("file-{rule_id}-{}", current_unix_ms());
         let alert = Alert {
             originator_fp: ctx.originator_fp.as_bytes().to_vec(),
             episode_id: episode_id.clone(),
@@ -592,22 +655,7 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
     // finding is still raised.
     let exe = bowery_events::enrich::pid_exe_path(open.pid)
         .or_else(|| ctx.procs.exe_at(open.pid, open.ts));
-    let (exe_sha, provenance) = match exe.clone() {
-        Some(exe) => {
-            let packages = ctx.packages.clone();
-            match tokio::task::spawn_blocking(move || {
-                let sha = enrich::sha256_file(&exe).ok()?;
-                let provenance = packages.classify(&exe, &sha);
-                Some((sha, provenance))
-            })
-            .await
-            {
-                Ok(Some((sha, provenance))) => (Some(sha), provenance),
-                _ => (None, bowery_analysis::provenance::Provenance::Unknown),
-            }
-        }
-        None => (None, bowery_analysis::provenance::Provenance::Unknown),
-    };
+    let (exe_sha, provenance) = hash_and_classify(ctx, exe.as_ref()).await;
     let exe_str = exe.as_ref().map(|p| p.display().to_string());
 
     // Record the attributed access BEFORE the sanctioned check, and

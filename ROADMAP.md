@@ -87,7 +87,7 @@ now.
 | **Discovery** | **nothing** | recon bursts — five distinct discovery commands from one parent in a minute |
 | **Lateral movement** | partial, genuinely ahead | unchanged — the corroboration work |
 | Collection / exfil | partial | **C2 beaconing scored**: a timer to a destination this host has not known long |
-| **Impact (ransomware)** | **nothing** | write sweeps that rename what they encrypt; in-place encryption still invisible |
+| **Impact (ransomware)** | **nothing** | write sweeps that rename what they encrypt, **plus the ransom note itself** — one filename fanned across unrelated directories, which does not depend on renaming and so catches the in-place families |
 
 Per-technique detail, generated from the rule tables so it cannot drift
 from the code, is in [`docs/ATTACK-COVERAGE.md`](docs/ATTACK-COVERAGE.md).
@@ -260,6 +260,17 @@ Two limits are recorded rather than hidden: paths are captured to 256
 bytes and flagged when truncated, and relative paths (an `openat`
 against a dirfd the probe cannot resolve) are stored but never matched,
 because guessing would attribute a write to a file nobody touched.
+
+**Closed since:** the in-place-encryption gap. A second shape — the same
+filename written into many directories whose shared ancestor is shallow —
+is the ransom note, the half of a sweep that cannot be left out because
+it exists to be found. Thresholds were measured, not chosen: replaying
+163,737 real write-intent opens from the fleet through the rule gave six
+findings, all four package-management tools, all suppressed by a
+provenance-gated exemption. The same replay found a latent false positive
+in the *existing* sweep rule — `dpkg` unpacking 70 `.dpkg-new` files
+across 20 directories inside one 60-second window, which would have read
+as "possible ransomware" during an ordinary `apt upgrade`.
 
 **Still open in this phase:** mass-write rate detection for ransomware.
 Credential reads landed — matched in the kernel by path suffix, since
