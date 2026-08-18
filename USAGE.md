@@ -449,6 +449,41 @@ own bookkeeping.
 | What is alerting? | `SELECT episode_id, rule_id, suspicion, confirmed, exe_path FROM bowery_alerts` |
 | Which rules are producing the noise? | `SELECT rule_id, COUNT(*) FROM bowery_alerts GROUP BY rule_id ORDER BY 2 DESC` |
 | What am I not being told about? | `SELECT id, rule_id, weight, matched, reason FROM bowery_silences ORDER BY matched DESC` |
+
+### Silencing a benign alert
+
+```bash
+bowery alerts silence <episode-id> \
+    --operator-key ~/.bowery/operator.key \
+    --agent-addr 100.x:9902 --agent-fp … --agent-pubkey-b64 … \
+    --cluster-id my-tailnet \
+    --reason "git reads its own netrc" \
+    --fanout
+```
+
+The episode id is a *handle*, not the thing silenced — it names one
+occurrence that will never recur. What gets signed is the rule, the
+binary's SHA-256 and the path that alert stands for, and the command
+prints that pattern plus **how many alerts it would have covered** before
+asking you to confirm. Signing blind is the mistake it exists to prevent:
+a pattern one field wider than intended looks identical on the command
+line and behaves nothing alike.
+
+Defaults are the narrowest useful thing: this rule, this binary, this
+path, every host. `--any-path` widens to the binary anywhere;
+`--this-host-only` narrows to the host that raised it. `--any-binary` is
+refused unless you pass it explicitly, because a silence that does not
+name a binary is inherited by whatever an attacker later writes at that
+path.
+
+`--weight 0` silences outright; `--weight 0.3` damps the score, so the
+finding still surfaces if something else about the episode is bad enough;
+`--weight 1` changes nothing and only counts matches, which is how you
+measure a pattern before committing to it.
+
+Every silence expires — 90 days by default, a year at most. Check what is
+in force, and what it has swallowed, with the `bowery_silences` query
+above.
 | Who talked to this endpoint? | `SELECT * FROM bowery_net_destinations WHERE dst_addr = '203.0.113.4'` |
 | What happened at 14:32? | `SELECT ts_unix_ms, kind, comm, path FROM bowery_events WHERE ts_unix_ms BETWEEN … ORDER BY seq` |
 | Is the history recording? | `SELECT recording, rows, oldest_ts_unix_ms FROM bowery_eventlog_status` |

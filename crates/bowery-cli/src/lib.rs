@@ -25,4 +25,5 @@ pub mod mesh_trust;
 pub mod model;
 pub mod notify;
 pub mod peers;
+pub mod silence;
 pub mod virustotal;

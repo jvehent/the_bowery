@@ -483,6 +483,67 @@ enum AlertsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Tell the fleet an alert is benign, deriving the pattern it stands
+    /// for and showing what that pattern would cover before signing.
+    ///
+    /// The episode id is a *handle* on an alert, not the thing silenced:
+    /// it names one occurrence that will never recur. What gets signed is
+    /// the rule, the binary's hash and the path that alert stands for.
+    Silence {
+        /// Episode id of an alert to derive the pattern from, as shown
+        /// by `bowery alerts tail` or `bowery_alerts`.
+        episode_id: String,
+        #[arg(long)]
+        operator_key: PathBuf,
+        #[arg(long)]
+        agent_addr: SocketAddr,
+        #[arg(long)]
+        agent_fp: String,
+        #[arg(long)]
+        agent_pubkey_b64: String,
+        /// Extra agent pubkeys, so fan-out reports from peers verify.
+        #[arg(long = "peer-pubkey-b64")]
+        peer_pubkeys_b64: Vec<String>,
+        /// Mesh cluster this applies to. Must match the agents'
+        /// `[mesh] cluster_id`, so a staging silence cannot quiet
+        /// production.
+        #[arg(long)]
+        cluster_id: String,
+        /// Why this is benign. Required — a silence nobody can explain
+        /// later is one nobody can safely revoke.
+        #[arg(long)]
+        reason: String,
+        /// `0` silences; `1` changes no score and only counts matches;
+        /// anything between damps the suspicion by that factor.
+        #[arg(long, default_value_t = 0.0)]
+        weight: f32,
+        /// How long it lasts. Capped at 365d.
+        #[arg(long, default_value = "90d", value_parser = parse_duration)]
+        expires: Duration,
+        /// Cover this rule and binary at any path.
+        #[arg(long)]
+        any_path: bool,
+        /// Cover this rule and path for *any* binary. Refused without
+        /// this flag, because such a silence is inherited by whatever an
+        /// attacker later writes there.
+        #[arg(long)]
+        any_binary: bool,
+        /// Only the host that raised the alert honours it.
+        #[arg(long)]
+        this_host_only: bool,
+        /// Propagate to the rest of the mesh.
+        #[arg(long)]
+        fanout: bool,
+        /// Hop budget for propagation. Clamped by each agent.
+        #[arg(long, default_value_t = 3)]
+        ttl: u32,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Per-command deadline.
+        #[arg(long, default_value = "10s", value_parser = parse_duration)]
+        timeout: Duration,
+    },
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -602,6 +663,57 @@ impl Cli {
                 Ok(ExitCode::SUCCESS)
             }
             Command::Doctor { json } => doctor_cmd(json),
+            Command::Alerts {
+                sub:
+                    AlertsCommand::Silence {
+                        episode_id,
+                        operator_key,
+                        agent_addr,
+                        agent_fp,
+                        agent_pubkey_b64,
+                        peer_pubkeys_b64,
+                        cluster_id,
+                        reason,
+                        weight,
+                        expires,
+                        any_path,
+                        any_binary,
+                        this_host_only,
+                        fanout,
+                        ttl,
+                        yes,
+                        timeout,
+                    },
+            } => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building tokio runtime")?;
+                runtime.block_on(bowery_cli::silence::silence_alert(
+                    bowery_cli::silence::Target {
+                        operator_key,
+                        addr: agent_addr,
+                        fp_hex: agent_fp,
+                        pubkey_b64: agent_pubkey_b64,
+                        peer_pubkeys_b64,
+                        timeout,
+                    },
+                    cluster_id,
+                    episode_id,
+                    reason,
+                    weight,
+                    expires,
+                    &bowery_cli::silence::Widen {
+                        any_path,
+                        any_binary,
+                        this_host_only,
+                    },
+                    fanout,
+                    ttl,
+                    yes,
+                ))?;
+                Ok(ExitCode::SUCCESS)
+            }
             Command::Alerts {
                 sub:
                     AlertsCommand::Tail {

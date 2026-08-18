@@ -1414,13 +1414,167 @@ pub async fn revoke_push(
         Err(_) => bail!("revoke push timed out after {exchange_timeout:?}"),
     }
 }
-
 fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::new(), |mut acc, b| {
         let _ = write!(acc, "{b:02x}");
         acc
     })
+}
+
+/// Push an already-signed [`AlertSilence`] to an agent, and optionally
+/// on through the mesh.
+///
+/// Takes the record rather than base64 because the caller just minted
+/// and signed it — round-tripping through a string would only add a
+/// place for it to be corrupted between signing and sending.
+#[allow(clippy::too_many_lines)] // one linear exchange, like its neighbours
+pub async fn silence_push(
+    target: &crate::silence::Target,
+    silence: &bowery_proto::AlertSilence,
+    fanout: bool,
+    ttl: u32,
+) -> Result<()> {
+    use bowery_proto::SilencePush;
+
+    let identity = Arc::new(Identity::load(&target.operator_key).with_context(|| {
+        format!(
+            "loading operator key from {}",
+            target.operator_key.display()
+        )
+    })?);
+    let target_fp = parse_fingerprint(&target.fp_hex)?;
+    let target_vk = parse_verifying_key(&target.pubkey_b64)?;
+    let mut resolver = StaticResolver::new();
+    let inserted_fp = resolver.insert(target_vk);
+    if inserted_fp != target_fp {
+        bail!("target_pubkey_b64 fingerprint {inserted_fp} doesn't match --agent-fp {target_fp}");
+    }
+    let agent_names = crate::silence::agent_names();
+    if let Ok(manifest_path) = crate::peers::default_path()
+        && let Ok(manifest) = crate::peers::Manifest::load(&manifest_path)
+    {
+        for peer in &manifest.peers {
+            if let Ok(vk) = parse_verifying_key(&peer.pubkey_b64) {
+                resolver.insert(vk);
+            }
+        }
+    }
+    // Propagating agents seal their reports for us directly, so their
+    // keys have to be resolvable or the replies read as unverifiable.
+    for b64 in &target.peer_pubkeys_b64 {
+        resolver.insert(parse_verifying_key(b64)?);
+    }
+    let resolver = Arc::new(resolver);
+
+    let bind_addr: SocketAddr = if target.addr.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
+    let endpoint = BoweryEndpoint::bind(identity.clone(), accept_verifier, bind_addr)
+        .context("binding operator-side endpoint")?;
+    let operator_fp = identity.fingerprint();
+    let sealer = Sealer::new(identity.clone());
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), target_fp));
+    let conn = endpoint
+        .dial(dial_verifier, target.addr)
+        .await
+        .with_context(|| format!("dialing agent at {}", target.addr))?;
+
+    let request_id = format!("op-{}", current_unix_ms());
+    let body = OperatorCommandBody::SilencePush(SilencePush {
+        silence: prost::Message::encode_to_vec(silence),
+        fanout,
+        ttl,
+    });
+    let auth =
+        bowery_whisper::forwarding::sign_operator_authorization(&identity, &request_id, &body);
+    let cmd = OperatorCommand {
+        forwarded_from_operator: prost::Message::encode_to_vec(&auth),
+        request_id: request_id.clone(),
+        timeout_ms: u32::try_from(target.timeout.as_millis()).unwrap_or(u32::MAX),
+        command: Some(body),
+    };
+    let outbound = sealer.seal_for(&target_fp, &WhisperPayload::operator_command(cmd));
+
+    let exchange_timeout = target.timeout + Duration::from_secs(2);
+    let exchange = async {
+        conn.send_envelope(&outbound)
+            .await
+            .context("sending SilencePush")?;
+        let (mut applied, mut already, mut refused) = (0usize, 0usize, 0usize);
+        loop {
+            let bytes = match conn.recv_envelope().await {
+                Ok(b) => b,
+                Err(e) => {
+                    if fanout {
+                        break;
+                    }
+                    return Err(anyhow::Error::from(e).context("awaiting SilenceReport"));
+                }
+            };
+            let opened = envelope_verifier
+                .open(&bytes)
+                .context("verifying SilenceReport envelope")?;
+            let sender = opened.sender;
+            let result = match opened.payload.body {
+                Some(Body::OperatorResult(r)) => r,
+                other => bail!("agent replied with unexpected body: {other:?}"),
+            };
+            if result.request_id != request_id {
+                bail!("agent echoed request_id {:?}", result.request_id);
+            }
+            match result.result {
+                Some(OperatorResultBody::SilenceReport(rep)) => {
+                    // Terminator honoured only from the dialled relay,
+                    // so a peer cannot truncate the fleet's replies.
+                    if fanout && rep.end && rep.agent_fp.is_empty() && sender == target_fp {
+                        break;
+                    }
+                    let name = agent_name_for(&agent_names, sender.as_bytes());
+                    let short = &sender.to_string()[..16];
+                    if rep.error.is_empty() {
+                        if rep.already_known {
+                            already += 1;
+                            println!("{name} ({short}): already held");
+                        } else {
+                            applied += 1;
+                            println!("{name} ({short}): APPLIED");
+                        }
+                    } else {
+                        refused += 1;
+                        println!("{name} ({short}): REFUSED — {}", rep.error);
+                    }
+                    if rep.end && !fanout {
+                        break;
+                    }
+                }
+                Some(OperatorResultBody::Error(e)) => {
+                    eprintln!("agent refused push: {} ({})", e.message, e.kind);
+                    bail!("silence push failed: {}", e.kind);
+                }
+                other => bail!("agent replied with an unexpected result body: {other:?}"),
+            }
+        }
+        println!("{applied} agent(s) newly applied, {already} already held, {refused} refused");
+        // A refusal is not a transport failure, but it is not success
+        // either: an operator who thinks a finding is silenced fleet-wide
+        // when one host refused has exactly the wrong picture.
+        if refused > 0 {
+            bail!("{refused} agent(s) refused the silence");
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let outcome = tokio::time::timeout(exchange_timeout, exchange).await;
+    drop(conn);
+    endpoint.close().await;
+    match outcome {
+        Ok(r) => r,
+        Err(_) => bail!("silence push timed out after {exchange_timeout:?}"),
+    }
 }
 
 #[cfg(test)]

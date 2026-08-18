@@ -19,6 +19,7 @@ name = "bowery"
 path = "src/main.rs"
 
 [dependencies]
+bowery-analysis = { workspace = true }
 bowery-crypto = { workspace = true }
 bowery-proto = { workspace = true }
 bowery-response = { workspace = true }
