@@ -734,11 +734,13 @@ fn finish_round(
             quorum = verdict.quorum,
             "alert confirmed by neighbourhood quorum"
         );
-        confirm.inbox.append(alert);
-        let _ = events_tx.send(AgentEvent::AlertEmitted {
-            episode_id: context.episode_id.clone(),
-            suspicion: pre_suspicion,
-        });
+        let appended = confirm.inbox.append(alert);
+        if appended.stored() {
+            let _ = events_tx.send(AgentEvent::AlertEmitted {
+                episode_id: context.episode_id.clone(),
+                suspicion: pre_suspicion,
+            });
+        }
     }
 
     // Broadcast the round result for observers (tests, dashboards). We

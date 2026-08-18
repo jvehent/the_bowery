@@ -288,11 +288,13 @@ async fn process_ptrace(ctx: &PipelineContext, t: &bowery_events::Ptrace) {
         bowery_proto::Attribute::new("comm", t.comm.clone()),
     ])
     .build();
-    ctx.inbox.append(alert);
-    let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
-        episode_id,
-        suspicion: 0.9,
-    });
+    let appended = ctx.inbox.append(alert);
+    if appended.stored() {
+        let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+            episode_id,
+            suspicion: 0.9,
+        });
+    }
 }
 
 /// A kernel module entered the kernel.
@@ -343,11 +345,13 @@ fn process_module_load(ctx: &PipelineContext, m: &bowery_events::ModuleLoad) {
         bowery_proto::Attribute::new("taint_reason", reason),
     ])
     .build();
-    ctx.inbox.append(alert);
-    let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
-        episode_id,
-        suspicion: 0.95,
-    });
+    let appended = ctx.inbox.append(alert);
+    if appended.stored() {
+        let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+            episode_id,
+            suspicion: 0.95,
+        });
+    }
 }
 
 async fn process_network_connect(ctx: &PipelineContext, conn: &bowery_events::NetworkConnect) {
@@ -433,11 +437,13 @@ async fn process_network_connect(ctx: &PipelineContext, conn: &bowery_events::Ne
                 bowery_proto::Attribute::new("connections", beacon.samples.to_string()),
             ])
             .build();
-            ctx.inbox.append(alert);
-            let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
-                episode_id,
-                suspicion: 0.85,
-            });
+            let appended = ctx.inbox.append(alert);
+            if appended.stored() {
+                let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+                    episode_id,
+                    suspicion: 0.85,
+                });
+            }
         }
     }
 
@@ -605,11 +611,13 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
                 .as_deref(),
         ))
         .build();
-        ctx.inbox.append(alert);
-        let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
-            episode_id,
-            suspicion: 0.95,
-        });
+        let appended = ctx.inbox.append(alert);
+        if appended.stored() {
+            let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+                episode_id,
+                suspicion: 0.95,
+            });
+        }
     }
 
     // The same path means different things read and written: reading
@@ -743,11 +751,13 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
         pid = open.pid,
         "file watch hit"
     );
-    ctx.inbox.append(alert);
-    let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
-        episode_id: episode_id.clone(),
-        suspicion: hit.severity,
-    });
+    let appended = ctx.inbox.append(alert);
+    if appended.stored() {
+        let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+            episode_id: episode_id.clone(),
+            suspicion: hit.severity,
+        });
+    }
 
     // Ask the neighbourhood whether this is just what the fleet does.
     //
@@ -938,11 +948,13 @@ async fn process_file_change(ctx: &PipelineContext, change: bowery_events::FileC
     .build();
     let episode_id = alert.episode_id.clone();
     info!(rule = %rule.id, path = %change.path.display(), op, "file monitor alert");
-    ctx.inbox.append(alert);
-    let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
-        episode_id,
-        suspicion,
-    });
+    let appended = ctx.inbox.append(alert);
+    if appended.stored() {
+        let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+            episode_id,
+            suspicion,
+        });
+    }
 }
 
 /// Fold a directly-scored finding into an exec's verdict.
@@ -1303,11 +1315,13 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
         .build();
         let episode_id = alert.episode_id.clone();
         let suspicion = alert.suspicion;
-        ctx.inbox.append(alert);
-        let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
-            episode_id,
-            suspicion,
-        });
+        let appended = ctx.inbox.append(alert);
+        if appended.stored() {
+            let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+                episode_id,
+                suspicion,
+            });
+        }
     }
 
     let _ = ctx.events_tx.send(AgentEvent::EpisodeAnalyzed { verdict });

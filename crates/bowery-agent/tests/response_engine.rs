@@ -112,7 +112,10 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, response: ResponseConfig) -> 
         },
         operators: OperatorsConfig::default(),
         inbox: InboxConfig::default(),
-        alerts: AlertsConfig { threshold: 0.4 },
+        alerts: AlertsConfig {
+            threshold: 0.4,
+            silences_path: dir.join("silences.b64"),
+        },
         bloom: BloomConfig::default(),
         response,
         sql: bowery_agent::config::SqlConfig::default(),

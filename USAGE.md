@@ -448,6 +448,7 @@ own bookkeeping.
 | Is every host running the same sensor? | `SELECT DISTINCT object_sha256 FROM bowery_probe_status --fanout` |
 | What is alerting? | `SELECT episode_id, rule_id, suspicion, confirmed, exe_path FROM bowery_alerts` |
 | Which rules are producing the noise? | `SELECT rule_id, COUNT(*) FROM bowery_alerts GROUP BY rule_id ORDER BY 2 DESC` |
+| What am I not being told about? | `SELECT id, rule_id, weight, matched, reason FROM bowery_silences ORDER BY matched DESC` |
 | Who talked to this endpoint? | `SELECT * FROM bowery_net_destinations WHERE dst_addr = '203.0.113.4'` |
 | What happened at 14:32? | `SELECT ts_unix_ms, kind, comm, path FROM bowery_events WHERE ts_unix_ms BETWEEN … ORDER BY seq` |
 | Is the history recording? | `SELECT recording, rows, oldest_ts_unix_ms FROM bowery_eventlog_status` |

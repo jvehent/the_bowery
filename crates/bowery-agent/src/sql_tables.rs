@@ -573,6 +573,99 @@ impl BoweryTable for BoweryDetectionsTable {
 }
 
 // ---------------------------------------------------------------------------
+// bowery_silences — what an operator has chosen not to be told about
+// ---------------------------------------------------------------------------
+
+/// `bowery_silences` — every operator-signed silence this agent honours,
+/// and how many alerts each has actually swallowed.
+///
+/// This view is not a convenience. Silencing is the only feature here
+/// whose effect is to create absence, and absence is precisely what this
+/// project refuses to leave unexplained: without a row saying "this
+/// silence suppressed 40,000 alerts", a muted fleet and a quiet one look
+/// identical from the outside.
+///
+/// So `matched` is the column to read. A silence with a large count is
+/// either doing its job or covering far more than its author intended,
+/// and only an operator can tell which — but they can only tell at all
+/// if the number is here.
+///
+/// ```sql
+/// SELECT id, rule_id, weight, matched, reason FROM bowery_silences
+///   ORDER BY matched DESC
+/// ```
+#[derive(Debug)]
+pub struct BowerySilencesTable {
+    silences: Option<Arc<crate::silence_store::SilenceStore>>,
+}
+
+impl BowerySilencesTable {
+    #[must_use]
+    pub fn new(silences: Option<Arc<crate::silence_store::SilenceStore>>) -> Self {
+        Self { silences }
+    }
+}
+
+impl BoweryTable for BowerySilencesTable {
+    fn name(&self) -> &'static str {
+        "bowery_silences"
+    }
+
+    fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bowery_silences (
+                id                   TEXT,
+                rule_id              TEXT,
+                exe_sha256_hex       TEXT,
+                exe_path             TEXT,
+                host_fp_hex          TEXT,
+                -- 0.0 silences outright; 1.0 changes no score and only
+                -- counts. Anything between damps.
+                weight               REAL,
+                reason               TEXT,
+                operator_fp_hex      TEXT,
+                issued_unix_ms       INTEGER,
+                expires_unix_ms      INTEGER,
+                -- How many alerts this has damped or withheld. The
+                -- reason this view exists.
+                matched              INTEGER,
+                -- NULL when it has never matched, which is a different
+                -- fact from matching at the epoch.
+                last_matched_unix_ms INTEGER
+            );",
+        )?;
+        let Some(store) = self.silences.as_ref() else {
+            return Ok(());
+        };
+        let mut stmt = conn.prepare(
+            "INSERT INTO bowery_silences (id, rule_id, exe_sha256_hex, exe_path,
+                                          host_fp_hex, weight, reason, operator_fp_hex,
+                                          issued_unix_ms, expires_unix_ms, matched,
+                                          last_matched_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        )?;
+        for r in store.rows() {
+            stmt.execute(params![
+                r.id,
+                r.rule_id,
+                r.exe_sha256_hex,
+                r.exe_path,
+                r.host_fp_hex,
+                f64::from(r.weight),
+                r.reason,
+                r.operator_fp_hex,
+                i64::try_from(r.issued_unix_ms).unwrap_or(i64::MAX),
+                i64::try_from(r.expires_unix_ms).unwrap_or(i64::MAX),
+                i64::try_from(r.matched).unwrap_or(i64::MAX),
+                r.last_matched_unix_ms
+                    .map(|t| i64::try_from(t).unwrap_or(i64::MAX)),
+            ])?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bowery_probe_status — is the kernel sensor actually watching?
 // ---------------------------------------------------------------------------
 
@@ -1313,7 +1406,7 @@ mod alerts_view_tests {
     #[tokio::test]
     async fn exposes_every_confirmation_column() {
         let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
-        inbox.append(Alert {
+        let _ = inbox.append(Alert {
             originator_fp: vec![0xab; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: "corr-net.inbound_connect-deadbeef".into(),
@@ -1368,7 +1461,7 @@ mod alerts_view_tests {
     #[tokio::test]
     async fn an_unwhispered_alert_has_null_confirmation_columns() {
         let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
-        inbox.append(Alert {
+        let _ = inbox.append(Alert {
             originator_fp: vec![0xcd; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: "ep-plain".into(),
@@ -1419,8 +1512,8 @@ mod alerts_view_tests {
             confirmation: None,
             context: Vec::new(),
         };
-        inbox.append(base("pre-filter score above threshold", 1.0));
-        inbox.append(base("the model looked and found nothing", 0.2));
+        let _ = inbox.append(base("pre-filter score above threshold", 1.0));
+        let _ = inbox.append(base("the model looked and found nothing", 0.2));
 
         let sql = bowery_sql::Sql::new().with_extra_table(Arc::new(BoweryAlertsTable::new(inbox)));
         let rows = sql
@@ -1450,7 +1543,7 @@ mod alerts_view_tests {
     async fn alerts_without_an_episode_never_collapse() {
         let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
         for path in ["/tmp/a", "/tmp/b", "/tmp/c"] {
-            inbox.append(Alert {
+            let _ = inbox.append(Alert {
                 originator_fp: vec![0x22; 32],
                 rule_id: "cred.read_netrc".into(),
                 episode_id: String::new(),

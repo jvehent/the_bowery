@@ -75,6 +75,7 @@ fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: St
         alerts: AlertsConfig {
             // First-time exec scores 1.0 — well above 0.5.
             threshold: 0.5,
+            silences_path: dir.join("silences.b64"),
         },
         bloom: BloomConfig::default(),
         response: ResponseConfig::default(),

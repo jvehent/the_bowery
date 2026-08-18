@@ -978,11 +978,13 @@ async fn handle_yara_push(
         .build();
         let episode_id = alert.episode_id.clone();
         warn!(rule = %m.rule_name, path = %m.path, "YARA MATCH");
-        yara.inbox.append(alert);
-        let _ = events_tx.send(AgentEvent::AlertEmitted {
-            episode_id,
-            suspicion: 1.0,
-        });
+        let appended = yara.inbox.append(alert);
+        if appended.stored() {
+            let _ = events_tx.send(AgentEvent::AlertEmitted {
+                episode_id,
+                suspicion: 1.0,
+            });
+        }
     }
 
     // --- Report this agent's own result. ---

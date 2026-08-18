@@ -358,10 +358,30 @@ impl Agent {
         if !yara_store.is_empty() {
             info!(rules = yara_store.len(), "yara rules loaded from store");
         }
-        let inbox = Arc::new(AlertInbox::new(
-            config.inbox.capacity,
-            config.inbox.retention,
-        ));
+        // Operator judgements about which findings are benign. Loaded
+        // and re-verified the same way revocations are — the file
+        // carries no authority of its own, only the signatures in it do.
+        let silences = {
+            let ops = operators.clone();
+            let resolve = move |fp: &Fingerprint| ops.resolve(fp);
+            Arc::new(crate::silence_store::SilenceStore::load(
+                &config.alerts.silences_path,
+                &cluster_id_for_trust,
+                &resolve,
+                crate::inbox::current_unix_ms(),
+            ))
+        };
+        if !silences.is_empty() {
+            info!(
+                count = silences.len(),
+                "loaded operator alert silences; matching alerts will be damped or withheld"
+            );
+        }
+
+        let inbox = Arc::new(
+            AlertInbox::new(config.inbox.capacity, config.inbox.retention)
+                .with_silences(silences.clone(), config.alerts.threshold),
+        );
 
         // Phase 7: load the response policy + instantiate an engine.
         // Today the only engine variant is NoopEngine (observe-only);
@@ -712,6 +732,9 @@ impl Agent {
             .with_extra_table(Arc::new(crate::sql_tables::BoweryAlertsTable::new(
                 inbox.clone(),
             )))
+            .with_extra_table(Arc::new(crate::sql_tables::BowerySilencesTable::new(Some(
+                silences.clone(),
+            ))))
             .with_extra_table(Arc::new(crate::sql_tables::BoweryAuditTable::new(
                 config.response.audit_log_path.clone(),
             )))
@@ -2201,11 +2224,13 @@ fn handle_llm_outcome(
                 )
                 .suggested_actions(verdict.suggested_actions.clone())
                 .build();
-                inbox.append(alert);
-                let _ = events_tx.send(AgentEvent::AlertEmitted {
-                    episode_id: episode_id.clone(),
-                    suspicion: verdict.suspicion,
-                });
+                let appended = inbox.append(alert);
+                if appended.stored() {
+                    let _ = events_tx.send(AgentEvent::AlertEmitted {
+                        episode_id: episode_id.clone(),
+                        suspicion: verdict.suspicion,
+                    });
+                }
             }
             // Phase 7: route every suggested action through the
             // response engine. The engine is policy-gated (defaults
@@ -2472,7 +2497,7 @@ fn witness_peer_logs(
             "a peer's event log went backwards"
         );
         let episode_id = format!("peer-{RULE_ID}-{}", crate::inbox::current_unix_ms());
-        inbox.append(
+        let appended = inbox.append(
             crate::alert_builder::AlertBuilder::new(
                 originator_fp,
                 backend_label,
@@ -2489,10 +2514,12 @@ fn witness_peer_logs(
             ])
             .build(),
         );
-        let _ = events_tx.send(AgentEvent::AlertEmitted {
-            episode_id,
-            suspicion: 0.9,
-        });
+        if appended.stored() {
+            let _ = events_tx.send(AgentEvent::AlertEmitted {
+                episode_id,
+                suspicion: 0.9,
+            });
+        }
     }
 }
 

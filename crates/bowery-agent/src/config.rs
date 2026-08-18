@@ -781,14 +781,29 @@ pub struct AlertsConfig {
     /// fill the inbox during steady state.
     #[serde(default = "default_alert_threshold")]
     pub threshold: f32,
+    /// Where operator-signed alert silences are kept.
+    ///
+    /// Re-verified against `[operators]` on every load, because the file
+    /// sits on a host root can edit — a silence believed merely because
+    /// it was on disk would let an attacker write their own. An agent
+    /// with no readable file here honours no silences and suppresses
+    /// nothing, which is the right default for a feature whose whole
+    /// effect is absence.
+    #[serde(default = "default_silences_path")]
+    pub silences_path: std::path::PathBuf,
 }
 
 impl Default for AlertsConfig {
     fn default() -> Self {
         Self {
             threshold: default_alert_threshold(),
+            silences_path: default_silences_path(),
         }
     }
+}
+
+fn default_silences_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/lib/bowery/silences.b64")
 }
 
 fn default_alert_threshold() -> f32 {

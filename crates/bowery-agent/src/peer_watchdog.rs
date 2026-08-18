@@ -306,11 +306,13 @@ pub fn spawn(
                             missing_alert(originator_fp, &backend_label, peer, live.len(), grace);
                         let episode_id = alert.episode_id.clone();
                         let suspicion = alert.suspicion;
-                        inbox.append(alert);
-                        let _ = events_tx.send(AgentEvent::AlertEmitted {
-                            episode_id,
-                            suspicion,
-                        });
+                        let appended = inbox.append(alert);
+                        if appended.stored() {
+                            let _ = events_tx.send(AgentEvent::AlertEmitted {
+                                episode_id,
+                                suspicion,
+                            });
+                        }
                     }
                 }
                 Verdict::Isolated { known } => {
@@ -319,11 +321,13 @@ pub fn spawn(
                         let alert = isolated_alert(originator_fp, &backend_label, known);
                         let episode_id = alert.episode_id.clone();
                         let suspicion = alert.suspicion;
-                        inbox.append(alert);
-                        let _ = events_tx.send(AgentEvent::AlertEmitted {
-                            episode_id,
-                            suspicion,
-                        });
+                        let appended = inbox.append(alert);
+                        if appended.stored() {
+                            let _ = events_tx.send(AgentEvent::AlertEmitted {
+                                episode_id,
+                                suspicion,
+                            });
+                        }
                         state.mark_isolated_reported(now);
                     }
                 }

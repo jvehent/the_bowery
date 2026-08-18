@@ -702,11 +702,13 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
             summary = %claim.summary,
             "corroboration failed — raising alert"
         );
-        ctx.inbox.append(alert);
-        let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
-            episode_id,
-            suspicion: claim.suspicion,
-        });
+        let appended = ctx.inbox.append(alert);
+        if appended.stored() {
+            let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+                episode_id,
+                suspicion: claim.suspicion,
+            });
+        }
     }
     // The neighbourhood explained it: same behaviour, other hosts.
     //
@@ -739,11 +741,13 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
             corroborated = tally.corroborated,
             "the neighbourhood explains this finding; superseding with a lower score"
         );
-        ctx.inbox.append(alert);
-        let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
-            episode_id,
-            suspicion: claim.explained_suspicion,
-        });
+        let appended = ctx.inbox.append(alert);
+        if appended.stored() {
+            let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+                episode_id,
+                suspicion: claim.explained_suspicion,
+            });
+        }
     }
 
     // The corroborating peer's evidence is logged where it arrives,

@@ -291,6 +291,27 @@ as "no such rule" rather than "never". They are now registered, mapped
 (T1204.002, T1059.004, and a new T1070.004 row for the deleted-binary
 case), counted, and provoked by `bowery-prove`.
 
+### Slice 5, as built
+
+Landed. The store is wired into `AlertInbox::append`, so from here an
+agent can withhold an alert.
+
+`append` returns a `#[must_use]` outcome rather than a ring length.
+Fifteen call sites emit an `AlertEmitted` event immediately afterwards,
+and a suppressed alert must not produce one — an operator watching the
+event stream would otherwise see a finding the inbox does not hold. The
+compiler flagged every one of those sites, which is the same forcing
+function `rule_id` used a slice earlier.
+
+The detection counter is deliberately untouched by suppression. Callers
+record the fire before appending, so `bowery_detections` reports what
+fired whether or not an operator chose to hear about it: silencing hides
+an alert, it never rewrites history.
+
+`bowery_silences` carries `matched`, and that column is the reason the
+view exists. Without it a muted fleet and a quiet one look identical from
+the outside, which is the one thing this project refuses.
+
 Slices 1–2 are independently useful and land first. Slice 5 is the point
 of no return for review: after it, an unsigned bug can suppress alerts.
 

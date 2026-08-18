@@ -238,7 +238,7 @@ pub fn spawn(
             }
 
             let episode_id = format!("sensor-{}-{}", verdict.kind(), current_unix_ms());
-            inbox.append(
+            let appended = inbox.append(
                 crate::alert_builder::AlertBuilder::new(
                     originator_fp,
                     &backend_label,
@@ -249,10 +249,12 @@ pub fn spawn(
                 )
                 .build(),
             );
-            let _ = events_tx.send(AgentEvent::AlertEmitted {
-                episode_id,
-                suspicion: SENSOR_SUSPICION,
-            });
+            if appended.stored() {
+                let _ = events_tx.send(AgentEvent::AlertEmitted {
+                    episode_id,
+                    suspicion: SENSOR_SUSPICION,
+                });
+            }
         }
     })
 }
