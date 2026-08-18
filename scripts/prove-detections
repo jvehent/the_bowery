@@ -98,18 +98,20 @@ echo "==> prover: $PROVER"
 echo "    provocations run locally, so this must be the local agent."
 echo
 
-before=$(mktemp); after=$(mktemp)
-trap 'rm -f "$before" "$after"' EXIT
+before=$(mktemp); after=$(mktemp); runlog=$(mktemp)
+trap 'rm -f "$before" "$after" "$runlog"' EXIT
 
 counters > "$before"
 echo "==> provoking"
-"$PROVER" run
+# Teed so the diff step can read which provocations could not run at
+# all: a rule whose tool is absent has not failed.
+"$PROVER" run | tee "$runlog"
 echo
 echo "==> waiting ${SETTLE}s for the pipeline"
 sleep "$SETTLE"
 counters > "$after"
 
-python3 - "$before" "$after" "$PROVER" <<'PY'
+python3 - "$before" "$after" "$PROVER" "$runlog" <<'PY'
 import subprocess, sys
 
 def load(path):
@@ -133,6 +135,15 @@ for line in listing.splitlines():
         continue
     (unprovable if "NOT PROVABLE" in parts[1] else expected).append(parts[0])
 
+# Provocations that could not run: the tool is not installed here, so
+# the rule was never exercised and must not be counted against it.
+could_not_run = {
+    line.split("\t", 1)[1].strip()
+    for line in open(sys.argv[4])
+    if line.startswith("UNAVAILABLE\t")
+}
+expected = [r for r in expected if r not in could_not_run]
+
 moved   = [r for r in expected if after.get(r, 0) > before.get(r, 0)]
 # A rule that did not move but is already above zero was proved by an
 # earlier run: the alert suppressor folds an identical finding — same
@@ -153,6 +164,10 @@ if folded:
 if never:
     print(f"\nNEVER FIRED ({len(never)}) — this is the finding:")
     for r in never:
+        print(f"   {r}")
+if could_not_run:
+    print(f"\nTOOL NOT INSTALLED ({len(could_not_run)}) — untested here, not failed:")
+    for r in sorted(could_not_run):
         print(f"   {r}")
 if unprovable:
     print(f"\nNOT PROVABLE HERE ({len(unprovable)}) — stated, not skipped:")

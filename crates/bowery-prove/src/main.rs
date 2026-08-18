@@ -431,6 +431,12 @@ fn run(all: &[Provocation]) {
                 "  {rule:38} no `{program}` here — UNPROVEN, not failed"
             );
         }
+        // Machine-readable, because the wrapper script has to tell this
+        // apart from a rule that failed to fire and cannot parse prose.
+        // Without it a missing `setenforce` reads as a broken detection.
+        for (rule, _) in &unavailable {
+            let _ = writeln!(out, "UNAVAILABLE\t{rule}");
+        }
     }
     print!("{out}");
     println!("\nnow compare bowery_detections; allow a few seconds for the pipeline.");
