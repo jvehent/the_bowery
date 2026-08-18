@@ -348,13 +348,14 @@ pub const TECHNIQUES: &[Technique] = &[
         id: "T1055",
         name: "Process Injection",
         tactic: "Defense Evasion",
-        coverage: Coverage::None,
-        rules: &[],
-        gap: "nothing watches `ptrace`, `process_vm_writev` or writes to `/proc/<pid>/mem`, \
-              so code injected into a process this agent already trusts is invisible. The \
-              injected code inherits that process's identity, which defeats every \
-              provenance and lineage check here — a packaged, unmodified binary is still \
-              packaged and unmodified after something else is running inside it",
+        coverage: Coverage::Partial,
+        rules: &["defense_evasion.ptrace_inject"],
+        gap: "watches the `ptrace` requests that write to or seize a process, exempting \
+              packaged debuggers. Two other doors reach the same place and neither is \
+              watched: `process_vm_writev`, and writing `/proc/<pid>/mem` directly. And \
+              an attacker who runs the distribution's own `gdb` is exempted by the very \
+              rule that makes this usable — the same boundary the privilege-transition \
+              exemption has with `sudo`",
     },
     // -- Initial Access / Lateral Movement (uncovered) -------------------
     Technique {
@@ -523,6 +524,7 @@ pub fn all_rule_ids() -> Vec<&'static str> {
     out.extend(crate::mass_write::rule_ids());
     out.extend(crate::beacon::rule_ids());
     out.extend(crate::kmod::rule_ids());
+    out.extend(crate::injection::rule_ids());
     out.extend(NON_TABLE_RULES);
     out.sort_unstable();
     out.dedup();

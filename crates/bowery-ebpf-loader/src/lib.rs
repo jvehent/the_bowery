@@ -52,7 +52,7 @@ use aya::programs::{Lsm, TracePoint};
 use aya::{Btf, BtfError};
 use bowery_events::source::{
     DEFAULT_CHANNEL_CAPACITY, EventSource, PROBE_CONNECT, PROBE_EXEC, PROBE_EXIT, PROBE_FILE,
-    PROBE_MODULE, PROBE_NAMES, ProbeHealth,
+    PROBE_MODULE, PROBE_NAMES, PROBE_PTRACE, ProbeHealth,
 };
 use bowery_events::{
     Event, FileOpen, NetDirection, NetFamily, NetworkConnect, ProcessExec, ProcessExit, enrich,
@@ -381,6 +381,21 @@ async fn run(
         }
     };
 
+    let ptrace_probe = match verify_ptrace_layout() {
+        Ok(()) => attach_tp(&mut ebpf, "ptrace_enter", "syscalls", "sys_enter_ptrace")
+            .inspect(|()| health.mark_attached(PROBE_PTRACE))
+            .map_err(|e| warn!(error = %e, "ptrace probe unavailable"))
+            .is_ok(),
+        Err(reason) => {
+            error!(
+                reason = %reason,
+                "refusing to attach the ptrace probe: the kernel's tracepoint layout \
+                 does not match what the BPF program reads"
+            );
+            false
+        }
+    };
+
     let exec_ring = take_ring(&mut ebpf, "EVENTS")?;
     let exit_ring = take_ring(&mut ebpf, "EXIT_EVENTS")?;
     let connect_ring = take_ring(&mut ebpf, "CONNECT_EVENTS")?;
@@ -397,6 +412,14 @@ async fn run(
     let module_ring = if module_probe {
         take_ring(&mut ebpf, "MODULE_EVENTS")
             .map_err(|e| warn!(error = %e, "MODULE_EVENTS ring unavailable"))
+            .ok()
+    } else {
+        None
+    };
+
+    let ptrace_ring = if ptrace_probe {
+        take_ring(&mut ebpf, "PTRACE_EVENTS")
+            .map_err(|e| warn!(error = %e, "PTRACE_EVENTS ring unavailable"))
             .ok()
     } else {
         None
@@ -460,7 +483,14 @@ async fn run(
             PROBE_FILE,
             health.clone()
         ),
-        drain_optional_ring(module_ring, tx, parse_module, PROBE_MODULE, health.clone()),
+        drain_optional_ring(
+            module_ring,
+            tx.clone(),
+            parse_module,
+            PROBE_MODULE,
+            health.clone()
+        ),
+        drain_optional_ring(ptrace_ring, tx, parse_ptrace, PROBE_PTRACE, health.clone()),
         poll_drops(drops_map, health),
     )?;
 
@@ -535,6 +565,12 @@ const OPENAT_EXPECTED: [(&str, usize); 2] = [("filename", 24), ("flags", 32)];
 /// would report module names read from arbitrary bytes.
 const MODLOAD_EXPECTED: [(&str, usize); 2] = [("taints", 8), ("name", 12)];
 
+/// `sys_enter_ptrace` argument offsets. Structural for any 64-bit
+/// syscall tracepoint, and checked anyway: a wrong offset here would
+/// read a request code out of unrelated bytes and could report an
+/// injection that never happened.
+const PTRACE_EXPECTED: [(&str, usize); 2] = [("request", 16), ("pid", 24)];
+
 /// Check the assumed offsets against the kernel's published format.
 ///
 /// `Err` only on a *proven* mismatch, which fails closed: the probe is
@@ -568,6 +604,34 @@ fn verify_openat_layout() -> Result<(), String> {
         }
     }
     info!("sys_enter_openat layout verified against the kernel");
+    Ok(())
+}
+
+/// Same check again, for `syscalls:sys_enter_ptrace`.
+fn verify_ptrace_layout() -> Result<(), String> {
+    let candidates = [
+        "/sys/kernel/tracing/events/syscalls/sys_enter_ptrace/format",
+        "/sys/kernel/debug/tracing/events/syscalls/sys_enter_ptrace/format",
+    ];
+    let Some(text) = candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+    else {
+        warn!("could not read the sys_enter_ptrace format file; proceeding with assumed offsets");
+        return Ok(());
+    };
+    for (field, expected) in PTRACE_EXPECTED {
+        let Some(actual) = parse_field_offset(&text, field) else {
+            warn!(field, "field absent from tracepoint format; cannot verify");
+            continue;
+        };
+        if actual != expected {
+            return Err(format!(
+                "sys_enter_ptrace.{field} is at offset {actual}, but the BPF program reads {expected}"
+            ));
+        }
+    }
+    info!("sys_enter_ptrace layout verified against the kernel");
     Ok(())
 }
 
@@ -718,6 +782,38 @@ struct RawModuleEvent {
     name: [u8; 64],
 }
 const RAW_MODULE_SIZE: usize = std::mem::size_of::<RawModuleEvent>();
+
+/// Mirrors `PtraceEvent` in the BPF program byte for byte.
+#[repr(C)]
+struct RawPtraceEvent {
+    pid: u32,
+    target_pid: u32,
+    request: u32,
+    _pad: u32,
+    comm: [u8; 16],
+}
+const RAW_PTRACE_SIZE: usize = std::mem::size_of::<RawPtraceEvent>();
+
+fn parse_ptrace(bytes: &[u8]) -> Option<Event> {
+    if bytes.len() < RAW_PTRACE_SIZE {
+        warn!(
+            got = bytes.len(),
+            want = RAW_PTRACE_SIZE,
+            "short ptrace record"
+        );
+        return None;
+    }
+    // SAFETY: size-checked above; RawPtraceEvent is repr(C) POD.
+    let raw: RawPtraceEvent =
+        unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<RawPtraceEvent>()) };
+    Some(Event::Ptrace(bowery_events::Ptrace {
+        pid: raw.pid,
+        comm: comm_to_string(&raw.comm),
+        target_pid: raw.target_pid,
+        request: raw.request,
+        ts: std::time::SystemTime::now(),
+    }))
+}
 
 fn parse_module(bytes: &[u8]) -> Option<Event> {
     if bytes.len() < RAW_MODULE_SIZE {

@@ -183,6 +183,7 @@ async fn process_event(ctx: &PipelineContext, event: Event) {
             process_file_change(ctx, change).await;
         }
         Event::ModuleLoad(m) => process_module_load(ctx, &m),
+        Event::Ptrace(t) => process_ptrace(ctx, &t).await,
         Event::NetworkConnect(conn) => {
             process_network_connect(ctx, &conn).await;
         }
@@ -213,6 +214,98 @@ async fn process_event(ctx: &PipelineContext, event: Event) {
 /// never contacted, and every one of them would then look normal
 /// fleet-wide. Instead it becomes a claim: the host it came from is
 /// asked whether it made the connection, and a denial is the finding.
+/// One process took control of another.
+///
+/// The kernel probe already filtered to the requests that write to or
+/// seize a process, so what remains is a judgement about *who* is doing
+/// it. `ptrace` is how debuggers work and a host that never runs one is
+/// not a host anyone develops on — so a packaged debugger at a path this
+/// rule names is exempt, on the same two-condition footing as the
+/// credential readers.
+///
+/// Resolving the caller's provenance costs a sha256, and it runs only
+/// here, on a syscall the kernel filter has already made rare.
+async fn process_ptrace(ctx: &PipelineContext, t: &bowery_events::Ptrace) {
+    let exe = bowery_events::enrich::pid_exe_path(t.pid).or_else(|| ctx.procs.exe_at(t.pid, t.ts));
+    let provenance = match exe.clone() {
+        Some(exe) => {
+            let packages = ctx.packages.clone();
+            tokio::task::spawn_blocking(move || {
+                enrich::sha256_file(&exe)
+                    .map_or(bowery_analysis::provenance::Provenance::Unknown, |sha| {
+                        packages.classify(&exe, &sha)
+                    })
+            })
+            .await
+            .unwrap_or(bowery_analysis::provenance::Provenance::Unknown)
+        }
+        None => bowery_analysis::provenance::Provenance::Unknown,
+    };
+    let exe_str = exe.as_ref().map(|p| p.display().to_string());
+    if bowery_analysis::injection::is_sanctioned_debugger(exe_str.as_deref(), provenance) {
+        debug!(
+            pid = t.pid,
+            target = t.target_pid,
+            exe = exe_str.as_deref().unwrap_or("<unresolved>"),
+            "packaged debugger; not a finding"
+        );
+        return;
+    }
+    // Repeats fold: a debugger-shaped tool stepping through a process
+    // issues thousands of these, and restating each one is the noise
+    // this project keeps removing.
+    let subject = format!("{}->{}", t.pid, t.target_pid);
+    let folded = match ctx.suppressor.observe(
+        bowery_analysis::injection::RULE_ID,
+        &subject,
+        exe_str.as_deref(),
+        std::time::Instant::now(),
+    ) {
+        bowery_analysis::SuppressDecision::Suppress => return,
+        bowery_analysis::SuppressDecision::Report { folded } => folded,
+    };
+    let note = bowery_analysis::suppress::folded_note(folded, ctx.suppress_window);
+    let request = bowery_analysis::injection::request_name(t.request);
+    ctx.detections.record(bowery_analysis::injection::RULE_ID);
+    warn!(
+        rule = bowery_analysis::injection::RULE_ID,
+        pid = t.pid,
+        target = t.target_pid,
+        request = t.request,
+        "process injection attempt"
+    );
+    let episode_id = format!("inject-{}-{}", t.pid, current_unix_ms());
+    let alert = crate::alert_builder::AlertBuilder::new(
+        ctx.originator_fp,
+        &ctx.backend_label,
+        episode_id.clone(),
+        0.9,
+        format!(
+            "{} (pid {}) issued ptrace {request} against pid {} and is not a packaged \
+             debugger. Code injected this way inherits the identity of the process it \
+             lands in, so every provenance and lineage check here would keep vouching \
+             for that process afterwards — which is what makes this worth reading even \
+             though the target may be entirely ordinary{note}",
+            exe_str.as_deref().unwrap_or(&t.comm),
+            t.pid,
+            t.target_pid
+        ),
+    )
+    .subject(exe_str.clone().unwrap_or_else(|| t.comm.clone()))
+    .context(vec![
+        bowery_proto::Attribute::new("pid", t.pid.to_string()),
+        bowery_proto::Attribute::new("target_pid", t.target_pid.to_string()),
+        bowery_proto::Attribute::new("request", request),
+        bowery_proto::Attribute::new("comm", t.comm.clone()),
+    ])
+    .build();
+    ctx.inbox.append(alert);
+    let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+        episode_id,
+        suspicion: 0.9,
+    });
+}
+
 /// A kernel module entered the kernel.
 ///
 /// Reported only when the kernel itself declines to vouch for it —

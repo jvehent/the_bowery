@@ -125,6 +125,8 @@ pub const KIND_FILE_CHANGE: &str = "file_change";
 pub const KIND_FILE_ACCESS: &str = "file_access";
 /// A kernel module entering the running kernel.
 pub const KIND_MODULE_LOAD: &str = "module_load";
+/// One process taking control of another.
+pub const KIND_PTRACE: &str = "ptrace";
 
 /// Retention policy. Both bounds apply; whichever bites first wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -685,6 +687,16 @@ impl Row {
                     e.path.display().to_string()
                 });
                 r.open_flags = Some(i64::from(e.flags));
+            }
+            Event::Ptrace(e) => {
+                r.kind = KIND_PTRACE;
+                r.pid = Some(i64::from(e.pid));
+                r.comm = Some(e.comm.clone());
+                // The target goes in `ppid`: it is the other process in
+                // the relationship, which is what that column already
+                // means for an exec.
+                r.ppid = Some(i64::from(e.target_pid));
+                r.open_flags = Some(i64::from(e.request));
             }
             Event::ModuleLoad(e) => {
                 r.kind = KIND_MODULE_LOAD;

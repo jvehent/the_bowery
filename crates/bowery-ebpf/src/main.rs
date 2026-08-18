@@ -286,6 +286,19 @@ pub struct ModuleLoadEvent {
 #[map]
 static MODULE_EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024, 0);
 
+/// One process taking control of another.
+#[repr(C)]
+pub struct PtraceEvent {
+    pub pid: u32,
+    pub target_pid: u32,
+    pub request: u32,
+    pub _pad: u32,
+    pub comm: [u8; 16],
+}
+
+#[map]
+static PTRACE_EVENTS: RingBuf = RingBuf::with_byte_size(32 * 1024, 0);
+
 /// Blocklist keyed by the identity of the *file being executed*:
 /// `[dev, ino]`.
 ///
@@ -485,6 +498,21 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
 /// are a uniform array, this one has named fields: `taints` (u32) then
 /// `name` as a `__data_loc`. Verified against the kernel's own format
 /// file at load time — see `verify_module_load_layout`.
+/// `sys_enter_ptrace` args, at the structural offsets every 64-bit
+/// syscall tracepoint uses: `trace_entry`(8) + `nr`(4+4 pad) + args[].
+const PTRACE_ARG_REQUEST: usize = 16; // args[0]
+const PTRACE_ARG_PID: usize = 24; // args[1]
+
+/// The requests that write or seize another process, from
+/// `uapi/linux/ptrace.h`. Reading (`PEEK*`) and the self-attach a
+/// debuggee performs (`TRACEME`) are deliberately absent: this is about
+/// taking control of a process, not observing one.
+const PTRACE_POKETEXT: u64 = 4;
+const PTRACE_POKEDATA: u64 = 5;
+const PTRACE_ATTACH: u64 = 16;
+const PTRACE_SETREGS: u64 = 13;
+const PTRACE_SEIZE: u64 = 0x4206;
+
 const MODLOAD_TAINTS: usize = 8;
 const MODLOAD_NAME_DATALOC: usize = 12;
 
@@ -665,6 +693,55 @@ fn try_openat(ctx: &TracePointContext) -> Result<(), i64> {
 /// `b"bash\0\0\0..."`. Zero out trailing whitespace bytes before the
 /// map lookup so both `echo "x" > /proc/<pid>/comm` and
 /// `printf "x" > /proc/<pid>/comm` produce the same key.
+/// Report `ptrace` requests that write to or seize another process.
+///
+/// Injected code inherits the identity of the process it lands in, which
+/// is what makes this worth a probe: a packaged, unmodified binary is
+/// still packaged and unmodified after something else is running inside
+/// it, so every provenance and lineage check in this agent is blind to
+/// it.
+///
+/// Filtered in the kernel to the control-taking requests. Reads
+/// (`PEEK*`) and `TRACEME` are far more common and are not injection —
+/// shipping them would bury the signal in a debugger's own traffic.
+#[tracepoint]
+pub fn ptrace_enter(ctx: TracePointContext) -> u32 {
+    match try_ptrace(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_ptrace(ctx: &TracePointContext) -> Result<(), i64> {
+    let request: u64 = unsafe { ctx.read_at(PTRACE_ARG_REQUEST)? };
+    if request != PTRACE_ATTACH
+        && request != PTRACE_SEIZE
+        && request != PTRACE_POKETEXT
+        && request != PTRACE_POKEDATA
+        && request != PTRACE_SETREGS
+    {
+        return Ok(());
+    }
+    let target: u64 = unsafe { ctx.read_at(PTRACE_ARG_PID)? };
+
+    let Some(mut entry) = PTRACE_EVENTS.reserve::<PtraceEvent>(0) else {
+        count_drop(DROP_EXEC);
+        return Err(-1);
+    };
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    let event = entry.as_mut_ptr();
+    unsafe {
+        (*event).pid = (pid_tgid >> 32) as u32;
+        (*event).target_pid = target as u32;
+        (*event).request = request as u32;
+        (*event)._pad = 0;
+        (*event).comm = comm;
+    }
+    entry.submit(0);
+    Ok(())
+}
+
 /// Report every module load, with the taint flags the kernel assigned.
 ///
 /// Deliberately reports *all* of them rather than filtering in-kernel on

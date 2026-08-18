@@ -64,7 +64,7 @@ now.
 | Execution | partial | partial + provenance and lineage damp the noise |
 | **Persistence** | **nothing** | rules for units, cron, `authorized_keys`, `ld.so.preload`, PAM, udev, shell rc, **untrusted kernel modules** |
 | **Privilege escalation** | almost nothing | `sudoers`, set-id binaries no package owns, uid transitions to root outside the sanctioned path |
-| **Defense evasion** | **nothing** | auth/wtmp tampering; `comm`-keyed blocking still evadable |
+| **Defense evasion** | **nothing** | auth/wtmp tampering; **ptrace injection**; inode-keyed blocking now unspoofable |
 | **Credential access** | **nothing** | writes *and* reads: `shadow`, SSH keys, `~/.aws`, `~/.kube`, `.pgpass`, and eleven more |
 | **Discovery** | **nothing** | recon bursts — five distinct discovery commands from one parent in a minute |
 | **Lateral movement** | partial, genuinely ahead | unchanged — the corroboration work |

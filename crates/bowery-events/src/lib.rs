@@ -35,6 +35,8 @@ pub enum Event {
     /// the probes above — including the probe that would have reported
     /// it. Only the load itself is observable, so it is the only chance.
     ModuleLoad(ModuleLoad),
+    /// One process took control of another via `ptrace`.
+    Ptrace(Ptrace),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +58,18 @@ pub struct ProcessExec {
     /// follow `/proc/<pid>/exe` (e.g. very short-lived process).
     pub exe_path: Option<PathBuf>,
     pub args: Vec<String>,
+    pub ts: SystemTime,
+}
+
+/// One process taking control of another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ptrace {
+    pub pid: u32,
+    pub comm: String,
+    pub target_pid: u32,
+    /// The `ptrace` request, already filtered in-kernel to the ones that
+    /// write to or seize a process.
+    pub request: u32,
     pub ts: SystemTime,
 }
 
@@ -240,6 +254,7 @@ impl Event {
             Event::FileOpen(e) => e.pid,
             Event::NetworkConnect(e) => e.pid,
             Event::ModuleLoad(e) => e.pid,
+            Event::Ptrace(e) => e.pid,
             Event::FileChange(_) => 0,
         }
     }
@@ -251,6 +266,7 @@ impl Event {
             Event::FileOpen(e) => e.ts,
             Event::NetworkConnect(e) => e.ts,
             Event::ModuleLoad(e) => e.ts,
+            Event::Ptrace(e) => e.ts,
             Event::FileChange(e) => e.ts,
         }
     }
