@@ -33,6 +33,7 @@ Existing EDRs send everything home and decide centrally. The Bowery flips that: 
 - [the_bowery_design.md](the_bowery_design.md) — original product brief.
 - [DESIGN.md](DESIGN.md) — engineering design, locked decisions, phased delivery plan.
 - [DESIGN-NATIVE-SQL.md](DESIGN-NATIVE-SQL.md) — Phase-9 design rationale + operator guide for the native SQL surface.
+- [DESIGN-ALERT-SILENCING.md](DESIGN-ALERT-SILENCING.md) — planned: operator-signed alert silencing over the mesh, and why a detection-disabling primitive needs its threat model written first.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — deep dive: every crate, every protocol, every architectural decision and why. §22 covers the Phase-9 SQL surface in detail.
 - [SECURITY-AUDIT-PHASE9.md](SECURITY-AUDIT-PHASE9.md) — two-pass audit of the SQL/fan-out surface and what shipped to address each finding.
 - [INSTALL.md](INSTALL.md) — building, installing, configuring, and operating an agent.
