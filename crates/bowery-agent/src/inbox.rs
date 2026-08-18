@@ -65,6 +65,13 @@ impl AlertInbox {
     /// Append an alert. Evicts the oldest entry if the ring is at
     /// capacity. Returns the now-current ring length.
     pub fn append(&self, alert: Alert) -> usize {
+        debug_assert!(
+            !alert.rule_id.is_empty(),
+            "alert {} carries no rule_id — it cannot be counted against a detection, \
+             found by rule in bowery_alerts, or pointed at by an operator saying it is \
+             benign. Built-in detections are checked harder in `AlertBuilder::new`.",
+            alert.episode_id,
+        );
         let mut g = self.inner.lock().expect("inbox poisoned");
         if g.items.len() >= g.capacity {
             g.items.pop_front();
@@ -151,6 +158,7 @@ mod tests {
     fn alert_at(ts_ms: u64, episode: &str) -> Alert {
         Alert {
             originator_fp: vec![0u8; 32],
+            rule_id: "cred.read_netrc".into(),
             episode_id: episode.into(),
             exe_sha256_hex: String::new(),
             exe_path: String::new(),

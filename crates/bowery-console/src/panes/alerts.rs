@@ -470,6 +470,7 @@ mod render_tests {
         (0..n)
             .map(|i| Alert {
                 originator_fp: vec![0xaa; 32],
+                rule_id: "cred.read_netrc".into(),
                 episode_id: format!("ep-{i}"),
                 exe_sha256_hex: "ab".repeat(32),
                 exe_path: format!("/tmp/payload-{i}"),

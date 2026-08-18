@@ -52,6 +52,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// This module's rule id on the ATT&CK map. Both findings — a peer gone
+/// silent, and this host isolated from all of them — are the same
+/// detection seen from the two possible sides.
+pub const RULE_ID: &str = "peer.silent";
+
 use bowery_crypto::Fingerprint;
 use bowery_mesh::PeerInfo;
 use bowery_proto::{Alert, Attribute};
@@ -225,7 +230,7 @@ fn missing_alert(
     AlertBuilder::new(
         originator_fp,
         backend_label,
-        // `peer.silent` on the ATT&CK map.
+        RULE_ID,
         format!("peer-silent-{peer}-{}", current_unix_ms()),
         // High, and deliberately so. Every other detection this agent
         // makes is void on a host whose agent is not running, and
@@ -251,6 +256,7 @@ fn isolated_alert(originator_fp: Fingerprint, backend_label: &str, known: usize)
     AlertBuilder::new(
         originator_fp,
         backend_label,
+        RULE_ID,
         format!("peer-isolated-{}", current_unix_ms()),
         0.8,
         format!(

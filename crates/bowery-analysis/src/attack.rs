@@ -86,6 +86,7 @@ pub const TECHNIQUES: &[Technique] = &[
         rules: &[
             "lineage.service_spawned_shell",
             "lineage.service_spawned_interpreter",
+            "exec_suspicious_args",
         ],
         gap: "only fires when a network service or scheduler is the parent. A shell \
               started from an interactive login looks exactly like a person working",
@@ -95,7 +96,7 @@ pub const TECHNIQUES: &[Technique] = &[
         name: "User Execution: Malicious File",
         tactic: "Execution",
         coverage: Coverage::Partial,
-        rules: &["baseline.rarity", "yara.match"],
+        rules: &["baseline.rarity", "yara.match", "exec_from_writable_path"],
         gap: "rests on the binary being rare for this host or matching a YARA rule. A \
               malicious file that is neither is executed silently",
     },
@@ -279,6 +280,18 @@ pub const TECHNIQUES: &[Technique] = &[
               privilege-transition rule has with `sudo`. Injection that never touches \
               another process — a malicious `LD_PRELOAD` on a process it starts itself — \
               is a different technique and not covered here",
+    },
+    Technique {
+        id: "T1070.004",
+        name: "Indicator Removal: File Deletion",
+        tactic: "Defense Evasion",
+        coverage: Coverage::Partial,
+        rules: &["exec_missing_exe_path"],
+        gap: "sees only the case where a *running* process has no resolvable \
+              `/proc/<pid>/exe`, which is what a binary deleted after launch looks \
+              like. A file deleted without ever being executed, or deleted after the \
+              process exited, is not visible: the sensor reports opens with write \
+              intent and never unlinks, so deletion itself is not observed anywhere",
     },
     // -- Credential Access -------------------------------------------------
     Technique {
@@ -650,6 +663,7 @@ pub fn markdown() -> String {
 #[must_use]
 pub fn all_rule_ids() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = crate::file_watch::rule_ids();
+    out.extend(crate::rule::rule_ids());
     out.extend(crate::lineage::rule_ids());
     out.extend(crate::provenance::rule_ids());
     out.extend(crate::escalation::rule_ids());

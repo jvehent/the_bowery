@@ -61,7 +61,7 @@ use async_trait::async_trait;
 use bowery_crypto::Fingerprint;
 use bowery_mesh::PeerInfo;
 use bowery_proto::{
-    Alert, AlertConfirmation, Attribute, Corroboration, CorroborationAnswer, CorroborationQuery,
+    AlertConfirmation, Attribute, Corroboration, CorroborationAnswer, CorroborationQuery,
 };
 use bowery_whisper::Sealer;
 use bowery_whisper::corroborate;
@@ -76,11 +76,29 @@ use tracing::{debug, info, warn};
 
 use crate::agent::AgentEvent;
 use crate::config::CorroborationConfig;
-use crate::inbox::{AlertInbox, current_unix_ms};
+use crate::inbox::AlertInbox;
 
 // ---------------------------------------------------------------------------
 // Claims
 // ---------------------------------------------------------------------------
+
+/// The ATT&CK-registry id for a claim kind.
+///
+/// Kinds are wire strings (`net.inbound_connect`) chosen for the
+/// protocol; rule ids are what the coverage map and the detection
+/// counters use (`corroborate.net_inbound_connect`). Written out rather
+/// than derived from the kind, so renaming one fails a test instead of
+/// quietly producing an id nothing else knows.
+#[must_use]
+pub fn rule_id_for_kind(kind: &str) -> &'static str {
+    if kind == file_access::KIND {
+        return "corroborate.file_access";
+    }
+    // `net_inbound` is also the fallback: every registered kind is
+    // covered by the test below, and if one ever is not, a registered id
+    // is a better answer than an unregistered or empty one.
+    "corroborate.net_inbound_connect"
+}
 
 /// Something this host observed that it cannot judge alone.
 ///
@@ -668,19 +686,16 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
     if confirmed {
         let confirmation = tally.to_confirmation(claim.rule, true);
         let episode_id = format!("corr-{}-{}", claim.kind, query_id);
-        let alert = Alert {
-            originator_fp: ctx.originator_fp.as_bytes().to_vec(),
-            episode_id: episode_id.clone(),
-            exe_sha256_hex: String::new(),
-            exe_path: String::new(),
-            suspicion: claim.suspicion,
-            rationale: rationale(&claim, &tally),
-            suggested_actions: Vec::new(),
-            ts_unix_ms: current_unix_ms(),
-            backend: ctx.backend_label.clone(),
-            confirmation: Some(confirmation),
-            context: Vec::new(),
-        };
+        let alert = crate::alert_builder::AlertBuilder::new(
+            ctx.originator_fp,
+            &ctx.backend_label,
+            rule_id_for_kind(claim.kind),
+            episode_id.clone(),
+            claim.suspicion,
+            rationale(&claim, &tally),
+        )
+        .confirmation(confirmation)
+        .build();
         warn!(
             kind = claim.kind,
             episode = %episode_id,
@@ -704,23 +719,20 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
         && tally.corroborated > 0
         && let Some(episode_id) = claim.supersedes.clone()
     {
-        let alert = Alert {
-            originator_fp: ctx.originator_fp.as_bytes().to_vec(),
-            episode_id: episode_id.clone(),
-            exe_sha256_hex: String::new(),
-            exe_path: String::new(),
-            suspicion: claim.explained_suspicion,
-            rationale: format!(
+        let alert = crate::alert_builder::AlertBuilder::new(
+            ctx.originator_fp,
+            &ctx.backend_label,
+            rule_id_for_kind(claim.kind),
+            episode_id.clone(),
+            claim.explained_suspicion,
+            format!(
                 "{} — but {} of {} peers asked report the same, so this is how this \
                  fleet behaves rather than something this host is doing alone",
                 claim.summary, tally.corroborated, tally.asked
             ),
-            suggested_actions: Vec::new(),
-            ts_unix_ms: current_unix_ms(),
-            backend: ctx.backend_label.clone(),
-            confirmation: Some(tally.to_confirmation(claim.rule, false)),
-            context: Vec::new(),
-        };
+        )
+        .confirmation(tally.to_confirmation(claim.rule, false))
+        .build();
         info!(
             kind = claim.kind,
             episode = %episode_id,
@@ -850,6 +862,28 @@ pub fn window_around(at: SystemTime, half_width: Duration) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every claim kind must map to an id the registry knows.
+    ///
+    /// Kinds are wire strings and rule ids are registry strings, and
+    /// nothing but this connects them — a renamed kind would otherwise
+    /// produce alerts attributed to a rule that does not exist.
+    #[test]
+    fn every_claim_kind_maps_to_a_registered_rule() {
+        let known = bowery_analysis::attack::all_rule_ids();
+        for kind in [net_inbound::KIND, file_access::KIND] {
+            let id = rule_id_for_kind(kind);
+            assert!(
+                known.contains(&id),
+                "{kind} maps to {id}, which is not registered"
+            );
+        }
+        // And the two must not collapse onto one id.
+        assert_ne!(
+            rule_id_for_kind(net_inbound::KIND),
+            rule_id_for_kind(file_access::KIND)
+        );
+    }
 
     fn tally(corroborated: usize, denied: usize, refused: usize, no_reply: usize) -> Tally {
         Tally {

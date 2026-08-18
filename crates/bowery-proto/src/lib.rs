@@ -481,6 +481,27 @@ pub struct Alert {
     /// to the reader.
     #[prost(message, repeated, tag = "11")]
     pub context: Vec<Attribute>,
+
+    /// The detection that produced this alert, e.g.
+    /// `cred.read_netrc` or `lineage.service_spawned_shell`.
+    ///
+    /// Every alert has one. For an exec that cleared the threshold on
+    /// baseline rarity alone the answer is `baseline.rarity` — a score
+    /// rather than a rule table entry, and named so rather than left
+    /// blank.
+    ///
+    /// Added because the id was previously recoverable only by
+    /// *parsing* it back out of `episode_id` (which encodes it for file
+    /// findings and not for exec ones) or by reading it out of the
+    /// rationale prose. Nothing structured carried it, so `bowery_alerts`
+    /// could not answer "which rule produced these" and an operator had
+    /// nothing to point at when saying a finding is benign.
+    ///
+    /// A **superseding** alert carries the rule of the episode it
+    /// refines, not a rule of its own: an LLM re-scoring a
+    /// `lineage.service_spawned_shell` episode is still that finding.
+    #[prost(string, tag = "12")]
+    pub rule_id: String,
 }
 
 /// What the neighbourhood said when asked about an alert.
@@ -1407,6 +1428,7 @@ mod tests {
     fn alert_roundtrip() {
         let alert = Alert {
             originator_fp: vec![0xaa; 32],
+            rule_id: "cred.read_netrc".into(),
             episode_id: "ep-7".into(),
             exe_sha256_hex: "abcdef".repeat(8),
             exe_path: "/tmp/payload".into(),
@@ -1444,6 +1466,7 @@ mod tests {
     fn alert_without_confirmation_field_still_decodes() {
         let mut legacy = Alert {
             originator_fp: vec![0xbb; 32],
+            rule_id: "cred.read_netrc".into(),
             episode_id: "ep-legacy".into(),
             exe_sha256_hex: "ab".repeat(32),
             exe_path: "/usr/bin/legacy".into(),
@@ -1483,6 +1506,7 @@ mod tests {
         let resp = Alerts {
             items: vec![Alert {
                 originator_fp: vec![1; 32],
+                rule_id: "cred.read_netrc".into(),
                 episode_id: "x".into(),
                 exe_sha256_hex: "deadbeef".into(),
                 exe_path: "/x".into(),

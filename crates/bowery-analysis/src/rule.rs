@@ -106,6 +106,23 @@ mod severity_tests {
     }
 }
 
+/// Every rule id [`default_rules`] can produce.
+///
+/// These three are the oldest detections in the agent and were absent
+/// from the registry until `rule_id` became a required field on an
+/// alert. The consequence was quiet: they fired, they raised alerts, and
+/// they appeared on no coverage map, moved no counter, and had no row in
+/// `bowery_detections` — so "has the writable-path rule ever fired here"
+/// returned nothing at all rather than a number.
+#[must_use]
+pub const fn rule_ids() -> &'static [&'static str] {
+    &[
+        "exec_from_writable_path",
+        "exec_missing_exe_path",
+        "exec_suspicious_args",
+    ]
+}
+
 /// Run every rule against `episode`, collect hits.
 pub fn evaluate_all(rules: &[Box<dyn Rule>], episode: &Episode) -> Vec<RuleHit> {
     rules.iter().filter_map(|r| r.check(episode)).collect()

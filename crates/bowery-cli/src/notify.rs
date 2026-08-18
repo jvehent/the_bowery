@@ -988,6 +988,7 @@ mod tests {
     fn alert(episode: &str, suspicion: f32, confirmed: bool) -> Alert {
         Alert {
             originator_fp: vec![0xab; 32],
+            rule_id: "cred.read_netrc".into(),
             episode_id: episode.into(),
             exe_sha256_hex: "ab".repeat(32),
             exe_path: "/tmp/payload".into(),

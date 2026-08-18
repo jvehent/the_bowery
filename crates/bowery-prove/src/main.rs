@@ -79,6 +79,8 @@ enum TempShape {
     NoteFanout,
     /// Many files sharing an unusual extension: an encryption sweep.
     EncryptionSweep,
+    /// Run a binary from a world-writable directory.
+    ExecFromTmp,
 }
 
 struct Provocation {
@@ -213,6 +215,26 @@ fn provocations() -> Vec<Provocation> {
         Provocation {
             rule: bowery_analysis::defense::MAC_RULE_ID,
             act: Act::Exec("setenforce", &["0"]),
+        },
+        // -- the three oldest exec rules -------------------------------
+        //
+        // Registered only once `rule_id` became required on an alert;
+        // before that they fired and were counted nowhere.
+        Provocation {
+            rule: "exec_from_writable_path",
+            act: Act::TempFiles(TempShape::ExecFromTmp),
+        },
+        Provocation {
+            rule: "exec_suspicious_args",
+            act: Act::Exec("sh", &["-c", "true 'curl | sh'"]),
+        },
+        Provocation {
+            rule: "exec_missing_exe_path",
+            act: Act::Unsupported(
+                "needs a process whose binary is deleted while it runs; staging that \
+                 means leaving a running process with no file behind it, which is not \
+                 a thing to do to a host unasked",
+            ),
         },
         // -- lineage: the parent is the signal -------------------------
         //
@@ -354,6 +376,9 @@ fn list(all: &[Provocation]) {
             }
             Act::TempFiles(TempShape::EncryptionSweep) => {
                 "write 60 temp files sharing an odd extension".into()
+            }
+            Act::TempFiles(TempShape::ExecFromTmp) => {
+                "run a trivial script from a world-writable directory".into()
             }
             Act::PtraceOwnChild => "PTRACE_ATTACH to a child of our own".into(),
             Act::SpawnAs {
@@ -497,6 +522,7 @@ fn temp_files(shape: &TempShape) -> io::Result<()> {
     let result = match shape {
         TempShape::NoteFanout => note_fanout(&root),
         TempShape::EncryptionSweep => encryption_sweep(&root),
+        TempShape::ExecFromTmp => exec_from_tmp(&root),
     };
     // Best effort: leaving these behind would be untidy but harmless.
     let _ = std::fs::remove_dir_all(&root);
@@ -597,6 +623,19 @@ fn spawn_as(parent: &str, program: &str, args: &[&str]) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Execute something harmless from a world-writable directory.
+fn exec_from_tmp(root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = root.join("bowery-prove-benign");
+    std::fs::write(&script, b"#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    Command::new(&script)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(drop)
 }
 
 #[cfg(test)]

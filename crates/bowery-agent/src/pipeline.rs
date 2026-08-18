@@ -32,12 +32,13 @@ use bowery_baseline::Baseline;
 use bowery_crypto::Fingerprint;
 use bowery_events::{Event, ProcessExec, enrich};
 use bowery_llm::{AnalysisContext, Submitter};
-use bowery_proto::Alert;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::agent::{AgentEvent, leading_rule_message, parent_privilege_helper, sha_to_hex};
+use crate::agent::{
+    AgentEvent, leading_rule_id, leading_rule_message, parent_privilege_helper, sha_to_hex,
+};
 use crate::config::{CorroborationConfig, DetectionConfig};
 use crate::detection_stats::DetectionStats;
 use crate::eventlog_writer::EventLogHandle;
@@ -265,6 +266,7 @@ async fn process_ptrace(ctx: &PipelineContext, t: &bowery_events::Ptrace) {
     let alert = crate::alert_builder::AlertBuilder::new(
         ctx.originator_fp,
         &ctx.backend_label,
+        bowery_analysis::injection::RULE_ID,
         episode_id.clone(),
         0.9,
         format!(
@@ -324,6 +326,7 @@ fn process_module_load(ctx: &PipelineContext, m: &bowery_events::ModuleLoad) {
     let alert = crate::alert_builder::AlertBuilder::new(
         ctx.originator_fp,
         &ctx.backend_label,
+        bowery_analysis::kmod::RULE_ID,
         episode_id.clone(),
         0.95,
         format!(
@@ -413,31 +416,23 @@ async fn process_network_connect(ctx: &PipelineContext, conn: &bowery_events::Ne
                 "possible C2 beaconing"
             );
             let episode_id = format!("net-c2.beacon-{}", current_unix_ms());
-            let alert = Alert {
-                originator_fp: ctx.originator_fp.as_bytes().to_vec(),
-                episode_id: episode_id.clone(),
-                exe_sha256_hex: String::new(),
-                exe_path: format!("{}:{}", beacon.dst_addr, beacon.dst_port),
-                suspicion: 0.85,
-                rationale: why,
-                suggested_actions: Vec::new(),
-                ts_unix_ms: current_unix_ms(),
-                backend: ctx.backend_label.clone(),
-                confirmation: None,
-                context: vec![
-                    bowery_proto::Attribute::new("dst_addr", beacon.dst_addr.clone()),
-                    bowery_proto::Attribute::new("dst_port", beacon.dst_port.to_string()),
-                    bowery_proto::Attribute::new(
-                        "interval_s",
-                        beacon.interval.as_secs().to_string(),
-                    ),
-                    bowery_proto::Attribute::new(
-                        "jitter_pct",
-                        format!("{:.0}", beacon.jitter * 100.0),
-                    ),
-                    bowery_proto::Attribute::new("connections", beacon.samples.to_string()),
-                ],
-            };
+            let alert = crate::alert_builder::AlertBuilder::new(
+                ctx.originator_fp,
+                &ctx.backend_label,
+                bowery_analysis::beacon::RULE_ID,
+                episode_id.clone(),
+                0.85,
+                why,
+            )
+            .subject(format!("{}:{}", beacon.dst_addr, beacon.dst_port))
+            .context(vec![
+                bowery_proto::Attribute::new("dst_addr", beacon.dst_addr.clone()),
+                bowery_proto::Attribute::new("dst_port", beacon.dst_port.to_string()),
+                bowery_proto::Attribute::new("interval_s", beacon.interval.as_secs().to_string()),
+                bowery_proto::Attribute::new("jitter_pct", format!("{:.0}", beacon.jitter * 100.0)),
+                bowery_proto::Attribute::new("connections", beacon.samples.to_string()),
+            ])
+            .build();
             ctx.inbox.append(alert);
             let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
                 episode_id,
@@ -594,24 +589,22 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
     {
         ctx.detections.record(rule_id);
         let episode_id = format!("file-{rule_id}-{}", current_unix_ms());
-        let alert = Alert {
-            originator_fp: ctx.originator_fp.as_bytes().to_vec(),
-            episode_id: episode_id.clone(),
-            exe_sha256_hex: String::new(),
-            exe_path: path.clone(),
-            suspicion: 0.95,
-            rationale: why,
-            suggested_actions: Vec::new(),
-            ts_unix_ms: current_unix_ms(),
-            backend: ctx.backend_label.clone(),
-            confirmation: None,
-            context: file_open_context(
-                open,
-                bowery_events::enrich::pid_exe_path(open.pid)
-                    .map(|p| p.display().to_string())
-                    .as_deref(),
-            ),
-        };
+        let alert = crate::alert_builder::AlertBuilder::new(
+            ctx.originator_fp,
+            &ctx.backend_label,
+            rule_id,
+            episode_id.clone(),
+            0.95,
+            why,
+        )
+        .subject(path.clone())
+        .context(file_open_context(
+            open,
+            bowery_events::enrich::pid_exe_path(open.pid)
+                .map(|p| p.display().to_string())
+                .as_deref(),
+        ))
+        .build();
         ctx.inbox.append(alert);
         let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
             episode_id,
@@ -712,21 +705,13 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
         ""
     };
     let episode_id = format!("file-{}-{}", hit.rule_id, current_unix_ms());
-    let alert = Alert {
-        originator_fp: ctx.originator_fp.as_bytes().to_vec(),
-        episode_id: episode_id.clone(),
-        // The **reader's** hash, not the file's. It was empty until now,
-        // which meant VirusTotal screening could not see file alerts at
-        // all — every one of them bypassed the filter that exists to
-        // hold back the uninteresting. Hashing the file itself would be
-        // the wrong choice: nobody has a reputation record for a copy of
-        // `/etc/shadow`, and the binary that read it is the lead worth
-        // pursuing.
-        exe_sha256_hex: exe_sha.as_ref().map(sha_to_hex).unwrap_or_default(),
-        // The path is the finding; the process that wrote it is the lead.
-        exe_path: path.clone(),
-        suspicion: hit.severity,
-        rationale: format!(
+    let alert = crate::alert_builder::AlertBuilder::new(
+        ctx.originator_fp,
+        &ctx.backend_label,
+        hit.rule_id,
+        episode_id.clone(),
+        hit.severity,
+        format!(
             "{} {} {path}{path_note} by {} (pid {}) — {}{folded_note}",
             hit.category.label(),
             if open.sensitive_read {
@@ -745,14 +730,11 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
             open.pid,
             hit.why
         ),
-        suggested_actions: Vec::new(),
-        ts_unix_ms: current_unix_ms(),
-        backend: ctx.backend_label.clone(),
-        confirmation: None,
-        // The process that touched the file is the lead to follow, so
-        // its ancestry and open handles travel with the alert.
-        context: file_open_context(open, exe_str.as_deref()),
-    };
+    )
+    .subject(path.clone())
+    .exe_sha256_hex(exe_sha.as_ref().map(sha_to_hex).unwrap_or_default())
+    .context(file_open_context(open, exe_str.as_deref()))
+    .build();
     ctx.detections.record(hit.rule_id);
     warn!(
         rule = hit.rule_id,
@@ -938,27 +920,22 @@ async fn process_file_change(ctx: &PipelineContext, change: bowery_events::FileC
 
     let op = crate::monitor::file_op_label(change.op);
     let suspicion = crate::monitor::severity_weight(rule.severity);
-    let alert = Alert {
-        originator_fp: ctx.originator_fp.as_bytes().to_vec(),
-        episode_id: format!("file-{}-{}", rule.id, current_unix_ms()),
-        exe_sha256_hex: sha_hex,
-        exe_path: change.path.display().to_string(),
+    let alert = crate::alert_builder::AlertBuilder::for_operator_rule(
+        ctx.originator_fp,
+        &ctx.backend_label,
+        rule.id.clone(),
+        format!("file-{}-{}", rule.id, current_unix_ms()),
         suspicion,
-        rationale: format!(
+        format!(
             "file rule `{}`: {} was {}",
             rule.id,
             change.path.display(),
             op
         ),
-        suggested_actions: Vec::new(),
-        ts_unix_ms: current_unix_ms(),
-        backend: ctx.backend_label.clone(),
-        // File watches don't whisper: a deleted file has no hash to ask
-        // the neighbourhood about, and the operator asked to be told
-        // regardless of what peers think.
-        confirmation: None,
-        context: Vec::new(),
-    };
+    )
+    .subject(change.path.display().to_string())
+    .exe_sha256_hex(sha_hex)
+    .build();
     let episode_id = alert.episode_id.clone();
     info!(rule = %rule.id, path = %change.path.display(), op, "file monitor alert");
     ctx.inbox.append(alert);
@@ -1037,6 +1014,16 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
             return;
         }
     };
+
+    // Count what the pre-filter rules found. `fold_finding` counts the
+    // directly-scored detections below, but these three come back from
+    // `analyze` and nothing had ever counted them — so `bowery_detections`
+    // had no row for the three oldest rules in the agent, and asking
+    // whether the writable-path rule had ever fired returned nothing
+    // rather than a number.
+    for hit in &verdict.rule_hits {
+        ctx.detections.record(hit.rule_id);
+    }
 
     // Provenance: was this on the disk before anyone logged in?
     //
@@ -1297,25 +1284,23 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
     if verdict.suspicion >= ctx.alert_threshold {
         let rationale = leading_rule_message(&verdict)
             .unwrap_or_else(|| "pre-filter score above threshold".to_string());
-        let alert = Alert {
-            originator_fp: ctx.originator_fp.as_bytes().to_vec(),
-            episode_id: verdict.episode_id.clone(),
-            exe_sha256_hex: sha_to_hex(&sha),
-            exe_path: exec
-                .exe_path
+        let alert = crate::alert_builder::AlertBuilder::new(
+            ctx.originator_fp,
+            &ctx.backend_label,
+            leading_rule_id(&verdict),
+            verdict.episode_id.clone(),
+            verdict.suspicion,
+            rationale,
+        )
+        .subject(
+            exec.exe_path
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            suspicion: verdict.suspicion,
-            rationale,
-            suggested_actions: Vec::new(), // populated by the LLM enrichment, later phase
-            ts_unix_ms: current_unix_ms(),
-            backend: ctx.backend_label.clone(),
-            // First alert for this episode. A whisper round may follow and
-            // append a confirmed, superseding alert.
-            confirmation: None,
-            context: context.clone(),
-        };
+        )
+        .exe_sha256_hex(sha_to_hex(&sha))
+        .context(context.clone())
+        .build();
         let episode_id = alert.episode_id.clone();
         let suspicion = alert.suspicion;
         ctx.inbox.append(alert);

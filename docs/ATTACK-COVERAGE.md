@@ -17,7 +17,7 @@ that something fires?*
 - **partial** — one narrow variant fires; the common forms do not.
 - **none** — nothing fires. Listed anyway; the gaps are the useful half.
 
-Today: **12 good, 15 partial, 2 uncovered** across 29 techniques.
+Today: **12 good, 16 partial, 2 uncovered** across 30 techniques.
 
 ## Initial Access
 
@@ -38,7 +38,7 @@ largest gap on the map and it is not closeable with host telemetry alone.
 
 **Coverage: partial**
 
-Rules: `lineage.service_spawned_shell`, `lineage.service_spawned_interpreter`
+Rules: `lineage.service_spawned_shell`, `lineage.service_spawned_interpreter`, `exec_suspicious_args`
 
 Gap: only fires when a network service or scheduler is the parent. A shell started
 from an interactive login looks exactly like a person working.
@@ -47,7 +47,7 @@ from an interactive login looks exactly like a person working.
 
 **Coverage: partial**
 
-Rules: `baseline.rarity`, `yara.match`
+Rules: `baseline.rarity`, `yara.match`, `exec_from_writable_path`
 
 Gap: rests on the binary being rare for this host or matching a YARA rule. A
 malicious file that is neither is executed silently.
@@ -210,6 +210,18 @@ What remains is that exemption itself: an attacker who runs the distribution's o
 `gdb` is not a finding, the same boundary the privilege-transition rule has with
 `sudo`. Injection that never touches another process — a malicious `LD_PRELOAD` on a
 process it starts itself — is a different technique and not covered here.
+
+### T1070.004 — Indicator Removal: File Deletion
+
+**Coverage: partial**
+
+Rules: `exec_missing_exe_path`
+
+Gap: sees only the case where a *running* process has no resolvable
+`/proc/<pid>/exe`, which is what a binary deleted after launch looks like. A file
+deleted without ever being executed, or deleted after the process exited, is not
+visible: the sensor reports opens with write intent and never unlinks, so deletion
+itself is not observed anywhere.
 
 ## Credential Access
 

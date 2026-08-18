@@ -34,9 +34,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// This module's rule id on the ATT&CK map — the sensor reporting that
+/// it is not watching.
+pub const RULE_ID: &str = "probe.sensor_blind";
+
 use bowery_crypto::Fingerprint;
 use bowery_events::source::ProbeHealth;
-use bowery_proto::Alert;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -235,22 +238,17 @@ pub fn spawn(
             }
 
             let episode_id = format!("sensor-{}-{}", verdict.kind(), current_unix_ms());
-            inbox.append(Alert {
-                originator_fp: originator_fp.as_bytes().to_vec(),
-                episode_id: episode_id.clone(),
-                exe_sha256_hex: String::new(),
-                exe_path: String::new(),
-                suspicion: SENSOR_SUSPICION,
-                rationale: text,
-                suggested_actions: Vec::new(),
-                ts_unix_ms: current_unix_ms(),
-                backend: backend_label.clone(),
-                // No confirmation block: this is a fact about *this*
-                // host, not a claim peers can corroborate. Asking the
-                // neighbourhood whether we are blind would be absurd.
-                confirmation: None,
-                context: Vec::new(),
-            });
+            inbox.append(
+                crate::alert_builder::AlertBuilder::new(
+                    originator_fp,
+                    &backend_label,
+                    RULE_ID,
+                    episode_id.clone(),
+                    SENSOR_SUSPICION,
+                    text,
+                )
+                .build(),
+            );
             let _ = events_tx.send(AgentEvent::AlertEmitted {
                 episode_id,
                 suspicion: SENSOR_SUSPICION,

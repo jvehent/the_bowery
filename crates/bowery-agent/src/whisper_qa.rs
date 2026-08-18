@@ -27,7 +27,7 @@ use bowery_baseline::Baseline;
 use bowery_crypto::Fingerprint;
 use bowery_llm::{AnalysisContext, Submitter};
 use bowery_mesh::{Mesh, PeerInfo};
-use bowery_proto::{Alert, AlertConfirmation, BloomAdvert};
+use bowery_proto::{AlertConfirmation, BloomAdvert};
 use bowery_whisper::fingerprint::{BloomFilter, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::KnownNeighbors;
 use bowery_whisper::pool::PeerConnections;
@@ -40,7 +40,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::agent::{AgentEvent, LlmShedReason};
+use crate::agent::{AgentEvent, LlmShedReason, leading_rule_id};
 use crate::config::WhisperQaConfig;
 use crate::inbox::AlertInbox;
 
@@ -710,23 +710,23 @@ fn finish_round(
     }
 
     if verdict.confirmed && pre_suspicion >= confirm.alert_threshold {
-        let alert = Alert {
-            originator_fp: confirm.originator_fp.as_bytes().to_vec(),
-            episode_id: context.episode_id.clone(),
-            exe_sha256_hex: ctx.exe_sha256_hex.clone().unwrap_or_default(),
-            exe_path: ctx
-                .exe_path
+        let alert = crate::alert_builder::AlertBuilder::new(
+            confirm.originator_fp,
+            &confirm.backend_label,
+            leading_rule_id(&ctx.pre_verdict),
+            context.episode_id.clone(),
+            pre_suspicion,
+            confirmation_rationale(&verdict),
+        )
+        .subject(
+            ctx.exe_path
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            suspicion: pre_suspicion,
-            rationale: confirmation_rationale(&verdict),
-            suggested_actions: Vec::new(),
-            ts_unix_ms: crate::inbox::current_unix_ms(),
-            backend: confirm.backend_label.clone(),
-            confirmation: Some(verdict),
-            context: Vec::new(),
-        };
+        )
+        .exe_sha256_hex(ctx.exe_sha256_hex.clone().unwrap_or_default())
+        .confirmation(verdict)
+        .build();
         info!(
             episode = %context.episode_id,
             unseen = verdict.peers_unseen,

@@ -252,10 +252,44 @@ before signing, fetch the derived pattern's match count against the local
 inbox and print what it would have silenced, requiring confirmation.
 Signing a silence blind is the mistake to design against.
 
-**Slice 8 — integration + docs.** Two-agent test: operator silences on
+**Slice 8 — the console.** Reviewing and silencing an alert wants to be
+interactive: the CLI form is `bowery alerts silence <episode-id>`, which
+means copying an id out of one pane into a shell. In the Alerts pane,
+`s` on the selected alert opens a silence form pre-filled from that
+alert — the derived match spec, the weight, the reason, the expiry — with
+the blast-radius count rendered live as the spec is widened or narrowed.
+Confirming signs and pushes. A `Silences` pane lists what is currently
+suppressed, with match counts, and `u` revokes.
+
+The console is the better place for the safety property: the CLI can
+print a blast radius, but a pane can show *which* alerts a spec would
+have swallowed, and let an operator page through them before signing.
+
+**Slice 9 — integration + docs.** Two-agent test: operator silences on
 alpha, beta honours it after propagation, and a *different* binary at the
 same path still alerts. README/USAGE/ROADMAP, and an ATT&CK note that
 silencing is a coverage-reducing control with its own visibility.
+
+### Slice 1, as built
+
+Landed. Two things worth recording because neither was in the plan.
+
+`AlertBuilder` gained a second constructor. Operator-configured
+`[monitor]` rules carry ids chosen in config — a filename, a `comm=`
+fragment — so they cannot be checked against a compiled-in registry the
+way a built-in can. Rather than weaken the check for everyone,
+`for_operator_rule` is a separate door and `new` debug-asserts the id is
+registered.
+
+That assertion found something on its first run. `exec_from_writable_path`,
+`exec_missing_exe_path` and `exec_suspicious_args` — the three oldest
+detections in the agent, shipped in Phase 3 — were in no registry. They
+fired, they raised alerts, and they appeared on no coverage map, moved no
+counter, and had no row in `bowery_detections`: asking whether the
+writable-path rule had ever fired returned *nothing at all*, which reads
+as "no such rule" rather than "never". They are now registered, mapped
+(T1204.002, T1059.004, and a new T1070.004 row for the deleted-binary
+case), counted, and provoked by `bowery-prove`.
 
 Slices 1–2 are independently useful and land first. Slice 5 is the point
 of no return for review: after it, an unsigned bug can suppress alerts.

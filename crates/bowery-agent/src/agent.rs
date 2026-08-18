@@ -34,7 +34,7 @@ use bowery_whisper::{CompositeResolver, FingerprintResolver, Sealer, StaticResol
 use ed25519_dalek::VerifyingKey;
 
 use crate::bloom_publisher;
-use crate::inbox::{AlertInbox, current_unix_ms};
+use crate::inbox::AlertInbox;
 use crate::monitor::MonitorRules;
 use crate::seen::RecentlySeen;
 use crate::whisper_qa::{WhisperContext, WhisperQaTrigger, spawn_whisper_qa_task};
@@ -1958,6 +1958,29 @@ pub(crate) async fn parent_privilege_helper(
 /// the rationale should lead with the one that drove the number an
 /// operator is looking at. Ties keep evaluation order, so the output is
 /// stable.
+/// The rule that best explains the verdict, as an id.
+///
+/// Pairs with [`leading_rule_message`] and picks the same hit, so an
+/// alert's `rule_id` and its rationale never name different detections.
+///
+/// An exec that cleared the threshold without any rule firing did so on
+/// baseline rarity, which is a score rather than a rule table entry;
+/// `baseline.rarity` is its registered id, so the alert is attributable
+/// rather than blank.
+pub(crate) fn leading_rule_id(verdict: &Verdict) -> String {
+    verdict
+        .rule_hits
+        .iter()
+        .reduce(|best, h| {
+            if h.severity.weight() > best.severity.weight() {
+                h
+            } else {
+                best
+            }
+        })
+        .map_or_else(|| "baseline.rarity".to_string(), |h| h.rule_id.to_string())
+}
+
 pub(crate) fn leading_rule_message(verdict: &Verdict) -> Option<String> {
     verdict
         .rule_hits
@@ -2155,34 +2178,29 @@ fn handle_llm_outcome(
             // threshold (e.g. "this is a known build artifact, not
             // malicious"). In that case we don't append.
             if verdict.suspicion >= alert_threshold {
-                let alert = Alert {
-                    originator_fp: originator_fp.as_bytes().to_vec(),
-                    episode_id: episode_id.clone(),
-                    exe_sha256_hex: ctx.exe_sha256_hex.clone().unwrap_or_default(),
-                    exe_path: ctx
-                        .exe_path
+                let alert = crate::alert_builder::AlertBuilder::new(
+                    originator_fp,
+                    backend_label,
+                    leading_rule_id(&ctx.pre_verdict),
+                    episode_id.clone(),
+                    verdict.suspicion,
+                    verdict.rationale.clone(),
+                )
+                .subject(
+                    ctx.exe_path
                         .as_ref()
                         .map(|p| p.display().to_string())
                         .unwrap_or_default(),
-                    suspicion: verdict.suspicion,
-                    rationale: verdict.rationale.clone(),
-                    suggested_actions: verdict.suggested_actions.clone(),
-                    ts_unix_ms: current_unix_ms(),
-                    backend: backend_label.to_string(),
-                    // The LLM refinement path doesn't carry the whisper
-                    // round's outcome; confirmation arrives on its own
-                    // superseding alert from `finish_round`.
-                    confirmation: None,
-                    // Recovered from the analysis context, which carries what
-                    // was sampled at exec time. Re-reading /proc now would
-                    // report "already exited" for a process that was alive
-                    // when the sample that matters was taken.
-                    context: ctx
-                        .extra
+                )
+                .exe_sha256_hex(ctx.exe_sha256_hex.clone().unwrap_or_default())
+                .context(
+                    ctx.extra
                         .iter()
                         .map(|(k, v)| bowery_proto::Attribute::new(k, v))
                         .collect(),
-                };
+                )
+                .suggested_actions(verdict.suggested_actions.clone())
+                .build();
                 inbox.append(alert);
                 let _ = events_tx.send(AgentEvent::AlertEmitted {
                     episode_id: episode_id.clone(),
@@ -2454,24 +2472,23 @@ fn witness_peer_logs(
             "a peer's event log went backwards"
         );
         let episode_id = format!("peer-{RULE_ID}-{}", crate::inbox::current_unix_ms());
-        inbox.append(Alert {
-            originator_fp: originator_fp.as_bytes().to_vec(),
-            episode_id: episode_id.clone(),
-            exe_sha256_hex: String::new(),
-            exe_path: String::new(),
-            suspicion: 0.9,
-            rationale: why,
-            suggested_actions: Vec::new(),
-            ts_unix_ms: crate::inbox::current_unix_ms(),
-            backend: backend_label.to_string(),
-            confirmation: None,
-            context: vec![
+        inbox.append(
+            crate::alert_builder::AlertBuilder::new(
+                originator_fp,
+                backend_label,
+                RULE_ID,
+                episode_id.clone(),
+                0.9,
+                why,
+            )
+            .context(vec![
                 bowery_proto::Attribute::new("peer", fp_hex),
                 bowery_proto::Attribute::new("witnessed_seq", finding.witnessed_seq.to_string()),
                 bowery_proto::Attribute::new("reported_seq", finding.reported_seq.to_string()),
                 bowery_proto::Attribute::new("events_lost", finding.lost.to_string()),
-            ],
-        });
+            ])
+            .build(),
+        );
         let _ = events_tx.send(AgentEvent::AlertEmitted {
             episode_id,
             suspicion: 0.9,
@@ -2619,6 +2636,7 @@ mod alert_chunk_tests {
     fn sample_alert(i: u64, rationale_len: usize) -> Alert {
         Alert {
             originator_fp: vec![0u8; 32],
+            rule_id: "cred.read_netrc".into(),
             episode_id: format!("ep-{i}"),
             exe_sha256_hex: "ab".repeat(32),
             exe_path: "/usr/bin/example".to_string(),

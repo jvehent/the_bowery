@@ -381,6 +381,10 @@ impl BoweryTable for BoweryAlertsTable {
             "CREATE TABLE IF NOT EXISTS bowery_alerts (
                 originator_fp_hex TEXT,
                 episode_id        TEXT,
+                -- Which detection fired. Previously recoverable only by
+                -- parsing it back out of `episode_id`, which encodes it
+                -- for file findings and not for exec ones.
+                rule_id           TEXT,
                 exe_sha256_hex    TEXT,
                 exe_path          TEXT,
                 suspicion         REAL,
@@ -397,11 +401,11 @@ impl BoweryTable for BoweryAlertsTable {
         let (alerts, _) = self.inbox.read_since(0, usize::MAX);
         let alerts = collapse_superseded(alerts);
         let mut stmt = conn.prepare(
-            "INSERT INTO bowery_alerts (originator_fp_hex, episode_id, exe_sha256_hex,
-                                         exe_path, suspicion, rationale, ts_unix_ms, backend,
-                                         confirmed, peers_asked, peers_unseen, peers_seen,
-                                         peers_refused)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO bowery_alerts (originator_fp_hex, episode_id, rule_id,
+                                         exe_sha256_hex, exe_path, suspicion, rationale,
+                                         ts_unix_ms, backend, confirmed, peers_asked,
+                                         peers_unseen, peers_seen, peers_refused)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?;
         for a in alerts {
             let originator_hex = hex_lower(&a.originator_fp);
@@ -409,6 +413,7 @@ impl BoweryTable for BoweryAlertsTable {
             stmt.execute(params![
                 originator_hex,
                 a.episode_id,
+                a.rule_id,
                 a.exe_sha256_hex,
                 a.exe_path,
                 f64::from(a.suspicion),
@@ -1310,6 +1315,7 @@ mod alerts_view_tests {
         let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
         inbox.append(Alert {
             originator_fp: vec![0xab; 32],
+            rule_id: "cred.read_netrc".into(),
             episode_id: "corr-net.inbound_connect-deadbeef".into(),
             exe_sha256_hex: String::new(),
             exe_path: String::new(),
@@ -1364,6 +1370,7 @@ mod alerts_view_tests {
         let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
         inbox.append(Alert {
             originator_fp: vec![0xcd; 32],
+            rule_id: "cred.read_netrc".into(),
             episode_id: "ep-plain".into(),
             exe_sha256_hex: String::new(),
             exe_path: "/bin/true".into(),
@@ -1400,6 +1407,7 @@ mod alerts_view_tests {
         let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
         let base = |rationale: &str, suspicion: f32| Alert {
             originator_fp: vec![0x11; 32],
+            rule_id: "cred.read_netrc".into(),
             episode_id: "ep-27234-refined".into(),
             exe_sha256_hex: "ea7ac6f7".into(),
             exe_path: "/usr/bin/bowery".into(),
@@ -1444,6 +1452,7 @@ mod alerts_view_tests {
         for path in ["/tmp/a", "/tmp/b", "/tmp/c"] {
             inbox.append(Alert {
                 originator_fp: vec![0x22; 32],
+                rule_id: "cred.read_netrc".into(),
                 episode_id: String::new(),
                 exe_sha256_hex: String::new(),
                 exe_path: path.into(),

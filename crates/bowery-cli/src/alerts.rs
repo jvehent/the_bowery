@@ -316,6 +316,7 @@ mod json_tests {
     fn base() -> Alert {
         Alert {
             originator_fp: vec![0xab; 32],
+            rule_id: "cred.read_netrc".into(),
             episode_id: "ep-1".into(),
             exe_sha256_hex: "cd".repeat(32),
             exe_path: "/tmp/pay\"load".into(), // embedded quote — escaping must hold

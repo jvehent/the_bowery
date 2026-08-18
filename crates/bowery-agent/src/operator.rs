@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime};
 use bowery_baseline::Baseline;
 use bowery_crypto::Fingerprint;
 use bowery_mesh::PeerInfo;
-use bowery_proto::{Alert, Body, WhisperPayload};
+use bowery_proto::{Body, WhisperPayload};
 use bowery_whisper::FingerprintResolver;
 use bowery_whisper::fingerprint::{TIER1_LEN, Tier1Fingerprint};
 use bowery_whisper::known_neighbors::KnownNeighbors;
@@ -966,21 +966,16 @@ async fn handle_yara_push(
     // --- Alert on every match, so a hit reaches the operator's inbox
     // even if they aren't watching this command's response. ---
     for m in &matches {
-        let alert = Alert {
-            originator_fp: yara.originator_fp.as_bytes().to_vec(),
-            episode_id: format!("yara-{}-{}", push.rule_id, current_unix_ms()),
-            exe_sha256_hex: String::new(),
-            exe_path: m.path.clone(),
-            suspicion: 1.0,
-            rationale: format!("yara rule `{}` matched {}", m.rule_name, m.path),
-            suggested_actions: Vec::new(),
-            ts_unix_ms: current_unix_ms(),
-            backend: "yara".to_string(),
-            // A YARA hit is a direct content match; there is nothing for
-            // the neighbourhood to corroborate.
-            confirmation: None,
-            context: Vec::new(),
-        };
+        let alert = crate::alert_builder::AlertBuilder::new(
+            yara.originator_fp,
+            "yara",
+            "yara.match",
+            format!("yara-{}-{}", push.rule_id, current_unix_ms()),
+            1.0,
+            format!("yara rule `{}` matched {}", m.rule_name, m.path),
+        )
+        .subject(m.path.clone())
+        .build();
         let episode_id = alert.episode_id.clone();
         warn!(rule = %m.rule_name, path = %m.path, "YARA MATCH");
         yara.inbox.append(alert);

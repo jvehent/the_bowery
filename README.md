@@ -112,7 +112,7 @@ RUSTFLAGS='-C target-cpu=native' \
 
 <!-- BEGIN GENERATED: capabilities — edit crates/bowery-analysis/src/attack.rs, then BOWERY_UPDATE_DOCS=1 cargo test -p bowery-analysis -->
 
-The agent watches 6 kernel probes and scores what they produce against 59 detections, mapped onto 29 ATT&CK techniques — **12 covered well, 15 partially, 2 not at all**.
+The agent watches 6 kernel probes and scores what they produce against 62 detections, mapped onto 30 ATT&CK techniques — **12 covered well, 16 partially, 2 not at all**.
 
 **Initial Access** — 1 uncovered  
 Valid Accounts
@@ -126,8 +126,8 @@ systemd Service · Cron · SSH Authorized Keys · Unix Shell Configuration Modif
 **Privilege Escalation** — 2 good, 1 partial  
 Sudo and Sudo Caching · Setuid and Setgid · Exploitation for Privilege Escalation
 
-**Defense Evasion** — 2 good, 3 partial  
-Clear Linux or Mac System Logs · Dynamic Linker Hijacking · Disable or Modify Tools · Disable or Modify System Firewall · Process Injection
+**Defense Evasion** — 2 good, 4 partial  
+Clear Linux or Mac System Logs · Dynamic Linker Hijacking · Disable or Modify Tools · Disable or Modify System Firewall · Process Injection · File Deletion
 
 **Credential Access** — 3 good  
 /etc/passwd and /etc/shadow · Credentials In Files · Private Keys
