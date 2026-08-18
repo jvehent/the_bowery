@@ -365,6 +365,19 @@ pub fn kernel_ships_read(path: &str) -> bool {
 const RULES: &[Rule] = &[
     // -- persistence: execution that outlives a session -----------------
     Rule {
+        id: "evade.watchdog_disarm",
+        m: Match::Prefix("/dev/watchdog"),
+        category: FileWatchCategory::DefenseEvasion,
+        why: "the hardware watchdog was opened for write. A watchdog reboots a board that \
+              stops petting it, so malware that wants to survive opens it and either keeps \
+              it fed or disables it outright — this is what the Mirai family does on the \
+              devices it takes, and it is how a compromised board stops recovering on its \
+              own. Almost nothing else opens it: systemd and a watchdog daemon, and they \
+              do it once at boot",
+        severity: 0.8,
+        readers: NOBODY,
+    },
+    Rule {
         id: "persist.ld_preload",
         m: Match::Exact("/etc/ld.so.preload"),
         category: FileWatchCategory::Persistence,
@@ -997,6 +1010,30 @@ mod tests {
         assert_eq!(
             classify("/etc/sudoers.d/90-cloud-init-users").map(|h| h.rule_id),
             Some("privesc.sudoers"),
+        );
+    }
+
+    /// The watchdog is how an IoT implant stops a board recovering on
+    /// its own, and it is a write-intent open, so the sensor already
+    /// delivers it — this rule is the whole change.
+    #[test]
+    fn opening_the_watchdog_for_write_is_a_finding() {
+        for path in ["/dev/watchdog", "/dev/watchdog0", "/dev/watchdog1"] {
+            assert_eq!(
+                classify(path).map(|h| h.rule_id),
+                Some("evade.watchdog_disarm"),
+                "{path}"
+            );
+        }
+        // Not every /dev node, and not a lookalike elsewhere.
+        assert_eq!(classify("/dev/null"), None);
+        assert_eq!(classify("/home/j/watchdog"), None);
+        // The prover names a path that does not exist, because opening
+        // the real device arms the timer and closing it can reboot the
+        // board. It has to still classify.
+        assert_eq!(
+            classify("/dev/watchdog-bowery-prove-nosuch").map(|h| h.rule_id),
+            Some("evade.watchdog_disarm")
         );
     }
 

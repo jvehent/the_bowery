@@ -25,6 +25,14 @@
 //! writes nothing, while producing exactly the event a real write
 //! produces. On a path that does not exist the call simply fails.
 //!
+//! One provocation names a path that deliberately does not exist rather
+//! than the real device: opening `/dev/watchdog` *arms* the hardware
+//! timer, and closing it without first writing the magic `V` reboots the
+//! board on any kernel built with `CONFIG_WATCHDOG_NOWAYOUT`. A prover
+//! that reboots the fleet it is checking would be worse than no prover,
+//! and the rule matches on a prefix so a non-existent sibling still
+//! classifies.
+//!
 //! Every provocation here is of that kind, or is a plainly harmless act
 //! (running `whoami`, writing files inside a temporary directory). None
 //! of them modifies a system file, and the ones that could not be made
@@ -197,6 +205,19 @@ fn provocations() -> Vec<Provocation> {
         Provocation {
             rule: bowery_analysis::injection::RULE_ID,
             act: Act::PtraceOwnChild,
+        },
+        // -- the hardware watchdog ------------------------------------
+        //
+        // A path that deliberately does not exist. Opening the *real*
+        // `/dev/watchdog` arms the timer, and closing it without first
+        // writing the magic `V` reboots the board on any kernel built
+        // with `CONFIG_WATCHDOG_NOWAYOUT` — which is exactly the fleet
+        // this rule is for. The open fails with ENOENT, after the
+        // tracepoint has already emitted, and the rule matches on a
+        // prefix so the name still classifies.
+        Provocation {
+            rule: "evade.watchdog_disarm",
+            act: Act::WriteIntent("/dev/watchdog-bowery-prove-nosuch"),
         },
         // -- defence tampering ----------------------------------------
         //

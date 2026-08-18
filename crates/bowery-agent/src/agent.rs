@@ -1963,28 +1963,89 @@ async fn send_heartbeat(
 ///
 /// `false` whenever the parent cannot be resolved, which fails towards
 /// alerting: an exemption has to be demonstrated.
+/// Why the sanctioned-path exemption did or did not apply.
+///
+/// Reported rather than reduced to a bool because the answer decides
+/// whether an alert an operator is reading is a finding or an artefact,
+/// and the two are indistinguishable without it. On a live fleet this
+/// rule fired 206 times in a fortnight, every sampled instance an
+/// ordinary `sudo`-driven deploy — and nothing recorded *which* check had
+/// declined, so the cause could only be guessed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HelperCheck {
+    /// The parent is a packaged, unmodified setuid helper. Exempt.
+    Helper,
+    /// `/proc/<ppid>/exe` could not be read — almost always because the
+    /// parent exited between the exec and this lookup. A short-lived
+    /// `sudo` running a fast command is exactly that shape.
+    ParentGone,
+    /// The parent is not setuid, so it did not grant the privilege.
+    NotSetuid { exe: String },
+    /// Setuid, but no package vouches for it unmodified.
+    NotPackaged {
+        exe: String,
+        provenance: bowery_analysis::provenance::Provenance,
+    },
+}
+
+impl HelperCheck {
+    pub(crate) fn is_helper(&self) -> bool {
+        matches!(self, Self::Helper)
+    }
+
+    /// One clause for the alert rationale, so a reader can tell an
+    /// escalation from a lost race.
+    pub(crate) fn why(&self) -> String {
+        match self {
+            Self::Helper => String::new(),
+            Self::ParentGone => " The parent had already exited when this was checked, so \
+                 whether it was a sanctioned helper could not be established — a short-lived \
+                 `sudo` running a fast command looks exactly like this."
+                .to_string(),
+            Self::NotSetuid { exe } => {
+                format!(" The parent ({exe}) is not setuid, so it did not grant this privilege.")
+            }
+            Self::NotPackaged { exe, provenance } => format!(
+                " The parent ({exe}) is setuid but its provenance is {provenance:?}, so no \
+                 package vouches for it."
+            ),
+        }
+    }
+}
+
 pub(crate) async fn parent_privilege_helper(
     ppid: u32,
     packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
-) -> bool {
+) -> HelperCheck {
     let Some(exe) = bowery_events::enrich::pid_exe_path(ppid) else {
-        return false;
+        return HelperCheck::ParentGone;
     };
     let Some((setuid, _)) = bowery_analysis::provenance::setid_bits(&exe) else {
-        return false;
+        return HelperCheck::ParentGone;
     };
     if !setuid {
-        return false;
+        return HelperCheck::NotSetuid {
+            exe: exe.display().to_string(),
+        };
     }
     let packages = packages.clone();
     tokio::task::spawn_blocking(move || {
+        let shown = exe.display().to_string();
         let Ok(sha) = enrich::sha256_file(&exe) else {
-            return false;
+            return HelperCheck::ParentGone;
         };
-        bowery_analysis::provenance::is_privilege_helper(true, packages.classify(&exe, &sha))
+        let provenance = packages.classify(&exe, &sha);
+        if bowery_analysis::provenance::is_privilege_helper(true, provenance) {
+            HelperCheck::Helper
+        } else {
+            HelperCheck::NotPackaged {
+                exe: shown,
+                provenance,
+            }
+        }
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or(HelperCheck::ParentGone)
 }
 
 /// The finding that best explains the verdict's score.
@@ -2697,6 +2758,76 @@ pub(crate) async fn send_silence_report(
     };
     let outbound = sealer.seal_for(operator, &WhisperPayload::operator_result(response));
     conn.send_envelope(&outbound).await
+}
+
+#[cfg(test)]
+mod helper_check_tests {
+    use super::HelperCheck;
+    use bowery_analysis::provenance::Provenance;
+
+    #[test]
+    fn only_a_packaged_setuid_parent_is_a_helper() {
+        assert!(HelperCheck::Helper.is_helper());
+        assert!(!HelperCheck::ParentGone.is_helper());
+        assert!(
+            !HelperCheck::NotSetuid {
+                exe: "/usr/bin/bash".into()
+            }
+            .is_helper()
+        );
+        assert!(
+            !HelperCheck::NotPackaged {
+                exe: "/tmp/sudo".into(),
+                provenance: Provenance::Unpackaged,
+            }
+            .is_helper()
+        );
+    }
+
+    /// The exemption declining is the whole reason an alert exists, so
+    /// each reason has to reach the operator in words. A rule that fired
+    /// 206 times in a fortnight said only "privilege transition to root"
+    /// for every one of them.
+    #[test]
+    fn every_declining_reason_explains_itself() {
+        assert!(
+            HelperCheck::Helper.why().is_empty(),
+            "an exemption says nothing"
+        );
+        for reason in [
+            HelperCheck::ParentGone,
+            HelperCheck::NotSetuid {
+                exe: "/usr/bin/bash".into(),
+            },
+            HelperCheck::NotPackaged {
+                exe: "/tmp/sudo".into(),
+                provenance: Provenance::Unpackaged,
+            },
+        ] {
+            let why = reason.why();
+            assert!(why.len() > 30, "{reason:?} explains too little: {why:?}");
+        }
+        // And the two that name a binary must name it.
+        assert!(
+            HelperCheck::NotSetuid {
+                exe: "/usr/bin/bash".into()
+            }
+            .why()
+            .contains("/usr/bin/bash")
+        );
+    }
+
+    /// A parent that exited is the case most easily mistaken for an
+    /// escalation, so it must say so plainly.
+    #[test]
+    fn a_vanished_parent_says_the_check_could_not_be_made() {
+        let why = HelperCheck::ParentGone.why();
+        assert!(why.contains("already exited"), "{why}");
+        assert!(
+            why.contains("sudo"),
+            "the likely benign cause is named: {why}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -238,6 +238,7 @@ pub const TECHNIQUES: &[Technique] = &[
             "defense_evasion.security_service_stopped",
             "defense_evasion.mac_disabled",
             "evade.event_log_rollback",
+            "evade.watchdog_disarm",
         ],
         gap: "the agent reports its own blindness, its neighbours report it going \
               silent altogether, and stopping another host defence — the audit daemon, \

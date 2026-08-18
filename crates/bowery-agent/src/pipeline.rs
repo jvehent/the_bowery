@@ -1110,26 +1110,31 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
         // ordinary host it is `sudo` and little else — so the expensive
         // half runs only where an alert was otherwise about to be
         // raised.
-        let parent_is_helper = if parent_uid.is_some_and(|u| u != 0) {
+        let helper = if parent_uid.is_some_and(|u| u != 0) {
             parent_privilege_helper(exec.ppid, &ctx.packages).await
         } else {
-            false
+            crate::agent::HelperCheck::Helper
         };
         if let Some(hit) = bowery_analysis::uid_transition(
             exec.uid,
             parent_uid,
             exec_provenance,
             setid.is_some_and(|(setuid, _)| setuid),
-            parent_is_helper,
+            helper.is_helper(),
         ) {
+            // Say which check declined the exemption. Without it, an
+            // ordinary `sudo`-driven deploy and a real escalation
+            // produce identical lines.
             warn!(
                 rule = hit.rule_id,
                 pid = exec.pid,
                 ppid = exec.ppid,
                 parent_uid,
+                declined = ?helper,
                 "privilege transition to root"
             );
-            fold_finding(ctx, &mut verdict, hit.rule_id, hit.severity, hit.why);
+            let why = format!("{}{}", hit.why, helper.why());
+            fold_finding(ctx, &mut verdict, hit.rule_id, hit.severity, why);
         }
     }
 

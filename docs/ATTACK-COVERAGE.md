@@ -173,7 +173,7 @@ not, because the exec sensor does not capture the environment.
 
 **Coverage: partial**
 
-Rules: `probe.sensor_blind`, `peer.silent`, `defense_evasion.security_service_stopped`, `defense_evasion.mac_disabled`, `evade.event_log_rollback`
+Rules: `probe.sensor_blind`, `peer.silent`, `defense_evasion.security_service_stopped`, `defense_evasion.mac_disabled`, `evade.event_log_rollback`, `evade.watchdog_disarm`
 
 Gap: the agent reports its own blindness, its neighbours report it going silent
 altogether, and stopping another host defence — the audit daemon, AppArmor, SELinux
