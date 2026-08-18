@@ -23,6 +23,7 @@ pub mod probe_watchdog;
 pub mod proc_table;
 pub mod response_bpf;
 pub mod seen;
+pub mod silence_store;
 pub mod sql_tables;
 pub mod whisper_qa;
 pub mod yara_store;
