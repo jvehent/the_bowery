@@ -571,6 +571,7 @@ async fn a_silence_propagates_and_only_covers_what_it_names() {
 
     let a_pub = BASE64.encode(id_a.verifying_key().to_bytes());
     let b_pub = BASE64.encode(id_b.verifying_key().to_bytes());
+    let (op_key2, a_pub2, b_pub2) = (op_key.clone(), a_pub.clone(), b_pub.clone());
     bowery_cli::exec::silence_push(
         &bowery_cli::silence::Target {
             operator_key: op_key.clone(),
@@ -649,6 +650,42 @@ async fn a_silence_propagates_and_only_covers_what_it_names() {
         "a re-issue replaces rather than stacks"
     );
     assert_eq!(b.silences().len(), 1);
+
+    // Revoking must reach the peer too. Re-issuing at full weight is a
+    // *change* even though the id is already known, and propagation keys
+    // on change — getting that wrong strands the revocation on the agent
+    // it was pushed to while every other host keeps suppressing, which is
+    // this feature failing in its dangerous direction.
+    let mut revoked = silence.clone();
+    revoked.weight_permille = bowery_proto::AlertSilence::FULL_WEIGHT;
+    revoked.issued_unix_ms = now + 1;
+    revoked.sig = Vec::new();
+    let revoked_input = revoked.to_signing_input().expect("signable");
+    revoked.sig = operator.sign(&revoked_input).to_bytes().to_vec();
+
+    bowery_cli::exec::silence_push(
+        &bowery_cli::silence::Target {
+            operator_key: op_key2,
+            addr: whisper_a,
+            fp_hex: id_a.fingerprint().to_hex(),
+            pubkey_b64: a_pub2,
+            peer_pubkeys_b64: vec![b_pub2],
+            timeout: Duration::from_secs(10),
+        },
+        &revoked,
+        true,
+        4,
+    )
+    .await
+    .expect("push revocation");
+
+    for (name, agent) in [("a", &a), ("b", &b)] {
+        let held = agent.silences().get(&silence.id).expect("still held");
+        assert!(
+            (held.weight - 1.0).abs() < f32::EPSILON,
+            "{name} must honour the revocation — not only the agent it was pushed to"
+        );
+    }
 
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");

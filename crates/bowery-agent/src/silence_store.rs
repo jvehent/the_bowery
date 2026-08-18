@@ -248,21 +248,28 @@ impl SilenceStore {
     }
 
     /// Verify, store and persist a silence.
+    ///
+    /// Returns whether this **changed** anything, which is not the same
+    /// as whether the id was new. Revoking a silence re-issues the same
+    /// id at full weight, so an id that already exists can still carry a
+    /// change — and propagation keys on this, so treating a re-issue as
+    /// "already known" strands the revocation on the first agent while
+    /// every other host keeps suppressing.
     pub fn accept(
         &self,
         silence: &AlertSilence,
         trusted_operators: &dyn Fn(&Fingerprint) -> Option<VerifyingKey>,
         now_unix_ms: u64,
-    ) -> Result<(), SilenceRejected> {
+    ) -> Result<bool, SilenceRejected> {
         self.verify(silence, trusted_operators, now_unix_ms)?;
         if self.len() >= self.max_entries && self.get(&silence.id).is_none() {
             return Err(SilenceRejected::Full);
         }
-        let fresh = self.insert_verified(silence);
-        if fresh {
+        let changed = self.insert_verified(silence);
+        if changed {
             self.persist();
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// Insert a silence already known good. Returns whether it changed
@@ -735,6 +742,39 @@ mod tests {
 
         let later = SilenceStore::load(&path, CLUSTER, &trusting(&op), 500_000);
         assert!(later.is_empty(), "expiry survives a restart");
+    }
+
+    /// Revoking re-issues the same id at full weight. If that reports
+    /// "already known", propagation stops at the first agent and every
+    /// other host keeps suppressing — the fleet split in half, in the
+    /// direction that stays quiet.
+    #[test]
+    fn a_reissue_that_changes_the_weight_reports_as_a_change() {
+        let op = Identity::generate();
+        let store = SilenceStore::in_memory(CLUSTER);
+        assert!(
+            store
+                .accept(&sign(&op, a_silence()), &trusting(&op), 5_000)
+                .expect("accepted"),
+            "a brand-new silence is a change"
+        );
+        // The same record again is not.
+        assert!(
+            !store
+                .accept(&sign(&op, a_silence()), &trusting(&op), 5_000)
+                .expect("accepted"),
+            "a redelivered copy must not re-propagate, or a flood never converges"
+        );
+        // A revocation is.
+        let mut revoked = a_silence();
+        revoked.weight_permille = AlertSilence::FULL_WEIGHT;
+        revoked.issued_unix_ms = 9_000;
+        assert!(
+            store
+                .accept(&sign(&op, revoked), &trusting(&op), 5_000)
+                .expect("accepted"),
+            "revoking must propagate, or it reaches only the agent it was pushed to"
+        );
     }
 
     #[test]

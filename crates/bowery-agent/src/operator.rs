@@ -1568,30 +1568,38 @@ async fn handle_silence_push(
     match <bowery_proto::AlertSilence as prost::Message>::decode(push.silence.as_slice()) {
         Err(e) => report.error = format!("undecodable silence: {e}"),
         Ok(silence) => {
-            let already = ctx.store.get(&silence.id).is_some();
             let ops = ctx.operators.clone();
             let resolve = move |fp: &Fingerprint| ops.resolve(fp);
-            if let Err(e) = ctx
+            match ctx
                 .store
                 .accept(&silence, &resolve, crate::inbox::current_unix_ms())
             {
-                warn!(sender = %operator, error = %e, "rejecting unverifiable alert silence");
-                report.error = e.to_string();
-            } else {
-                report.accepted = true;
-                report.already_known = already;
-                is_new = !already;
-                if is_new {
-                    // At WARN, not INFO. Something just stopped being
-                    // reported, and that is worth a line in the journal
-                    // of every host it reaches.
-                    warn!(
-                        silence = %silence.id,
-                        rule = %silence.rule_id,
-                        weight_permille = silence.weight_permille,
-                        reason = %silence.reason,
-                        "alert silence applied"
-                    );
+                Err(e) => {
+                    warn!(sender = %operator, error = %e, "rejecting unverifiable alert silence");
+                    report.error = e.to_string();
+                }
+                // `changed`, not "the id was absent". Revoking re-issues
+                // the same id at full weight, so an already-known id can
+                // still carry a change — and propagation keys on this.
+                // Getting it wrong strands a revocation on the first
+                // agent while every other host keeps suppressing, which
+                // is this feature failing in its dangerous direction.
+                Ok(changed) => {
+                    report.accepted = true;
+                    report.already_known = !changed;
+                    is_new = changed;
+                    if is_new {
+                        // At WARN, not INFO. Something just stopped being
+                        // reported, and that is worth a line in the journal
+                        // of every host it reaches.
+                        warn!(
+                            silence = %silence.id,
+                            rule = %silence.rule_id,
+                            weight_permille = silence.weight_permille,
+                            reason = %silence.reason,
+                            "alert silence applied"
+                        );
+                    }
                 }
             }
         }
