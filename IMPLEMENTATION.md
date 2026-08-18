@@ -2001,14 +2001,14 @@ fixes:
   `/proc` snapshot and `kill(2)`) wants `pidfd_open` +
   `pidfd_send_signal`. Needs `pid_starttime` plumbing through
   `Action::KillProcess`.
-- **P9-2: H6 LSM keys on inode.** Today's BPF-LSM hook keys on the
-  caller's `comm`, defeated by `prctl(PR_SET_NAME)`. Tier-1+2
-  defense (critical-comm deny-list, forbidden-pid list, LRU map,
-  integrity-checked loader) blocks the catastrophic outcomes; the
-  full fix needs aya CO-RE access to `bprm->file->f_inode->i_ino`
-  and a wire-format change for the action.
+- ~~**P9-2: H6 LSM keys on inode.**~~ **Done** — see §28c. The hook
+  reads `bprm->file->f_inode` through offsets resolved from the
+  running kernel's BTF rather than through aya CO-RE, which does not
+  emit relocations; `block_exec_by_inode` is the resulting action, and
+  it refuses rather than degrading when the kernel cannot arm it. The
+  `comm`-keyed `block_exec` in §16.3 remains for hosts without BTF.
 
-Tracking: `memory/project_phase9_remaining.md`.
+Tracking: `memory/project_phase9_remaining.md` — P9-1 only.
 
 ## 21. Phase 6b operator commands
 

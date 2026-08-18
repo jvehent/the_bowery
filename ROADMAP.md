@@ -14,13 +14,22 @@ project like this fools itself.
 
 ## 1. What the agent can see today
 
-**Kernel sensors** (eBPF, three tracepoints):
+**Kernel sensors** (eBPF, seven tracepoints across six probe slots):
 
 | probe | yields |
 | --- | --- |
-| `sched_process_exec` | pid, uid, comm |
+| `sched_process_exec` | pid, uid, comm, parent comm |
 | `sched_process_exit` | pid, comm |
 | `sock/inet_sock_set_state` | TCP connect, both directions, addrs + ports |
+| `syscalls/sys_enter_openat` | path, flags, write-intent and sensitive-read opens |
+| `module/module_load` | module name, loader, kernel taint bits |
+| `syscalls/sys_enter_ptrace` | tracer, target, request |
+| `syscalls/sys_enter_process_vm_writev` | shares the ptrace record via a sentinel request |
+
+Each attachment verifies the tracepoint's argument layout against the
+running kernel before arming, and the loaded object's SHA-256 is exposed
+in `bowery_probe_status` — the agent and the object install separately,
+and a host has run a new agent against a stale one.
 
 **Userspace enrichment** (`/proc`, after the fact): `exe_path`,
 sha256 of the exe, `cmdline`, `cgroup`.
@@ -34,8 +43,12 @@ from it.
 
 ### What it can conclude
 
-- **Three built-in rules**: exec from a world-writable path, exec with no
-  resolvable `exe_path`, exec with suspicious args.
+- **Three built-in exec rules**: exec from a world-writable path, exec
+  with no resolvable `exe_path`, exec with suspicious args. Alongside
+  them, roughly fifty file-watch, provenance, lineage, escalation and
+  discovery detections — every one of them on the ATT&CK map, which the
+  build enforces, and every one counted in `bowery_detections` so a rule
+  that has never fired is a visible zero rather than a silence.
 - **Local rarity**: a binary not in the baseline scores 1.0.
 - **Fleet rarity**: `bowery_net_destinations` answers "which hosts ever
   contacted this endpoint" — queryable, but nothing alerts on it.
@@ -46,8 +59,13 @@ from it.
 
 ### What it can do about any of it
 
-Two actions: `kill_process`, and `block_exec` — the latter keyed by the
-kernel's 16-byte `comm`.
+Three actions: `kill_process`, `block_exec` (by `comm`), and
+`block_exec_by_inode` — the last keyed on the filesystem inode, so
+renaming or copying the binary does not escape it and a 16-byte `comm`
+cannot be spoofed past it.
+
+All of it is gated off. `[response] mode` defaults to `Off` and the
+policy defaults to deny-all; the whole fleet runs `engine = "noop"`.
 
 ---
 

@@ -215,6 +215,21 @@ const SUDO_TOOLS: &[&str] = &[
     "/usr/bin/sudoreplay",
 ];
 
+/// Git reaching for the credentials it was configured to use.
+///
+/// `git-remote-http` links libcurl, which reads `~/.netrc` as a
+/// documented part of authenticating a fetch or push — so an ordinary
+/// `git pull` over https raised a credential-access alert on this fleet.
+/// One path covers https, ftp and ftps too: those are symlinks to
+/// `git-remote-http`, and `/proc/<pid>/exe` reports the resolved target.
+///
+/// Deliberately just the one binary. `git-credential-store` reading
+/// `.git-credentials` is arguably as legitimate, but that file holds
+/// long-lived tokens with write access to source and has raised nothing
+/// here — an exemption granted without a false positive to justify it is
+/// detection given away for free.
+const GIT_TOOLS: &[&str] = &["/usr/lib/git-core/git-remote-http"];
+
 /// GnuPG reading its own keyring.
 const GPG_TOOLS: &[&str] = &[
     "/usr/bin/gpg",
@@ -515,7 +530,7 @@ const READ_RULES: &[Rule] = &[
         why: "a .netrc was read; it stores passwords in plain text for every host \
               listed in it",
         severity: 0.85,
-        readers: NOBODY,
+        readers: GIT_TOOLS,
     },
     Rule {
         id: "cred.read_pgpass",
@@ -788,6 +803,12 @@ mod tests {
     /// Secrets that belong to a person, not to a daemon, keep no
     /// exemption: there is no packaged binary whose job is reading your
     /// AWS keys.
+    ///
+    /// `.netrc` is the exception and is absent from this list on purpose
+    /// — libcurl reads it to authenticate an ordinary `git` fetch, which
+    /// this fleet raised as a credential-access alert. The rule for
+    /// telling the two apart is whether a packaged binary reads the file
+    /// as its documented job, not whether the file belongs to a person.
     #[test]
     fn user_secrets_have_no_sanctioned_reader() {
         for path in [
@@ -802,6 +823,39 @@ mod tests {
                 "{path} must have no sanctioned reader"
             );
         }
+    }
+
+    /// `git` fetching over https reads `~/.netrc` through libcurl. That
+    /// raised a credential-access alert on a live fleet for what is an
+    /// ordinary `git pull`.
+    #[test]
+    fn git_reading_a_netrc_to_authenticate_a_fetch_is_sanctioned() {
+        let hit = classify_read("/home/julien/.netrc").expect("rule matches");
+        assert!(reader_is_sanctioned(
+            &hit,
+            Some("/usr/lib/git-core/git-remote-http"),
+            crate::provenance::Provenance::PackagedIntact,
+        ));
+        // The exemption is the packaged binary, not the name. A copy
+        // that a package does not vouch for reads as what it is.
+        assert!(!reader_is_sanctioned(
+            &hit,
+            Some("/usr/lib/git-core/git-remote-http"),
+            crate::provenance::Provenance::PackagedModified,
+        ));
+        assert!(!reader_is_sanctioned(
+            &hit,
+            Some("/tmp/git-remote-http"),
+            crate::provenance::Provenance::PackagedIntact,
+        ));
+        // And it does not extend to the neighbouring credential file,
+        // which holds tokens rather than a fetch password.
+        let git_creds = classify_read("/home/julien/.git-credentials").expect("rule matches");
+        assert!(!reader_is_sanctioned(
+            &git_creds,
+            Some("/usr/lib/git-core/git-remote-http"),
+            crate::provenance::Provenance::PackagedIntact,
+        ));
     }
 
     /// Every sanctioned path must be absolute, or it can never match a
