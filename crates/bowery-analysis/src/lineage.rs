@@ -66,6 +66,32 @@ const NETWORK_TOOLS: &[&str] = &[
 /// Interpreters — the second half of most download-and-run chains.
 const INTERPRETERS: &[&str] = &["python3", "python", "perl", "ruby", "php", "lua"];
 
+/// Is `base` this interpreter, possibly carrying a version?
+///
+/// `/proc/<pid>/exe` resolves symlinks, so a host that spawns
+/// `/usr/bin/python3` reports `/usr/bin/python3.12` — and an exact match
+/// against `python3` never fired. That is every modern Debian and
+/// Ubuntu, for the most common interpreter there is, which made this
+/// rule unable to fire in the case it was written for. Found by
+/// provoking it on a live host; no amount of reading the rule showed it.
+///
+/// Only trailing digits and dots count as a version, so `phpize` and
+/// `perlbrew` are still not `php` and `perl`.
+fn is_versioned(base: &str, name: &str) -> bool {
+    if base == name {
+        return true;
+    }
+    match base.strip_prefix(name) {
+        Some(rest) => !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.'),
+        None => false,
+    }
+}
+
+/// Is `base` one of the interpreters, version suffix and all?
+fn is_interpreter(base: &str) -> bool {
+    INTERPRETERS.iter().any(|i| is_versioned(base, i))
+}
+
 /// Schedulers and init paths, whose children run unattended.
 const SCHEDULERS: &[&str] = &["cron", "crond", "atd", "anacron", "systemd"];
 
@@ -137,7 +163,7 @@ pub fn classify(parent_comm: &str, child: &str) -> Option<LineageHit> {
 
     // A service starting an interpreter. Legitimate for some stacks
     // (CGI, a PHP worker pool), so scored below the shell case.
-    if in_set(parent, NETWORK_SERVICES) && in_set(child, INTERPRETERS) {
+    if in_set(parent, NETWORK_SERVICES) && is_interpreter(child) {
         return Some(LineageHit {
             rule_id: "lineage.service_spawned_interpreter",
             why: "a network-facing service started a script interpreter; legitimate for \
@@ -169,6 +195,40 @@ mod tests {
     ///
     /// Every parent set crossed with every child set is a few hundred
     /// pairs — cheap enough to be exhaustive, which means a rule added
+    /// A versioned interpreter is still that interpreter.
+    ///
+    /// `/proc/<pid>/exe` resolves symlinks, so `/usr/bin/python3` is
+    /// reported as `python3.12` on every current Debian and Ubuntu. The
+    /// exact-match version of this rule therefore could not fire for the
+    /// commonest interpreter on the commonest distributions, and only
+    /// provoking it on a live host revealed that.
+    #[test]
+    fn a_service_spawning_a_versioned_interpreter_is_still_a_finding() {
+        for child in [
+            "/usr/bin/python3.12",
+            "/usr/bin/python3",
+            "/usr/bin/php8.2",
+            "/usr/bin/ruby3.1",
+            "/usr/bin/lua5.4",
+            "/usr/bin/perl",
+        ] {
+            assert_eq!(
+                classify("nginx", child).map(|h| h.rule_id),
+                Some("lineage.service_spawned_interpreter"),
+                "{child}"
+            );
+        }
+    }
+
+    /// Only trailing digits and dots are a version. A name that merely
+    /// starts with an interpreter's is a different program.
+    #[test]
+    fn a_name_that_merely_starts_with_an_interpreter_is_not_one() {
+        for child in ["/usr/bin/phpize", "/usr/bin/perlbrew", "/usr/bin/rubygems"] {
+            assert_eq!(classify("nginx", child), None, "{child}");
+        }
+    }
+
     /// to `classify` and not to `rule_ids` fails here rather than
     /// quietly disappearing from the ATT&CK map.
     #[test]
