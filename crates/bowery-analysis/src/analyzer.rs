@@ -66,14 +66,8 @@ impl Analyzer {
 }
 
 fn rule_hits_weight(hits: &[RuleHit]) -> f32 {
-    use crate::rule::RuleSeverity;
     hits.iter()
-        .map(|h| match h.severity {
-            RuleSeverity::Info => 0.1,
-            RuleSeverity::Low => 0.3,
-            RuleSeverity::Medium => 0.6,
-            RuleSeverity::High => 0.9,
-        })
+        .map(|h| h.severity.weight())
         .fold(0.0_f32, f32::max)
 }
 

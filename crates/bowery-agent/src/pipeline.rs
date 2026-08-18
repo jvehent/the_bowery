@@ -37,7 +37,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::agent::{AgentEvent, first_rule_message, parent_privilege_helper, sha_to_hex};
+use crate::agent::{AgentEvent, leading_rule_message, parent_privilege_helper, sha_to_hex};
 use crate::config::{CorroborationConfig, DetectionConfig};
 use crate::detection_stats::DetectionStats;
 use crate::eventlog_writer::EventLogHandle;
@@ -920,6 +920,36 @@ async fn process_file_change(ctx: &PipelineContext, change: bowery_events::FileC
     });
 }
 
+/// Fold a directly-scored finding into an exec's verdict.
+///
+/// Four detections used to do this by hand, and all four did it the same
+/// way: raise `suspicion`, append to `score.reason`, bump the counter.
+/// None of them recorded a [`RuleHit`] — and that is the only channel the
+/// alert rationale and the model prompt read. The result was an alert
+/// whose entire explanation was the fallback string "pre-filter score
+/// above threshold", and a prompt that told the model "Rule hits: none"
+/// while asking it to judge an episode scored 0.9.
+///
+/// One function, so a fifth detection cannot rediscover the same gap.
+fn fold_finding(
+    ctx: &PipelineContext,
+    verdict: &mut bowery_analysis::Verdict,
+    rule_id: &'static str,
+    severity: f32,
+    why: String,
+) {
+    if severity > verdict.suspicion {
+        verdict.suspicion = severity;
+    }
+    verdict.score.reason = format!("{} | {why}", verdict.score.reason);
+    verdict.rule_hits.push(bowery_analysis::RuleHit {
+        rule_id,
+        severity: bowery_analysis::RuleSeverity::from_weight(severity),
+        reason: why,
+    });
+    ctx.detections.record(rule_id);
+}
+
 #[allow(clippy::too_many_lines)] // one linear scoring path
 async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
     let Some(exe_path) = exec.exe_path.clone() else {
@@ -1005,17 +1035,13 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
         && let Some((rule_id, severity, why)) =
             bowery_analysis::provenance::setid_finding(setuid, setgid, exec_provenance)
     {
-        if severity > verdict.suspicion {
-            verdict.suspicion = severity;
-        }
-        verdict.score.reason = format!("{} | {why}", verdict.score.reason);
-        ctx.detections.record(rule_id);
         warn!(
             rule = rule_id,
             exe = %exe.display(),
             pid = exec.pid,
             "set-id binary finding"
         );
+        fold_finding(ctx, &mut verdict, rule_id, severity, why.to_string());
     }
 
     // Privilege transition: did this process reach root, and if so, how?
@@ -1049,11 +1075,6 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
             setid.is_some_and(|(setuid, _)| setuid),
             parent_is_helper,
         ) {
-            if hit.severity > verdict.suspicion {
-                verdict.suspicion = hit.severity;
-            }
-            verdict.score.reason = format!("{} | {}", verdict.score.reason, hit.why);
-            ctx.detections.record(hit.rule_id);
             warn!(
                 rule = hit.rule_id,
                 pid = exec.pid,
@@ -1061,6 +1082,7 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
                 parent_uid,
                 "privilege transition to root"
             );
+            fold_finding(ctx, &mut verdict, hit.rule_id, hit.severity, hit.why);
         }
     }
 
@@ -1080,20 +1102,19 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
             .discovery
             .observe(exec.ppid, &name, std::time::Instant::now())
     {
-        let severity = 0.75;
-        if severity > verdict.suspicion {
-            verdict.suspicion = severity;
-        }
-        let why = bowery_analysis::escalation::discovery_rationale(&burst);
-        verdict.score.reason = format!("{} | {why}", verdict.score.reason);
-        ctx.detections
-            .record(bowery_analysis::escalation::DISCOVERY_RULE_ID);
         warn!(
             rule = bowery_analysis::escalation::DISCOVERY_RULE_ID,
             pid = exec.pid,
             ppid = exec.ppid,
             commands = %burst.commands.join(","),
             "reconnaissance burst"
+        );
+        fold_finding(
+            ctx,
+            &mut verdict,
+            bowery_analysis::escalation::DISCOVERY_RULE_ID,
+            0.75,
+            bowery_analysis::escalation::discovery_rationale(&burst),
         );
     }
 
@@ -1110,20 +1131,19 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
         && let Some(child) = exec.exe_path.as_ref().map(|p| p.display().to_string())
         && let Some(hit) = bowery_analysis::lineage::classify(&exec.parent_comm, &child)
     {
-        if hit.severity > verdict.suspicion {
-            verdict.suspicion = hit.severity;
-        }
-        verdict.score.reason = format!(
-            "{} | {} spawned {}: {}",
-            verdict.score.reason, exec.parent_comm, child, hit.why
-        );
-        ctx.detections.record(hit.rule_id);
         warn!(
             rule = hit.rule_id,
             parent = %exec.parent_comm,
             child = %child,
             pid = exec.pid,
             "lineage hit"
+        );
+        fold_finding(
+            ctx,
+            &mut verdict,
+            hit.rule_id,
+            hit.severity,
+            format!("{} spawned {}: {}", exec.parent_comm, child, hit.why),
         );
     }
     let verdict = verdict;
@@ -1208,7 +1228,7 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
     // suspicion + rule rationale here; a later phase can re-emit a
     // refined alert when the LLM's verdict comes back.
     if verdict.suspicion >= ctx.alert_threshold {
-        let rationale = first_rule_message(&verdict)
+        let rationale = leading_rule_message(&verdict)
             .unwrap_or_else(|| "pre-filter score above threshold".to_string());
         let alert = Alert {
             originator_fp: ctx.originator_fp.as_bytes().to_vec(),

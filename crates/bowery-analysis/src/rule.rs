@@ -25,6 +25,42 @@ pub enum RuleSeverity {
     High,
 }
 
+impl RuleSeverity {
+    /// The suspicion weight this severity contributes.
+    ///
+    /// The single definition of the band edges; the analyzer's
+    /// aggregation and [`Self::from_weight`] both read it, so a change
+    /// here cannot leave one of them behind.
+    #[must_use]
+    pub fn weight(self) -> f32 {
+        match self {
+            Self::Info => 0.1,
+            Self::Low => 0.3,
+            Self::Medium => 0.6,
+            Self::High => 0.9,
+        }
+    }
+
+    /// The band closest to a directly-scored finding.
+    ///
+    /// Some detections score themselves as a float rather than picking a
+    /// band — a discovery burst is 0.75, which is neither Medium nor
+    /// High. They still need to be reportable as a [`RuleHit`], because
+    /// that is the only channel the alert rationale and the model prompt
+    /// read. The float stays authoritative for `Verdict::suspicion`;
+    /// this is the label that travels with it.
+    /// A tie rounds **up** — 0.75 is equidistant from Medium and High and
+    /// reports as High. Understating a finding is the worse of the two
+    /// errors this can make.
+    #[must_use]
+    pub fn from_weight(w: f32) -> Self {
+        [Self::High, Self::Medium, Self::Low, Self::Info]
+            .into_iter()
+            .min_by(|a, b| (a.weight() - w).abs().total_cmp(&(b.weight() - w).abs()))
+            .unwrap_or(Self::Info)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuleHit {
     pub rule_id: &'static str,
@@ -36,6 +72,38 @@ pub struct RuleHit {
 pub trait Rule: Send + Sync {
     fn id(&self) -> &'static str;
     fn check(&self, episode: &Episode) -> Option<RuleHit>;
+}
+
+#[cfg(test)]
+mod severity_tests {
+    use super::*;
+
+    #[test]
+    fn a_directly_scored_finding_lands_in_the_nearest_band() {
+        assert_eq!(RuleSeverity::from_weight(0.9), RuleSeverity::High);
+        assert_eq!(RuleSeverity::from_weight(0.95), RuleSeverity::High);
+        // A discovery burst scores 0.75 — nearer High than Medium.
+        assert_eq!(RuleSeverity::from_weight(0.75), RuleSeverity::High);
+        assert_eq!(RuleSeverity::from_weight(0.6), RuleSeverity::Medium);
+        assert_eq!(RuleSeverity::from_weight(0.0), RuleSeverity::Info);
+        // Out of range rather than panicking: clamps to the ends.
+        assert_eq!(RuleSeverity::from_weight(-1.0), RuleSeverity::Info);
+        assert_eq!(RuleSeverity::from_weight(9.0), RuleSeverity::High);
+    }
+
+    /// The band edges have one definition. If `weight` changes,
+    /// `from_weight` must follow it rather than drifting.
+    #[test]
+    fn every_band_round_trips_through_its_own_weight() {
+        for s in [
+            RuleSeverity::Info,
+            RuleSeverity::Low,
+            RuleSeverity::Medium,
+            RuleSeverity::High,
+        ] {
+            assert_eq!(RuleSeverity::from_weight(s.weight()), s);
+        }
+    }
 }
 
 /// Run every rule against `episode`, collect hits.

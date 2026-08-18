@@ -240,3 +240,76 @@ async fn role_publisher_emits_periodically_and_round_trips_via_mesh_kv() {
 
     agent.shutdown().await.expect("shutdown");
 }
+
+/// A directly-scored detection must reach the operator as a *reason*,
+/// not just as a number.
+///
+/// Four detections — set-id, privilege transition, discovery burst and
+/// lineage — raised `Verdict::suspicion` and appended to the baseline
+/// narrative, but never recorded a `RuleHit`. `RuleHit` is the only
+/// channel the alert rationale and the model prompt read, so every alert
+/// those four produced carried the fallback text "pre-filter score above
+/// threshold" and the prompt told the model "Rule hits: none" while
+/// asking it to judge an episode scored 0.95. This is that shape, end to
+/// end: nginx starting a shell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directly_scored_finding_explains_itself_in_the_alert() {
+    let workdir = TempDir::new().unwrap();
+    let shell = workdir.path().join("dash");
+    std::fs::write(&shell, b"#!/bin/sh\n").unwrap();
+
+    let (source, gate) = MockEventSource::new(vec![Event::ProcessExec(ProcessExec {
+        pid: 6001,
+        ppid: 1,
+        // The signal: a network-facing service is the parent.
+        parent_comm: "nginx".into(),
+        uid: 0,
+        comm: "dash".into(),
+        exe_path: Some(shell),
+        args: vec!["dash".into()],
+        ts: SystemTime::now(),
+    })])
+    .gated();
+
+    let identity = Arc::new(Identity::generate());
+    let cfg = build_config(workdir.path(), reserve_udp_port(), Duration::from_hours(1));
+    let agent = Agent::start(cfg, identity, Box::new(source))
+        .await
+        .expect("start");
+    let mut events = agent.subscribe();
+    gate.open();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let episode = loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for the alert");
+        if let Ok(Ok(AgentEvent::AlertEmitted { episode_id, .. })) =
+            tokio::time::timeout(left, events.recv()).await
+        {
+            break episode_id;
+        }
+    };
+
+    let (alerts, _) = agent.inbox().read_since(0, 100);
+    let alert = alerts
+        .iter()
+        .find(|a| a.episode_id == episode)
+        .expect("alert in the inbox");
+
+    assert!(
+        alert.rationale.contains("lineage.service_spawned_shell"),
+        "the alert must name the rule that fired, got: {}",
+        alert.rationale
+    );
+    assert_ne!(
+        alert.rationale, "pre-filter score above threshold",
+        "a scored finding that cannot explain itself is the defect"
+    );
+    assert!(
+        alert.rationale.contains("nginx"),
+        "and it must name the parent that made it a finding, got: {}",
+        alert.rationale
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}

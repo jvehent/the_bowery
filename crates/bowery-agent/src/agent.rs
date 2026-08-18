@@ -1931,10 +1931,25 @@ pub(crate) async fn parent_privilege_helper(
     .unwrap_or(false)
 }
 
-pub(crate) fn first_rule_message(verdict: &Verdict) -> Option<String> {
+/// The finding that best explains the verdict's score.
+///
+/// The most severe hit, not the first one evaluated. An episode routinely
+/// collects several — a binary under `/tmp` that a web server also
+/// started trips both the writable-path rule and the lineage rule — and
+/// the rationale should lead with the one that drove the number an
+/// operator is looking at. Ties keep evaluation order, so the output is
+/// stable.
+pub(crate) fn leading_rule_message(verdict: &Verdict) -> Option<String> {
     verdict
         .rule_hits
-        .first()
+        .iter()
+        .reduce(|best, h| {
+            if h.severity.weight() > best.severity.weight() {
+                h
+            } else {
+                best
+            }
+        })
         .map(|h| format!("{}: {}", h.rule_id, h.reason))
 }
 
