@@ -397,6 +397,23 @@ const RULES: &[Rule] = &[
     },
     // -- defense evasion -------------------------------------------------
     Rule {
+        id: "defense_evasion.proc_mem_write",
+        // Suffix rather than prefix: `/proc/` is far too broad, and the
+        // pid in the middle cannot be expressed by the matcher. Very
+        // little else on a Linux host is named `mem` at the end of a
+        // path, and the write-intent filter narrows it further — reading
+        // /proc/<pid>/mem is a debugger's business, writing it is
+        // somebody putting code into a process.
+        m: Match::Suffix("/mem"),
+        category: FileWatchCategory::DefenseEvasion,
+        why: "a process's memory was opened for writing through /proc. This is process \
+              injection by the other door: code written here inherits the identity of \
+              the process it lands in, so every provenance and lineage check keeps \
+              vouching for that process afterwards",
+        severity: 0.92,
+        readers: NOBODY,
+    },
+    Rule {
         id: "evade.auth_log",
         m: Match::Prefix("/var/log/auth"),
         category: FileWatchCategory::DefenseEvasion,

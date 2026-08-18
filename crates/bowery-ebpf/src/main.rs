@@ -513,6 +513,16 @@ const PTRACE_ATTACH: u64 = 16;
 const PTRACE_SETREGS: u64 = 13;
 const PTRACE_SEIZE: u64 = 0x4206;
 
+/// Not a `ptrace` request. `process_vm_writev` reaches the same place by
+/// another door, and reporting it as its own event type would mean a
+/// second ring, a second parser and a second rule for one finding —
+/// "something wrote another process's memory". This sentinel rides the
+/// same record; userspace names it.
+const REQUEST_VM_WRITEV: u64 = 0xFFFF_FFFF;
+
+/// `sys_enter_process_vm_writev` args: pid is args[0].
+const VM_WRITEV_ARG_PID: usize = 16;
+
 const MODLOAD_TAINTS: usize = 8;
 const MODLOAD_NAME_DATALOC: usize = 12;
 
@@ -735,6 +745,40 @@ fn try_ptrace(ctx: &TracePointContext) -> Result<(), i64> {
         (*event).pid = (pid_tgid >> 32) as u32;
         (*event).target_pid = target as u32;
         (*event).request = request as u32;
+        (*event)._pad = 0;
+        (*event).comm = comm;
+    }
+    entry.submit(0);
+    Ok(())
+}
+
+/// Report `process_vm_writev`, which writes another process's memory
+/// without `ptrace` at all.
+///
+/// Almost nothing legitimate does this. It exists for debuggers and
+/// checkpoint/restore, both of which are exempted in userspace by the
+/// same packaged-binary test the `ptrace` path uses.
+#[tracepoint]
+pub fn vm_writev_enter(ctx: TracePointContext) -> u32 {
+    match try_vm_writev(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_vm_writev(ctx: &TracePointContext) -> Result<(), i64> {
+    let target: u64 = unsafe { ctx.read_at(VM_WRITEV_ARG_PID)? };
+    let Some(mut entry) = PTRACE_EVENTS.reserve::<PtraceEvent>(0) else {
+        count_drop(DROP_EXEC);
+        return Err(-1);
+    };
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    let event = entry.as_mut_ptr();
+    unsafe {
+        (*event).pid = (pid_tgid >> 32) as u32;
+        (*event).target_pid = target as u32;
+        (*event).request = REQUEST_VM_WRITEV as u32;
         (*event)._pad = 0;
         (*event).comm = comm;
     }

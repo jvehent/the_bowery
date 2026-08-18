@@ -270,13 +270,14 @@ messages; and a beacon slower than a few hours outruns the measurement window.
 
 **Coverage: partial**
 
-Rules: `defense_evasion.ptrace_inject`
+Rules: `defense_evasion.ptrace_inject`, `defense_evasion.proc_mem_write`
 
-Gap: watches the `ptrace` requests that write to or seize a process, exempting
-packaged debuggers. Two other doors reach the same place and neither is watched:
-`process_vm_writev`, and writing `/proc/<pid>/mem` directly. And an attacker who
-runs the distribution's own `gdb` is exempted by the very rule that makes this
-usable — the same boundary the privilege-transition exemption has with `sudo`.
+Gap: all three doors into another process's memory are watched — `ptrace`,
+`process_vm_writev`, and writing `/proc/<pid>/mem` — with packaged debuggers exempt.
+What remains is that exemption itself: an attacker who runs the distribution's own
+`gdb` is not a finding, the same boundary the privilege-transition rule has with
+`sudo`. Injection that never touches another process — a malicious `LD_PRELOAD` on a
+process it starts itself — is a different technique and not covered here.
 
 ## Initial Access
 

@@ -19,9 +19,12 @@
 //!
 //! # What it cannot see
 //!
-//! **Injection without `ptrace`.** Writing `/proc/<pid>/mem` directly,
-//! or `process_vm_writev`, reaches the same place by another door and
-//! neither is watched here.
+//! **A debugger being used as the weapon** — see below. Beyond that, the
+//! three doors into another process's memory are all watched now:
+//! `ptrace`, `process_vm_writev` (reported through the same event with a
+//! sentinel request, because it is the same finding), and writing
+//! `/proc/<pid>/mem`, which the file probe already sees as a
+//! write-intent open and `defense_evasion.proc_mem_write` scores.
 //!
 //! **A debugger being used as the weapon.** An attacker who runs the
 //! distribution's own `gdb` to attach to a process is exempted by the
@@ -73,6 +76,10 @@ pub fn request_name(request: u32) -> &'static str {
         5 => "POKEDATA (write to its data)",
         13 => "SETREGS (redirect its execution)",
         16 => "ATTACH",
+        // Not a ptrace request: the sentinel the probe uses for
+        // process_vm_writev, which reaches the same place without
+        // ptrace at all.
+        0xFFFF_FFFF => "process_vm_writev (wrote its memory directly)",
         0x4206 => "SEIZE",
         _ => "control request",
     }

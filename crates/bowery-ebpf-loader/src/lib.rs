@@ -396,6 +396,33 @@ async fn run(
         }
     };
 
+    // Shares PTRACE_EVENTS: writing another process's memory is one
+    // finding whichever syscall gets there, so it rides the same record
+    // with a sentinel request code. Attached independently, because a
+    // kernel may have one tracepoint and not the other.
+    match verify_tracepoint_layout(
+        "sys_enter_process_vm_writev",
+        &[
+            "/sys/kernel/tracing/events/syscalls/sys_enter_process_vm_writev/format",
+            "/sys/kernel/debug/tracing/events/syscalls/sys_enter_process_vm_writev/format",
+        ],
+        &VM_WRITEV_EXPECTED,
+    ) {
+        Ok(()) => {
+            let _ = attach_tp(
+                &mut ebpf,
+                "vm_writev_enter",
+                "syscalls",
+                "sys_enter_process_vm_writev",
+            )
+            .map_err(|e| warn!(error = %e, "process_vm_writev probe unavailable"));
+        }
+        Err(reason) => error!(
+            reason = %reason,
+            "refusing to attach the process_vm_writev probe: layout mismatch"
+        ),
+    }
+
     let exec_ring = take_ring(&mut ebpf, "EVENTS")?;
     let exit_ring = take_ring(&mut ebpf, "EXIT_EVENTS")?;
     let connect_ring = take_ring(&mut ebpf, "CONNECT_EVENTS")?;
@@ -571,6 +598,9 @@ const MODLOAD_EXPECTED: [(&str, usize); 2] = [("taints", 8), ("name", 12)];
 /// injection that never happened.
 const PTRACE_EXPECTED: [(&str, usize); 2] = [("request", 16), ("pid", 24)];
 
+/// `sys_enter_process_vm_writev` — the target pid is args[0].
+const VM_WRITEV_EXPECTED: [(&str, usize); 1] = [("pid", 16)];
+
 /// Check the assumed offsets against the kernel's published format.
 ///
 /// `Err` only on a *proven* mismatch, which fails closed: the probe is
@@ -604,6 +634,45 @@ fn verify_openat_layout() -> Result<(), String> {
         }
     }
     info!("sys_enter_openat layout verified against the kernel");
+    Ok(())
+}
+
+/// Check assumed offsets for any tracepoint against the kernel's own
+/// published format.
+///
+/// Factored out at the third copy. `Err` only on a *proven* mismatch,
+/// which fails closed; an unreadable format file is an inability to
+/// check rather than a mismatch, so it warns and proceeds.
+fn verify_tracepoint_layout(
+    what: &str,
+    candidates: &[&str],
+    expected: &[(&str, usize)],
+) -> Result<(), String> {
+    let Some(text) = candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+    else {
+        warn!(
+            what,
+            "could not read the tracepoint format file; assuming offsets"
+        );
+        return Ok(());
+    };
+    for (field, want) in expected {
+        let Some(actual) = parse_field_offset(&text, field) else {
+            warn!(
+                what,
+                field, "field absent from tracepoint format; cannot verify"
+            );
+            continue;
+        };
+        if actual != *want {
+            return Err(format!(
+                "{what}.{field} is at offset {actual}, but the BPF program reads {want}"
+            ));
+        }
+    }
+    info!(what, "tracepoint layout verified against the kernel");
     Ok(())
 }
 
