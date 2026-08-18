@@ -23,6 +23,7 @@ default = []
 llm-llama-cpp = ["bowery-llm/llama-cpp"]
 
 [dependencies]
+bowery-analysis = { workspace = true }
 bowery-cli = { workspace = true }
 bowery-crypto = { workspace = true }
 bowery-llm = { workspace = true }

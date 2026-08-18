@@ -10,6 +10,7 @@ pub(crate) mod help;
 pub(crate) mod map;
 pub(crate) mod peers;
 pub(crate) mod query;
+pub(crate) mod silences;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum PaneId {
@@ -18,6 +19,7 @@ pub(crate) enum PaneId {
     Map,
     Audit,
     Peers,
+    Silences,
     Doctor,
     Chat,
     Help,
@@ -35,6 +37,7 @@ impl PaneId {
             Self::Doctor => '6',
             Self::Chat => '7',
             Self::Help => '8',
+            Self::Silences => '9',
         }
     }
 
@@ -48,10 +51,11 @@ impl PaneId {
             Self::Doctor => "Doctor",
             Self::Chat => "Chat",
             Self::Help => "Help",
+            Self::Silences => "Silences",
         }
     }
 
-    pub(crate) const ALL: [PaneId; 8] = [
+    pub(crate) const ALL: [PaneId; 9] = [
         Self::Query,
         Self::Alerts,
         Self::Map,
@@ -60,6 +64,7 @@ impl PaneId {
         Self::Doctor,
         Self::Chat,
         Self::Help,
+        Self::Silences,
     ];
 
     /// Panes whose contents are a selectable list. These get row
@@ -68,7 +73,7 @@ impl PaneId {
     pub(crate) fn is_browsable(self) -> bool {
         matches!(
             self,
-            Self::Query | Self::Alerts | Self::Audit | Self::Peers | Self::Map
+            Self::Query | Self::Alerts | Self::Audit | Self::Peers | Self::Map | Self::Silences
         )
     }
 
@@ -345,7 +350,8 @@ mod tests {
                 PaneId::Alerts,
                 PaneId::Map,
                 PaneId::Audit,
-                PaneId::Peers
+                PaneId::Peers,
+                PaneId::Silences
             ],
             "if this changes, App::browser_mut and App::open_detail must \
              gain or lose the same arm"

@@ -171,7 +171,7 @@ impl AlertsPane {
         let mut state = TableState::default().with_selected(self.browser.selected_in_view());
         f.render_stateful_widget(table, list_area, &mut state);
         f.render_widget(
-            Paragraph::new("↑↓ move  ⏎ detail  r refresh").style(theme::hint()),
+            Paragraph::new("↑↓ move  ⏎ detail  s silence  r refresh").style(theme::hint()),
             hint_area,
         );
     }

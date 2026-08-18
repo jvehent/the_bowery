@@ -200,6 +200,7 @@ pub struct Agent {
     /// `None` when cross-host corroboration is disabled.
     corroboration_task: Option<JoinHandle<()>>,
     revocations: Arc<RevocationStore>,
+    silences: Arc<crate::silence_store::SilenceStore>,
     /// `None` when no file rules are configured (or inotify is unavailable).
     file_monitor_task: Option<JoinHandle<()>>,
     detection_stats: Arc<crate::detection_stats::DetectionStats>,
@@ -1138,6 +1139,7 @@ impl Agent {
             eventlog_tasks,
             corroboration_task,
             revocations,
+            silences,
             file_monitor_task,
             detection_stats,
             detection_flush_task,
@@ -1207,6 +1209,11 @@ impl Agent {
     /// The verified revocation set, for tests and diagnostics.
     pub fn revocations(&self) -> &Arc<RevocationStore> {
         &self.revocations
+    }
+
+    /// Operator judgements this agent is honouring.
+    pub fn silences(&self) -> &Arc<crate::silence_store::SilenceStore> {
+        &self.silences
     }
 
     pub fn known_neighbors(&self) -> &Arc<KnownNeighbors> {

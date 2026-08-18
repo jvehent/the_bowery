@@ -54,6 +54,12 @@ struct Args {
 
     /// Per-query default timeout. The agent enforces its own
     /// stricter cap.
+    /// Mesh cluster id, needed to sign an alert silence. Must match the
+    /// agents' `[mesh] cluster_id` — a staging silence must not be able
+    /// to quiet production.
+    #[arg(long)]
+    cluster_id: Option<String>,
+
     #[arg(long, value_parser = humantime::parse_duration, default_value = "10s")]
     timeout: Duration,
 
@@ -87,6 +93,7 @@ fn main() -> Result<()> {
     let timeout = args.timeout;
     let agent_fp = args.agent_fp;
     let agent_pubkey_b64 = args.agent_pubkey_b64;
+    let cluster_id = args.cluster_id;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -103,6 +110,7 @@ fn main() -> Result<()> {
         agent_fp,
         agent_pubkey_b64,
         default_timeout: timeout,
+        cluster_id,
         chat_backend,
     };
 

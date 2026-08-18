@@ -604,3 +604,26 @@ CI runs behave as you'd expect.
 
 Should be fixed in current main. If it ever recurs, `RUST_LOG=debug`
 on launch will surface the panic origin.
+
+## Silences — what you have chosen not to be told
+
+`[9]` lists every operator-signed silence this fleet honours, ordered by
+how many alerts each has swallowed. That ordering is the point: a large
+`matched` count is either the feature working or a pattern far wider than
+its author meant, and only a person can tell which — but only if the
+number is in front of them.
+
+From the Alerts pane, `s` on a selected alert derives the pattern that
+alert stands for — its rule, the binary's SHA-256, and the path — and
+shows what that pattern *would have covered* before asking to confirm.
+`y` signs and pushes it to the mesh; any other key cancels. Nothing is
+signed until then.
+
+Needs `--cluster-id` at startup, matching the agents' `[mesh] cluster_id`.
+Without it the pane still lists what is in force, but cannot mint
+anything: a silence issued for the wrong mesh would be refused by every
+agent, and guessing is worse than declining.
+
+The console mints a 90-day, weight-zero silence with a stock reason. A
+different lifetime, a partial weight, or a hand-written justification is
+a job for `bowery alerts silence`, which takes all three.

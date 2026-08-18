@@ -476,3 +476,180 @@ async fn a_pushed_revocation_propagates_to_peers_and_converges() {
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");
 }
+
+/// An operator silences a finding on one agent and the mesh converges.
+///
+/// The whole point of the feature end to end: the record is signed by an
+/// operator, applied by the agent it was pushed to, propagated to a peer
+/// that verifies it independently, and honoured by both — while a
+/// *different* binary at the same path still alerts, which is what stops
+/// a silence being an evasion primitive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one linear two-agent scenario
+async fn a_silence_propagates_and_only_covers_what_it_names() {
+    use bowery_analysis::silence::AlertSubject;
+    use bowery_proto::AlertSilence;
+
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let op_dir = TempDir::new().unwrap();
+    let op_key = op_dir.path().join("operator.key");
+    let operator = Identity::generate();
+    operator.save(&op_key).expect("save operator key");
+    let operator_pubkey_b64 = BASE64.encode(operator.verifying_key().to_bytes());
+
+    let id_a = Arc::new(Identity::generate());
+    let id_b = Arc::new(Identity::generate());
+    let addr_a = reserve_udp_port();
+    let addr_b = reserve_udp_port();
+
+    let mut cfg_a = build_config(
+        dir_a.path(),
+        addr_a,
+        vec![addr_b.to_string()],
+        operator_pubkey_b64.clone(),
+        EnrollmentPolicy::Tofu,
+        None,
+    );
+    let whisper_a = reserve_udp_port();
+    cfg_a.whisper.bind_addr = whisper_a;
+    let cfg_b = build_config(
+        dir_b.path(),
+        addr_b,
+        vec![addr_a.to_string()],
+        operator_pubkey_b64,
+        EnrollmentPolicy::Tofu,
+        None,
+    );
+
+    let a = Agent::start(cfg_a, id_a.clone(), Box::new(NoopEventSource))
+        .await
+        .expect("start a");
+    let b = Agent::start(cfg_b, id_b.clone(), Box::new(NoopEventSource))
+        .await
+        .expect("start b");
+    assert!(
+        wait_for_pins(&a, 1, Duration::from_secs(20)).await,
+        "a never pinned b"
+    );
+    assert!(
+        wait_for_pins(&b, 1, Duration::from_secs(20)).await,
+        "b never pinned a"
+    );
+
+    // Mint the silence the CLI would mint: this rule, this binary, this
+    // path, every host.
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let spec = bowery_analysis::silence::SilenceSpec {
+        rule_id: "cred.read_netrc".into(),
+        exe_sha256_hex: "8353a512".into(),
+        exe_path: "/home/j/.netrc".into(),
+        host_fp_hex: String::new(),
+    };
+    let mut silence = AlertSilence {
+        id: spec.id(CLUSTER),
+        cluster_id: CLUSTER.into(),
+        rule_id: spec.rule_id.clone(),
+        exe_sha256_hex: spec.exe_sha256_hex.clone(),
+        exe_path: spec.exe_path.clone(),
+        host_fp: Vec::new(),
+        weight_permille: 0,
+        reason: "git reads its own netrc".into(),
+        issued_unix_ms: now,
+        expires_unix_ms: now + 3_600_000,
+        operator_fp: operator.fingerprint().as_bytes().to_vec(),
+        sig: Vec::new(),
+    };
+    let input = silence.to_signing_input().expect("signable");
+    silence.sig = operator.sign(&input).to_bytes().to_vec();
+
+    let a_pub = BASE64.encode(id_a.verifying_key().to_bytes());
+    let b_pub = BASE64.encode(id_b.verifying_key().to_bytes());
+    bowery_cli::exec::silence_push(
+        &bowery_cli::silence::Target {
+            operator_key: op_key.clone(),
+            addr: whisper_a,
+            fp_hex: id_a.fingerprint().to_hex(),
+            pubkey_b64: a_pub.clone(),
+            peer_pubkeys_b64: vec![b_pub.clone()],
+            timeout: Duration::from_secs(10),
+        },
+        &silence,
+        true,
+        4,
+    )
+    .await
+    .expect("push silence");
+
+    // Both hold it — the dialled agent and the peer that only ever saw
+    // it relayed, and verified it for itself.
+    assert!(
+        a.silences().get(&silence.id).is_some(),
+        "the dialled agent must apply it"
+    );
+    assert!(
+        b.silences().get(&silence.id).is_some(),
+        "the peer must apply it — propagation is the point, not manual per-host delivery"
+    );
+
+    // And it covers what it names, on both.
+    let covered = AlertSubject {
+        rule_id: "cred.read_netrc",
+        exe_sha256_hex: "8353a512",
+        exe_path: "/home/j/.netrc",
+        host_fp_hex: "whatever",
+    };
+    for (name, agent) in [("a", &a), ("b", &b)] {
+        assert!(
+            matches!(
+                agent.silences().decide(&covered, 0.9, now + 1),
+                bowery_analysis::silence::SilenceDecision::Damped { .. }
+            ),
+            "{name} should honour the silence"
+        );
+        // A different binary at the same path is *not* covered. This is
+        // what stops a silence being an evasion primitive: replace the
+        // file and the exemption does not follow.
+        let trojan = AlertSubject {
+            exe_sha256_hex: "deadbeef",
+            ..covered
+        };
+        assert_eq!(
+            agent.silences().decide(&trojan, 0.9, now + 1),
+            bowery_analysis::silence::SilenceDecision::Unaffected,
+            "{name} must still alert on a different binary at the same path"
+        );
+    }
+
+    // Re-push converges rather than re-flooding.
+    bowery_cli::exec::silence_push(
+        &bowery_cli::silence::Target {
+            operator_key: op_key,
+            addr: whisper_a,
+            fp_hex: id_a.fingerprint().to_hex(),
+            pubkey_b64: a_pub,
+            peer_pubkeys_b64: vec![b_pub],
+            timeout: Duration::from_secs(10),
+        },
+        &silence,
+        true,
+        4,
+    )
+    .await
+    .expect("re-push silence");
+    assert_eq!(
+        a.silences().len(),
+        1,
+        "a re-issue replaces rather than stacks"
+    );
+    assert_eq!(b.silences().len(), 1);
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}

@@ -291,6 +291,25 @@ as "no such rule" rather than "never". They are now registered, mapped
 (T1204.002, T1059.004, and a new T1070.004 row for the deleted-binary
 case), counted, and provoked by `bowery-prove`.
 
+### Slices 8 and 9, as built
+
+The two-agent test found a real bug on its first run, which is the
+argument for having written it: `handle_silence_push` never sent the
+fan-out completion terminator. Both agents applied the silence and
+reported success, and the operator then waited out the entire deadline
+for a stream that had already finished. A push that works but never
+returns is the most confusing way for this to fail, and no unit test
+could have seen it.
+
+The console mints a fixed 90-day, weight-zero silence with a stock
+reason. Anything needing a different lifetime, a partial weight, or a
+written justification is `bowery alerts silence`, which takes all three —
+two interfaces offering the same knobs is two things to keep agreeing,
+and the console's job is the quick judgement.
+
+It refuses to mint without `--cluster-id`. A silence issued for the wrong
+mesh is refused by every agent, and guessing is worse than declining.
+
 ### Slice 5, as built
 
 Landed. The store is wired into `AlertInbox::append`, so from here an

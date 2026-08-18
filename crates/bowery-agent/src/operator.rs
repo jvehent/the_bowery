@@ -1617,6 +1617,25 @@ async fn handle_silence_push(
         )
         .await?;
     }
+
+    // Fan-out completion terminator, mirroring the revoke and SQL paths.
+    // Without it the operator waits out its whole deadline for a stream
+    // that already finished — the push having in fact succeeded, which
+    // is the most confusing way for this to fail.
+    if push.fanout {
+        send_silence_report(
+            conn,
+            sealer,
+            &operator,
+            request_id,
+            bowery_proto::SilenceReport {
+                agent_fp: Vec::new(),
+                end: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 
