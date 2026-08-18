@@ -63,6 +63,13 @@ enum Act {
     TempFiles(TempShape),
     /// Take control of a child of our own with `ptrace`.
     PtraceOwnChild,
+    /// Run a program from a child that has renamed itself, so the
+    /// lineage rules see the parent they are written about.
+    SpawnAs {
+        parent: &'static str,
+        program: &'static str,
+        args: &'static [&'static str],
+    },
     /// Known to be unprovable safely, with the reason.
     Unsupported(&'static str),
 }
@@ -189,9 +196,54 @@ fn provocations() -> Vec<Provocation> {
             rule: bowery_analysis::injection::RULE_ID,
             act: Act::PtraceOwnChild,
         },
+        // -- lineage: the parent is the signal -------------------------
+        //
+        // Provoked by renaming a *child* of this process and having it
+        // exec, so the rename dies with the provocation rather than
+        // following this binary through the rest of the run. The rule
+        // reads the parent's `comm` from /proc, which is exactly as
+        // spoofable as this makes it look — that limitation is the
+        // rule's, and stated on it.
+        Provocation {
+            rule: "lineage.service_spawned_shell",
+            act: Act::SpawnAs {
+                parent: "nginx",
+                program: "/bin/sh",
+                args: &["-c", "true"],
+            },
+        },
+        Provocation {
+            rule: "lineage.service_spawned_downloader",
+            act: Act::SpawnAs {
+                parent: "nginx",
+                program: "curl",
+                args: &["--version"],
+            },
+        },
+        Provocation {
+            rule: "lineage.service_spawned_interpreter",
+            act: Act::SpawnAs {
+                parent: "nginx",
+                program: "python3",
+                args: &["-c", "pass"],
+            },
+        },
+        Provocation {
+            rule: "lineage.scheduled_downloader",
+            act: Act::SpawnAs {
+                parent: "cron",
+                program: "curl",
+                args: &["--version"],
+            },
+        },
+        // -- persistence, second unit directory ------------------------
+        Provocation {
+            rule: "persist.systemd_unit_lib",
+            act: Act::WriteIntent("/usr/lib/systemd/system/bowery-prove.service"),
+        },
         // -- what cannot be proved safely -----------------------------
         Provocation {
-            rule: "persist.kernel_module",
+            rule: "persist.kernel_module_untrusted",
             act: Act::Unsupported(
                 "needs an out-of-tree or unsigned module loaded into the running kernel; \
                  building and inserting one is not a safe thing for this to do unasked",
@@ -203,6 +255,48 @@ fn provocations() -> Vec<Provocation> {
                 "needs repeated outbound connections to one destination on a regular \
                  interval, sustained past the novelty window — minutes of real traffic \
                  to a host chosen by the operator, not something to synthesise here",
+            ),
+        },
+        Provocation {
+            rule: "corroborate.net_inbound_connect",
+            act: Act::Unsupported(
+                "needs a second host to connect here and then deny having done so; \
+                 a local provocation cannot produce a peer's answer",
+            ),
+        },
+        Provocation {
+            rule: "corroborate.file_access",
+            act: Act::Unsupported(
+                "needs peers to answer a round about a file this host touched — \
+                 not a thing one machine can do to itself",
+            ),
+        },
+        Provocation {
+            rule: "probe.sensor_blind",
+            act: Act::Unsupported(
+                "needs the sensor to stop, which means stopping the thing that would \
+                 report it; provoke it by stopping the agent and watching a peer",
+            ),
+        },
+        Provocation {
+            rule: "peer.silent",
+            act: Act::Unsupported(
+                "needs a neighbour to stop gossiping while others remain — a fleet \
+                 action, and the one failure a host cannot stage for itself",
+            ),
+        },
+        Provocation {
+            rule: "yara.match",
+            act: Act::Unsupported(
+                "needs an operator to push a rule and a file that matches it; the \
+                 rule set is deliberately not something this invents",
+            ),
+        },
+        Provocation {
+            rule: "privesc.setid_unpackaged",
+            act: Act::Unsupported(
+                "needs a setuid binary no package owns, which requires root to create \
+                 and is the finding itself rather than a rehearsal of it",
             ),
         },
         Provocation {
@@ -244,6 +338,14 @@ fn list(all: &[Provocation]) {
                 "write 60 temp files sharing an odd extension".into()
             }
             Act::PtraceOwnChild => "PTRACE_ATTACH to a child of our own".into(),
+            Act::SpawnAs {
+                parent,
+                program,
+                args,
+            } => format!(
+                "as a process named {parent}: exec {program} {}",
+                args.join(" ")
+            ),
             Act::Unsupported(why) => format!("NOT PROVABLE — {why}"),
         };
         if !matches!(p.act, Act::Unsupported(_)) {
@@ -315,6 +417,11 @@ fn perform(act: &Act) -> io::Result<()> {
             .map(drop),
         Act::TempFiles(shape) => temp_files(shape),
         Act::PtraceOwnChild => ptrace_own_child(),
+        Act::SpawnAs {
+            parent,
+            program,
+            args,
+        } => spawn_as(parent, program, args),
         Act::Unsupported(_) => Ok(()),
     }
 }
@@ -392,4 +499,76 @@ fn ptrace_own_child() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run `program` from a child that has renamed itself to `parent`.
+///
+/// The rename happens in the child and dies with it, so it cannot follow
+/// this binary into the rest of the run and confuse a later provocation.
+#[allow(unsafe_code)] // prctl and fork have no safe wrapper here
+fn spawn_as(parent: &str, program: &str, args: &[&str]) -> io::Result<()> {
+    let mut name = [0u8; 16];
+    let bytes = parent.as_bytes();
+    let n = bytes.len().min(15);
+    name[..n].copy_from_slice(&bytes[..n]);
+
+    // Single-threaded, so forking is safe; the child execs immediately.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if child == 0 {
+        unsafe {
+            libc::prctl(libc::PR_SET_NAME, name.as_ptr());
+        }
+        let failed = Command::new(program)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err();
+        unsafe { libc::_exit(i32::from(failed)) };
+    }
+    let mut status = 0;
+    unsafe { libc::waitpid(child, &raw mut status, 0) };
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) != 0 {
+        return Err(io::Error::other(format!("{program} could not be run")));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every rule this claims to provoke must be a rule the agent can
+    /// actually fire.
+    ///
+    /// A prover that names a rule which does not exist reports a
+    /// permanent, unexplained zero — and this shipped naming
+    /// `persist.kernel_module`, whose real id is
+    /// `persist.kernel_module_untrusted`. That is the same defect as the
+    /// LLM prompt advertising five action ids the engine had never
+    /// implemented, in the one tool whose job is to find it.
+    #[test]
+    fn every_rule_named_here_exists_in_the_registry() {
+        let known = bowery_analysis::attack::all_rule_ids();
+        for p in provocations() {
+            assert!(
+                known.contains(&p.rule),
+                "{} is not a rule the agent knows — it can never move a counter",
+                p.rule
+            );
+        }
+    }
+
+    /// And no rule may be named twice, which would report one
+    /// provocation's result under two headings.
+    #[test]
+    fn no_rule_is_provoked_twice() {
+        let mut seen = std::collections::HashSet::new();
+        for p in provocations() {
+            assert!(seen.insert(p.rule), "{} appears more than once", p.rule);
+        }
+    }
 }
