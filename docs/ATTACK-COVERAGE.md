@@ -17,7 +17,7 @@ that something fires?*
 - **partial** — one narrow variant fires; the common forms do not.
 - **none** — nothing fires. Listed anyway; the gaps are the useful half.
 
-Today: **12 good, 12 partial, 1 uncovered** across 25 techniques.
+Today: **12 good, 13 partial, 3 uncovered** across 28 techniques.
 
 ## Execution
 
@@ -77,12 +77,16 @@ is not enumerated.
 
 ### T1547.006 — Boot or Logon Autostart Execution: Kernel Modules
 
-**Coverage: none**
+**Coverage: partial**
 
-No rule fires.
+Rules: `persist.kernel_module_untrusted`
 
-Gap: no module-load sensor. A kernel rootkit is invisible to this agent, and would
-in fact be able to hide the agent's own sensors.
+Gap: reports a module the kernel itself declines to vouch for — out-of-tree or
+unsigned — at the moment it loads, which is the only moment anything here can be
+trusted about it. A module signed with a key the host accepts, or any module at all
+where signature enforcement is off, produces no taint and no finding. Nothing
+already resident when the agent started is visible, and a module that hides itself
+stays hidden — which is why this fires at load rather than by polling.
 
 ### T1546 — Event Triggered Execution (udev rules)
 
@@ -259,6 +263,46 @@ what makes it readable. A jittered beacon, which is what any serious implant use
 is indistinguishable from ordinary traffic by this measure; so is one multiplexed
 onto an existing TLS session, since the sensor sees connection setup and not
 messages; and a beacon slower than a few hours outruns the measurement window.
+
+## Defense Evasion
+
+### T1055 — Process Injection
+
+**Coverage: none**
+
+No rule fires.
+
+Gap: nothing watches `ptrace`, `process_vm_writev` or writes to `/proc/<pid>/mem`,
+so code injected into a process this agent already trusts is invisible. The injected
+code inherits that process's identity, which defeats every provenance and lineage
+check here — a packaged, unmodified binary is still packaged and unmodified after
+something else is running inside it.
+
+## Initial Access
+
+### T1078 — Valid Accounts
+
+**Coverage: none**
+
+No rule fires.
+
+Gap: an attacker using credentials that work looks exactly like the person those
+credentials belong to. Nothing here models who *should* be logging in, from where,
+or when, so a stolen key or password produces no signal at all. This is the single
+largest gap on the map and it is not closeable with host telemetry alone.
+
+## Command and Control
+
+### T1572 — Protocol Tunneling
+
+**Coverage: none**
+
+No rule fires.
+
+Gap: connections are recorded with addresses and ports and nothing inspects what
+travels over them. SSH port-forwarding, DNS tunnelling and traffic wrapped in TLS on
+a normal-looking port are all indistinguishable from the legitimate use of the same
+protocols.
 
 ## Impact
 

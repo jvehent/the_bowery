@@ -129,10 +129,15 @@ pub const TECHNIQUES: &[Technique] = &[
         id: "T1547.006",
         name: "Boot or Logon Autostart Execution: Kernel Modules",
         tactic: "Persistence",
-        coverage: Coverage::None,
-        rules: &[],
-        gap: "no module-load sensor. A kernel rootkit is invisible to this agent, and \
-              would in fact be able to hide the agent's own sensors",
+        coverage: Coverage::Partial,
+        rules: &["persist.kernel_module_untrusted"],
+        gap: "reports a module the kernel itself declines to vouch for — out-of-tree or \
+              unsigned — at the moment it loads, which is the only moment anything here \
+              can be trusted about it. A module signed with a key the host accepts, or \
+              any module at all where signature enforcement is off, produces no taint \
+              and no finding. Nothing already resident when the agent started is visible, \
+              and a module that hides itself stays hidden — which is why this fires at \
+              load rather than by polling",
     },
     Technique {
         // ATT&CK has no udev sub-technique; this is the parent, which is
@@ -338,6 +343,44 @@ pub const TECHNIQUES: &[Technique] = &[
               sensor sees connection setup and not messages; and a beacon slower than a \
               few hours outruns the measurement window",
     },
+    // -- Defense Evasion (uncovered) ------------------------------------
+    Technique {
+        id: "T1055",
+        name: "Process Injection",
+        tactic: "Defense Evasion",
+        coverage: Coverage::None,
+        rules: &[],
+        gap: "nothing watches `ptrace`, `process_vm_writev` or writes to `/proc/<pid>/mem`, \
+              so code injected into a process this agent already trusts is invisible. The \
+              injected code inherits that process's identity, which defeats every \
+              provenance and lineage check here — a packaged, unmodified binary is still \
+              packaged and unmodified after something else is running inside it",
+    },
+    // -- Initial Access / Lateral Movement (uncovered) -------------------
+    Technique {
+        id: "T1078",
+        name: "Valid Accounts",
+        tactic: "Initial Access",
+        coverage: Coverage::None,
+        rules: &[],
+        gap: "an attacker using credentials that work looks exactly like the person those \
+              credentials belong to. Nothing here models who *should* be logging in, from \
+              where, or when, so a stolen key or password produces no signal at all. This \
+              is the single largest gap on the map and it is not closeable with host \
+              telemetry alone",
+    },
+    // -- Command and Control (uncovered) ---------------------------------
+    Technique {
+        id: "T1572",
+        name: "Protocol Tunneling",
+        tactic: "Command and Control",
+        coverage: Coverage::None,
+        rules: &[],
+        gap: "connections are recorded with addresses and ports and nothing inspects what \
+              travels over them. SSH port-forwarding, DNS tunnelling and traffic wrapped \
+              in TLS on a normal-looking port are all indistinguishable from the \
+              legitimate use of the same protocols",
+    },
     // -- Impact ---------------------------------------------------------
     Technique {
         id: "T1486",
@@ -479,6 +522,7 @@ pub fn all_rule_ids() -> Vec<&'static str> {
     out.extend(crate::escalation::rule_ids());
     out.extend(crate::mass_write::rule_ids());
     out.extend(crate::beacon::rule_ids());
+    out.extend(crate::kmod::rule_ids());
     out.extend(NON_TABLE_RULES);
     out.sort_unstable();
     out.dedup();

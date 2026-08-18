@@ -62,7 +62,7 @@ now.
 | --- | --- | --- |
 | Initial access | nothing | nothing — no visibility into the vector |
 | Execution | partial | partial + provenance and lineage damp the noise |
-| **Persistence** | **nothing** | rules for units, cron, `authorized_keys`, `ld.so.preload`, PAM, udev, shell rc |
+| **Persistence** | **nothing** | rules for units, cron, `authorized_keys`, `ld.so.preload`, PAM, udev, shell rc, **untrusted kernel modules** |
 | **Privilege escalation** | almost nothing | `sudoers`, set-id binaries no package owns, uid transitions to root outside the sanctioned path |
 | **Defense evasion** | **nothing** | auth/wtmp tampering; `comm`-keyed blocking still evadable |
 | **Credential access** | **nothing** | writes *and* reads: `shadow`, SSH keys, `~/.aws`, `~/.kube`, `.pgpass`, and eleven more |

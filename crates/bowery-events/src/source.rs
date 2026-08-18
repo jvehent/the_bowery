@@ -182,11 +182,12 @@ pub const PROBE_EXEC: usize = 0;
 pub const PROBE_EXIT: usize = 1;
 pub const PROBE_CONNECT: usize = 2;
 pub const PROBE_FILE: usize = 3;
-pub const PROBE_COUNT: usize = 4;
+pub const PROBE_MODULE: usize = 4;
+pub const PROBE_COUNT: usize = 5;
 
 /// Operator-facing probe names. These appear in a SQL view, so they are
 /// spelled out rather than derived from Rust identifiers.
-pub const PROBE_NAMES: [&str; PROBE_COUNT] = ["exec", "exit", "connect", "file"];
+pub const PROBE_NAMES: [&str; PROBE_COUNT] = ["exec", "exit", "connect", "file", "module"];
 
 /// Live health of the kernel sensor.
 ///

@@ -533,6 +533,9 @@ uid_transitions     = true   # a process running as root whose parent was not,
 discovery_bursts    = true   # several DIFFERENT recon commands from one parent
 discovery_window    = "1m"
 discovery_threshold = 5      # distinct commands; `id` in a loop never trips it
+# Kernel module loads are always reported when the kernel declines to vouch
+# for them (out-of-tree or unsigned); there is no knob, because a stock host
+# never loads one and the probe costs nothing when nothing loads.
 beacons             = true   # a process calling home on a timer to a destination this
                              # host has not known long. Periodicity ALONE is not the
                              # signal — NTP, package mirrors and monitoring agents all

@@ -182,6 +182,7 @@ async fn process_event(ctx: &PipelineContext, event: Event) {
         Event::FileChange(change) => {
             process_file_change(ctx, change).await;
         }
+        Event::ModuleLoad(m) => process_module_load(ctx, &m),
         Event::NetworkConnect(conn) => {
             process_network_connect(ctx, &conn).await;
         }
@@ -212,6 +213,60 @@ async fn process_event(ctx: &PipelineContext, event: Event) {
 /// never contacted, and every one of them would then look normal
 /// fleet-wide. Instead it becomes a claim: the host it came from is
 /// asked whether it made the connection, and a denial is the finding.
+/// A kernel module entered the kernel.
+///
+/// Reported only when the kernel itself declines to vouch for it —
+/// out-of-tree or unsigned. A stock host loads modules constantly: at
+/// boot, on hotplug, the first time a filesystem is mounted. Alerting on
+/// all of them would bury the operator on every reboot, and the taint
+/// flags already draw the line the kernel itself draws.
+///
+/// The severity is high because of what a module *is*. Every other
+/// detection in this agent runs in userspace and can be lied to by code
+/// running in the kernel — including the probe that reported this. The
+/// load is the last moment anything here is trustworthy about it.
+use bowery_analysis::kmod::RULE_ID as MODULE_RULE_ID;
+
+fn process_module_load(ctx: &PipelineContext, m: &bowery_events::ModuleLoad) {
+    let Some(reason) = m.taint_reason() else {
+        return;
+    };
+    ctx.detections.record(MODULE_RULE_ID);
+    warn!(
+        rule = MODULE_RULE_ID,
+        module = %m.name,
+        comm = %m.comm,
+        pid = m.pid,
+        taints = m.taints,
+        "untrusted kernel module loaded"
+    );
+    let episode_id = format!("mod-{}-{}", m.name, current_unix_ms());
+    let alert = crate::alert_builder::AlertBuilder::new(
+        ctx.originator_fp,
+        &ctx.backend_label,
+        episode_id.clone(),
+        0.95,
+        format!(
+            "kernel module `{}` was loaded by {} (pid {}) and is {reason}. A module runs in              kernel context: it can hide processes, files and sockets from every other              detection here, including the probe that reported it, so this is the last              point at which anything this agent says about it can be trusted. A stock host              loads only in-tree signed modules, so this is either a driver someone              installed deliberately or something that should not be there",
+            m.name, m.comm, m.pid
+        ),
+    )
+    .subject(m.name.clone())
+    .context(vec![
+        bowery_proto::Attribute::new("module", m.name.clone()),
+        bowery_proto::Attribute::new("loaded_by", m.comm.clone()),
+        bowery_proto::Attribute::new("pid", m.pid.to_string()),
+        bowery_proto::Attribute::new("taints", format!("{:#x}", m.taints)),
+        bowery_proto::Attribute::new("taint_reason", reason),
+    ])
+    .build();
+    ctx.inbox.append(alert);
+    let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
+        episode_id,
+        suspicion: 0.95,
+    });
+}
+
 async fn process_network_connect(ctx: &PipelineContext, conn: &bowery_events::NetworkConnect) {
     if conn.direction != bowery_events::NetDirection::Outbound {
         if let Some(claims) = ctx.claims.as_ref()

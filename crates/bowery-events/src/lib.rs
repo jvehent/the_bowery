@@ -28,6 +28,13 @@ pub enum Event {
     /// the operator-configured file-integrity signal, and carries no pid
     /// (inotify doesn't attribute the change to a process).
     FileChange(FileChange),
+    /// A kernel module was loaded.
+    ///
+    /// The one event that can invalidate every other one: a module runs
+    /// in kernel context and can hide processes, files and sockets from
+    /// the probes above — including the probe that would have reported
+    /// it. Only the load itself is observable, so it is the only chance.
+    ModuleLoad(ModuleLoad),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +57,50 @@ pub struct ProcessExec {
     pub exe_path: Option<PathBuf>,
     pub args: Vec<String>,
     pub ts: SystemTime,
+}
+
+/// A kernel module entering the running kernel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleLoad {
+    pub pid: u32,
+    /// The loading process (`insmod`, `modprobe`, `systemd-udevd`).
+    pub comm: String,
+    pub name: String,
+    /// Kernel taint bitmask at load time.
+    pub taints: u32,
+    pub ts: SystemTime,
+}
+
+impl ModuleLoad {
+    /// Bit 12: built outside the kernel tree.
+    pub const TAINT_OOT: u32 = 1 << 12;
+    /// Bit 13: loaded without a valid signature.
+    pub const TAINT_UNSIGNED: u32 = 1 << 13;
+
+    /// Was this module vouched for by the kernel's own signing?
+    ///
+    /// The distinction that makes this rule usable: a stock host loads
+    /// modules constantly — at boot, on hotplug, when a filesystem is
+    /// first mounted — and every one of them is in-tree and signed. One
+    /// that is neither is a different kind of event.
+    #[must_use]
+    pub fn is_untrusted(&self) -> bool {
+        self.taints & (Self::TAINT_OOT | Self::TAINT_UNSIGNED) != 0
+    }
+
+    /// Human-readable reason, or `None` when the module is trusted.
+    #[must_use]
+    pub fn taint_reason(&self) -> Option<&'static str> {
+        match (
+            self.taints & Self::TAINT_OOT != 0,
+            self.taints & Self::TAINT_UNSIGNED != 0,
+        ) {
+            (true, true) => Some("built out of tree AND unsigned"),
+            (true, false) => Some("built out of tree"),
+            (false, true) => Some("unsigned"),
+            (false, false) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +239,7 @@ impl Event {
             Event::ProcessExit(e) => e.pid,
             Event::FileOpen(e) => e.pid,
             Event::NetworkConnect(e) => e.pid,
+            Event::ModuleLoad(e) => e.pid,
             Event::FileChange(_) => 0,
         }
     }
@@ -198,6 +250,7 @@ impl Event {
             Event::ProcessExit(e) => e.ts,
             Event::FileOpen(e) => e.ts,
             Event::NetworkConnect(e) => e.ts,
+            Event::ModuleLoad(e) => e.ts,
             Event::FileChange(e) => e.ts,
         }
     }

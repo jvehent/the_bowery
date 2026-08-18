@@ -18,6 +18,7 @@ pub mod beacon;
 pub mod episode;
 pub mod escalation;
 pub mod file_watch;
+pub mod kmod;
 pub mod lineage;
 pub mod mass_write;
 pub mod peer_select;

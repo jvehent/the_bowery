@@ -52,7 +52,7 @@ use aya::programs::{Lsm, TracePoint};
 use aya::{Btf, BtfError};
 use bowery_events::source::{
     DEFAULT_CHANNEL_CAPACITY, EventSource, PROBE_CONNECT, PROBE_EXEC, PROBE_EXIT, PROBE_FILE,
-    PROBE_NAMES, ProbeHealth,
+    PROBE_MODULE, PROBE_NAMES, ProbeHealth,
 };
 use bowery_events::{
     Event, FileOpen, NetDirection, NetFamily, NetworkConnect, ProcessExec, ProcessExit, enrich,
@@ -364,6 +364,23 @@ async fn run(
         }
     };
 
+    // Same shape as the file probe: attached only if its layout checks
+    // out, and absent entirely on an object built before it existed.
+    let module_probe = match verify_module_load_layout() {
+        Ok(()) => attach_tp(&mut ebpf, "module_load", "module", "module_load")
+            .inspect(|()| health.mark_attached(PROBE_MODULE))
+            .map_err(|e| warn!(error = %e, "module probe unavailable"))
+            .is_ok(),
+        Err(reason) => {
+            error!(
+                reason = %reason,
+                "refusing to attach the module probe: the kernel's tracepoint layout \
+                 does not match what the BPF program reads"
+            );
+            false
+        }
+    };
+
     let exec_ring = take_ring(&mut ebpf, "EVENTS")?;
     let exit_ring = take_ring(&mut ebpf, "EXIT_EVENTS")?;
     let connect_ring = take_ring(&mut ebpf, "CONNECT_EVENTS")?;
@@ -372,6 +389,14 @@ async fn run(
     let file_ring = if file_probe {
         take_ring(&mut ebpf, "FILE_EVENTS")
             .map_err(|e| warn!(error = %e, "FILE_EVENTS ring unavailable"))
+            .ok()
+    } else {
+        None
+    };
+
+    let module_ring = if module_probe {
+        take_ring(&mut ebpf, "MODULE_EVENTS")
+            .map_err(|e| warn!(error = %e, "MODULE_EVENTS ring unavailable"))
             .ok()
     } else {
         None
@@ -428,7 +453,14 @@ async fn run(
             PROBE_CONNECT,
             health.clone()
         ),
-        drain_optional_ring(file_ring, tx, parse_file, PROBE_FILE, health.clone()),
+        drain_optional_ring(
+            file_ring,
+            tx.clone(),
+            parse_file,
+            PROBE_FILE,
+            health.clone()
+        ),
+        drain_optional_ring(module_ring, tx, parse_module, PROBE_MODULE, health.clone()),
         poll_drops(drops_map, health),
     )?;
 
@@ -495,6 +527,14 @@ async fn poll_drops(
 /// path, which looks exactly like a host that opens no files.
 const OPENAT_EXPECTED: [(&str, usize); 2] = [("filename", 24), ("flags", 32)];
 
+/// `module:module_load` field offsets the BPF program assumes.
+///
+/// Unlike a syscall tracepoint, whose arguments are a uniform array,
+/// this one has named fields. Same discipline as openat: a proven
+/// mismatch means the probe is not attached, because a wrong offset here
+/// would report module names read from arbitrary bytes.
+const MODLOAD_EXPECTED: [(&str, usize); 2] = [("taints", 8), ("name", 12)];
+
 /// Check the assumed offsets against the kernel's published format.
 ///
 /// `Err` only on a *proven* mismatch, which fails closed: the probe is
@@ -528,6 +568,37 @@ fn verify_openat_layout() -> Result<(), String> {
         }
     }
     info!("sys_enter_openat layout verified against the kernel");
+    Ok(())
+}
+
+/// Same check as [`verify_openat_layout`], for `module:module_load`.
+fn verify_module_load_layout() -> Result<(), String> {
+    let candidates = [
+        "/sys/kernel/tracing/events/module/module_load/format",
+        "/sys/kernel/debug/tracing/events/module/module_load/format",
+    ];
+    let Some(text) = candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+    else {
+        warn!(
+            "could not read the module_load format file; proceeding with assumed \
+             field offsets"
+        );
+        return Ok(());
+    };
+    for (field, expected) in MODLOAD_EXPECTED {
+        let Some(actual) = parse_field_offset(&text, field) else {
+            warn!(field, "field absent from tracepoint format; cannot verify");
+            continue;
+        };
+        if actual != expected {
+            return Err(format!(
+                "module_load.{field} is at offset {actual}, but the BPF program reads {expected}"
+            ));
+        }
+    }
+    info!("module_load layout verified against the kernel");
     Ok(())
 }
 
@@ -637,6 +708,43 @@ where
 // ---------------------------------------------------------------------------
 // Parsers — one per ring buffer.
 // ---------------------------------------------------------------------------
+
+/// Mirrors `ModuleLoadEvent` in the BPF program byte for byte.
+#[repr(C)]
+struct RawModuleEvent {
+    pid: u32,
+    taints: u32,
+    comm: [u8; 16],
+    name: [u8; 64],
+}
+const RAW_MODULE_SIZE: usize = std::mem::size_of::<RawModuleEvent>();
+
+fn parse_module(bytes: &[u8]) -> Option<Event> {
+    if bytes.len() < RAW_MODULE_SIZE {
+        warn!(
+            got = bytes.len(),
+            want = RAW_MODULE_SIZE,
+            "short module record"
+        );
+        return None;
+    }
+    // SAFETY: size-checked above; RawModuleEvent is repr(C) POD.
+    let raw: RawModuleEvent =
+        unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<RawModuleEvent>()) };
+    let name = cstr_to_string(&raw.name);
+    if name.is_empty() {
+        // A module with no readable name tells us nothing actionable and
+        // would render as an empty alert subject.
+        return None;
+    }
+    Some(Event::ModuleLoad(bowery_events::ModuleLoad {
+        pid: raw.pid,
+        comm: comm_to_string(&raw.comm),
+        name,
+        taints: raw.taints,
+        ts: std::time::SystemTime::now(),
+    }))
+}
 
 fn parse_file(bytes: &[u8]) -> Option<Event> {
     if bytes.len() < RAW_FILE_SIZE {

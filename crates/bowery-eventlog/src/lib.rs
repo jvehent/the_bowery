@@ -123,6 +123,8 @@ pub const KIND_FILE_CHANGE: &str = "file_change";
 /// it a finding there" — a peer whose own `sshd` is sanctioned must
 /// still be able to say that its `sshd` reads host keys.
 pub const KIND_FILE_ACCESS: &str = "file_access";
+/// A kernel module entering the running kernel.
+pub const KIND_MODULE_LOAD: &str = "module_load";
 
 /// Retention policy. Both bounds apply; whichever bites first wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -683,6 +685,18 @@ impl Row {
                     e.path.display().to_string()
                 });
                 r.open_flags = Some(i64::from(e.flags));
+            }
+            Event::ModuleLoad(e) => {
+                r.kind = KIND_MODULE_LOAD;
+                r.pid = Some(i64::from(e.pid));
+                r.comm = Some(e.comm.clone());
+                // The module name goes in `path`: it is what an operator
+                // greps for, and a module has no path the kernel reports.
+                r.path = Some(e.name.clone());
+                // Taints in `open_flags` rather than a new column — a
+                // bitmask is a bitmask, and the alternative is widening
+                // a table that is already mostly NULLs.
+                r.open_flags = Some(i64::from(e.taints));
             }
             Event::FileChange(e) => {
                 r.kind = KIND_FILE_CHANGE;

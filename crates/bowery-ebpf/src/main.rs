@@ -266,6 +266,26 @@ const OFF_INODE_INO: u32 = 3;
 const OFF_INODE_SB: u32 = 4;
 const OFF_SB_DEV: u32 = 5;
 
+/// Kernel module loads, which are how an attacker stops any of this
+/// working.
+///
+/// A module runs in kernel context and can hide processes, files and
+/// sockets from every other probe here — including the ones that would
+/// have reported it. Catching the *load* is the only chance: after it,
+/// the module decides what the agent is allowed to see.
+#[repr(C)]
+pub struct ModuleLoadEvent {
+    pub pid: u32,
+    /// Kernel taint bitmask at load time. Bit 12 (`TAINT_OOT_MODULE`)
+    /// and bit 13 (`TAINT_UNSIGNED_MODULE`) are the ones that matter.
+    pub taints: u32,
+    pub comm: [u8; 16],
+    pub name: [u8; 64],
+}
+
+#[map]
+static MODULE_EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024, 0);
+
 /// Blocklist keyed by the identity of the *file being executed*:
 /// `[dev, ino]`.
 ///
@@ -461,6 +481,13 @@ fn try_connect(ctx: &TracePointContext) -> Result<(), i64> {
 // offsets (byte-swapped ports that every test agreed on), and the
 // failure mode here is worse: a wrong offset yields a garbage pointer
 // and silently empty paths.
+/// `module:module_load` layout. Unlike a syscall tracepoint, whose args
+/// are a uniform array, this one has named fields: `taints` (u32) then
+/// `name` as a `__data_loc`. Verified against the kernel's own format
+/// file at load time — see `verify_module_load_layout`.
+const MODLOAD_TAINTS: usize = 8;
+const MODLOAD_NAME_DATALOC: usize = 12;
+
 const OPENAT_ARG_FILENAME: usize = 24; // args[1]
 const OPENAT_ARG_FLAGS: usize = 32; // args[2]
 
@@ -638,6 +665,59 @@ fn try_openat(ctx: &TracePointContext) -> Result<(), i64> {
 /// `b"bash\0\0\0..."`. Zero out trailing whitespace bytes before the
 /// map lookup so both `echo "x" > /proc/<pid>/comm` and
 /// `printf "x" > /proc/<pid>/comm` produce the same key.
+/// Report every module load, with the taint flags the kernel assigned.
+///
+/// Deliberately reports *all* of them rather than filtering in-kernel on
+/// taint. A stock host loads modules constantly at boot and on hotplug,
+/// so the interesting question — is this one unsigned, out-of-tree, or
+/// arriving long after boot — is a userspace judgement, and filtering
+/// here would throw away the context needed to make it.
+#[tracepoint]
+pub fn module_load(ctx: TracePointContext) -> u32 {
+    match try_module_load(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_module_load(ctx: &TracePointContext) -> Result<(), i64> {
+    let taints: u32 = unsafe { ctx.read_at(MODLOAD_TAINTS)? };
+    // `__data_loc` packs the payload's length in the high 16 bits and
+    // its offset from the record start in the low 16.
+    let dataloc: u32 = unsafe { ctx.read_at(MODLOAD_NAME_DATALOC)? };
+    let name_off = (dataloc & 0xffff) as usize;
+
+    let Some(mut entry) = MODULE_EVENTS.reserve::<ModuleLoadEvent>(0) else {
+        count_drop(DROP_EXEC);
+        return Err(-1);
+    };
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    let event = entry.as_mut_ptr();
+    unsafe {
+        (*event).pid = (pid_tgid >> 32) as u32;
+        (*event).taints = taints;
+        (*event).comm = comm;
+        (*event).name = [0u8; 64];
+        // Bounded copy from the record's variable-length area. The
+        // verifier needs a compile-time bound, and a module name is far
+        // shorter than 64 bytes (MODULE_NAME_LEN is 56).
+        let mut i = 0usize;
+        while i < 56 {
+            let Ok(b) = ctx.read_at::<u8>(name_off + i) else {
+                break;
+            };
+            if b == 0 {
+                break;
+            }
+            (*event).name[i & 63] = b;
+            i += 1;
+        }
+    }
+    entry.submit(0);
+    Ok(())
+}
+
 #[lsm(hook = "bprm_check_security")]
 pub fn block_exec(ctx: LsmContext) -> i32 {
     // Identity of the binary being exec'd, when userspace has armed us
