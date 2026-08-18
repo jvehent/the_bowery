@@ -30,6 +30,7 @@ pub mod provenance;
 pub mod role;
 pub mod rule;
 pub mod score;
+pub mod silence;
 pub mod suppress;
 
 pub use analyzer::{Analyzer, Verdict};

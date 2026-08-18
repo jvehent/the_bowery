@@ -1304,6 +1304,130 @@ impl MembershipGrant {
     }
 }
 
+/// Domain separator for [`AlertSilence`] signatures.
+pub const ALERT_SILENCE_DOMAIN: &[u8] = b"bowery/mesh/alert-silence/v1";
+
+/// An operator's signed statement that a shape of alert is benign.
+///
+/// Every other signed object here *adds* something an agent will act on.
+/// This one takes something away, and it is the only record in the system
+/// whose effect is to make findings stop reaching a human. Read
+/// `DESIGN-ALERT-SILENCING.md` §4 before extending it.
+///
+/// **Self-authenticating**, exactly as [`Revocation`] is: the record
+/// carries its own operator signature, so a relaying peer can drop a
+/// silence but never forge one, and every hop verifies it independently
+/// rather than trusting whoever handed it over.
+///
+/// **An empty match field is a wildcard, and a record with every match
+/// field empty covers nothing.** That is enforced in
+/// `bowery_analysis::silence`, deliberately at the point of use rather
+/// than only at the point of signing — a guard that lives with the
+/// signer is a guard an unsigned bug walks past.
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct AlertSilence {
+    /// Stable content id over the match spec, so re-issuing the same
+    /// judgement replaces it instead of stacking another.
+    #[prost(string, tag = "1")]
+    pub id: String,
+    /// Mesh cluster this applies to, checked against the agent's own
+    /// `[mesh] cluster_id` so a staging silence cannot quiet production.
+    #[prost(string, tag = "2")]
+    pub cluster_id: String,
+
+    /// Detection to silence. Empty matches any.
+    #[prost(string, tag = "3")]
+    pub rule_id: String,
+    /// Lowercase hex SHA-256 of the binary. Empty matches any — which
+    /// the CLI refuses to sign without an explicit flag, because a
+    /// silence that does not name a binary is inherited by whatever an
+    /// attacker puts at the path it does name.
+    #[prost(string, tag = "4")]
+    pub exe_sha256_hex: String,
+    /// Subject path — the binary for an exec finding, the file touched
+    /// for a file finding. Empty matches any.
+    #[prost(string, tag = "5")]
+    pub exe_path: String,
+    /// Fingerprint of the only host that should honour this. Empty means
+    /// fleet-wide.
+    #[prost(bytes = "vec", tag = "6")]
+    pub host_fp: Vec<u8>,
+
+    /// Suspicion multiplier in thousandths: `0` silences, `1000` leaves
+    /// the score alone and only counts matches.
+    ///
+    /// An integer rather than a float because this value is covered by a
+    /// signature. Two encodings of the same float would sign
+    /// differently, and comparing signed floats for equality is a
+    /// question nobody should have to answer about an audit record.
+    #[prost(uint32, tag = "7")]
+    pub weight_permille: u32,
+    /// Why the operator judged it benign. Required by the CLI — the
+    /// audit trail is most of the point.
+    #[prost(string, tag = "8")]
+    pub reason: String,
+
+    #[prost(uint64, tag = "9")]
+    pub issued_unix_ms: u64,
+    /// Mandatory upstream. An unbounded silence is a permanent blind
+    /// spot, so nothing here can express "never expires".
+    #[prost(uint64, tag = "10")]
+    pub expires_unix_ms: u64,
+
+    #[prost(bytes = "vec", tag = "11")]
+    pub operator_fp: Vec<u8>,
+    #[prost(bytes = "vec", tag = "12")]
+    pub sig: Vec<u8>,
+}
+
+impl AlertSilence {
+    /// Full weight, as permille.
+    pub const FULL_WEIGHT: u32 = 1000;
+
+    /// The bytes this record's signature covers, or `None` when
+    /// `operator_fp` is not a fingerprint.
+    ///
+    /// Every field that changes what gets suppressed is in here. A field
+    /// left out of the signing input is a field a relay could rewrite,
+    /// so widening the match spec later means widening this too — the
+    /// only field deliberately excluded is `sig` itself.
+    ///
+    /// Takes `&self` rather than the eleven fields separately, which is
+    /// also the natural minting flow: build the record with an empty
+    /// `sig`, sign this, then fill it in.
+    #[must_use]
+    pub fn to_signing_input(&self) -> Option<Vec<u8>> {
+        let operator: [u8; 32] = self.operator_fp.as_slice().try_into().ok()?;
+        let mut buf = Vec::with_capacity(ALERT_SILENCE_DOMAIN.len() + 256);
+        buf.extend_from_slice(ALERT_SILENCE_DOMAIN);
+        // Every variable-length field is length-prefixed, so no two
+        // different specs can produce the same bytes by shifting a
+        // boundary — `("a", "bc")` must not sign the same as `("ab", "c")`.
+        for field in [
+            self.id.as_bytes(),
+            self.cluster_id.as_bytes(),
+            self.rule_id.as_bytes(),
+            self.exe_sha256_hex.as_bytes(),
+            self.exe_path.as_bytes(),
+            self.host_fp.as_slice(),
+            self.reason.as_bytes(),
+        ] {
+            let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
+            buf.extend_from_slice(&len.to_be_bytes());
+            buf.extend_from_slice(field);
+        }
+        buf.extend_from_slice(&self.weight_permille.to_be_bytes());
+        buf.extend_from_slice(&self.issued_unix_ms.to_be_bytes());
+        buf.extend_from_slice(&self.expires_unix_ms.to_be_bytes());
+        buf.extend_from_slice(&operator);
+        Some(buf)
+    }
+
+    // The content id is derived by `bowery_analysis::silence::SilenceSpec::id`,
+    // which owns the spec semantics and the hash. This crate stays a
+    // wire-format crate with no dependency beyond prost.
+}
+
 /// An operator's signed statement that an agent is no longer trusted.
 ///
 /// TOFU has no exit: once pinned, a peer stays a full mesh member for
@@ -1373,6 +1497,146 @@ impl Revocation {
 
 #[cfg(test)]
 mod tests {
+
+    /// A silence must survive the wire unchanged, and its signing input
+    /// must cover every field that decides what gets suppressed.
+    #[test]
+    fn an_alert_silence_round_trips_and_signs_over_everything_that_matters() {
+        let base = AlertSilence {
+            id: "sil-0123456789abcdef".into(),
+            cluster_id: "prod".into(),
+            rule_id: "cred.read_netrc".into(),
+            exe_sha256_hex: "8353a512".into(),
+            exe_path: "/home/j/.netrc".into(),
+            host_fp: vec![0xaa; 32],
+            weight_permille: 300,
+            reason: "git reads its own netrc".into(),
+            issued_unix_ms: 1_000,
+            expires_unix_ms: 2_000,
+            operator_fp: vec![0xbb; 32],
+            sig: vec![0xcc; 64],
+        };
+        let bytes = base.encode_to_vec();
+        let decoded = AlertSilence::decode(bytes.as_slice()).expect("decodes");
+        assert_eq!(decoded, base);
+
+        let input = base.to_signing_input().expect("signable");
+        // Changing any field that affects what is suppressed must change
+        // the bytes being signed. A field left out here is a field a
+        // relay could rewrite without breaking the signature.
+        for mutated in [
+            AlertSilence {
+                id: "sil-other".into(),
+                ..base.clone()
+            },
+            AlertSilence {
+                cluster_id: "staging".into(),
+                ..base.clone()
+            },
+            AlertSilence {
+                rule_id: "cred.read_aws".into(),
+                ..base.clone()
+            },
+            AlertSilence {
+                exe_sha256_hex: "deadbeef".into(),
+                ..base.clone()
+            },
+            AlertSilence {
+                exe_path: "/etc/shadow".into(),
+                ..base.clone()
+            },
+            AlertSilence {
+                host_fp: vec![0xdd; 32],
+                ..base.clone()
+            },
+            AlertSilence {
+                weight_permille: 0,
+                ..base.clone()
+            },
+            AlertSilence {
+                reason: "different".into(),
+                ..base.clone()
+            },
+            AlertSilence {
+                issued_unix_ms: 9,
+                ..base.clone()
+            },
+            AlertSilence {
+                expires_unix_ms: 9,
+                ..base.clone()
+            },
+            AlertSilence {
+                operator_fp: vec![0xee; 32],
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(
+                mutated.to_signing_input().expect("signable"),
+                input,
+                "a change to this field did not change the signed bytes"
+            );
+        }
+
+        // The signature itself is excluded, or signing would be circular.
+        let resigned = AlertSilence {
+            sig: vec![0x11; 64],
+            ..base.clone()
+        };
+        assert_eq!(resigned.to_signing_input().expect("signable"), input);
+    }
+
+    /// Length prefixes, so no two different specs can produce the same
+    /// signed bytes by shifting a field boundary.
+    #[test]
+    fn silence_field_boundaries_cannot_be_shifted() {
+        let a = AlertSilence {
+            rule_id: "a".into(),
+            exe_sha256_hex: "bc".into(),
+            operator_fp: vec![0; 32],
+            ..Default::default()
+        };
+        let b = AlertSilence {
+            rule_id: "ab".into(),
+            exe_sha256_hex: "c".into(),
+            operator_fp: vec![0; 32],
+            ..Default::default()
+        };
+        assert_ne!(a.to_signing_input(), b.to_signing_input());
+    }
+
+    /// Domains keep a signature minted for one purpose from verifying as
+    /// another. A silence is the one record whose misuse turns detection
+    /// off, so this matters more here than anywhere else.
+    #[test]
+    fn the_silence_domain_is_distinct_from_every_other() {
+        let domains = [
+            ALERT_SILENCE_DOMAIN,
+            REVOCATION_DOMAIN,
+            MEMBERSHIP_GRANT_DOMAIN,
+            OPERATOR_AUTHORIZATION_DOMAIN,
+            LOG_REPORT_DOMAIN,
+        ];
+        for (i, a) in domains.iter().enumerate() {
+            for b in domains.iter().skip(i + 1) {
+                assert_ne!(a, b);
+                // Nor may one be a prefix of another: a length-prefixed
+                // body after a prefix-colliding domain could otherwise
+                // be reinterpreted.
+                assert!(!a.starts_with(b) && !b.starts_with(a), "{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    /// An operator fingerprint that is not 32 bytes cannot be signed
+    /// over, and must refuse rather than pad.
+    #[test]
+    fn a_malformed_operator_fingerprint_is_not_signable() {
+        let bad = AlertSilence {
+            operator_fp: vec![0xaa; 31],
+            ..Default::default()
+        };
+        assert!(bad.to_signing_input().is_none());
+    }
     use super::*;
 
     #[test]
