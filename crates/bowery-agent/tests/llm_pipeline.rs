@@ -115,11 +115,13 @@ async fn high_suspicion_exec_routes_to_llm_and_emits_verdict() {
     let suspicious_bin = workdir.path().join("payload");
     std::fs::write(&suspicious_bin, b"suspicious").unwrap();
 
-    let source = Box::new(MockEventSource::new(vec![make_exec(
+    // Gated so the pipeline cannot outrun `subscribe()`; see `EventGate`.
+    let (source, gate) = MockEventSource::new(vec![make_exec(
         4242,
         vec!["payload", "--exfil"],
         suspicious_bin,
-    )]));
+    )])
+    .gated();
 
     let identity = Arc::new(Identity::generate());
     // Threshold 0.5 — the writable-path rule (medium severity, weight 0.6)
@@ -127,11 +129,12 @@ async fn high_suspicion_exec_routes_to_llm_and_emits_verdict() {
     let cfg = build_config(workdir.path(), reserve_udp_port(), 0.5);
     let llm: Arc<dyn LlmAnalyzer> = Arc::new(MockLlmAnalyzer::new(MockMode::Echo));
 
-    let agent = Agent::start_with_llm(cfg, identity, source, llm)
+    let agent = Agent::start_with_llm(cfg, identity, Box::new(source), llm)
         .await
         .expect("start");
 
     let mut events = agent.subscribe();
+    gate.open();
 
     // Wait for the EpisodeAnalyzed first to capture the episode_id, then
     // for the LlmVerdict that should reference it.
@@ -201,16 +204,15 @@ async fn low_suspicion_exec_skips_llm() {
     let cfg = build_config(workdir.path(), reserve_udp_port(), 1.5);
 
     let llm: Arc<dyn LlmAnalyzer> = Arc::new(MockLlmAnalyzer::new(MockMode::Echo));
-    let source = Box::new(MockEventSource::new(vec![make_exec(
-        99,
-        vec!["test"],
-        normal_bin,
-    )]));
-    let agent = Agent::start_with_llm(cfg, identity, source, llm)
+    // Gated so the pipeline cannot outrun `subscribe()`; see `EventGate`.
+    let (source, gate) =
+        MockEventSource::new(vec![make_exec(99, vec!["test"], normal_bin)]).gated();
+    let agent = Agent::start_with_llm(cfg, identity, Box::new(source), llm)
         .await
         .expect("start");
 
     let mut events = agent.subscribe();
+    gate.open();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let mut saw_episode = false;
     let mut saw_llm_verdict = false;

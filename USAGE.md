@@ -434,6 +434,13 @@ one that answers *has this ever fired here* — the first misled twice in
 one session, reading as a dead rule when the agent had simply restarted
 minutes earlier. `since_unix_ms` says which window `fired` covers.
 
+`fired` really does cover that whole window: the periodic flush folds a
+*delta* into the baseline rather than resetting the counter. It did reset
+it once, which meant a rule that had fired five hundred times could read
+`0` against a three-hour-old `since_unix_ms` — the same "a zero that does
+not mean never" this table exists to abolish, reintroduced by the table's
+own bookkeeping.
+
 
 | question | query |
 | --- | --- |

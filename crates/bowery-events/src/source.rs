@@ -49,6 +49,34 @@ pub trait EventSource: Send + 'static {
 pub struct MockEventSource {
     events: Vec<Event>,
     delay_between: Duration,
+    /// Held closed until the test opens it. See [`MockEventSource::gated`].
+    gate: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+/// Holds a [`MockEventSource`] shut until the test says go.
+///
+/// Exists to close a race that cost a CI run: `Agent::start` spawns the
+/// pipeline before it returns, so a source that emits immediately can be
+/// fully processed in the microseconds before the test's `subscribe()`
+/// lands — and `broadcast::Receiver` never replays what was sent before it
+/// existed. The test then waits out its whole deadline for an alert that
+/// was already delivered.
+///
+/// A sleep only lengthens the odds. This removes the race: nothing is
+/// emitted until [`EventGate::open`] is called, which the test does after
+/// every observer is attached.
+///
+/// Dropping the gate opens it, so a test that forgets degrades to the old
+/// racy behaviour rather than hanging.
+#[derive(Debug)]
+#[must_use = "the source emits nothing until the gate is opened or dropped"]
+pub struct EventGate(#[allow(dead_code)] tokio::sync::oneshot::Sender<()>);
+
+impl EventGate {
+    /// Let the source start emitting.
+    pub fn open(self) {
+        let _ = self.0.send(());
+    }
 }
 
 impl MockEventSource {
@@ -56,6 +84,7 @@ impl MockEventSource {
         Self {
             events,
             delay_between: Duration::ZERO,
+            gate: None,
         }
     }
 
@@ -63,6 +92,19 @@ impl MockEventSource {
     pub fn with_delay(mut self, d: Duration) -> Self {
         self.delay_between = d;
         self
+    }
+
+    /// Withhold every event until the returned [`EventGate`] is opened.
+    ///
+    /// Use this whenever the test observes the agent through
+    /// [`Agent::subscribe`]-style broadcast rather than through a durable
+    /// record; see [`EventGate`] for what it prevents.
+    ///
+    /// [`Agent::subscribe`]: https://docs.rs/bowery-agent
+    pub fn gated(mut self) -> (Self, EventGate) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.gate = Some(rx);
+        (self, EventGate(tx))
     }
 }
 
@@ -83,9 +125,15 @@ impl EventSource for MockEventSource {
         let MockEventSource {
             events,
             delay_between,
+            gate,
         } = *self;
         let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
         tokio::spawn(async move {
+            if let Some(gate) = gate {
+                // Err means the gate was dropped without opening, which
+                // releases us too — a forgotten gate must not hang.
+                let _ = gate.await;
+            }
             for e in events {
                 if !delay_between.is_zero() {
                     tokio::time::sleep(delay_between).await;
@@ -160,6 +208,39 @@ mod tests {
             rx.recv().await.is_none(),
             "channel should close after replay"
         );
+    }
+
+    #[tokio::test]
+    async fn a_gated_source_emits_nothing_until_it_is_opened() {
+        let (source, gate) = MockEventSource::new(vec![exec(1)]).gated();
+        let mut rx = Box::new(source).start();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "a closed gate must hold the source"
+        );
+
+        gate.open();
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the opened gate must release the source")
+            .expect("event");
+        assert_eq!(event.pid(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_gate_releases_rather_than_hanging() {
+        let (source, gate) = MockEventSource::new(vec![exec(7)]).gated();
+        let mut rx = Box::new(source).start();
+        drop(gate);
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a dropped gate must not deadlock the source")
+            .expect("event");
+        assert_eq!(event.pid(), 7);
     }
 
     #[tokio::test]

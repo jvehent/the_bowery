@@ -34,11 +34,11 @@
 //!
 //! # Scope
 //!
-//! Counts are since **this agent started**, and `since_unix_ms` says so
-//! rather than leaving the reader to guess. Persisting them across
-//! restarts would answer the stronger question ("never since install")
-//! and needs a baseline schema change; until then, an operator reading
-//! a zero should check the window first.
+//! [`DetectionStats::snapshot`] counts since **this agent started**, and
+//! `since_unix_ms` says so rather than leaving the reader to guess. The
+//! periodic flush folds a *delta* into the baseline without rewinding
+//! that counter, so the two never disagree; `bowery_detections` reports
+//! both, as `fired` and `fired_since_install`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,8 +59,27 @@ pub struct RuleStat {
 /// detection cannot grow this.
 #[derive(Debug)]
 pub struct DetectionStats {
-    rules: HashMap<&'static str, (AtomicU64, AtomicU64)>,
+    rules: HashMap<&'static str, RuleCounters>,
     since_unix_ms: u64,
+}
+
+/// One rule's live counters.
+///
+/// `fired` is monotonic for the life of the agent, and `flushed` records
+/// how much of it the periodic flush has already folded into the
+/// baseline. They are kept apart because the obvious implementation —
+/// one counter that the flush resets — makes [`DetectionStats::snapshot`]
+/// report "since the last flush" while [`DetectionStats::since_unix_ms`]
+/// still claims "since startup". An operator reading `fired = 0` against
+/// a three-hour-old agent would conclude the rule had never fired, when
+/// it may have fired five hundred times four minutes ago. That is the
+/// precise failure this module exists to make impossible, so it must not
+/// be reintroduced by its own bookkeeping.
+#[derive(Debug, Default)]
+struct RuleCounters {
+    fired: AtomicU64,
+    flushed: AtomicU64,
+    last_unix_ms: AtomicU64,
 }
 
 impl Default for DetectionStats {
@@ -75,7 +94,7 @@ impl DetectionStats {
     pub fn new() -> Self {
         let rules = bowery_analysis::attack::all_rule_ids()
             .into_iter()
-            .map(|id| (id, (AtomicU64::new(0), AtomicU64::new(0))))
+            .map(|id| (id, RuleCounters::default()))
             .collect();
         Self {
             rules,
@@ -90,9 +109,9 @@ impl DetectionStats {
     /// row that no rule can ever produce — which is the shape of defect
     /// this whole module exists to surface.
     pub fn record(&self, rule_id: &str) {
-        if let Some((count, last)) = self.rules.get(rule_id) {
-            count.fetch_add(1, Ordering::Relaxed);
-            last.store(current_unix_ms(), Ordering::Relaxed);
+        if let Some(c) = self.rules.get(rule_id) {
+            c.fired.fetch_add(1, Ordering::Relaxed);
+            c.last_unix_ms.store(current_unix_ms(), Ordering::Relaxed);
         } else {
             debug_assert!(false, "unregistered rule id fired: {rule_id}");
         }
@@ -104,13 +123,12 @@ impl DetectionStats {
         let mut out: Vec<(&'static str, RuleStat)> = self
             .rules
             .iter()
-            .map(|(id, (count, last))| {
-                let fired = count.load(Ordering::Relaxed);
-                let last = last.load(Ordering::Relaxed);
+            .map(|(id, c)| {
+                let last = c.last_unix_ms.load(Ordering::Relaxed);
                 (
                     *id,
                     RuleStat {
-                        fired,
+                        fired: c.fired.load(Ordering::Relaxed),
                         last_unix_ms: (last > 0).then_some(last),
                     },
                 )
@@ -120,25 +138,50 @@ impl DetectionStats {
         out
     }
 
+    /// Per-rule counts not yet folded into the baseline.
+    ///
+    /// The `bowery_detections` view adds this to the durable total to get
+    /// "since install". Adding [`Self::snapshot`]'s `fired` instead would
+    /// double-count every fire the flush has already written to disk,
+    /// because that counter is monotonic for the session by design.
+    #[must_use]
+    pub fn unflushed(&self) -> HashMap<&'static str, u64> {
+        self.rules
+            .iter()
+            .map(|(id, c)| {
+                let fired = c.fired.load(Ordering::Relaxed);
+                (*id, fired.saturating_sub(c.flushed.load(Ordering::Relaxed)))
+            })
+            .collect()
+    }
+
     /// When this agent started counting.
     #[must_use]
     pub fn since_unix_ms(&self) -> u64 {
         self.since_unix_ms
     }
 
-    /// Take everything counted since the last drain.
+    /// Take what has fired since the last drain, for folding into the
+    /// baseline.
     ///
-    /// Resets the counters, so repeated calls accumulate into the
-    /// durable store rather than re-adding the same totals. Returns
-    /// every rule, including the zeros, so a never-fired rule gets a row
-    /// on disk too — the whole point is that its absence is visible.
+    /// Returns a **delta**, and advances the flush watermark rather than
+    /// rewinding the counter — repeated calls accumulate on disk instead
+    /// of re-adding the same totals, while [`Self::snapshot`] keeps
+    /// meaning "since this agent started". Returns every rule, including
+    /// the zeros, so a never-fired rule gets a row on disk too: the whole
+    /// point is that its absence is visible.
+    ///
+    /// Assumes a single caller. Two concurrent drainers could both
+    /// observe the same delta; there is one flush task, and making this
+    /// safe for many would cost a lock on a path that does not need one.
     pub fn drain(&self) -> Vec<(&'static str, u64, Option<u64>)> {
         self.rules
             .iter()
-            .map(|(id, (count, last))| {
-                let fired = count.swap(0, Ordering::Relaxed);
-                let last = last.load(Ordering::Relaxed);
-                (*id, fired, (last > 0).then_some(last))
+            .map(|(id, c)| {
+                let fired = c.fired.load(Ordering::Relaxed);
+                let delta = fired.saturating_sub(c.flushed.swap(fired, Ordering::Relaxed));
+                let last = c.last_unix_ms.load(Ordering::Relaxed);
+                (*id, delta, (last > 0).then_some(last))
             })
             .collect()
     }
@@ -208,6 +251,70 @@ mod tests {
         // no-growth property without tripping it.
         assert!(!s.rules.contains_key("not.a.real.rule"));
         assert_eq!(s.snapshot().len(), before);
+    }
+
+    /// The flush must not rewind what `snapshot` reports.
+    ///
+    /// A counter the flush resets turns `fired = 0` into "not since the
+    /// last flush" while `since_unix_ms` still says "since startup" —
+    /// the exact ambiguity this module exists to remove.
+    #[test]
+    fn draining_folds_a_delta_without_rewinding_the_session_count() {
+        let s = DetectionStats::new();
+        s.record("privesc.uid_transition_no_helper");
+        s.record("privesc.uid_transition_no_helper");
+
+        let first: Vec<_> = s.drain().into_iter().filter(|(_, n, _)| *n > 0).collect();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].1, 2, "the first drain carries both");
+
+        let stat = s
+            .snapshot()
+            .into_iter()
+            .find(|(id, _)| *id == "privesc.uid_transition_no_helper")
+            .expect("row")
+            .1;
+        assert_eq!(
+            stat.fired, 2,
+            "a flush must not make a rule that fired look like one that never did"
+        );
+
+        // A second drain with nothing new in between adds nothing, so
+        // the durable total does not double-count.
+        assert!(
+            s.drain().iter().all(|(_, n, _)| *n == 0),
+            "an idle interval must fold nothing"
+        );
+
+        s.record("privesc.uid_transition_no_helper");
+        let third: Vec<_> = s.drain().into_iter().filter(|(_, n, _)| *n > 0).collect();
+        assert_eq!(third[0].1, 1, "only what arrived since the last flush");
+        assert_eq!(
+            s.snapshot()
+                .into_iter()
+                .find(|(id, _)| *id == "privesc.uid_transition_no_helper")
+                .expect("row")
+                .1
+                .fired,
+            3
+        );
+    }
+
+    /// `fired_since_install` = durable + unflushed. Using `fired` there
+    /// would count every already-persisted fire twice.
+    #[test]
+    fn what_is_left_to_flush_shrinks_as_it_is_flushed() {
+        let s = DetectionStats::new();
+        s.record("privesc.uid_transition_no_helper");
+        assert_eq!(s.unflushed()["privesc.uid_transition_no_helper"], 1);
+        s.drain();
+        assert_eq!(
+            s.unflushed()["privesc.uid_transition_no_helper"],
+            0,
+            "what the baseline already holds must not be counted again"
+        );
+        s.record("privesc.uid_transition_no_helper");
+        assert_eq!(s.unflushed()["privesc.uid_transition_no_helper"], 1);
     }
 
     #[test]

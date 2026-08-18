@@ -123,10 +123,12 @@ async fn analyzer_fires_per_episode_with_expected_suspicion() {
         normal_bin.display()
     );
 
-    let source = Box::new(MockEventSource::new(vec![
+    // Gated so the pipeline cannot outrun `subscribe()`; see `EventGate`.
+    let (source, gate) = MockEventSource::new(vec![
         make_exec(1, vec!["payload", "--tail"], suspicious_bin),
         make_exec(2, vec!["test-runner"], normal_bin),
-    ]));
+    ])
+    .gated();
 
     let identity = Arc::new(Identity::generate());
     let cfg = build_config(
@@ -134,9 +136,12 @@ async fn analyzer_fires_per_episode_with_expected_suspicion() {
         reserve_udp_port(),
         Duration::from_millis(200),
     );
-    let agent = Agent::start(cfg, identity, source).await.expect("start");
+    let agent = Agent::start(cfg, identity, Box::new(source))
+        .await
+        .expect("start");
 
     let mut events = agent.subscribe();
+    gate.open();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 
     let mut sus: Option<Verdict> = None;

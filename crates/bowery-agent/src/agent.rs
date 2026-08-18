@@ -645,7 +645,12 @@ impl Agent {
             let baseline = baseline.clone();
             let mut shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_mins(5));
+                // `interval_at`, not `interval`: the latter's first tick
+                // completes immediately, which wrote a full table of
+                // zeros to SQLite at every agent start for no reason.
+                let period = Duration::from_mins(5);
+                let mut tick =
+                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     let stopping = tokio::select! {

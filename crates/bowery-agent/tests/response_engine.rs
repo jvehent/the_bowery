@@ -154,10 +154,11 @@ async fn run_scenario(response: ResponseConfig) -> Vec<(String, &'static str, Ac
 
     let identity = Arc::new(Identity::generate());
     let cfg = build_config(workdir.path(), reserve_udp_port(), response);
-    let source = Box::new(
-        MockEventSource::new(vec![make_exec(31337, payload_path)])
-            .with_delay(Duration::from_millis(200)),
-    );
+    // Gated rather than delayed: `Agent::start_with_llm` spawns the
+    // pipeline before it returns, and a broadcast receiver never
+    // replays what was sent before it existed.
+    let (source, gate) = MockEventSource::new(vec![make_exec(31337, payload_path)]).gated();
+    let source = Box::new(source);
     let llm: Arc<dyn LlmAnalyzer> = Arc::new(AlwaysKillAnalyzer);
 
     let agent = Agent::start_with_llm(cfg, identity, source, llm)
@@ -165,6 +166,7 @@ async fn run_scenario(response: ResponseConfig) -> Vec<(String, &'static str, Ac
         .expect("start");
 
     let mut events = agent.subscribe();
+    gate.open();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     let mut attempted: Vec<(String, &'static str, ActionOutcome)> = Vec::new();
     let mut llm_done = false;
@@ -246,10 +248,11 @@ async fn process_kill_engine_actually_kills_a_real_child() {
             audit_log_path: None,
         },
     );
-    let source = Box::new(
-        MockEventSource::new(vec![make_exec(target_pid, payload_path)])
-            .with_delay(Duration::from_millis(200)),
-    );
+    // Gated rather than delayed: `Agent::start_with_llm` spawns the
+    // pipeline before it returns, and a broadcast receiver never
+    // replays what was sent before it existed.
+    let (source, gate) = MockEventSource::new(vec![make_exec(target_pid, payload_path)]).gated();
+    let source = Box::new(source);
     let llm: Arc<dyn LlmAnalyzer> = Arc::new(AlwaysKillAnalyzer);
 
     let agent = Agent::start_with_llm(cfg, identity, source, llm)
@@ -258,6 +261,7 @@ async fn process_kill_engine_actually_kills_a_real_child() {
 
     // Wait for ActionAttempted with Executed outcome.
     let mut events = agent.subscribe();
+    gate.open();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let outcome = loop {
         let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -343,10 +347,11 @@ async fn audit_log_records_signed_envelope_per_action() {
         audit_log_path: Some(audit_path.clone()),
     };
     let cfg = build_config(workdir.path(), reserve_udp_port(), response);
-    let source = Box::new(
-        MockEventSource::new(vec![make_exec(31338, payload_path)])
-            .with_delay(Duration::from_millis(200)),
-    );
+    // Gated rather than delayed: `Agent::start_with_llm` spawns the
+    // pipeline before it returns, and a broadcast receiver never
+    // replays what was sent before it existed.
+    let (source, gate) = MockEventSource::new(vec![make_exec(31338, payload_path)]).gated();
+    let source = Box::new(source);
     let llm: Arc<dyn LlmAnalyzer> = Arc::new(AlwaysKillAnalyzer);
 
     let agent = Agent::start_with_llm(cfg, identity, source, llm)
@@ -357,6 +362,7 @@ async fn audit_log_records_signed_envelope_per_action() {
     // chance to land. The audit write happens after the AgentEvent is
     // emitted, so loop briefly until the file is non-empty.
     let mut events = agent.subscribe();
+    gate.open();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
         let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());

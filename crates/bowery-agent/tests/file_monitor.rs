@@ -15,7 +15,7 @@ use bowery_agent::config::{
 use bowery_agent::{Agent, AgentEvent};
 use bowery_analysis::RuleSeverity;
 use bowery_crypto::Identity;
-use bowery_events::source::MockEventSource;
+use bowery_events::source::{EventGate, MockEventSource};
 use bowery_events::{Event, FileOpen};
 use tempfile::TempDir;
 use tokio::sync::broadcast::error::RecvError;
@@ -84,6 +84,19 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, monitor: MonitorConfig) -> Co
             ..Default::default()
         },
     }
+}
+
+/// A source that emits nothing until the returned gate is opened.
+///
+/// These tests watch the agent through its event broadcast, which does
+/// not replay. `Agent::start` spawns the pipeline before it returns, so
+/// an ungated source can be drained to completion in the microseconds
+/// before `subscribe()` lands — and the test then waits out its whole
+/// deadline for an alert that was already delivered. Open the gate once
+/// every observer is attached.
+fn gated_source(events: Vec<Event>) -> (Box<MockEventSource>, EventGate) {
+    let (source, gate) = MockEventSource::new(events).gated();
+    (Box::new(source), gate)
 }
 
 /// Wait for an `AlertEmitted` event, or panic on timeout.
@@ -234,8 +247,9 @@ async fn a_write_to_a_persistence_path_alerts_and_names_the_process() {
     let workdir = TempDir::new().unwrap();
     let cfg = build_config(workdir.path(), reserve_udp_port(), MonitorConfig::default());
 
-    // Feed the event the kernel sensor would produce.
-    let source = Box::new(MockEventSource::new(vec![Event::FileOpen(FileOpen {
+    // Feed the event the kernel sensor would produce, held until we are
+    // watching — see `EventGate`.
+    let (source, gate) = gated_source(vec![Event::FileOpen(FileOpen {
         pid: 4242,
         comm: "curl".into(),
         path: "/root/.ssh/authorized_keys".into(),
@@ -243,11 +257,12 @@ async fn a_write_to_a_persistence_path_alerts_and_names_the_process() {
         truncated: false,
         sensitive_read: false,
         ts: SystemTime::now(),
-    })]));
+    })]);
 
     let identity = Arc::new(Identity::generate());
     let agent = Agent::start(cfg, identity, source).await.expect("start");
     let mut events = agent.subscribe();
+    gate.open();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let episode = loop {
@@ -310,11 +325,12 @@ async fn an_identical_finding_repeated_is_folded_into_one_alert() {
             ts: SystemTime::now(),
         })
     };
-    let source = Box::new(MockEventSource::new(vec![dup(), dup(), dup(), dup()]));
+    let (source, gate) = gated_source(vec![dup(), dup(), dup(), dup()]);
 
     let identity = Arc::new(Identity::generate());
     let agent = Agent::start(cfg, identity, source).await.expect("start");
     let mut events = agent.subscribe();
+    gate.open();
 
     // Wait for the first alert, then give the remaining three events
     // room to be processed and folded.
@@ -370,7 +386,7 @@ async fn a_reader_that_already_exited_is_still_named_from_the_exec_record() {
     // only the recorded exec can.
     let ghost = 4_194_301;
     let now = SystemTime::now();
-    let source = Box::new(MockEventSource::new(vec![
+    let (source, gate) = gated_source(vec![
         Event::ProcessExec(bowery_events::ProcessExec {
             pid: ghost,
             ppid: 1,
@@ -390,11 +406,12 @@ async fn a_reader_that_already_exited_is_still_named_from_the_exec_record() {
             sensitive_read: false,
             ts: now,
         }),
-    ]));
+    ]);
 
     let identity = Arc::new(Identity::generate());
     let agent = Agent::start(cfg, identity, source).await.expect("start");
     let mut events = agent.subscribe();
+    gate.open();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let episode = loop {
@@ -442,7 +459,7 @@ async fn a_fired_rule_shows_up_in_the_detection_counters() {
     let workdir = TempDir::new().unwrap();
     let cfg = build_config(workdir.path(), reserve_udp_port(), MonitorConfig::default());
 
-    let source = Box::new(MockEventSource::new(vec![Event::FileOpen(FileOpen {
+    let (source, gate) = gated_source(vec![Event::FileOpen(FileOpen {
         pid: 4242,
         comm: "curl".into(),
         path: "/root/.ssh/authorized_keys".into(),
@@ -450,11 +467,12 @@ async fn a_fired_rule_shows_up_in_the_detection_counters() {
         truncated: false,
         sensitive_read: false,
         ts: SystemTime::now(),
-    })]));
+    })]);
 
     let identity = Arc::new(Identity::generate());
     let agent = Agent::start(cfg, identity, source).await.expect("start");
     let mut events = agent.subscribe();
+    gate.open();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {

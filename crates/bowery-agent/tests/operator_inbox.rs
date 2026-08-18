@@ -128,10 +128,11 @@ async fn high_suspicion_exec_appears_in_operator_inbox_via_subscribe() {
     // Delay the event so the test has time to subscribe before the
     // pipeline emits AlertEmitted. See the refined-alert test below
     // for the broadcast::Receiver race writeup.
-    let source = Box::new(
-        MockEventSource::new(vec![make_exec(4242, payload_path)])
-            .with_delay(Duration::from_millis(200)),
-    );
+    // Gated, not delayed: the pipeline is spawned before `Agent::start`
+    // returns, so an ungated source can be fully drained before
+    // `subscribe()` lands — and a broadcast receiver never replays.
+    let (source, gate) = MockEventSource::new(vec![make_exec(4242, payload_path)]).gated();
+    let source = Box::new(source);
 
     let agent = Agent::start(cfg, agent_id, source)
         .await
@@ -141,6 +142,7 @@ async fn high_suspicion_exec_appears_in_operator_inbox_via_subscribe() {
     // Wait for the agent to emit the AlertEmitted event before
     // Subscribing — the inbox would be empty otherwise.
     let mut events = agent.subscribe();
+    gate.open();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut emitted_episode: Option<String> = None;
     while emitted_episode.is_none() {
@@ -343,16 +345,13 @@ async fn llm_verdict_re_emits_refined_alert_into_inbox() {
         llama_cpp: None,
     };
 
-    // Delay the event so the test has time to subscribe before any
-    // AlertEmitted broadcast fires. Without this, fast runners (CI) can
-    // race the entire process_exec pipeline to completion in the few
-    // microseconds between Agent::start_with_llm returning and
+    // Hold the event until we are subscribed. Without the gate, fast
+    // runners (CI) race the entire process_exec pipeline to completion in
+    // the few microseconds between Agent::start_with_llm returning and
     // agent.subscribe() being called, and broadcast::Receiver doesn't
     // replay messages sent before it was created.
-    let source = Box::new(
-        MockEventSource::new(vec![make_exec(4242, payload_path)])
-            .with_delay(Duration::from_millis(200)),
-    );
+    let (source, gate) = MockEventSource::new(vec![make_exec(4242, payload_path)]).gated();
+    let source = Box::new(source);
     let llm: Arc<dyn LlmAnalyzer> = Arc::new(MockLlmAnalyzer::new(MockMode::Echo));
 
     let agent = Agent::start_with_llm(cfg, agent_id, source, llm)
@@ -363,6 +362,7 @@ async fn llm_verdict_re_emits_refined_alert_into_inbox() {
     // They share an `episode_id`, so we collect AlertEmitted events
     // until we have two with the same id.
     let mut events = agent.subscribe();
+    gate.open();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     let mut alerts_seen: Vec<(String, f32)> = Vec::new();
     let mut llm_done = false;

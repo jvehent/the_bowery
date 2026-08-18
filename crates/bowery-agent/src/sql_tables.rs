@@ -545,8 +545,13 @@ impl BoweryTable for BoweryDetectionsTable {
             .into_iter()
             .map(|(id, n, _)| (id, n))
             .collect();
+        // Durable + *unflushed*, never durable + `fired`: the periodic
+        // flush has already written part of this session's count to the
+        // baseline, and `fired` still includes it.
+        let unflushed = self.stats.unflushed();
         for (rule_id, stat) in self.stats.snapshot() {
-            let total = durable.get(rule_id).copied().unwrap_or(0) + stat.fired;
+            let total = durable.get(rule_id).copied().unwrap_or(0)
+                + unflushed.get(rule_id).copied().unwrap_or(0);
             stmt.execute(params![
                 rule_id,
                 i64::try_from(stat.fired).unwrap_or(i64::MAX),

@@ -111,17 +111,22 @@ async fn pipeline_records_binary_from_exec_event() {
     hasher.update(b"the bowery is watching");
     let expected_sha: [u8; 32] = hasher.finalize().into();
 
-    let source = Box::new(MockEventSource::new(vec![
+    // Gated so the pipeline cannot outrun `subscribe()`; see `EventGate`.
+    let (source, gate) = MockEventSource::new(vec![
         make_exec(1234, bin_path.clone()),
         make_exec(1235, bin_path.clone()),
-    ]));
+    ])
+    .gated();
 
     let identity = Arc::new(Identity::generate());
     let cfg = build_config(workdir.path(), reserve_udp_port());
 
-    let agent = Agent::start(cfg, identity, source).await.expect("start");
+    let agent = Agent::start(cfg, identity, Box::new(source))
+        .await
+        .expect("start");
 
     let mut events = agent.subscribe();
+    gate.open();
 
     // First event: Inserted.
     let outcome_1 = wait_for_binary(&mut events, expected_sha).await;
