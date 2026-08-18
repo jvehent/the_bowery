@@ -6,7 +6,6 @@
 //! to line up: pipeline → bounded writer → `SQLite` file → read-only
 //! `ATTACH` behind the SQL surface.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -22,10 +21,8 @@ use bowery_events::source::MockEventSource;
 use bowery_events::{Event, NetFamily, NetworkConnect, ProcessExec, ProcessExit};
 use tempfile::TempDir;
 
-fn reserve_udp_port() -> SocketAddr {
-    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    sock.local_addr().unwrap()
-}
+mod common;
+use common::reserve_udp_port;
 
 fn build_config(dir: &Path, eventlog_path: PathBuf) -> Config {
     let mesh_addr = reserve_udp_port();

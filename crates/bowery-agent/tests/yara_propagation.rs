@@ -8,7 +8,7 @@
 //! `(operator_fp, request_id)` — alpha drops the push coming back
 //! instead of bouncing it again.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,14 +32,8 @@ use prost::Message as _;
 use tempfile::TempDir;
 use tokio::sync::broadcast::error::RecvError;
 
-fn loopback_ephemeral() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-}
-
-fn reserve_udp_port() -> SocketAddr {
-    let socket = std::net::UdpSocket::bind(loopback_ephemeral()).expect("bind");
-    socket.local_addr().expect("local_addr")
-}
+mod common;
+use common::{loopback_ephemeral, reserve_udp_port};
 
 #[allow(clippy::too_many_arguments)]
 fn build_config(

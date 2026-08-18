@@ -3,7 +3,7 @@
 //! the dispatch path returns the expected `OperatorResult`.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,14 +30,8 @@ use bowery_whisper::{Sealer, StaticResolver, Verifier};
 use tempfile::TempDir;
 use tokio::sync::broadcast::error::RecvError;
 
-fn loopback_ephemeral() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-}
-
-fn reserve_udp_port() -> SocketAddr {
-    let socket = std::net::UdpSocket::bind(loopback_ephemeral()).expect("bind");
-    socket.local_addr().expect("local_addr")
-}
+mod common;
+use common::{loopback_ephemeral, reserve_udp_port};
 
 fn build_agent_config(dir: &Path, mesh_addr: SocketAddr, operator_pubkey_b64: String) -> Config {
     Config {

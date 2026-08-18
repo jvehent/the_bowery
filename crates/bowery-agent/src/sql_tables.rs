@@ -616,14 +616,24 @@ impl BoweryTable for BoweryProbeStatusTable {
                 parse_failed       INTEGER,
                 kernel_drops       INTEGER,
                 last_event_unix_ms INTEGER,
-                stopped_reason     TEXT
+                stopped_reason     TEXT,
+                -- Which kernel object is actually loaded. The agent and
+                -- the object install separately, and a new agent beside
+                -- a stale one reports every probe attached and healthy
+                -- while missing whatever the newer object added. Diffing
+                -- this across the fleet answers whether a deploy landed,
+                -- without inferring it from a version string that only
+                -- speaks for the binary.
+                object_path        TEXT,
+                object_sha256      TEXT
             );",
         )?;
         let mut stmt = conn.prepare(
             "INSERT INTO bowery_probe_status (probe, watching, attached, emitted,
                                               parse_failed, kernel_drops,
-                                              last_event_unix_ms, stopped_reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                              last_event_unix_ms, stopped_reason,
+                                              object_path, object_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
 
         let Some(health) = self.health.as_ref() else {
@@ -640,12 +650,15 @@ impl BoweryTable for BoweryProbeStatusTable {
                 Option::<i64>::None,
                 Option::<i64>::None,
                 "no kernel event source — agent is not observing",
+                Option::<String>::None,
+                Option::<String>::None,
             ])?;
             return Ok(());
         };
 
         let watching = i64::from(health.is_watching());
         let stopped = health.stopped_reason();
+        let object = health.object();
         for p in health.snapshot() {
             stmt.execute(params![
                 p.name,
@@ -660,6 +673,8 @@ impl BoweryTable for BoweryProbeStatusTable {
                 p.last_event_unix_ms
                     .map(|t| i64::try_from(t).unwrap_or(i64::MAX)),
                 stopped.clone(),
+                object.as_ref().map(|o| o.path.clone()),
+                object.as_ref().map(|o| o.sha256.clone()),
             ])?;
         }
         Ok(())
@@ -1195,6 +1210,83 @@ impl BoweryTable for BoweryEventLogStatusTable {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod probe_status_tests {
+    use super::*;
+    use bowery_events::source::{PROBE_EXEC, ProbeHealth};
+
+    fn query(table: &BoweryProbeStatusTable, sql: &str) -> Vec<Vec<String>> {
+        let conn = Connection::open_in_memory().expect("sqlite");
+        table.register(&conn).expect("register");
+        let mut stmt = conn.prepare(sql).expect("prepare");
+        let n = stmt.column_count();
+        stmt.query_map([], |r| {
+            Ok((0..n)
+                .map(|i| {
+                    r.get::<_, Option<String>>(i)
+                        .unwrap_or_default()
+                        .unwrap_or_default()
+                })
+                .collect())
+        })
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows")
+    }
+
+    /// The object's identity is queryable by name.
+    ///
+    /// It exists because this fleet ran a new agent against a stale
+    /// kernel object: every probe reported attached and healthy while
+    /// the newest one was simply absent. Nothing in the agent's version
+    /// string speaks for the object, so an operator has to be able to
+    /// diff the object itself across hosts.
+    #[test]
+    fn reports_which_kernel_object_is_loaded() {
+        let health = Arc::new(ProbeHealth::new());
+        health.mark_attached(PROBE_EXEC);
+        health.set_object(
+            std::path::Path::new("/usr/local/lib/bowery/bowery-ebpf"),
+            b"abc",
+        );
+
+        let rows = query(
+            &BoweryProbeStatusTable::new(Some(health)),
+            "SELECT object_path, object_sha256 FROM bowery_probe_status LIMIT 1",
+        );
+        assert_eq!(rows[0][0], "/usr/local/lib/bowery/bowery-ebpf");
+        // SHA-256 of "abc".
+        assert_eq!(
+            rows[0][1],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// A sensor that loaded nothing reports nothing, rather than a
+    /// stale or invented hash.
+    #[test]
+    fn an_object_that_was_never_loaded_reads_as_absent() {
+        let health = Arc::new(ProbeHealth::new());
+        health.mark_attached(PROBE_EXEC);
+        let rows = query(
+            &BoweryProbeStatusTable::new(Some(health)),
+            "SELECT object_sha256 FROM bowery_probe_status LIMIT 1",
+        );
+        assert_eq!(rows[0][0], "", "unknown must not read as a value");
+    }
+
+    /// And a host with no source at all still answers the question.
+    #[test]
+    fn no_source_at_all_still_returns_a_row() {
+        let rows = query(
+            &BoweryProbeStatusTable::new(None),
+            "SELECT probe, CAST(watching AS TEXT), object_sha256 FROM bowery_probe_status",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], "0", "not watching is the finding");
     }
 }
 

@@ -23,12 +23,10 @@ use bowery_crypto::Identity;
 use bowery_events::source::NoopEventSource;
 use tempfile::TempDir;
 
-const CLUSTER: &str = "bowery-test-enrollment";
+mod common;
+use common::reserve_udp_port;
 
-fn reserve_udp_port() -> SocketAddr {
-    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    sock.local_addr().unwrap()
-}
+const CLUSTER: &str = "bowery-test-enrollment";
 
 #[allow(clippy::too_many_arguments)]
 fn build_config(

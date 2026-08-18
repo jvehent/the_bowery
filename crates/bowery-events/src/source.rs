@@ -301,6 +301,25 @@ pub struct ProbeHealth {
     /// Why the source stopped, if it did. A source that exits is as
     /// blind as one that never started.
     stopped: Mutex<Option<String>>,
+    /// Identity of the kernel object actually loaded: its path and the
+    /// SHA-256 of the bytes.
+    ///
+    /// The agent binary and the BPF object ship and install separately,
+    /// and this fleet has run a new agent against a stale object — a
+    /// state in which every probe reports `attached` and healthy while
+    /// the newest one simply is not there. Version strings answer for
+    /// the agent and say nothing about the object, so the object has to
+    /// answer for itself. Comparing this across hosts turns "did that
+    /// actually deploy" from an inference into a query.
+    object: Mutex<Option<LoadedObject>>,
+}
+
+/// Which kernel object a sensor is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedObject {
+    pub path: String,
+    /// Lowercase hex SHA-256 of the object file as loaded.
+    pub sha256: String,
 }
 
 impl ProbeHealth {
@@ -344,6 +363,33 @@ impl ProbeHealth {
     #[must_use]
     pub fn kernel_drops_available(&self) -> bool {
         self.kernel_drops_available.load(Ordering::Relaxed)
+    }
+
+    /// Record which object was loaded, hashing its bytes.
+    ///
+    /// Best effort: a hash we could not compute is reported as absent
+    /// rather than as a wrong value, because an operator diffing these
+    /// across a fleet has to be able to trust a match.
+    pub fn set_object(&self, path: &std::path::Path, bytes: &[u8]) {
+        use sha2::{Digest, Sha256};
+        let mut hex = String::with_capacity(64);
+        for b in Sha256::digest(bytes) {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        *self.object.lock().expect("probe health mutex poisoned") = Some(LoadedObject {
+            path: path.display().to_string(),
+            sha256: hex,
+        });
+    }
+
+    /// The kernel object this sensor loaded, if it loaded one.
+    #[must_use]
+    pub fn object(&self) -> Option<LoadedObject> {
+        self.object
+            .lock()
+            .expect("probe health mutex poisoned")
+            .clone()
     }
 
     pub fn mark_stopped(&self, reason: impl Into<String>) {

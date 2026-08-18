@@ -445,6 +445,7 @@ own bookkeeping.
 | question | query |
 | --- | --- |
 | Is every host actually watching? | `SELECT probe, watching, emitted, kernel_drops FROM bowery_probe_status` |
+| Is every host running the same sensor? | `SELECT DISTINCT object_sha256 FROM bowery_probe_status --fanout` |
 | What is alerting? | `SELECT episode_id, suspicion, confirmed, exe_path FROM bowery_alerts` |
 | Who talked to this endpoint? | `SELECT * FROM bowery_net_destinations WHERE dst_addr = '203.0.113.4'` |
 | What happened at 14:32? | `SELECT ts_unix_ms, kind, comm, path FROM bowery_events WHERE ts_unix_ms BETWEEN … ORDER BY seq` |
@@ -465,6 +466,18 @@ being deliberately careful.
 sensor stopped. Every detection on that host is inactive, and its
 whisper answers are worthless as evidence of absence. Check
 `bowery_probe_status`; the usual cause is a missing object.
+
+**"Every probe is attached, but a detection never fires."** Check
+`object_sha256` across the fleet before suspecting the rule. The agent
+and the kernel object install separately, and a host can run a new agent
+against a stale object: every probe reports attached and healthy, and
+whatever the newer object added is simply absent. This has happened here.
+More than one `DISTINCT object_sha256` across hosts you deployed together
+means one of them did not take:
+
+```sql
+SELECT DISTINCT object_sha256 FROM bowery_probe_status
+```
 
 **"Peers `declined` instead of voting."** A peer only answers "never
 seen it" once it has observed enough for that to mean anything —

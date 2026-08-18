@@ -317,6 +317,20 @@ async fn run(
         }
     };
 
+    // Record which object this actually is. Hashed from disk rather
+    // than taken from the build, because the question worth answering
+    // is "what is running", and a fleet has already answered it wrong:
+    // a new agent beside a stale object reports every probe attached
+    // and healthy while quietly missing the newest one.
+    match std::fs::read(obj_path) {
+        Ok(bytes) => health.set_object(obj_path, &bytes),
+        Err(e) => warn!(
+            error = %e,
+            path = %obj_path.display(),
+            "could not hash the BPF object; its identity will read as unknown"
+        ),
+    }
+
     // Best-effort: hook up aya-log if the BPF program emits log records.
     // No log map => silently skip.
     let _ = aya_log::EbpfLogger::init(&mut ebpf);
@@ -862,6 +876,58 @@ struct RawPtraceEvent {
     comm: [u8; 16],
 }
 const RAW_PTRACE_SIZE: usize = std::mem::size_of::<RawPtraceEvent>();
+
+// ---------------------------------------------------------------------------
+// Record layout, pinned
+// ---------------------------------------------------------------------------
+
+/// The wire size of every kernel record, asserted at compile time.
+///
+/// Each `Raw*Event` above claims to mirror a struct in `bowery-ebpf`
+/// "byte for byte", and nothing checked that claim. The two live in
+/// different crates built for different targets, so the compiler cannot
+/// compare them — and the rings are untagged, one fixed parser each. A
+/// field inserted into the middle of a kernel struct still satisfies the
+/// `bytes.len() < RAW_*_SIZE` guard and every field after it decodes as
+/// garbage: paths that no longer match a rule, ports that are not ports.
+/// Silently, and in the direction that loses detections.
+///
+/// These assertions turn that into a build failure rather than a silent
+/// misparse. Change a record on either side and the build stops until
+/// both sides and this list agree. Updating only the number here
+/// restores a green build and leaves the sensor decoding garbage, which
+/// is the failure being prevented — so change the structs, not the
+/// constant.
+///
+/// It cannot catch *deploy* skew — an old object beside a new agent, a
+/// state this fleet has actually been in — which is what
+/// [`ProbeHealth::object_sha256`] is for.
+const _: () = {
+    assert!(
+        RAW_EXEC_SIZE == 24,
+        "exec record layout drifted from the BPF program"
+    );
+    assert!(
+        RAW_EXIT_SIZE == 20,
+        "exit record layout drifted from the BPF program"
+    );
+    assert!(
+        RAW_CONNECT_SIZE == 68,
+        "connect record layout drifted from the BPF program"
+    );
+    assert!(
+        RAW_FILE_SIZE == 284,
+        "file record layout drifted from the BPF program"
+    );
+    assert!(
+        RAW_MODULE_SIZE == 88,
+        "module record layout drifted from the BPF program"
+    );
+    assert!(
+        RAW_PTRACE_SIZE == 32,
+        "ptrace record layout drifted from the BPF program"
+    );
+};
 
 fn parse_ptrace(bytes: &[u8]) -> Option<Event> {
     if bytes.len() < RAW_PTRACE_SIZE {
@@ -1600,5 +1666,24 @@ mod inbound_tests {
             RAW_CONNECT_SIZE, 68,
             "ConnectEvent layout changed; update crates/bowery-ebpf/src/main.rs to match"
         );
+    }
+}
+
+#[cfg(test)]
+mod record_layout_tests {
+    use super::*;
+
+    /// A record one byte short of its struct must be refused, not read.
+    ///
+    /// The compile-time assertions above pin the sizes; this pins the
+    /// behaviour when the kernel hands over less than a whole record.
+    #[test]
+    fn a_short_record_is_refused_rather_than_read_past() {
+        assert!(parse_exec(&[0u8; RAW_EXEC_SIZE - 1]).is_none());
+        assert!(parse_exit(&[0u8; RAW_EXIT_SIZE - 1]).is_none());
+        assert!(parse_connect(&[0u8; RAW_CONNECT_SIZE - 1]).is_none());
+        assert!(parse_file(&[0u8; RAW_FILE_SIZE - 1]).is_none());
+        assert!(parse_module(&[0u8; RAW_MODULE_SIZE - 1]).is_none());
+        assert!(parse_ptrace(&[0u8; RAW_PTRACE_SIZE - 1]).is_none());
     }
 }

@@ -5,7 +5,7 @@
 //! exercises chitchat, the TOFU pinning store, the QUIC transport, the
 //! envelope crypto, and the agent's task supervision in one go.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,18 +21,8 @@ use bowery_events::source::NoopEventSource;
 use tempfile::TempDir;
 use tokio::sync::broadcast::error::RecvError;
 
-fn loopback_ephemeral() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-}
-
-/// Reserve an ephemeral UDP port on loopback by briefly binding it. Returns
-/// the address; the OS will likely re-issue this same port immediately
-/// after we drop the socket. There's a small race window, but it's
-/// acceptable for tests.
-fn reserve_udp_port() -> SocketAddr {
-    let socket = std::net::UdpSocket::bind(loopback_ephemeral()).expect("bind");
-    socket.local_addr().expect("local_addr")
-}
+mod common;
+use common::{loopback_ephemeral, reserve_udp_port};
 
 fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>) -> Config {
     Config {

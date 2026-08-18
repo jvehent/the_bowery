@@ -14,6 +14,20 @@ use bowery_crypto::Fingerprint;
 
 const WINDOW_BITS: u64 = 128;
 
+/// Per-sender replay state.
+///
+/// The map has no cap of its own, and does not need one: an entry is
+/// created only after [`crate::envelope`] has verified a recipient-bound
+/// Ed25519 signature, and the QUIC handshake that carried it already
+/// refused any peer whose fingerprint is not pinned
+/// ([`crate::tls::PinnedCertVerifier`]). So the key space is the pinned
+/// set, which `known_neighbors.max_pinned_peers` bounds — not the set of
+/// keypairs an attacker can generate.
+///
+/// Written down because the bound is enforced two crates away from the
+/// code that relies on it. Anyone who makes this reachable before
+/// pinning has turned it into an unauthenticated memory-growth
+/// denial of service.
 #[derive(Debug, Default)]
 pub struct ReplayGuard {
     peers: HashMap<Fingerprint, PerSenderState>,

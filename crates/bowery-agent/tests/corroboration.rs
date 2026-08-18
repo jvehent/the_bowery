@@ -38,18 +38,12 @@ use bowery_proto::attribute;
 use tempfile::TempDir;
 use tokio::sync::broadcast::error::RecvError;
 
+mod common;
+use common::{loopback_ephemeral, reserve_udp_port};
+
 const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// The port alpha "listens" on in these scenarios.
 const TARGET_PORT: u16 = 22;
-
-fn loopback_ephemeral() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(LOOPBACK), 0)
-}
-
-fn reserve_udp_port() -> SocketAddr {
-    let socket = std::net::UdpSocket::bind(loopback_ephemeral()).expect("bind");
-    socket.local_addr().expect("local_addr")
-}
 
 fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>, cluster: &str) -> Config {
     Config {
