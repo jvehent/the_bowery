@@ -25,6 +25,18 @@ mod common;
 use common::{loopback_ephemeral, reserve_udp_port};
 
 fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>) -> Config {
+    build_config_with_log(dir, mesh_addr, seeds, false)
+}
+
+/// `with_log` gives the agent a real on-disk event log, which the
+/// log-witness path needs: an agent with no log publishes no height, so
+/// there is nothing for a peer to remember.
+fn build_config_with_log(
+    dir: &Path,
+    mesh_addr: SocketAddr,
+    seeds: Vec<String>,
+    with_log: bool,
+) -> Config {
     Config {
         identity: IdentityConfig {
             path: dir.join("identity.key"),
@@ -75,7 +87,8 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, seeds: Vec<String>) -> Config
         // need a writer task (the default path isn't writable in CI).
         detection: bowery_agent::config::DetectionConfig::default(),
         eventlog: bowery_agent::config::EventLogConfig {
-            enabled: false,
+            enabled: with_log,
+            path: dir.join("events.db"),
             ..Default::default()
         },
     }
@@ -175,4 +188,130 @@ where
             Err(RecvError::Closed) => panic!("event channel closed"),
         }
     }
+}
+
+/// A peer notices another peer's event log losing history.
+///
+/// The point of the whole mechanism: root on a host can delete that
+/// host's log, and nothing local survives to say it existed — a verifier
+/// only sees what remains. A neighbour that already wrote the number
+/// down is not so easily edited.
+///
+/// The wipe is staged the way it really happens: the agent is stopped,
+/// its database file is removed, and it comes back with the same
+/// identity. Deleting *rows* would not do — `highest_seq` is read from
+/// `sqlite_sequence`, which `DELETE` does not reset, which is exactly
+/// why retention pruning can never look like an attack.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_notices_an_event_log_that_went_backwards() {
+    use bowery_events::{Event, ProcessExit};
+    use std::time::SystemTime;
+
+    let dir_alpha = TempDir::new().unwrap();
+    let dir_beta = TempDir::new().unwrap();
+    let mesh_addr_alpha = reserve_udp_port();
+    let mesh_addr_beta = reserve_udp_port();
+    let id_alpha = Arc::new(Identity::generate());
+    let id_beta = Arc::new(Identity::generate());
+    let beta_db = dir_beta.path().join("events.db");
+
+    let events = |n: u32| -> Vec<Event> {
+        (0..n)
+            .map(|i| {
+                Event::ProcessExit(ProcessExit {
+                    pid: 9000 + i,
+                    exit_code: 0,
+                    ts: SystemTime::now(),
+                })
+            })
+            .collect()
+    };
+
+    let agent_alpha = Agent::start(
+        build_config_with_log(dir_alpha.path(), mesh_addr_alpha, Vec::new(), true),
+        id_alpha,
+        Box::new(NoopEventSource),
+    )
+    .await
+    .expect("start alpha");
+
+    let beta_cfg = || {
+        build_config_with_log(
+            dir_beta.path(),
+            mesh_addr_beta,
+            vec![mesh_addr_alpha.to_string()],
+            true,
+        )
+    };
+    let agent_beta = Agent::start(
+        beta_cfg(),
+        id_beta.clone(),
+        Box::new(bowery_events::source::MockEventSource::new(events(40))),
+    )
+    .await
+    .expect("start beta");
+
+    let beta_fp = agent_beta.fingerprint();
+
+    // Wait until alpha has witnessed beta at a nonzero height. Until
+    // then there is nothing to roll back *from*, and asserting earlier
+    // would test something else.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "alpha never witnessed beta's log height"
+        );
+        if agent_alpha
+            .mesh()
+            .peers()
+            .into_iter()
+            .any(|p| p.fingerprint == beta_fp && p.log_report.is_some())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Subscribe before the wipe so the alert cannot be missed.
+    let alerts = agent_alpha.subscribe();
+
+    // The wipe, as an attacker with root performs it.
+    agent_beta.shutdown().await.expect("stop beta");
+    std::fs::remove_file(&beta_db).expect("remove beta's event log");
+    let agent_beta = Agent::start(
+        beta_cfg(),
+        id_beta,
+        Box::new(bowery_events::source::MockEventSource::new(events(2))),
+    )
+    .await
+    .expect("restart beta");
+
+    let episode = tokio::time::timeout(
+        Duration::from_secs(30),
+        wait_for_event(alerts, |e| match e {
+            AgentEvent::AlertEmitted { episode_id, .. }
+                if episode_id.contains("event_log_rollback") =>
+            {
+                Some(episode_id.clone())
+            }
+            _ => None,
+        }),
+    )
+    .await
+    .expect("alpha did not report beta's log rolling back");
+
+    let (found, _) = agent_alpha.inbox().read_since(0, 100);
+    let alert = found
+        .iter()
+        .find(|a| a.episode_id == episode)
+        .expect("the alert is in the inbox");
+    assert!(alert.rationale.contains("event log"), "{}", alert.rationale);
+    assert!(
+        alert.context.iter().any(|a| a.key == "events_lost"),
+        "an operator needs to know how much went missing"
+    );
+
+    agent_alpha.shutdown().await.expect("shutdown alpha");
+    agent_beta.shutdown().await.expect("shutdown beta");
 }

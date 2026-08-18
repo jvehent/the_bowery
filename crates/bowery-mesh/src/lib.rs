@@ -31,6 +31,9 @@ const KEY_WHISPER_ADDR: &str = "whisper_addr";
 const KEY_VERIFYING_KEY: &str = "verifying_key";
 /// Key under which each node publishes its base64-encoded role vector.
 pub const KEY_ROLE_VECTOR: &str = "role_vec";
+/// Signed `bowery_proto::LogReport`, base64. How much event-log history
+/// this peer holds, so neighbours can notice it losing some.
+pub const KEY_LOG_REPORT: &str = "log_report";
 /// Key under which each node publishes its base64-encoded
 /// `bowery_proto::BloomAdvert` (Phase 5: tier-1 fingerprint
 /// summary). Receivers compare epochs per peer and keep only the
@@ -75,6 +78,11 @@ pub struct PeerInfo {
     /// peer, if any. Phase-3 mesh trust: under the `grant` enrollment
     /// policy a peer without a valid one is never pinned.
     pub membership_grant: Option<String>,
+    /// Base64-encoded `bowery_proto::LogReport` published by the peer,
+    /// if any — how much event-log history it claims to hold. Signed by
+    /// the peer, because gossip is unauthenticated: verify before
+    /// believing it.
+    pub log_report: Option<String>,
 }
 
 #[derive(Debug)]
@@ -258,6 +266,7 @@ fn build_peer_infos(
             let role_vector = state.get(KEY_ROLE_VECTOR).map(str::to_string);
             let bloom_advert = state.get(KEY_BLOOM_ADVERT).map(str::to_string);
             let membership_grant = state.get(KEY_MEMBERSHIP_GRANT).map(str::to_string);
+            let log_report = state.get(KEY_LOG_REPORT).map(str::to_string);
             Some(PeerInfo {
                 fingerprint: fp,
                 verifying_key: vk,
@@ -266,6 +275,7 @@ fn build_peer_infos(
                 role_vector,
                 bloom_advert,
                 membership_grant,
+                log_report,
             })
         })
         .collect()

@@ -208,6 +208,7 @@ pub struct Agent {
     peer_watchdog_task: Option<JoinHandle<()>>,
     action_release_task: JoinHandle<()>,
     role_publisher_task: JoinHandle<()>,
+    log_witness_task: JoinHandle<()>,
     bloom_publisher_task: JoinHandle<()>,
     llm_outcomes_task: JoinHandle<()>,
     whisper_qa_task: JoinHandle<()>,
@@ -1060,6 +1061,22 @@ impl Agent {
             shutdown_rx.clone(),
         );
 
+        // Peers remember how much history this host had, and this host
+        // remembers theirs. Shares the role publisher's cadence: it is
+        // the same kind of slow, self-describing gossip.
+        let log_witness_task = spawn_log_witness_task(
+            mesh.clone(),
+            identity.clone(),
+            eventlog_store.clone(),
+            detection_stats.clone(),
+            inbox.clone(),
+            identity.fingerprint(),
+            llm.name().to_string(),
+            events_tx.clone(),
+            config.role.publish_interval,
+            shutdown_rx.clone(),
+        );
+
         let bloom_publisher_task = bloom_publisher::spawn_bloom_publisher_task(
             mesh.clone(),
             baseline.clone(),
@@ -1101,6 +1118,7 @@ impl Agent {
             peer_watchdog_task,
             action_release_task,
             role_publisher_task,
+            log_witness_task,
             bloom_publisher_task,
             llm_outcomes_task,
             whisper_qa_task,
@@ -1196,6 +1214,7 @@ impl Agent {
             let _ = t.await;
         }
         let _ = self.role_publisher_task.await;
+        let _ = self.log_witness_task.await;
         let _ = self.bloom_publisher_task.await;
         let _ = self.llm_outcomes_task.await;
         let _ = self.whisper_qa_task.await;
@@ -2280,6 +2299,194 @@ fn handle_llm_outcome(
 // ---------------------------------------------------------------------------
 // Role-vector publisher
 // ---------------------------------------------------------------------------
+
+/// Publish how much event-log history this host holds, and check what
+/// neighbours say about theirs.
+///
+/// Both halves in one task because they share a cadence and neither is
+/// worth its own. The publishing half is what lets a *peer* notice this
+/// host being cleared; the witnessing half is what lets this host notice
+/// a peer being cleared. Neither can do anything about its own log — an
+/// attacker who deletes it also deletes the evidence that it was ever
+/// bigger, which is exactly why the number has to live somewhere else.
+#[allow(clippy::too_many_arguments)] // wiring kept explicit at the call site
+fn spawn_log_witness_task(
+    mesh: Arc<Mesh>,
+    identity: Arc<Identity>,
+    event_log: Option<Arc<bowery_eventlog::EventLog>>,
+    detections: Arc<crate::detection_stats::DetectionStats>,
+    inbox: Arc<AlertInbox>,
+    originator_fp: Fingerprint,
+    backend_label: String,
+    events_tx: broadcast::Sender<AgentEvent>,
+    interval: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut witness = bowery_analysis::log_witness::LogWitness::new();
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    publish_log_report(&mesh, &identity, event_log.as_ref()).await;
+                    witness_peer_logs(
+                        &mesh,
+                        &mut witness,
+                        &detections,
+                        &inbox,
+                        originator_fp,
+                        &backend_label,
+                        &events_tx,
+                    );
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    })
+}
+
+/// Sign this host's event-log height and gossip it.
+async fn publish_log_report(
+    mesh: &Arc<Mesh>,
+    identity: &Arc<Identity>,
+    event_log: Option<&Arc<bowery_eventlog::EventLog>>,
+) {
+    // A host with no event log has no history to lose, and publishing a
+    // zero would make every restart of a logless agent look like a
+    // rollback to anyone watching.
+    let Some(log) = event_log else { return };
+    // `stats` queries SQLite, so it runs off the reactor like every
+    // other read of that store.
+    let log_for_call = log.clone();
+    let highest = match tokio::task::spawn_blocking(move || log_for_call.stats()).await {
+        Ok(Ok(stats)) => stats.highest_seq,
+        Ok(Err(e)) => {
+            warn!(error = %e, "could not read the event log height to publish");
+            return;
+        }
+        Err(e) => {
+            warn!(error = %e, "event log height task panicked");
+            return;
+        }
+    };
+    let now = crate::inbox::current_unix_ms();
+    let fp = identity.fingerprint();
+    let signature = identity.sign(&bowery_proto::LogReport::signing_input_for(
+        fp.as_bytes(),
+        highest,
+        now,
+    ));
+    let report = bowery_proto::LogReport {
+        host_fp: fp.as_bytes().to_vec(),
+        highest_seq: highest,
+        reported_unix_ms: now,
+        signature: signature.to_bytes().to_vec(),
+    };
+    let encoded = {
+        use base64::Engine as _;
+        use prost::Message as _;
+        base64::engine::general_purpose::STANDARD.encode(report.encode_to_vec())
+    };
+    if let Err(e) = mesh.set_state(bowery_mesh::KEY_LOG_REPORT, encoded).await {
+        warn!(error = %e, "failed to publish the log report");
+        return;
+    }
+    debug!(highest_seq = highest, "published event-log height");
+}
+
+/// Verify each peer's report and alert if one lost history.
+#[allow(clippy::too_many_arguments)] // wiring kept explicit
+fn witness_peer_logs(
+    mesh: &Arc<Mesh>,
+    witness: &mut bowery_analysis::log_witness::LogWitness,
+    detections: &Arc<crate::detection_stats::DetectionStats>,
+    inbox: &Arc<AlertInbox>,
+    originator_fp: Fingerprint,
+    backend_label: &str,
+    events_tx: &broadcast::Sender<AgentEvent>,
+) {
+    use bowery_analysis::log_witness::{LogReport as Witnessed, RULE_ID};
+    for peer in mesh.peers() {
+        let Some(encoded) = peer.log_report.as_ref() else {
+            continue;
+        };
+        let Some(report) = decode_log_report(encoded) else {
+            continue;
+        };
+        // The report must be *about* the peer publishing it, and signed
+        // by them. Gossip is unauthenticated, so without both checks a
+        // peer could accuse any host of rolling back.
+        if report.host_fp.as_slice() != peer.fingerprint.as_bytes() {
+            warn!(peer = %peer.fingerprint, "log report names a different host; ignored");
+            continue;
+        }
+        let Some(input) = report.signing_input() else {
+            continue;
+        };
+        let Ok(sig_bytes): Result<[u8; 64], _> = report.signature.as_slice().try_into() else {
+            continue;
+        };
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        if bowery_crypto::Identity::verify(&peer.verifying_key, &input, &signature).is_err() {
+            warn!(peer = %peer.fingerprint, "log report signature did not verify; ignored");
+            continue;
+        }
+
+        let fp_hex = peer.fingerprint.to_hex();
+        let Some(finding) = witness.observe(
+            &fp_hex,
+            Witnessed {
+                highest_seq: report.highest_seq,
+                reported_unix_ms: report.reported_unix_ms,
+            },
+        ) else {
+            continue;
+        };
+
+        let why = bowery_analysis::log_witness::rationale(&finding);
+        detections.record(RULE_ID);
+        warn!(
+            rule = RULE_ID,
+            peer = %peer.fingerprint,
+            witnessed = finding.witnessed_seq,
+            reported = finding.reported_seq,
+            "a peer's event log went backwards"
+        );
+        let episode_id = format!("peer-{RULE_ID}-{}", crate::inbox::current_unix_ms());
+        inbox.append(Alert {
+            originator_fp: originator_fp.as_bytes().to_vec(),
+            episode_id: episode_id.clone(),
+            exe_sha256_hex: String::new(),
+            exe_path: String::new(),
+            suspicion: 0.9,
+            rationale: why,
+            suggested_actions: Vec::new(),
+            ts_unix_ms: crate::inbox::current_unix_ms(),
+            backend: backend_label.to_string(),
+            confirmation: None,
+            context: vec![
+                bowery_proto::Attribute::new("peer", fp_hex),
+                bowery_proto::Attribute::new("witnessed_seq", finding.witnessed_seq.to_string()),
+                bowery_proto::Attribute::new("reported_seq", finding.reported_seq.to_string()),
+                bowery_proto::Attribute::new("events_lost", finding.lost.to_string()),
+            ],
+        });
+        let _ = events_tx.send(AgentEvent::AlertEmitted {
+            episode_id,
+            suspicion: 0.9,
+        });
+    }
+}
+
+fn decode_log_report(encoded: &str) -> Option<bowery_proto::LogReport> {
+    use base64::Engine as _;
+    use prost::Message as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .ok()?;
+    bowery_proto::LogReport::decode(bytes.as_slice()).ok()
+}
 
 fn spawn_role_publisher_task(
     mesh: Arc<Mesh>,

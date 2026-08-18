@@ -23,6 +23,7 @@ pub mod injection;
 pub mod invocation;
 pub mod kmod;
 pub mod lineage;
+pub mod log_witness;
 pub mod mass_write;
 pub mod peer_select;
 pub mod provenance;

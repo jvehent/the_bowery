@@ -173,7 +173,7 @@ not, because the exec sensor does not capture the environment.
 
 **Coverage: partial**
 
-Rules: `probe.sensor_blind`, `peer.silent`, `defense_evasion.security_service_stopped`, `defense_evasion.mac_disabled`
+Rules: `probe.sensor_blind`, `peer.silent`, `defense_evasion.security_service_stopped`, `defense_evasion.mac_disabled`, `evade.event_log_rollback`
 
 Gap: the agent reports its own blindness, its neighbours report it going silent
 altogether, and stopping another host defence — the audit daemon, AppArmor, SELinux
@@ -181,7 +181,9 @@ enforcement — is read from the command that does it. All of that is the *shell
 form: a process that speaks to netlink or the LSM interfaces directly execs nothing
 and is invisible here. And the quietest attack is still uncovered: an agent left
 running but tampered with, which gossips normally and so looks alive to every peer
-watching for silence.
+watching for silence. Clearing the agent's own event log is caught only because
+neighbours remember how much history it held — and only if a neighbour witnessed it
+before the log was cleared.
 
 ### T1562.004 — Impair Defenses: Disable or Modify System Firewall
 

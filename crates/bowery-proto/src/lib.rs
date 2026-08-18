@@ -1129,6 +1129,77 @@ pub const MEMBERSHIP_GRANT_DOMAIN: &[u8] = b"bowery/mesh/membership-grant/v1";
 /// Domain separator for [`Revocation`] signatures.
 pub const REVOCATION_DOMAIN: &[u8] = b"bowery/mesh/revocation/v1";
 
+/// Domain separator for [`LogReport`] signatures.
+pub const LOG_REPORT_DOMAIN: &[u8] = b"bowery/mesh/log-report/v1";
+
+/// An agent's signed statement of how much history its event log holds.
+///
+/// Published into the gossip KV so neighbours remember it. Root on a
+/// host can delete that host's log, and nothing local survives to say it
+/// existed — a verifier only sees what remains, so a log truncated to
+/// nothing looks exactly like an agent installed a minute ago. It does
+/// not look that way to a peer who already wrote the number down.
+///
+/// **Signed, because gossip is plain unauthenticated UDP.** Anyone who
+/// can reach the port can publish a KV value, so an unsigned report
+/// would let an attacker either forge a huge sequence number for a host
+/// they are about to clear, or accuse a healthy peer of rolling back.
+/// The signature is checked against the fingerprint of the peer actually
+/// gossiping, exactly as [`MembershipGrant`] is.
+///
+/// **`host_fp` binds the report to one identity** for the same reason a
+/// grant carries one: a report harvested off the wire is published in
+/// plaintext and meant to be, and without the binding it could be
+/// replayed under any key.
+#[derive(Clone, PartialEq, ProstMessage)]
+pub struct LogReport {
+    /// Fingerprint of the agent whose log this describes.
+    #[prost(bytes = "vec", tag = "1")]
+    pub host_fp: Vec<u8>,
+    /// Highest sequence number the event log has ever assigned. Rises
+    /// only: it survives a restart, and retention prunes old rows
+    /// without reissuing numbers.
+    #[prost(uint64, tag = "2")]
+    pub highest_seq: u64,
+    /// When the reporting host stamped this. Lets a receiver ignore a
+    /// stale value redelivered after a newer one, which eventually
+    /// consistent gossip will do.
+    #[prost(uint64, tag = "3")]
+    pub reported_unix_ms: u64,
+    /// Ed25519 signature over [`LogReport::signing_input`].
+    #[prost(bytes = "vec", tag = "4")]
+    pub signature: Vec<u8>,
+}
+
+impl LogReport {
+    /// The bytes a report's signature covers.
+    #[must_use]
+    pub fn signing_input_for(
+        host_fp: &[u8; 32],
+        highest_seq: u64,
+        reported_unix_ms: u64,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(LOG_REPORT_DOMAIN.len() + 32 + 8 + 8);
+        buf.extend_from_slice(LOG_REPORT_DOMAIN);
+        buf.extend_from_slice(host_fp);
+        buf.extend_from_slice(&highest_seq.to_be_bytes());
+        buf.extend_from_slice(&reported_unix_ms.to_be_bytes());
+        buf
+    }
+
+    /// This report's own signing input, or `None` if `host_fp` is not a
+    /// fingerprint.
+    #[must_use]
+    pub fn signing_input(&self) -> Option<Vec<u8>> {
+        let fp: [u8; 32] = self.host_fp.as_slice().try_into().ok()?;
+        Some(Self::signing_input_for(
+            &fp,
+            self.highest_seq,
+            self.reported_unix_ms,
+        ))
+    }
+}
+
 /// An operator's signed statement that a given agent belongs in a given
 /// mesh cluster.
 ///

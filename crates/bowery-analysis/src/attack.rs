@@ -236,6 +236,7 @@ pub const TECHNIQUES: &[Technique] = &[
             "peer.silent",
             "defense_evasion.security_service_stopped",
             "defense_evasion.mac_disabled",
+            "evade.event_log_rollback",
         ],
         gap: "the agent reports its own blindness, its neighbours report it going \
               silent altogether, and stopping another host defence — the audit daemon, \
@@ -244,7 +245,9 @@ pub const TECHNIQUES: &[Technique] = &[
               LSM interfaces directly execs nothing and is invisible here. And the \
               quietest attack is still uncovered: an agent left running but tampered \
               with, which gossips normally and so looks alive to every peer watching \
-              for silence",
+              for silence. Clearing the agent's own event log is caught only because \
+              neighbours remember how much history it held — and only if a neighbour \
+              witnessed it before the log was cleared",
     },
     Technique {
         id: "T1562.004",
@@ -655,6 +658,7 @@ pub fn all_rule_ids() -> Vec<&'static str> {
     out.extend(crate::kmod::rule_ids());
     out.extend(crate::injection::rule_ids());
     out.extend(crate::defense::rule_ids());
+    out.extend(crate::log_witness::rule_ids());
     out.extend(NON_TABLE_RULES);
     out.sort_unstable();
     out.dedup();

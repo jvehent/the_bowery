@@ -1047,6 +1047,7 @@ mod tests {
             role_vector: None,
             bloom_advert: Some(b64),
             membership_grant: None,
+            log_report: None,
         }
     }
 

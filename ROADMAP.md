@@ -425,7 +425,14 @@ Deliberately after the fundamentals, because a distributed detection
 built on a blind sensor is still blind.
 
 - **More corroboration kinds** — the substrate is generic and has two
-  registered kinds. `file.access` *(built)* asks "does this binary touch
+  registered kinds. *Destination rarity was measured and set aside*: on
+  this fleet 82% of outbound destinations are contacted by exactly one
+  host, because a workstation and two headless Pis have almost nothing in
+  common. A "no peer has seen this endpoint" rule would fire on four
+  connections in five. The mechanism is sound and needs a *homogeneous*
+  fleet — twenty web servers, where the one destination nineteen of them
+  never contact means something. It is a fleet-shape prerequisite, not a
+  code gap, and worth recording so it is not rediscovered. `file.access` *(built)* asks "does this binary touch
   this file on your host too?", and is the first round that can
   **downgrade** rather than escalate: every earlier kind could only make
   things worse, which could not express the most useful answer a
@@ -436,9 +443,28 @@ built on a blind sensor is still blind.
   push you this rule?" still fit with no protocol change.
 - **Peer-witnessed liveness** *(built)* — see Phase A. A stopped agent
   is now an event on its neighbours.
-- **Peer-witnessed audit.** Root on a host means deleting the local
-  audit log. Peers holding the chain head make deletion detectable — an
-  attacker cannot retract hashes their neighbours already have.
+- **Peer-witnessed history** *(built, for the event log)* — root on a
+  host means deleting that host's records, and nothing local survives to
+  say they existed: a verifier only sees what remains, so a log cleared
+  from 376,000 rows looks exactly like an agent installed a minute ago.
+  Agents now gossip a **signed** statement of how much history they hold
+  and remember each other's, so a height that goes backwards is a
+  finding on the neighbours rather than a silence on the victim. Signed
+  because gossip is unauthenticated UDP — otherwise an attacker could
+  inflate their own number before clearing, or accuse a healthy peer.
+
+  Applied to the **event log** rather than the audit log, which the
+  roadmap named first: the audit log records response actions, and on a
+  fleet with enforcement off it is empty on every host. Deletion
+  resistance for an empty file protects nothing. The event log has
+  376,000 rows and grows continuously.
+
+  The invariant is sturdier than it looks: `highest_seq` is read from
+  SQLite's `sqlite_sequence`, not from `MAX(seq)`, so retention pruning
+  every row still leaves the height where it was. Only replacing the
+  database lowers it. And the alert says plainly that reinstalling the
+  agent or restoring an older image produces identical evidence — it
+  reports that history was lost, not that someone took it.
 - **Herd immunity**: one agent confirms a bad artifact, the fleet blocks
   it within seconds, no console round trip. This is Phase D's response
   engine plus Phase E's quorum, and it is the single most compelling

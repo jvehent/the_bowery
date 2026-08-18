@@ -343,6 +343,7 @@ mod tests {
             role_vector: None,
             bloom_advert: None,
             membership_grant: None,
+            log_report: None,
         }
     }
 
