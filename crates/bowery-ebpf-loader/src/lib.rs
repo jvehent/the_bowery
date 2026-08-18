@@ -301,10 +301,22 @@ async fn run(
 ) -> Result<(), LoaderError> {
     info!(path = %obj_path.display(), "loading BPF object");
     // aya can panic on malformed BTF in some 0.13 paths. catch_unwind
-    // turns that into a clean error rather than tearing down the
-    // whole agent — important because the integrity check above is
-    // a static metadata check and can't catch every malformed-bytes
-    // case.
+    // turns that into a clean error rather than tearing down the whole
+    // agent — the static integrity check above cannot catch every
+    // malformed-bytes case.
+    //
+    // **This does not protect the shipped binary.** `[profile.release]`
+    // sets `panic = "abort"`, so there is no unwinding for this to
+    // catch: a release agent handed such an object aborts, and systemd
+    // restarts it into the same object. It works in debug and test
+    // builds, which is where the malformed-BTF fixtures run.
+    //
+    // Left in place rather than deleted because that coverage is real
+    // and the alternative — unwinding in a release EDR — is a worse
+    // trade than a crash-loop an operator can see. The failure is loud
+    // either way; this only decides whether it is loud as an error or
+    // loud as a restart. Anyone switching the profile to `unwind` gets
+    // the graceful path back for free.
     let load = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Ebpf::load_file(obj_path)));
     let mut ebpf = match load {
         Ok(Ok(e)) => e,
