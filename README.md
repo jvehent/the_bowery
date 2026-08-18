@@ -107,6 +107,88 @@ RUSTFLAGS='-C target-cpu=native' \
 
 `bowery doctor` on a candidate Linux host tells you whether the kernel is ready (BPF-LSM, BTF, bpffs, lsm= cmdline). `INSTALL.md §1.2` lists distros that work out of the box.
 
+## What it detects
+
+<!-- BEGIN GENERATED: capabilities — edit crates/bowery-analysis/src/attack.rs, then BOWERY_UPDATE_DOCS=1 cargo test -p bowery-analysis -->
+
+The agent watches 6 kernel probes and scores what they produce against 58 detections, mapped onto 29 ATT&CK techniques — **12 covered well, 15 partially, 2 not at all**.
+
+**Initial Access** — 1 uncovered  
+Valid Accounts
+
+**Execution** — 2 partial  
+Unix Shell · Malicious File
+
+**Persistence** — 5 good, 2 partial  
+systemd Service · Cron · SSH Authorized Keys · Unix Shell Configuration Modification · Kernel Modules · Event Triggered Execution (udev rules) · Pluggable Authentication Modules
+
+**Privilege Escalation** — 2 good, 1 partial  
+Sudo and Sudo Caching · Setuid and Setgid · Exploitation for Privilege Escalation
+
+**Defense Evasion** — 2 good, 3 partial  
+Clear Linux or Mac System Logs · Dynamic Linker Hijacking · Disable or Modify Tools · Disable or Modify System Firewall · Process Injection
+
+**Credential Access** — 3 good  
+/etc/passwd and /etc/shadow · Credentials In Files · Private Keys
+
+**Discovery** — 3 partial  
+Account Discovery · System Information Discovery · System Network Connections Discovery
+
+**Lateral Movement** — 1 partial  
+SSH
+
+**Command and Control** — 2 partial, 1 uncovered  
+Ingress Tool Transfer · Web Protocols · Protocol Tunneling
+
+**Impact** — 1 partial  
+Data Encrypted for Impact
+
+Every entry names what it *misses* as well as what it catches, and there is deliberately no grade above "good": no host sensor covers a technique completely, and a map claiming otherwise invites an operator to stop looking. Per-technique detail is in [`docs/ATTACK-COVERAGE.md`](docs/ATTACK-COVERAGE.md), generated from the same table.
+
+<!-- END GENERATED: capabilities -->
+
+### What the mesh adds
+
+A single host cannot answer certain questions about itself, and those are
+the ones worth asking.
+
+- **An inbound connection nobody admits making.** Unremarkable here,
+  unremarkable there, alarming only when the host it came from has no
+  record of it — so the receiving agent asks, and a *denial* is the
+  finding. Either that peer is blind or tampered with, or the source
+  address was spoofed.
+- **Rarity judged across the fleet, not the host.** A binary this machine
+  has never run is ordinary; one that a quorum of role-similar peers has
+  *also* never run is not. Confirmation counts peers that have **never
+  seen it**, because a peer that has it argues the opposite.
+- **A neighbourhood taking a finding back.** Peers can answer *"we all do
+  that"*, which supersedes the local alert with a lower score instead of
+  adding to it — the only corroboration direction that can make an alert
+  go away.
+- **Peers noticing an agent stop.** The one failure a host cannot report
+  about itself. When *every* peer vanishes at once the finding is raised
+  about **this** host instead, since that is almost always its own
+  network.
+- **A peer that has not seen enough refuses rather than answers.** Two
+  agents with dead sensors were once found unanimously confirming every
+  alert their neighbour raised. Silence and refusals never satisfy a
+  quorum.
+
+### What it deliberately does not do
+
+- **No central collection.** Nothing is shipped to a lake; queries are
+  answered where the data lives, and history is reconstructed by asking
+  the hosts.
+- **No enforcement unless you arm it.** `[response] mode` defaults to
+  `off` and the policy defaults to deny-all. Naming an engine does not
+  arm a host — an upgrade must never start killing processes on an
+  operator's behalf.
+- **No agent-side third-party lookups.** A hash sent to VirusTotal tells
+  anyone watching that this hash is being investigated. Screening is
+  operator-side, opt-in, and may only ever *suppress* on a clean verdict.
+- **No alerting on a quiet host.** Indistinguishable from an idle one.
+  Blindness alerts; silence does not.
+
 ## What's implemented
 
 - **Phase 0** — workspace skeleton, identity keys, CI, packaging.
@@ -133,7 +215,7 @@ RUSTFLAGS='-C target-cpu=native' \
 - **Credential-access reads and set-id backdoors** — reading `/etc/shadow` or an SSH private key was invisible, because the file probe filtered to *write* intent. It now also ships reads whose path ends in a credential name (`/shadow`, `/id_rsa`, `/credentials`, `/.pgpass`, `_key`, …), matched **in the kernel by suffix**: finding the basename by scanning meant a 256-iteration loop over a map buffer, and the verifier rejected that program after eight seconds of analysis, so patterns anchor at the end of the string and match a whole final path component. Sixteen read rules distinguish theft from routine — `sshd` reads host keys at startup and `sudo` reads its own policy, so those rank below an `/etc/shadow` read by something that is not a password tool. Reading and writing the same path are separate findings with separate wording, because they mean different things. Alongside: a **setuid-root binary that no package owns** (or one that a package owns but no longer matches) is how a foothold becomes permanent root without touching a service file — which composes provenance with file metadata, and stays silent for the distro's own `sudo`/`su`/`passwd`.
 - **Package provenance and process lineage** — a first execution scored 1.0, which made ordinary distro binaries the loudest thing in the alert stream (the live fleet quorum-confirmed `/usr/bin/nice` as an anomaly). A binary the package manager installed whose contents still match is damped to 15%: it was on disk before anyone logged in. Damped rather than zeroed, since `bash` and `curl` ship with the distro and other signals must still be able to carry an episode. The same index makes a **mismatch** a finding — a packaged system binary whose contents changed is trojanised. Alongside it, lineage rules judge *who asked*: a network service spawning a shell is the canonical webshell, while `sshd` spawning one is a login and must never alert. The parent comes from `/proc` at exec time, because `sched_process_exec` carries none and CO-RE cannot fetch it without the BTF Pi kernels lack.
 - **Privilege transitions and reconnaissance bursts** — a process running as root whose parent was not is either an escalation you sanctioned or one you didn't, and telling those apart is the whole detection. The sanctioned path *must* be exempt or the rule fires on every administrative action a human takes — but the exemption is anchored on **package provenance, not on a name**: a binary called `sudo` that no package owns is the finding, not the exemption. Both uids compared are the **real** uid (`bpf_get_current_uid_gid` returns `current_uid()`), because a setuid binary changes the *effective* uid while the real one still names whoever ran it — mix the two and every `sudo` looks like a transition and every genuine one looks like nothing. An unreadable parent reports nothing rather than guessing, since on a booting host most root processes have already lost theirs. Alongside it: `whoami` is not a detection — it runs constantly, in scripts nobody wrote for an attacker — but **five different discovery commands from one parent inside a minute** is someone working out where they are. *Distinct* is what makes it usable (a script running `id` in a loop never trips it) and *parent* is what makes it possible (each `whoami` is its own short-lived pid; the shell that ran them is what ties them together). It reports once per window rather than once per command, and folds into the completing exec's verdict so the alert arrives carrying the ancestry that says who ran it. Tunable via `[detection]`, on by default — these are things an agent should do on a host nobody configured.
-- **An ATT&CK coverage map that cannot lie** ([`docs/ATTACK-COVERAGE.md`](docs/ATTACK-COVERAGE.md)) — a coverage map kept in Markdown drifts the first time someone adds a rule and forgets to write it down, and it fails in the worst available direction: a document claiming coverage the code does not have. So the map is a table in [`attack.rs`](crates/bowery-analysis/src/attack.rs), the document is generated from it, and tests assert that every rule the agent can fire appears on the map, that the map names no rule that no longer exists, and that the checked-in file matches. There is deliberately **no grade above "good"** — no host sensor covers a technique completely, and a map that says "complete" invites an operator to stop looking — and every entry, including the well-covered ones, is required to name its own gap. Today: 12 good, 10 partial, 3 uncovered across 25 techniques. The uncovered rows (kernel modules, C2 beaconing, ransomware) are the useful half.
+- **An ATT&CK coverage map that cannot lie** ([`docs/ATTACK-COVERAGE.md`](docs/ATTACK-COVERAGE.md)) — a coverage map kept in Markdown drifts the first time someone adds a rule and forgets to write it down, and it fails in the worst available direction: a document claiming coverage the code does not have. So the map is a table in [`attack.rs`](crates/bowery-analysis/src/attack.rs), the document is generated from it, and tests assert that every rule the agent can fire appears on the map, that the map names no rule that no longer exists, and that the checked-in file matches. There is deliberately **no grade above "good"** — no host sensor covers a technique completely, and a map that says "complete" invites an operator to stop looking — and every entry, including the well-covered ones, is required to name its own gap. The tally is in [What it detects](#what-it-detects), generated from the same table — it read *12 good, 10 partial, 3 uncovered across 25 techniques* here for long enough to be wrong in the flattering direction, which is why no number in this file is now typed by hand.
 - **Alerts the agent can discard itself** — the live fleet produced 63 alerts in 24 minutes and 61 of them were `sshd` and `unix_chkpwd` doing exactly what they exist to do. Three separate mechanisms produced that flood and each needed a different answer. **The rule already knew**: `cred.read_ssh_host_key`'s own text reads *"sshd does this at startup"*, and it alerted anyway — so each credential rule now names the binaries whose job requires that path, exempt only when the resolved exe matches **and** package provenance vouches for it, meaning a trojanised or impostor `sshd` is still caught. Anchored on `/proc/<pid>/exe`, never on `comm`, for the same reason the file-watch layer already refused to suppress writes by process name: `comm` is 16 bytes any process sets with `prctl`, so a name-keyed allowlist is an instruction for reading every key on the host in silence. It fails **closed** — an unreadable exe earns no exemption, because a detection that goes quiet whenever it cannot look is one an attacker only has to outrun. **The repeat**: the same pid read the same key twice in the same second and alerted twice, so identical findings now fold into one report per window that states how many it stands for — counted, never discarded, since "read a host key" and "read a host key 4,000 times" are different events. **And our own deploy**: `/usr/bin/bowery` scored 1.00 on every node because the installer `scp`'d it, leaving it owned by no package. The detection was right; a binary in `/usr/bin` that no package owns genuinely is the shape it looks for. The deploy kit now builds a real `.deb`, so the agent stops reporting its own installation and starts reporting a *modified* copy of itself.
 - **The mesh can take a finding back** (`file.access`) — every corroboration kind until now could only make things worse: the round ran, the rule fired, an alert appeared. That shape cannot express the most useful thing a neighbourhood can say, which is *"we all do that"*. Agents now ask up to three peers whether the same binary touches the same file on their hosts, and a corroborated answer appends a **superseding, downgraded** alert rather than a new one — so `bowery notify`, which keeps the newest alert per episode, sends the explained version or nothing at all. Three properties keep it honest: the finding is raised locally **first and always**, because a detection that waits for the mesh says nothing on a single-node install or a partitioned network; corroboration from **zero** peers never downgrades anything, the same rule that stops a blind peer confirming an alert applied in the other direction; and a peer answers only about paths **its own watch set already covers**, so the query cannot become a filesystem-enumeration oracle. The exe is resolved by joining `file_open` rows against the `exec` row for the same pid — `file_open` carries no exe path, and resolving one per open would put a readlink on the agent's hottest path.
 - **Alerts that explain themselves** — "a rare binary ran" is not actionable. Every alert now carries a timestamp, the full command line, uid, working directory, the **process ancestry** (`systemd → sshd → bash → curl`), and a snapshot of the files and TCP peers the process had open, resolved from `/proc/net/tcp` so "held 3 sockets" becomes "connected to 198.51.100.7:80". The ancestry is usually what decides an alert: the same binary run by a human over SSH and run by a web server mean very different things. Carried as untyped key/value pairs so a new detection can attach what it needs without the alert path growing a field each time, sampled **once at exec time** while the process is still alive (by the time LLM inference returns it usually isn't), and rendered in the email, the CLI and the console. Unavailable context is omitted rather than shown as empty — "opened nothing" and "already exited" are different facts.

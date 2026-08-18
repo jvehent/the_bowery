@@ -19,6 +19,19 @@ that something fires?*
 
 Today: **12 good, 15 partial, 2 uncovered** across 29 techniques.
 
+## Initial Access
+
+### T1078 — Valid Accounts
+
+**Coverage: none**
+
+No rule fires.
+
+Gap: an attacker using credentials that work looks exactly like the person those
+credentials belong to. Nothing here models who *should* be logging in, from where,
+or when, so a stolen key or password produces no signal at all. This is the single
+largest gap on the map and it is not closeable with host telemetry alone.
+
 ## Execution
 
 ### T1059.004 — Command and Scripting Interpreter: Unix Shell
@@ -183,6 +196,19 @@ continuously, and firing on it would train an operator to ignore the rule. So an
 attacker who inserts one permissive rule rather than clearing the table passes
 unnoticed, and one who programs netlink directly execs nothing to read.
 
+### T1055 — Process Injection
+
+**Coverage: partial**
+
+Rules: `defense_evasion.ptrace_inject`, `defense_evasion.proc_mem_write`
+
+Gap: all three doors into another process's memory are watched — `ptrace`,
+`process_vm_writev`, and writing `/proc/<pid>/mem` — with packaged debuggers exempt.
+What remains is that exemption itself: an attacker who runs the distribution's own
+`gdb` is not a finding, the same boundary the privilege-transition rule has with
+`sudo`. Injection that never touches another process — a malicious `LD_PRELOAD` on a
+process it starts itself — is a different technique and not covered here.
+
 ## Credential Access
 
 ### T1003.008 — OS Credential Dumping: /etc/passwd and /etc/shadow
@@ -279,36 +305,6 @@ what makes it readable. A jittered beacon, which is what any serious implant use
 is indistinguishable from ordinary traffic by this measure; so is one multiplexed
 onto an existing TLS session, since the sensor sees connection setup and not
 messages; and a beacon slower than a few hours outruns the measurement window.
-
-## Defense Evasion
-
-### T1055 — Process Injection
-
-**Coverage: partial**
-
-Rules: `defense_evasion.ptrace_inject`, `defense_evasion.proc_mem_write`
-
-Gap: all three doors into another process's memory are watched — `ptrace`,
-`process_vm_writev`, and writing `/proc/<pid>/mem` — with packaged debuggers exempt.
-What remains is that exemption itself: an attacker who runs the distribution's own
-`gdb` is not a finding, the same boundary the privilege-transition rule has with
-`sudo`. Injection that never touches another process — a malicious `LD_PRELOAD` on a
-process it starts itself — is a different technique and not covered here.
-
-## Initial Access
-
-### T1078 — Valid Accounts
-
-**Coverage: none**
-
-No rule fires.
-
-Gap: an attacker using credentials that work looks exactly like the person those
-credentials belong to. Nothing here models who *should* be logging in, from where,
-or when, so a stolen key or password produces no signal at all. This is the single
-largest gap on the map and it is not closeable with host telemetry alone.
-
-## Command and Control
 
 ### T1572 — Protocol Tunneling
 

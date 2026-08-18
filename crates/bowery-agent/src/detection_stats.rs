@@ -317,6 +317,18 @@ mod tests {
         assert_eq!(s.unflushed()["privesc.uid_transition_no_helper"], 1);
     }
 
+    /// `bowery-analysis` states the probe count in the README summary
+    /// but cannot import it — it does not depend on the sensor crate.
+    /// This crate sees both, so it is where the two are compared.
+    #[test]
+    fn the_readme_probe_count_matches_the_sensor() {
+        let want = format!("{} kernel probes", bowery_events::source::PROBE_COUNT);
+        assert!(
+            bowery_analysis::attack::readme_capabilities().contains(&want),
+            "the README says a different number of probes than the sensor has; expected `{want}`"
+        );
+    }
+
     #[test]
     fn the_counting_window_is_stated() {
         let s = DetectionStats::new();

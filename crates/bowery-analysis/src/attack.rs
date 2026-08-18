@@ -64,7 +64,20 @@ pub struct Technique {
 /// Ordered by tactic as ATT&CK orders them, so it reads as a kill chain
 /// rather than as an alphabetised inventory.
 pub const TECHNIQUES: &[Technique] = &[
-    // -- Execution ------------------------------------------------------
+    // -- Initial Access ----------------------------------------------------
+    Technique {
+        id: "T1078",
+        name: "Valid Accounts",
+        tactic: "Initial Access",
+        coverage: Coverage::None,
+        rules: &[],
+        gap: "an attacker using credentials that work looks exactly like the person those \
+              credentials belong to. Nothing here models who *should* be logging in, from \
+              where, or when, so a stolen key or password produces no signal at all. This \
+              is the single largest gap on the map and it is not closeable with host \
+              telemetry alone",
+    },
+    // -- Execution ---------------------------------------------------------
     Technique {
         id: "T1059.004",
         name: "Command and Scripting Interpreter: Unix Shell",
@@ -86,7 +99,7 @@ pub const TECHNIQUES: &[Technique] = &[
         gap: "rests on the binary being rare for this host or matching a YARA rule. A \
               malicious file that is neither is executed silently",
     },
-    // -- Persistence ----------------------------------------------------
+    // -- Persistence -------------------------------------------------------
     Technique {
         id: "T1543.002",
         name: "Create or Modify System Process: systemd Service",
@@ -160,7 +173,7 @@ pub const TECHNIQUES: &[Technique] = &[
         gap: "watches the configuration; a replaced PAM `.so` is caught only if it \
               lands under a watched path",
     },
-    // -- Privilege Escalation -------------------------------------------
+    // -- Privilege Escalation ----------------------------------------------
     Technique {
         id: "T1548.003",
         name: "Abuse Elevation Control Mechanism: Sudo and Sudo Caching",
@@ -194,7 +207,7 @@ pub const TECHNIQUES: &[Technique] = &[
               not the exploit. An exploit that stays inside one process, never execs, \
               and does its work in-memory produces no transition to see",
     },
-    // -- Defense Evasion ------------------------------------------------
+    // -- Defense Evasion ---------------------------------------------------
     Technique {
         id: "T1070.002",
         name: "Indicator Removal: Clear Linux or Mac System Logs",
@@ -247,7 +260,24 @@ pub const TECHNIQUES: &[Technique] = &[
               rule rather than clearing the table passes unnoticed, and one who \
               programs netlink directly execs nothing to read",
     },
-    // -- Credential Access ----------------------------------------------
+    Technique {
+        id: "T1055",
+        name: "Process Injection",
+        tactic: "Defense Evasion",
+        coverage: Coverage::Partial,
+        rules: &[
+            "defense_evasion.ptrace_inject",
+            "defense_evasion.proc_mem_write",
+        ],
+        gap: "all three doors into another process's memory are watched — `ptrace`, \
+              `process_vm_writev`, and writing `/proc/<pid>/mem` — with packaged \
+              debuggers exempt. What remains is that exemption itself: an attacker who \
+              runs the distribution's own `gdb` is not a finding, the same boundary the \
+              privilege-transition rule has with `sudo`. Injection that never touches \
+              another process — a malicious `LD_PRELOAD` on a process it starts itself — \
+              is a different technique and not covered here",
+    },
+    // -- Credential Access -------------------------------------------------
     Technique {
         id: "T1003.008",
         name: "OS Credential Dumping: /etc/passwd and /etc/shadow",
@@ -298,7 +328,7 @@ pub const TECHNIQUES: &[Technique] = &[
         ],
         gap: "keys stored outside `~/.ssh` and `/etc/ssh` are missed",
     },
-    // -- Discovery ------------------------------------------------------
+    // -- Discovery ---------------------------------------------------------
     Technique {
         id: "T1087",
         name: "Account Discovery",
@@ -327,7 +357,7 @@ pub const TECHNIQUES: &[Technique] = &[
         rules: &["discovery.recon_burst"],
         gap: "same burst requirement",
     },
-    // -- Lateral Movement -----------------------------------------------
+    // -- Lateral Movement --------------------------------------------------
     Technique {
         id: "T1021.004",
         name: "Remote Services: SSH",
@@ -338,7 +368,7 @@ pub const TECHNIQUES: &[Technique] = &[
               is the strongest signal here — but it only covers hosts that are *in* the \
               mesh. A connection from anywhere else cannot be corroborated",
     },
-    // -- Command and Control --------------------------------------------
+    // -- Command and Control -----------------------------------------------
     Technique {
         id: "T1105",
         name: "Ingress Tool Transfer",
@@ -365,38 +395,6 @@ pub const TECHNIQUES: &[Technique] = &[
               sensor sees connection setup and not messages; and a beacon slower than a \
               few hours outruns the measurement window",
     },
-    // -- Defense Evasion (uncovered) ------------------------------------
-    Technique {
-        id: "T1055",
-        name: "Process Injection",
-        tactic: "Defense Evasion",
-        coverage: Coverage::Partial,
-        rules: &[
-            "defense_evasion.ptrace_inject",
-            "defense_evasion.proc_mem_write",
-        ],
-        gap: "all three doors into another process's memory are watched — `ptrace`, \
-              `process_vm_writev`, and writing `/proc/<pid>/mem` — with packaged \
-              debuggers exempt. What remains is that exemption itself: an attacker who \
-              runs the distribution's own `gdb` is not a finding, the same boundary the \
-              privilege-transition rule has with `sudo`. Injection that never touches \
-              another process — a malicious `LD_PRELOAD` on a process it starts itself — \
-              is a different technique and not covered here",
-    },
-    // -- Initial Access / Lateral Movement (uncovered) -------------------
-    Technique {
-        id: "T1078",
-        name: "Valid Accounts",
-        tactic: "Initial Access",
-        coverage: Coverage::None,
-        rules: &[],
-        gap: "an attacker using credentials that work looks exactly like the person those \
-              credentials belong to. Nothing here models who *should* be logging in, from \
-              where, or when, so a stolen key or password produces no signal at all. This \
-              is the single largest gap on the map and it is not closeable with host \
-              telemetry alone",
-    },
-    // -- Command and Control (uncovered) ---------------------------------
     Technique {
         id: "T1572",
         name: "Protocol Tunneling",
@@ -408,7 +406,7 @@ pub const TECHNIQUES: &[Technique] = &[
               in TLS on a normal-looking port are all indistinguishable from the \
               legitimate use of the same protocols",
     },
-    // -- Impact ---------------------------------------------------------
+    // -- Impact ------------------------------------------------------------
     Technique {
         id: "T1486",
         name: "Data Encrypted for Impact",
@@ -428,6 +426,105 @@ pub const TECHNIQUES: &[Technique] = &[
               unlinks, no contents, so there is no entropy check anywhere here",
     },
 ];
+
+/// The capability summary embedded in `README.md`.
+///
+/// Generated for the same reason the coverage document is: a
+/// hand-maintained list of what a security tool detects drifts toward
+/// claiming more than the code does, and a reader has no way to tell.
+/// The README's previous figures said *12 good, 10 partial, 3 uncovered
+/// across 25 techniques* while the map held 29 — stale in the flattering
+/// direction, which is the one that matters.
+///
+/// Emitted between markers so the surrounding prose stays hand-written.
+pub fn readme_capabilities() -> String {
+    use std::fmt::Write as _;
+    let (good, partial, none) = tally();
+    let mut out = String::new();
+
+    out.push_str(
+        "<!-- BEGIN GENERATED: capabilities — \
+         edit crates/bowery-analysis/src/attack.rs, then \
+         BOWERY_UPDATE_DOCS=1 cargo test -p bowery-analysis -->\n\n",
+    );
+
+    let _ = writeln!(
+        out,
+        "The agent watches {} kernel probes and scores what they produce against \
+         {} detections, mapped onto {} ATT&CK techniques — **{good} covered well, \
+         {partial} partially, {none} not at all**.\n",
+        bowery_events_probe_count(),
+        all_rule_ids().len(),
+        TECHNIQUES.len(),
+    );
+
+    let mut tactic = "";
+    for t in TECHNIQUES {
+        if t.tactic != tactic {
+            if !tactic.is_empty() {
+                out.push('\n');
+            }
+            tactic = t.tactic;
+            let (g, p, n) = tally_for(tactic);
+            let mut parts = Vec::new();
+            if g > 0 {
+                parts.push(format!("{g} good"));
+            }
+            if p > 0 {
+                parts.push(format!("{p} partial"));
+            }
+            if n > 0 {
+                parts.push(format!("{n} uncovered"));
+            }
+            let _ = writeln!(out, "**{tactic}** — {}  ", parts.join(", "));
+            let names: Vec<&str> = TECHNIQUES
+                .iter()
+                .filter(|x| x.tactic == tactic)
+                .map(|x| short_name(x.name))
+                .collect();
+            let _ = writeln!(out, "{}", names.join(" · "));
+        }
+    }
+
+    out.push_str(
+        "\nEvery entry names what it *misses* as well as what it catches, and there is \
+         deliberately no grade above \"good\": no host sensor covers a technique \
+         completely, and a map claiming otherwise invites an operator to stop looking. \
+         Per-technique detail is in [`docs/ATTACK-COVERAGE.md`](docs/ATTACK-COVERAGE.md), \
+         generated from the same table.\n",
+    );
+    out.push_str("\n<!-- END GENERATED: capabilities -->\n");
+    out
+}
+
+/// The distinguishing half of a technique name.
+///
+/// ATT&CK spells sub-techniques as `Parent: Child`, and the child is the
+/// part that tells a reader what the agent actually looks at.
+fn short_name(name: &str) -> &str {
+    match name.split_once(": ") {
+        Some((_, child)) => child,
+        None => name,
+    }
+}
+
+fn tally_for(tactic: &str) -> (usize, usize, usize) {
+    TECHNIQUES
+        .iter()
+        .filter(|t| t.tactic == tactic)
+        .fold((0, 0, 0), |(g, p, n), t| match t.coverage {
+            Coverage::Good => (g + 1, p, n),
+            Coverage::Partial => (g, p + 1, n),
+            Coverage::None => (g, p, n + 1),
+        })
+}
+
+/// Kernel probe count, named here rather than imported: `bowery-analysis`
+/// does not depend on the sensor crate, and one number is not worth a
+/// dependency edge. Pinned by a test in `bowery-agent`, which sees both.
+const fn bowery_events_probe_count() -> usize {
+    6
+}
 
 /// Every rule id the map claims, in declaration order.
 #[must_use]
@@ -689,6 +786,70 @@ mod tests {
             "docs/ATTACK-COVERAGE.md is out of date. \
              Regenerate: BOWERY_UPDATE_DOCS=1 cargo test -p bowery-analysis"
         );
+    }
+
+    /// `README.md` carries a generated capability summary; this is what
+    /// stops it from drifting.
+    ///
+    /// The section it replaces claimed *12 good, 10 partial, 3 uncovered
+    /// across 25 techniques* when the map held 29 — stale in the
+    /// flattering direction. A security tool's own description of what
+    /// it detects is exactly the text that must not be maintained by
+    /// hand.
+    ///
+    /// Set `BOWERY_UPDATE_DOCS=1` to rewrite the file instead of failing.
+    #[test]
+    fn the_readme_capability_summary_matches_the_map() {
+        const BEGIN: &str = "<!-- BEGIN GENERATED: capabilities";
+        const END: &str = "<!-- END GENERATED: capabilities -->";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md");
+        let readme = std::fs::read_to_string(&path).expect("read README.md");
+        let generated = readme_capabilities();
+
+        let start = readme
+            .find(BEGIN)
+            .expect("README.md has no generated capability block; add the BEGIN/END markers");
+        let end = readme.find(END).expect("README.md has no END marker") + END.len();
+        let current = &readme[start..end];
+        // The generator emits a trailing newline the block does not own.
+        let want = generated.trim_end();
+
+        if std::env::var_os("BOWERY_UPDATE_DOCS").is_some() {
+            let updated = format!("{}{}{}", &readme[..start], want, &readme[end..]);
+            std::fs::write(&path, updated).expect("write README.md");
+            return;
+        }
+        assert_eq!(
+            current, want,
+            "README.md's capability summary is out of date. \
+             Regenerate: BOWERY_UPDATE_DOCS=1 cargo test -p bowery-analysis"
+        );
+    }
+
+    /// Each tactic's techniques must sit together.
+    ///
+    /// Both generators walk the table once and start a new heading when
+    /// the tactic changes, so a technique filed out of order produces a
+    /// *second* heading for a tactic already emitted. `docs/ATTACK-COVERAGE.md`
+    /// carried two "Defense Evasion" sections and two "Command and
+    /// Control" sections for exactly that reason, and the table's own
+    /// doc comment claimed it "reads as a kill chain" throughout.
+    #[test]
+    fn techniques_are_grouped_by_tactic() {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut current = "";
+        for t in TECHNIQUES {
+            if t.tactic != current {
+                assert!(
+                    !seen.contains(&t.tactic),
+                    "{} appears in two places in the table, which gives it two headings \
+                     in every generated document",
+                    t.tactic
+                );
+                seen.push(t.tactic);
+                current = t.tactic;
+            }
+        }
     }
 
     /// The gaps are not a footnote — they are most of the map.
