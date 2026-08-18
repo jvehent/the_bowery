@@ -37,8 +37,8 @@ use tracing::{debug, info, warn};
 use crate::agent::{
     AgentEvent, MAX_REVOKE_TTL, OperatorCommandRouter, RateLimit, RelayContext, ResolverArc,
     RevocationContext, SQL_CHUNK_ROW_LIMIT, YaraContext, command_body_digest, encode_row,
-    respond_to_subscribe, run_peer_yara_push, send_chunk, send_revoke_report, send_sql_error,
-    send_yara_report,
+    respond_to_subscribe, run_peer_yara_push, send_chunk, send_revoke_report, send_silence_report,
+    send_sql_error, send_yara_report,
 };
 use crate::corroboration::ResponderRegistry;
 use crate::inbox::{AlertInbox, current_unix_ms};
@@ -409,6 +409,7 @@ async fn respond_to_operator_command(
         Some(OperatorCommandBody::Sql(_)) => "sql",
         Some(OperatorCommandBody::YaraPush(_)) => "yara_push",
         Some(OperatorCommandBody::RevokePush(_)) => "revoke_push",
+        Some(OperatorCommandBody::SilencePush(_)) => "silence_push",
         None => "<empty>",
     };
 
@@ -529,6 +530,58 @@ async fn respond_to_operator_command(
             &capped,
             &cmd.forwarded_from_operator,
             &rev_ctx,
+            op_router.relay.as_ref(),
+            effective_timeout,
+        )
+        .await;
+        let _ = events_tx.send(AgentEvent::OperatorCommandHandled {
+            operator,
+            request_id,
+            kind: command_kind,
+        });
+        return outcome;
+    }
+
+    // Alert silencing. Propagates like a revocation and for the same
+    // reason — a judgement about the whole fleet should reach the whole
+    // fleet — but in the opposite direction: this one takes detection
+    // away, so the payload's own operator signature is what every hop
+    // verifies, never the delegation chain that carried it.
+    if let Some(OperatorCommandBody::SilencePush(p)) = &cmd.command {
+        let Some(sil_ctx) = op_router.silence.clone() else {
+            return send_sql_error(
+                conn,
+                &sealer,
+                &operator,
+                &request_id,
+                "policy_denied",
+                "this agent does not accept alert silences",
+            )
+            .await;
+        };
+        if p.fanout && is_direct_operator && !op_router.fanout_rate_limit.try_acquire(&operator) {
+            return send_sql_error(
+                conn,
+                &sealer,
+                &operator,
+                &request_id,
+                "rate_limited",
+                "fan-out bucket empty for this operator; back off and retry",
+            )
+            .await;
+        }
+        let capped = bowery_proto::SilencePush {
+            ttl: p.ttl.min(MAX_REVOKE_TTL),
+            ..p.clone()
+        };
+        let outcome = handle_silence_push(
+            conn,
+            &sealer,
+            operator,
+            &request_id,
+            &capped,
+            &cmd.forwarded_from_operator,
+            &sil_ctx,
             op_router.relay.as_ref(),
             effective_timeout,
         )
@@ -1479,6 +1532,94 @@ fn resolve_effective_operator(
 /// seen-set: revocations are permanent, so a re-received one is not new
 /// and is not forwarded. `ttl` remains as an independent structural
 /// bound.
+/// Apply an operator-signed silence and, when asked, pass it on.
+///
+/// Self-authenticating like a revocation, and the reason is sharper
+/// here: a relay that could forge this payload could blind the fleet
+/// simply by relaying. Every hop verifies the operator signature itself,
+/// so a compromised peer can *drop* a silence in transit but never mint
+/// one. Dropping errs toward noise — an alert that should have been
+/// suppressed is raised — which is the safe direction for this feature
+/// and the opposite of the safe direction for a revocation.
+///
+/// Propagation terminates on the store rather than on a separate
+/// seen-set: a re-received silence is not new and is not forwarded.
+/// `ttl` remains an independent structural bound.
+#[allow(clippy::too_many_arguments)]
+async fn handle_silence_push(
+    conn: &BoweryConnection,
+    sealer: &Arc<Sealer>,
+    operator: Fingerprint,
+    request_id: &str,
+    push: &bowery_proto::SilencePush,
+    forwarded_authorization: &[u8],
+    ctx: &Arc<crate::agent::SilenceContext>,
+    relay: Option<&Arc<RelayContext>>,
+    timeout: Duration,
+) -> Result<(), bowery_whisper::transport::Error> {
+    let self_fp = sealer.fingerprint();
+    let mut report = bowery_proto::SilenceReport {
+        agent_fp: self_fp.as_bytes().to_vec(),
+        end: true,
+        ..Default::default()
+    };
+
+    let mut is_new = false;
+    match <bowery_proto::AlertSilence as prost::Message>::decode(push.silence.as_slice()) {
+        Err(e) => report.error = format!("undecodable silence: {e}"),
+        Ok(silence) => {
+            let already = ctx.store.get(&silence.id).is_some();
+            let ops = ctx.operators.clone();
+            let resolve = move |fp: &Fingerprint| ops.resolve(fp);
+            if let Err(e) = ctx
+                .store
+                .accept(&silence, &resolve, crate::inbox::current_unix_ms())
+            {
+                warn!(sender = %operator, error = %e, "rejecting unverifiable alert silence");
+                report.error = e.to_string();
+            } else {
+                report.accepted = true;
+                report.already_known = already;
+                is_new = !already;
+                if is_new {
+                    // At WARN, not INFO. Something just stopped being
+                    // reported, and that is worth a line in the journal
+                    // of every host it reaches.
+                    warn!(
+                        silence = %silence.id,
+                        rule = %silence.rule_id,
+                        weight_permille = silence.weight_permille,
+                        reason = %silence.reason,
+                        "alert silence applied"
+                    );
+                }
+            }
+        }
+    }
+
+    send_silence_report(conn, sealer, &operator, request_id, report).await?;
+
+    // Forward only what was new, which is what makes a flood converge
+    // rather than echo around the mesh.
+    if push.fanout
+        && push.ttl > 0
+        && is_new
+        && let Some(relay) = relay
+    {
+        relay_silence_push(
+            conn,
+            sealer,
+            request_id,
+            push,
+            forwarded_authorization,
+            relay,
+            timeout,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_revoke_push(
     conn: &BoweryConnection,
@@ -1691,6 +1832,129 @@ async fn run_peer_revoke_push(
             };
             if env.sender_fingerprint.as_slice() != peer_fp.as_bytes().as_slice() {
                 warn!(peer = %peer_fp, "revocation propagation sender mismatch");
+                return;
+            }
+            if bytes_tx.send(bytes).await.is_err() {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(timeout, pump).await;
+}
+
+/// Forward a revocation to every pinned peer with `ttl` decremented,
+/// piping their sealed reports back to the operator verbatim.
+async fn relay_silence_push(
+    conn: &BoweryConnection,
+    sealer: &Arc<Sealer>,
+    request_id: &str,
+    push: &bowery_proto::SilencePush,
+    forwarded_authorization: &[u8],
+    relay: &Arc<RelayContext>,
+    timeout: Duration,
+) -> Result<(), bowery_whisper::transport::Error> {
+    let peers: Vec<PeerInfo> = relay
+        .peers_watcher
+        .borrow()
+        .clone()
+        .into_iter()
+        .filter(|p| relay.known_neighbors.resolve(&p.fingerprint).is_some())
+        .filter(|p| p.fingerprint != sealer.fingerprint())
+        .collect();
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    let (bytes_tx, mut bytes_rx) = mpsc::channel::<Vec<u8>>(64);
+    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    let onward = bowery_proto::SilencePush {
+        silence: push.silence.clone(),
+        fanout: true,
+        ttl: push.ttl.saturating_sub(1),
+    };
+
+    for peer in peers {
+        let bytes_tx = bytes_tx.clone();
+        let endpoint = relay.endpoint.clone();
+        let kn = relay.known_neighbors.clone();
+        let sealer_clone = sealer.clone();
+        let request_id = request_id.to_string();
+        let auth = forwarded_authorization.to_vec();
+        let onward = onward.clone();
+        join_set.spawn(async move {
+            run_peer_silence_push(
+                endpoint,
+                kn,
+                &sealer_clone,
+                peer,
+                auth,
+                onward,
+                &request_id,
+                timeout,
+                bytes_tx,
+            )
+            .await;
+        });
+    }
+    drop(bytes_tx);
+
+    let drain: Result<(), bowery_whisper::transport::Error> = async {
+        while let Some(bytes) = bytes_rx.recv().await {
+            conn.send_envelope(&bytes).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    join_set.abort_all();
+    while join_set.join_next().await.is_some() {}
+    drain
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_peer_silence_push(
+    endpoint: BoweryEndpoint,
+    kn: Arc<KnownNeighbors>,
+    sealer: &Arc<Sealer>,
+    peer: PeerInfo,
+    forwarded_authorization: Vec<u8>,
+    push: bowery_proto::SilencePush,
+    request_id: &str,
+    timeout: Duration,
+    bytes_tx: mpsc::Sender<Vec<u8>>,
+) {
+    use bowery_proto::{OperatorCommand, OperatorCommandBody, WhisperEnvelope};
+    use prost::Message as _;
+
+    let peer_fp = peer.fingerprint;
+    let cmd = OperatorCommand {
+        request_id: request_id.to_string(),
+        timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+        forwarded_from_operator: forwarded_authorization,
+        command: Some(OperatorCommandBody::SilencePush(push)),
+    };
+    let outbound = sealer.seal_for(&peer_fp, &WhisperPayload::operator_command(cmd));
+
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(kn, peer_fp));
+    let Ok(conn) = endpoint.dial(dial_verifier, peer.whisper_addr).await else {
+        warn!(peer = %peer_fp, "silence propagation dial failed");
+        return;
+    };
+    if conn.send_envelope(&outbound).await.is_err() {
+        warn!(peer = %peer_fp, "silence propagation send failed");
+        return;
+    }
+
+    let pump = async {
+        loop {
+            let Ok(bytes) = conn.recv_envelope().await else {
+                return;
+            };
+            let Ok(env) = WhisperEnvelope::decode(bytes.as_slice()) else {
+                return;
+            };
+            if env.sender_fingerprint.as_slice() != peer_fp.as_bytes().as_slice() {
+                warn!(peer = %peer_fp, "silence propagation sender mismatch");
                 return;
             }
             if bytes_tx.send(bytes).await.is_err() {

@@ -641,7 +641,7 @@ pub struct OperatorCommand {
     #[prost(bytes = "vec", tag = "3")]
     pub forwarded_from_operator: Vec<u8>,
     /// One of the typed command bodies.
-    #[prost(oneof = "OperatorCommandBody", tags = "11, 12, 13")]
+    #[prost(oneof = "OperatorCommandBody", tags = "11, 12, 13, 14")]
     pub command: Option<OperatorCommandBody>,
 }
 
@@ -672,6 +672,54 @@ pub enum OperatorCommandBody {
     /// can therefore drop a revocation but cannot forge one.
     #[prost(message, tag = "13")]
     RevokePush(RevokePush),
+    /// Deliver an operator-signed [`AlertSilence`] and, when `fanout`,
+    /// propagate it onward.
+    ///
+    /// Self-authenticating like [`OperatorCommandBody::RevokePush`], and
+    /// for a sharper reason: this payload *stops* findings, so a relay
+    /// that could forge one could blind the fleet by relaying. Each hop
+    /// verifies the operator signature itself.
+    #[prost(message, tag = "14")]
+    SilencePush(SilencePush),
+}
+
+/// See [`OperatorCommandBody::SilencePush`].
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct SilencePush {
+    /// Prost-encoded [`AlertSilence`], carrying its own signature.
+    #[prost(bytes = "vec", tag = "1")]
+    pub silence: Vec<u8>,
+    /// Remaining hops. Clamped by the receiving agent, so one push
+    /// cannot be handed an unbounded budget.
+    #[prost(uint32, tag = "2")]
+    pub ttl: u32,
+    /// Propagate to pinned peers as well as applying locally.
+    #[prost(bool, tag = "3")]
+    pub fanout: bool,
+}
+
+/// One agent's response to a [`SilencePush`], framed like
+/// [`RevokeReport`].
+#[derive(Clone, PartialEq, Eq, ProstMessage)]
+pub struct SilenceReport {
+    /// Reporting agent. Empty on the fan-out completion terminator.
+    #[prost(bytes = "vec", tag = "1")]
+    pub agent_fp: Vec<u8>,
+    /// Verified and now in force here.
+    #[prost(bool, tag = "2")]
+    pub accepted: bool,
+    /// Already held. Reported apart from `accepted` because it is what
+    /// tells an operator the fleet has converged rather than that the
+    /// push is still spreading.
+    #[prost(bool, tag = "3")]
+    pub already_known: bool,
+    /// Why it was refused, in the agent's own words. Named rather than
+    /// generic: an operator whose silence did not take needs to know
+    /// whether it was the signature, the cluster, or the expiry.
+    #[prost(string, tag = "4")]
+    pub error: String,
+    #[prost(bool, tag = "5")]
+    pub end: bool,
 }
 
 /// See [`OperatorCommandBody::RevokePush`].
@@ -917,7 +965,7 @@ pub struct OperatorResult {
     /// `error` field so a future "always populated alongside the
     /// concrete result" pattern (e.g. structured warnings) can
     /// extend cleanly.
-    #[prost(oneof = "OperatorResultBody", tags = "11, 12, 13, 14")]
+    #[prost(oneof = "OperatorResultBody", tags = "11, 12, 13, 14, 15")]
     pub result: Option<OperatorResultBody>,
 }
 
@@ -944,6 +992,10 @@ pub enum OperatorResultBody {
     /// One agent's response to a `RevokePush`, framed like `YaraReport`.
     #[prost(message, tag = "14")]
     RevokeReport(RevokeReport),
+    /// One agent's response to a `SilencePush`, framed like
+    /// `RevokeReport`.
+    #[prost(message, tag = "15")]
+    SilenceReport(SilenceReport),
 }
 
 /// One chunk of a streaming SQL response. See

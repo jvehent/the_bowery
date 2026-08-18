@@ -310,6 +310,9 @@ pub async fn sql(
                 Some(OperatorResultBody::RevokeReport(_)) => {
                     bail!("agent replied with a RevokeReport to a SQL request");
                 }
+                Some(OperatorResultBody::SilenceReport(_)) => {
+                    bail!("agent replied with a SilenceReport to a SQL request");
+                }
                 Some(OperatorResultBody::YaraReport(_)) => {
                     // Wrong result type for this request — the agent
                     // echoed our request_id with a YARA body. Treat as a
@@ -1152,6 +1155,9 @@ pub async fn yara(
                 bail!("agent echoed request_id {:?}", result.request_id);
             }
             match result.result {
+                Some(OperatorResultBody::SilenceReport(_)) => {
+                    bail!("agent replied with a SilenceReport to a YARA request");
+                }
                 Some(OperatorResultBody::YaraReport(rep)) => {
                     // Fan-out terminator, honored only from the relay.
                     if fanout && rep.end && rep.agent_fp.is_empty() && sender == target_fp {
@@ -1357,6 +1363,9 @@ pub async fn revoke_push(
                 bail!("agent echoed request_id {:?}", result.request_id);
             }
             match result.result {
+                Some(OperatorResultBody::SilenceReport(_)) => {
+                    bail!("agent replied with a SilenceReport to a revoke request");
+                }
                 Some(OperatorResultBody::RevokeReport(rep)) => {
                     // Terminator honoured only from the dialled relay,
                     // so a peer can't truncate the fleet's replies.

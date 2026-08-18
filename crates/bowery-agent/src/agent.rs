@@ -775,6 +775,10 @@ impl Agent {
                 cluster_id: cluster_id_for_trust.clone(),
                 operators: operators.clone(),
             })),
+            silence: Some(Arc::new(SilenceContext {
+                store: silences.clone(),
+                operators: operators.clone(),
+            })),
             yara: Some(Arc::new(YaraContext {
                 store: yara_store.clone(),
                 // Remembering a push for 30 minutes is far longer than any
@@ -1476,6 +1480,9 @@ pub(crate) struct OperatorCommandRouter {
     /// Revocation store + pin store, for `RevokePush`. `None` rejects
     /// the command with `policy_denied`.
     pub revocation: Option<Arc<RevocationContext>>,
+    /// Operator judgements about which findings are benign. `None` on an
+    /// agent that cannot accept them at all.
+    pub silence: Option<Arc<SilenceContext>>,
 }
 
 /// Hop budget ceiling for revocation propagation. Small on purpose: a
@@ -2651,6 +2658,35 @@ pub(crate) async fn send_revoke_report(
     let response = OperatorResult {
         request_id: request_id.to_string(),
         result: Some(OperatorResultBody::RevokeReport(report)),
+    };
+    let outbound = sealer.seal_for(operator, &WhisperPayload::operator_result(response));
+    conn.send_envelope(&outbound).await
+}
+
+// ---------------------------------------------------------------------------
+// Silence propagation
+// ---------------------------------------------------------------------------
+
+/// Everything the `SilencePush` handler needs.
+pub(crate) struct SilenceContext {
+    /// Holds the cluster id and checks it on accept, so this struct
+    /// deliberately does not carry a second copy for the two to disagree
+    /// about.
+    pub store: Arc<crate::silence_store::SilenceStore>,
+    pub operators: Arc<StaticResolver>,
+}
+
+pub(crate) async fn send_silence_report(
+    conn: &BoweryConnection,
+    sealer: &Sealer,
+    operator: &Fingerprint,
+    request_id: &str,
+    report: bowery_proto::SilenceReport,
+) -> Result<(), bowery_whisper::transport::Error> {
+    use bowery_proto::{OperatorResult, OperatorResultBody};
+    let response = OperatorResult {
+        request_id: request_id.to_string(),
+        result: Some(OperatorResultBody::SilenceReport(report)),
     };
     let outbound = sealer.seal_for(operator, &WhisperPayload::operator_result(response));
     conn.send_envelope(&outbound).await

@@ -140,6 +140,17 @@ pub fn command_body_digest(body: &OperatorCommandBody) -> [u8; 32] {
                 ttl: 0,
             })
         }
+        // Same again. The silence bytes stay bound, which is what
+        // matters: a relay may not swap which findings get suppressed,
+        // and could not anyway — the payload carries its own operator
+        // signature.
+        OperatorCommandBody::SilencePush(p) => {
+            OperatorCommandBody::SilencePush(bowery_proto::SilencePush {
+                silence: p.silence.clone(),
+                fanout: false,
+                ttl: 0,
+            })
+        }
     };
     let wrapper = OperatorCommand {
         request_id: String::new(),
