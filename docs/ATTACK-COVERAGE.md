@@ -17,7 +17,7 @@ that something fires?*
 - **partial** — one narrow variant fires; the common forms do not.
 - **none** — nothing fires. Listed anyway; the gaps are the useful half.
 
-Today: **12 good, 14 partial, 2 uncovered** across 28 techniques.
+Today: **12 good, 15 partial, 2 uncovered** across 29 techniques.
 
 ## Execution
 
@@ -160,12 +160,28 @@ not, because the exec sensor does not capture the environment.
 
 **Coverage: partial**
 
-Rules: `probe.sensor_blind`, `peer.silent`
+Rules: `probe.sensor_blind`, `peer.silent`, `defense_evasion.security_service_stopped`, `defense_evasion.mac_disabled`
 
-Gap: the agent reports its own blindness, and its neighbours now report it going
-silent altogether — a host cannot witness its own death. What remains uncovered is
-the quieter attack: an agent left running but tampered with, which still gossips and
-so still looks alive to every peer watching for silence.
+Gap: the agent reports its own blindness, its neighbours report it going silent
+altogether, and stopping another host defence — the audit daemon, AppArmor, SELinux
+enforcement — is read from the command that does it. All of that is the *shell*
+form: a process that speaks to netlink or the LSM interfaces directly execs nothing
+and is invisible here. And the quietest attack is still uncovered: an agent left
+running but tampered with, which gossips normally and so looks alive to every peer
+watching for silence.
+
+### T1562.004 — Impair Defenses: Disable or Modify System Firewall
+
+**Coverage: partial**
+
+Rules: `defense_evasion.firewall_flushed`
+
+Gap: only the wholesale acts — flushing every chain, tearing down an nftables
+ruleset, disabling ufw, defaulting a chain to ACCEPT. Adding or removing individual
+rules is deliberately not a finding: Docker, libvirt, fail2ban and ufw itself do it
+continuously, and firing on it would train an operator to ignore the rule. So an
+attacker who inserts one permissive rule rather than clearing the table passes
+unnoticed, and one who programs netlink directly execs nothing to read.
 
 ## Credential Access
 

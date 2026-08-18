@@ -15,6 +15,7 @@
 pub mod analyzer;
 pub mod attack;
 pub mod beacon;
+pub mod defense;
 pub mod episode;
 pub mod escalation;
 pub mod file_watch;

@@ -831,6 +831,15 @@ pub struct DetectionConfig {
     /// script does in seconds.
     #[serde(default = "default_discovery_threshold")]
     pub discovery_threshold: usize,
+    /// Alert when a command switches a host defence off wholesale —
+    /// flushing the firewall, stopping the audit daemon, putting `SELinux`
+    /// into permissive mode.
+    ///
+    /// Deliberately only the wholesale acts: adding or removing one
+    /// firewall rule is what Docker, libvirt and fail2ban do all day.
+    /// See [`bowery_analysis::defense`].
+    #[serde(default = "default_true")]
+    pub defense_tampering: bool,
     /// Report one process writing many files, across many directories,
     /// that share an extension normal software does not produce.
     ///
@@ -897,6 +906,7 @@ pub struct DetectionConfig {
 impl Default for DetectionConfig {
     fn default() -> Self {
         Self {
+            defense_tampering: true,
             uid_transitions: true,
             discovery_bursts: true,
             discovery_window: default_discovery_window(),
@@ -1409,6 +1419,7 @@ suspicion      = 0.85
             &path,
             r#"
 [detection]
+defense_tampering   = true
 uid_transitions     = true
 discovery_bursts    = true
 discovery_window    = "1m"

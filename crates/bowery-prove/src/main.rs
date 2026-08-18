@@ -196,6 +196,24 @@ fn provocations() -> Vec<Provocation> {
             rule: bowery_analysis::injection::RULE_ID,
             act: Act::PtraceOwnChild,
         },
+        // -- defence tampering ----------------------------------------
+        //
+        // Each is run in a way that changes nothing. `iptables -F` needs
+        // a table that does not exist, `systemctl stop` names a unit
+        // that is not installed, and `setenforce` fails on a host
+        // without SELinux — all of them after the exec the rule reads.
+        Provocation {
+            rule: bowery_analysis::defense::FIREWALL_RULE_ID,
+            act: Act::Exec("iptables", &["-t", "bowery-prove-nosuch", "-F"]),
+        },
+        Provocation {
+            rule: bowery_analysis::defense::SERVICE_RULE_ID,
+            act: Act::Exec("systemctl", &["stop", "auditd@bowery-prove-nosuch.service"]),
+        },
+        Provocation {
+            rule: bowery_analysis::defense::MAC_RULE_ID,
+            act: Act::Exec("setenforce", &["0"]),
+        },
         // -- lineage: the parent is the signal -------------------------
         //
         // Provoked by renaming a *child* of this process and having it
@@ -362,20 +380,27 @@ fn list(all: &[Provocation]) {
 fn run(all: &[Provocation]) {
     let mut attempted = Vec::new();
     let mut skipped = Vec::new();
+    let mut unavailable = Vec::new();
     for p in all {
         match &p.act {
             Act::Unsupported(why) => skipped.push((p.rule, *why)),
-            act => {
-                let outcome = perform(act);
-                // A failure here is usually the point: opening
+            act => match perform(act) {
+                Ok(()) => attempted.push((p.rule, "ok".to_string())),
+                // A missing program is a different fact from a refused
+                // syscall: nothing was ever exec'd, so no event exists
+                // and the rule cannot be judged on this host. Reporting
+                // it as a failure would accuse a working rule.
+                Err(e) if e.kind() == io::ErrorKind::NotFound && act.needs_program() => {
+                    unavailable.push((p.rule, act.program().unwrap_or("?")));
+                }
+                // Any other failure is usually the point: opening
                 // /etc/shadow for write as a non-root user is refused by
                 // the kernel *after* the tracepoint has already fired.
-                let note = match outcome {
-                    Ok(()) => "ok".to_string(),
-                    Err(e) => format!("syscall returned {e} (the probe fired regardless)"),
-                };
-                attempted.push((p.rule, note));
-            }
+                Err(e) => attempted.push((
+                    p.rule,
+                    format!("syscall returned {e} (the probe fired regardless)"),
+                )),
+            },
         }
     }
 
@@ -394,8 +419,36 @@ fn run(all: &[Provocation]) {
             let _ = writeln!(out, "  {rule:38} {why}");
         }
     }
+    if !unavailable.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n{} rules whose provocation needs a program this host does not have:",
+            unavailable.len()
+        );
+        for (rule, program) in &unavailable {
+            let _ = writeln!(
+                out,
+                "  {rule:38} no `{program}` here — UNPROVEN, not failed"
+            );
+        }
+    }
     print!("{out}");
     println!("\nnow compare bowery_detections; allow a few seconds for the pipeline.");
+}
+
+impl Act {
+    /// The program this provocation runs, if it runs one.
+    fn program(&self) -> Option<&'static str> {
+        match self {
+            Self::Exec(program, _) | Self::SpawnAs { program, .. } => Some(program),
+            _ => None,
+        }
+    }
+
+    /// Does this provocation depend on a program being installed?
+    fn needs_program(&self) -> bool {
+        self.program().is_some()
+    }
 }
 
 fn perform(act: &Act) -> io::Result<()> {
@@ -532,7 +585,10 @@ fn spawn_as(parent: &str, program: &str, args: &[&str]) -> io::Result<()> {
     let mut status = 0;
     unsafe { libc::waitpid(child, &raw mut status, 0) };
     if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) != 0 {
-        return Err(io::Error::other(format!("{program} could not be run")));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{program} could not be run"),
+        ));
     }
     Ok(())
 }

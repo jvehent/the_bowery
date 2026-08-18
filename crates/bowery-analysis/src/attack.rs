@@ -218,12 +218,34 @@ pub const TECHNIQUES: &[Technique] = &[
         name: "Impair Defenses: Disable or Modify Tools",
         tactic: "Defense Evasion",
         coverage: Coverage::Partial,
-        rules: &["probe.sensor_blind", "peer.silent"],
-        gap: "the agent reports its own blindness, and its neighbours now report it \
-              going silent altogether — a host cannot witness its own death. What \
-              remains uncovered is the quieter attack: an agent left running but \
-              tampered with, which still gossips and so still looks alive to every \
-              peer watching for silence",
+        rules: &[
+            "probe.sensor_blind",
+            "peer.silent",
+            "defense_evasion.security_service_stopped",
+            "defense_evasion.mac_disabled",
+        ],
+        gap: "the agent reports its own blindness, its neighbours report it going \
+              silent altogether, and stopping another host defence — the audit daemon, \
+              AppArmor, SELinux enforcement — is read from the command that does it. \
+              All of that is the *shell* form: a process that speaks to netlink or the \
+              LSM interfaces directly execs nothing and is invisible here. And the \
+              quietest attack is still uncovered: an agent left running but tampered \
+              with, which gossips normally and so looks alive to every peer watching \
+              for silence",
+    },
+    Technique {
+        id: "T1562.004",
+        name: "Impair Defenses: Disable or Modify System Firewall",
+        tactic: "Defense Evasion",
+        coverage: Coverage::Partial,
+        rules: &["defense_evasion.firewall_flushed"],
+        gap: "only the wholesale acts — flushing every chain, tearing down an nftables \
+              ruleset, disabling ufw, defaulting a chain to ACCEPT. Adding or removing \
+              individual rules is deliberately not a finding: Docker, libvirt, fail2ban \
+              and ufw itself do it continuously, and firing on it would train an \
+              operator to ignore the rule. So an attacker who inserts one permissive \
+              rule rather than clearing the table passes unnoticed, and one who \
+              programs netlink directly execs nothing to read",
     },
     // -- Credential Access ----------------------------------------------
     Technique {
@@ -535,6 +557,7 @@ pub fn all_rule_ids() -> Vec<&'static str> {
     out.extend(crate::beacon::rule_ids());
     out.extend(crate::kmod::rule_ids());
     out.extend(crate::injection::rule_ids());
+    out.extend(crate::defense::rule_ids());
     out.extend(NON_TABLE_RULES);
     out.sort_unstable();
     out.dedup();

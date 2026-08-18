@@ -1166,6 +1166,24 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
         );
     }
 
+    // Switching a defence off. Read from the arguments, which the
+    // sensor has carried all along and nothing scored — `iptables` and
+    // `nft` were only ever counted as reconnaissance, so a bare
+    // `iptables -F` needed four other recon commands to be noticed.
+    if ctx.detection.defense_tampering
+        && let Some(exe) = exec.exe_path.as_ref()
+        && let Some(hit) =
+            bowery_analysis::defense::classify(&exe.display().to_string(), &exec.args)
+    {
+        warn!(
+            rule = hit.rule_id,
+            pid = exec.pid,
+            exe = %exe.display(),
+            "a host defence was switched off"
+        );
+        fold_finding(ctx, &mut verdict, hit.rule_id, hit.severity(), hit.why);
+    }
+
     // Lineage: who asked for this?
     //
     // Every binary a lineage rule names is legitimate somewhere — `sh`
