@@ -29,6 +29,38 @@
 # than skipped quietly.
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Find the prover before doing anything else, so a missing binary fails
+# here rather than after the counters have been read and the
+# provocations half-run. Checked in the order of least surprise: an
+# explicit override, then an installed copy, then this checkout's own
+# build output — which is where it is on a host that builds from source,
+# i.e. every host this was written for.
+resolve_prover() {
+    if [[ -n "${BOWERY_PROVE:-}" ]]; then
+        command -v "$BOWERY_PROVE" >/dev/null 2>&1 && { echo "$BOWERY_PROVE"; return; }
+        [[ -x "$BOWERY_PROVE" ]] && { echo "$BOWERY_PROVE"; return; }
+        echo "BOWERY_PROVE is set to '$BOWERY_PROVE', which is not executable" >&2
+        exit 2
+    fi
+    command -v bowery-prove >/dev/null 2>&1 && { command -v bowery-prove; return; }
+    for candidate in "$REPO_ROOT/target/release/bowery-prove" "$REPO_ROOT/target/debug/bowery-prove"; do
+        [[ -x "$candidate" ]] && { echo "$candidate"; return; }
+    done
+    cat >&2 <<MSG
+cannot find the bowery-prove binary.
+
+Build it from this checkout:
+    cargo build --release -p bowery-prove
+
+or point at one explicitly:
+    BOWERY_PROVE=/path/to/bowery-prove $0
+MSG
+    exit 2
+}
+PROVER="$(resolve_prover)"
+
 MANIFEST="${BOWERY_PEERS:-$HOME/.bowery/peers.toml}"
 KEY="${BOWERY_OPERATOR_KEY:-$HOME/.bowery/operator.key}"
 WANT_PEER="${1:-}"
@@ -61,7 +93,8 @@ counters() {
         | tail -n +2
 }
 
-echo "==> agent: $AGENT_NAME ($AGENT_ADDR)"
+echo "==> agent:  $AGENT_NAME ($AGENT_ADDR)"
+echo "==> prover: $PROVER"
 echo "    provocations run locally, so this must be the local agent."
 echo
 
@@ -70,13 +103,13 @@ trap 'rm -f "$before" "$after"' EXIT
 
 counters > "$before"
 echo "==> provoking"
-"${BOWERY_PROVE:-bowery-prove}" run
+"$PROVER" run
 echo
 echo "==> waiting ${SETTLE}s for the pipeline"
 sleep "$SETTLE"
 counters > "$after"
 
-python3 - "$before" "$after" "${BOWERY_PROVE:-bowery-prove}" <<'PY'
+python3 - "$before" "$after" "$PROVER" <<'PY'
 import subprocess, sys
 
 def load(path):
