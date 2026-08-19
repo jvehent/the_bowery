@@ -85,7 +85,8 @@ const LATEST_VIEW: &str = "CREATE VIEW IF NOT EXISTS alerts_latest AS
 /// reads them back by index, so the two must stay in step.
 const SELECT_COLUMNS: &str = "agent_fp, agent_name, episode_id, ts_unix_ms, archived_ms, \
                               rule_id, suspicion, exe_path, exe_sha256, rationale, backend, \
-                              confirmed, peers_asked, peers_unseen, peers_seen, context_json";
+                              confirmed, peers_asked, peers_unseen, peers_seen, \
+                              peers_incomparable, context_json";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS alerts (
@@ -104,6 +105,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     peers_asked     INTEGER,
     peers_unseen    INTEGER,
     peers_seen      INTEGER,
+    peers_incomparable INTEGER,
     peers_no_reply  INTEGER,
     peers_refused   INTEGER,
     quorum          INTEGER,
@@ -200,8 +202,9 @@ impl Archive {
                         agent_fp, agent_name, episode_id, ts_unix_ms, archived_ms,
                         rule_id, suspicion, exe_path, exe_sha256, rationale, backend,
                         confirmed, peers_asked, peers_unseen, peers_seen,
-                        peers_no_reply, peers_refused, quorum, context_json, actions_json
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                        peers_no_reply, peers_refused, peers_incomparable, quorum,
+                        context_json, actions_json
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                 )
                 .context("preparing archive insert")?;
             for a in alerts {
@@ -225,6 +228,7 @@ impl Archive {
                         c.map(|c| c.peers_seen),
                         c.map(|c| c.peers_no_reply),
                         c.map(|c| c.peers_refused),
+                        c.map(|c| c.peers_incomparable),
                         c.map(|c| c.quorum),
                         context_json(a),
                         actions_json(a),
@@ -430,6 +434,10 @@ pub struct Row {
     pub peers_asked: Option<u32>,
     pub peers_unseen: Option<u32>,
     pub peers_seen: Option<u32>,
+    /// Peers that answered but could not be compared against. `NULL`
+    /// from a row archived before the field existed — which is not the
+    /// same as zero, and the distinction is the point of the field.
+    pub peers_incomparable: Option<u32>,
     pub context_json: String,
 }
 
@@ -451,7 +459,8 @@ impl Row {
             peers_asked: opt_u32(r, 12)?,
             peers_unseen: opt_u32(r, 13)?,
             peers_seen: opt_u32(r, 14)?,
-            context_json: r.get(15)?,
+            peers_incomparable: opt_u32(r, 15)?,
+            context_json: r.get(16)?,
         })
     }
 
@@ -485,6 +494,7 @@ impl Row {
                     peers_seen: self.peers_seen.unwrap_or(0),
                     peers_no_reply: 0,
                     peers_refused: 0,
+                    peers_incomparable: self.peers_incomparable.unwrap_or(0),
                     quorum: 0,
                     confirmed,
                 }),
@@ -932,6 +942,7 @@ mod tests {
             peers_seen: 1,
             peers_no_reply: 0,
             peers_refused: 0,
+            peers_incomparable: 0,
             quorum: 2,
             confirmed: true,
         });
@@ -1077,7 +1088,7 @@ pub fn render(rows: &[Row], json: bool) -> String {
                 "{{\"ts_unix_ms\":{},\"archived_ms\":{},\"agent\":{},\"agent_fp\":{},\
                  \"episode_id\":{},\"rule_id\":{},\"suspicion\":{:.4},\"exe_path\":{},\
                  \"exe_sha256\":{},\"confirmed\":{},\"peers_unseen\":{},\"peers_asked\":{},\
-                 \"rationale\":{},\"context\":{}}}",
+                 \"peers_incomparable\":{},\"rationale\":{},\"context\":{}}}",
                 r.ts_unix_ms,
                 r.archived_ms,
                 json_string(&r.agent_label()),
@@ -1090,6 +1101,8 @@ pub fn render(rows: &[Row], json: bool) -> String {
                 r.confirmed.map_or("null".into(), |c| c.to_string()),
                 r.peers_unseen.map_or("null".into(), |v| v.to_string()),
                 r.peers_asked.map_or("null".into(), |v| v.to_string()),
+                r.peers_incomparable
+                    .map_or("null".into(), |v| v.to_string()),
                 r.rationale.as_deref().map_or("null".into(), json_string),
                 r.context_json,
             );
@@ -1098,8 +1111,14 @@ pub fn render(rows: &[Row], json: bool) -> String {
             // two: confirmed, asked-and-not-confirmed, and never asked.
             // A blank where "no round ran" belongs would read as a
             // negative verdict.
+            // Four states, not three. `?` is a round that ran and could
+            // compare nothing — distinct from one that compared and
+            // found nothing, which is what `·` means.
             let conf = match (r.confirmed, r.peers_unseen, r.peers_asked) {
                 (Some(true), Some(u), Some(t)) => format!("✓{u}/{t}"),
+                (Some(false), Some(0), Some(t)) if r.peers_incomparable.is_some_and(|n| n > 0) => {
+                    format!("?0/{t}")
+                }
                 (Some(false), Some(u), Some(t)) => format!("·{u}/{t}"),
                 _ => String::new(),
             };
@@ -1182,6 +1201,7 @@ mod roundtrip_tests {
                 peers_seen: 0,
                 peers_no_reply: 0,
                 peers_refused: 0,
+                peers_incomparable: 0,
                 quorum: 2,
                 confirmed: true,
             }),

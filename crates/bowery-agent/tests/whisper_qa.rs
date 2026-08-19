@@ -364,6 +364,7 @@ async fn whisper_round_skips_peers_whose_bloom_advert_excludes_tier1() {
 /// a peer that HAS the binary argues it is a normal fleet artifact, so it
 /// counts *against* confirmation. `high_suspicion_exec_..._beta_sighting`
 /// covers that direction.
+#[allow(clippy::too_many_lines)] // two-agent fixture plus the round assertions
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn neighbourhood_quorum_confirms_an_alert_nobody_else_has_seen() {
     let workdir_alpha = TempDir::new().unwrap();
@@ -454,6 +455,24 @@ async fn neighbourhood_quorum_confirms_an_alert_nobody_else_has_seen() {
     assert_eq!(sighting.seen_count, 0, "beta has never seen this payload");
     assert_eq!(context.corroborating_peers, 0);
 
+    // Both agents are this machine, so beta's answer *is* comparable and
+    // must be classified as such.
+    //
+    // This guards the inverse of the bug the platform gate was added
+    // for. Getting the comparison backwards — or shipping a responder
+    // that omits its platform — would make every peer incomparable, and
+    // confirmation would stop working fleet-wide without a single test
+    // failing anywhere else. The failure would look exactly like a quiet
+    // network.
+    assert!(
+        !matches!(
+            context.peers[0].reply,
+            bowery_agent::whisper_qa::PeerReply::Incomparable { .. }
+        ),
+        "a same-platform peer must be comparable, got {:?}",
+        context.peers[0].reply
+    );
+
     // The superseding alert is appended before WhisperContextReady is
     // broadcast, so it is already readable.
     let (alerts, _) = agent_alpha.inbox().read_since(0, 100);
@@ -468,6 +487,15 @@ async fn neighbourhood_quorum_confirms_an_alert_nobody_else_has_seen() {
         "expected exactly one confirmed alert for the episode, got {} of {} alerts",
         confirmed.len(),
         alerts.len()
+    );
+    assert_eq!(
+        confirmed[0].peers_incomparable, 0,
+        "same-platform round must report nothing incomparable"
+    );
+    assert_eq!(
+        confirmed[0].comparable(),
+        1,
+        "beta's answer must have been weighable"
     );
     let c = confirmed[0];
     assert!(c.confirmed, "quorum of 1 never-seen-it vote must confirm");

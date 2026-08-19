@@ -113,6 +113,7 @@ pub fn build_question(fp: Tier1Fingerprint, ttl: Duration, note: impl Into<Strin
         tier1_fp: fp.as_bytes().to_vec(),
         ttl_ms: ttl_deadline_ms(ttl_ms),
         note: note.into(),
+        asker_platform: bowery_proto::platform_key(),
     }
 }
 
@@ -295,12 +296,14 @@ where
             last_seen_unix_ms: sighting.last_seen_unix_ms,
             note: note.to_string(),
             refused: String::new(),
+            platform: bowery_proto::platform_key(),
         },
         LocalAnswer::Refused(reason) => Answer {
             episode_id: question.episode_id.clone(),
             tier1_fp: question.tier1_fp.clone(),
             note: note.to_string(),
             refused: reason,
+            platform: bowery_proto::platform_key(),
             ..Default::default()
         },
     };

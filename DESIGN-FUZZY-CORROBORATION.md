@@ -1,6 +1,6 @@
 # Fuzzy corroboration — making the neighbourhood watch mean something
 
-**Status:** proposed. Nothing here is implemented.
+**Status:** slice 1 implemented (`Incomparable`); slices 2–6 proposed.
 
 ## 1. The finding
 
@@ -178,11 +178,20 @@ Richer descriptors leak more. Constraints:
 Each slice is useful alone and none breaks the wire format
 irreversibly.
 
-1. **Say `Incomparable` out loud.** Cheapest and highest value: have
-   responders report `elf.machine` / OS, and mark a verdict
-   incomparable when no peer shares the asker's architecture. This
-   alone stops `/usr/bin/dash CONFIRMED 2/2`. It does not need a
-   descriptor store.
+1. ~~**Say `Incomparable` out loud.**~~ **Done.** `Question` carries
+   `asker_platform`, `Answer` carries `platform`, and a peer on a
+   different platform is classified `PeerReply::Incomparable` — a
+   fourth bucket that never counts toward a quorum. An unknown platform
+   (a peer too old to say) is treated as incomparable, which is the
+   safe direction: the cost is a confirmation that does not happen
+   rather than an alert that is not raised.
+
+   Surfaced everywhere a verdict is read: `bowery_alerts.peers_incomparable`,
+   the console detail (`COULD NOT CHECK (no comparable peer)`), the
+   digest (amber `NOT CHECKED`, not grey "not confirmed"), the archive,
+   and `Dropped::NotComparable` in the audit trail. A round that could
+   compare nothing also warns every time, because the only moment
+   anyone would otherwise notice is during an incident.
 2. **Give the baseline a descriptor.** Add path, size, package
    identity, build-id, `DT_NEEDED` hash to the binaries table. Backfill
    lazily on next exec. Nothing queries it yet.

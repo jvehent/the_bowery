@@ -101,6 +101,16 @@ pub enum PeerReply {
     /// Answered, but declined: too little observed for its "no" to mean
     /// anything. Carries the responder's reason.
     Refused(String),
+    /// Answered, and is watching, but cannot be compared against.
+    ///
+    /// A peer on another architecture does not have — cannot have — the
+    /// asker's binary: the same program compiled for a different target
+    /// is a different file with a different hash. Its "never seen it"
+    /// is true of every binary that exists and is evidence of nothing.
+    ///
+    /// Carries the responder's platform so an operator reading the
+    /// alert can see *why* it could not speak.
+    Incomparable { platform: String },
     /// Timed out, failed to dial, or replied unintelligibly.
     Silent,
 }
@@ -111,7 +121,7 @@ impl PeerReply {
     pub fn observed(&self) -> Option<qa::LocalSighting> {
         match self {
             Self::Observed(s) => Some(*s),
-            Self::Refused(_) | Self::Silent => None,
+            Self::Refused(_) | Self::Incomparable { .. } | Self::Silent => None,
         }
     }
 }
@@ -515,6 +525,7 @@ async fn run_round(
     let mut peers = Vec::with_capacity(results.len());
     let mut total_seen_count = 0u64;
     let mut corroborating_peers = 0usize;
+    let asker_platform = bowery_proto::platform_key();
     for (peer, similarity, outcome) in results {
         let (reply, note) = match outcome {
             // A peer that declined is not a peer that said no. Checked
@@ -529,21 +540,59 @@ async fn run_round(
                 );
                 (PeerReply::Refused(answer.refused.clone()), answer.note)
             }
-            Ok(answer) => {
-                let seen = answer.seen_count;
-                if seen > 0 {
-                    corroborating_peers += 1;
-                    total_seen_count = total_seen_count.saturating_add(seen);
-                }
+            // A peer that reports having seen it is believed whatever
+            // platform it is on — a positive sighting only needs the
+            // hashes to match, and if they match the platforms are
+            // compatible by construction. Checked before comparability
+            // so a cross-architecture peer that somehow *does* have the
+            // binary still counts in the direction that argues benign.
+            Ok(answer) if answer.seen_count > 0 => {
+                corroborating_peers += 1;
+                total_seen_count = total_seen_count.saturating_add(answer.seen_count);
                 (
                     PeerReply::Observed(LocalSighting {
-                        seen_count: seen,
+                        seen_count: answer.seen_count,
                         first_seen_unix_ms: answer.first_seen_unix_ms,
                         last_seen_unix_ms: answer.last_seen_unix_ms,
                     }),
                     answer.note,
                 )
             }
+            // "Never seen it" only means something from a peer that
+            // could have seen it. On another architecture it is true of
+            // every binary in existence, so it is not evidence — and an
+            // unknown platform is treated the same way, because a peer
+            // too old to say which it is cannot be assumed compatible.
+            //
+            // Failing this direction costs a confirmation that does not
+            // happen. Failing the other way is what confirmed
+            // /usr/bin/dash 2/2 on a live fleet.
+            Ok(answer) if !comparable(&asker_platform, &answer.platform) => {
+                debug!(
+                    peer = %peer.fingerprint,
+                    peer_platform = %answer.platform,
+                    asker_platform = %asker_platform,
+                    "peer cannot be compared against; not counting its answer as evidence"
+                );
+                (
+                    PeerReply::Incomparable {
+                        platform: if answer.platform.is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            answer.platform.clone()
+                        },
+                    },
+                    answer.note,
+                )
+            }
+            Ok(answer) => (
+                PeerReply::Observed(LocalSighting {
+                    seen_count: 0,
+                    first_seen_unix_ms: answer.first_seen_unix_ms,
+                    last_seen_unix_ms: answer.last_seen_unix_ms,
+                }),
+                answer.note,
+            ),
             Err(e) => {
                 debug!(peer = %peer.fingerprint, error = %e, "whisper ask failed");
                 (PeerReply::Silent, String::new())
@@ -610,11 +659,13 @@ pub fn quorum_verdict(peers: &[PeerSighting], quorum: usize) -> AlertConfirmatio
     let mut seen = 0u32;
     let mut no_reply = 0u32;
     let mut refused = 0u32;
+    let mut incomparable = 0u32;
     for p in peers {
         match &p.reply {
             PeerReply::Observed(s) if s.seen_count > 0 => seen += 1,
             PeerReply::Observed(_) => unseen += 1,
             PeerReply::Refused(_) => refused += 1,
+            PeerReply::Incomparable { .. } => incomparable += 1,
             PeerReply::Silent => no_reply += 1,
         }
     }
@@ -625,11 +676,37 @@ pub fn quorum_verdict(peers: &[PeerSighting], quorum: usize) -> AlertConfirmatio
         peers_seen: seen,
         peers_no_reply: no_reply,
         peers_refused: refused,
+        peers_incomparable: incomparable,
         quorum: quorum_u32,
-        // quorum == 0 disables confirmation outright rather than
+        // Two gates, and the second one is the fix.
+        //
+        // `quorum == 0` disables confirmation outright rather than
         // confirming everything, which is what `>=` alone would do.
+        //
+        // `unseen` now counts only peers that could actually compare —
+        // an incomparable peer never lands in it. That is what stops a
+        // cross-architecture fleet confirming every alert it raises:
+        // an aarch64 peer asked about an x86-64 binary has never seen
+        // it, will never have seen it, and saying so is not evidence.
         confirmed: quorum > 0 && unseen >= quorum_u32,
     }
+}
+
+/// Can this peer's "never seen it" mean anything to us?
+///
+/// Same-architecture is **necessary, not sufficient**: the two aarch64
+/// hosts on the reference fleet still share only 5 of ~100 baseline
+/// hashes, because a build is pinned by distro, version and compile
+/// flags as well as target. This gate removes the answers that are
+/// provably meaningless; narrowing the rest is what the descriptor
+/// dimensions in DESIGN-FUZZY-CORROBORATION.md §3.1 are for.
+///
+/// An empty peer platform is a peer built before the field existed. It
+/// is treated as incomparable rather than comparable — the safe
+/// direction, and one that resolves itself as responders upgrade.
+#[must_use]
+pub fn comparable(asker: &str, peer: &str) -> bool {
+    !asker.is_empty() && !peer.is_empty() && asker == peer
 }
 
 /// Human-readable evidence for the confirmed alert's rationale.
@@ -648,8 +725,34 @@ fn confirmation_rationale(c: &AlertConfirmation) -> String {
             c.peers_refused
         );
     }
+    if c.peers_incomparable > 0 {
+        let _ = write!(
+            s,
+            ", {} could not be compared (different platform)",
+            c.peers_incomparable
+        );
+    }
     if c.peers_no_reply > 0 {
         let _ = write!(s, ", {} did not reply", c.peers_no_reply);
+    }
+    s
+}
+
+/// Why a round produced no verdict, when nothing could be compared.
+///
+/// Worth logging on its own: a fleet whose members cannot corroborate
+/// each other is a standing gap, and the only moment anyone would
+/// notice is when they expect a confirmation and none arrives. Saying
+/// it every round is how that becomes visible before an incident rather
+/// than during one.
+fn incomparable_note(c: &AlertConfirmation, platforms: &[String]) -> String {
+    let mut s = format!(
+        "the neighbourhood could not check this: {}/{} peers answered but run a different \
+         platform, so their \"never seen it\" is true of every binary they do not have",
+        c.peers_incomparable, c.peers_asked
+    );
+    if !platforms.is_empty() {
+        let _ = write!(s, " (asked: {})", platforms.join(", "));
     }
     s
 }
@@ -677,6 +780,29 @@ fn finish_round(
     // supersede-by-episode_id pattern.
     let verdict = quorum_verdict(&context.peers, confirm.quorum);
 
+    // A round where nobody could compare is a standing gap in the mesh,
+    // not a quiet result. Logged every time rather than once, because
+    // the only moment anyone would otherwise notice is when they expect
+    // a confirmation and none comes — which is during an incident.
+    let nothing_comparable = verdict.comparable() == 0 && verdict.peers_incomparable > 0;
+    if nothing_comparable {
+        let platforms: Vec<String> = context
+            .peers
+            .iter()
+            .filter_map(|p| match &p.reply {
+                PeerReply::Incomparable { platform } => Some(platform.clone()),
+                _ => None,
+            })
+            .collect();
+        warn!(
+            episode = %context.episode_id,
+            incomparable = verdict.peers_incomparable,
+            asked = verdict.peers_asked,
+            "{}",
+            incomparable_note(&verdict, &platforms)
+        );
+    }
+
     // Release, or abandon, anything the response path parked on this
     // round. Both outcomes are reported: an action that was decided and
     // never carried out is exactly what an operator reads the audit
@@ -689,7 +815,11 @@ fn finish_round(
         } else {
             (
                 confirm.pending.discard(&context.episode_id),
-                Some(crate::pending_actions::Dropped::NotCorroborated),
+                Some(if nothing_comparable {
+                    crate::pending_actions::Dropped::NotComparable
+                } else {
+                    crate::pending_actions::Dropped::NotCorroborated
+                }),
             )
         };
         for action in actions {
@@ -1266,6 +1396,113 @@ mod quorum_tests {
         let v = quorum_verdict(&[], 2);
         assert!(!v.confirmed);
         assert_eq!(v.peers_asked, 0);
+    }
+
+    /// A peer on another architecture answering "never seen it".
+    fn incomparable(b: u8, platform: &str) -> PeerSighting {
+        PeerSighting {
+            peer: fp(b),
+            similarity: 0.9,
+            reply: PeerReply::Incomparable {
+                platform: platform.to_string(),
+            },
+            note: String::new(),
+        }
+    }
+
+    /// The failure this whole change exists for, as it occurred.
+    ///
+    /// otter1 (x86-64) asked its two aarch64 neighbours about
+    /// `/usr/bin/dash`. Both were healthy, fully observing, and had
+    /// never seen that hash — because they never could: their `dash` is
+    /// a different build. The mesh reported `CONFIRMED 2/2` on the
+    /// system shell, and every other alert besides.
+    #[test]
+    fn cross_architecture_peers_cannot_confirm_the_system_shell() {
+        let peers = vec![
+            incomparable(1, "aarch64/linux"),
+            incomparable(2, "aarch64/linux"),
+        ];
+        let v = quorum_verdict(&peers, 2);
+        assert!(
+            !v.confirmed,
+            "two peers that cannot have the binary must not confirm it"
+        );
+        assert_eq!(v.peers_incomparable, 2);
+        assert_eq!(v.peers_unseen, 0, "an incomparable peer is not a denial");
+        assert_eq!(v.comparable(), 0, "nothing could be weighed");
+    }
+
+    /// Comparable peers still confirm. The gate must remove meaningless
+    /// answers, not the mechanism.
+    #[test]
+    fn same_platform_peers_still_confirm() {
+        let peers = vec![unseen(1), unseen(2), incomparable(3, "aarch64/linux")];
+        let v = quorum_verdict(&peers, 2);
+        assert!(v.confirmed, "two comparable denials are still evidence");
+        assert_eq!(v.peers_unseen, 2);
+        assert_eq!(v.peers_incomparable, 1);
+        assert_eq!(v.comparable(), 2);
+    }
+
+    /// An incomparable peer must not be able to make up the numbers.
+    #[test]
+    fn incomparable_peers_never_count_toward_a_quorum() {
+        let peers = vec![unseen(1), incomparable(2, "aarch64/linux")];
+        let v = quorum_verdict(&peers, 2);
+        assert!(
+            !v.confirmed,
+            "one real denial plus one incomparable is one denial"
+        );
+        assert_eq!(v.peers_unseen, 1);
+    }
+
+    /// A peer that *has* the binary is believed regardless of platform:
+    /// if the hashes match, the platforms were compatible after all, and
+    /// the answer argues benign — the safe direction to accept.
+    #[test]
+    fn a_positive_sighting_counts_whatever_the_platform() {
+        let peers = vec![seen(1, 40), seen(2, 12)];
+        let v = quorum_verdict(&peers, 2);
+        assert!(!v.confirmed);
+        assert_eq!(v.peers_seen, 2);
+    }
+
+    /// Same architecture is necessary, not sufficient — the two aarch64
+    /// hosts on the reference fleet share only 5 of ~100 hashes. This
+    /// pins the gate's actual semantics so nobody later reads it as a
+    /// claim that same-platform peers are directly comparable.
+    #[test]
+    fn comparability_is_platform_equality_and_unknown_is_not_comparable() {
+        assert!(comparable("x86_64/linux", "x86_64/linux"));
+        assert!(!comparable("x86_64/linux", "aarch64/linux"));
+        // A peer too old to say. Treated as incomparable, because
+        // assuming compatibility is what produced the bug.
+        assert!(!comparable("x86_64/linux", ""));
+        assert!(!comparable("", "x86_64/linux"));
+        assert!(!comparable("", ""));
+    }
+
+    #[test]
+    fn the_rationale_names_the_platform_gap() {
+        let v = quorum_verdict(&[unseen(1), unseen(2), incomparable(3, "aarch64/linux")], 2);
+        let text = confirmation_rationale(&v);
+        assert!(text.contains("1 could not be compared"), "{text}");
+
+        let nothing = quorum_verdict(
+            &[
+                incomparable(1, "aarch64/linux"),
+                incomparable(2, "aarch64/linux"),
+            ],
+            2,
+        );
+        let gap = incomparable_note(&nothing, &["aarch64/linux".into()]);
+        assert!(gap.contains("2/2"), "{gap}");
+        assert!(gap.contains("aarch64/linux"), "{gap}");
+        assert!(
+            gap.contains("could not check"),
+            "must read as a gap, not a clean result: {gap}"
+        );
     }
 
     #[test]

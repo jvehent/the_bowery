@@ -272,6 +272,18 @@ impl Tally {
             peers_seen: u32::try_from(self.corroborated).unwrap_or(u32::MAX),
             peers_no_reply: u32::try_from(self.no_reply).unwrap_or(u32::MAX),
             peers_refused: u32::try_from(self.refused).unwrap_or(u32::MAX),
+            // Zero, and deliberately so for now. Comparability is a
+            // per-kind question, not a global one: architecture makes
+            // two hosts incomparable about a *binary hash*, and is
+            // irrelevant to whether a peer opened a path or made a
+            // connection. These kinds ask about paths and endpoints,
+            // which mean the same thing on any machine.
+            //
+            // Kinds that do compare host-specific artifacts will need
+            // their own notion of it — see DESIGN-FUZZY-CORROBORATION.md
+            // §3.3. Reporting a fabricated non-zero here would be worse
+            // than reporting none.
+            peers_incomparable: 0,
             quorum: u32::try_from(rule.deny_quorum).unwrap_or(u32::MAX),
             confirmed,
         }

@@ -50,6 +50,15 @@ pub const DEFAULT_TTL: Duration = Duration::from_mins(2);
 pub enum Dropped {
     /// The round completed and the neighbourhood did not confirm.
     NotCorroborated,
+    /// The round completed and nothing could be compared — every peer
+    /// that answered runs a different platform.
+    ///
+    /// Distinct from [`Self::NotCorroborated`] for the same reason that
+    /// module records a reason at all: "the fleet disagreed with you"
+    /// and "the fleet was never able to look" are different facts about
+    /// an action that did not happen, and an operator reading the audit
+    /// trail to find out why is owed the second one.
+    NotComparable,
     /// No confirmation arrived in time — usually because the episode
     /// never triggered a round at all.
     Expired,
@@ -61,6 +70,9 @@ impl Dropped {
     pub const fn reason(self) -> &'static str {
         match self {
             Self::NotCorroborated => "held for corroboration; the neighbourhood did not confirm",
+            Self::NotComparable => {
+                "held for corroboration; no peer could compare (different platform)"
+            }
             Self::Expired => "held for corroboration; no whisper round confirmed it in time",
         }
     }

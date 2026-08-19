@@ -349,6 +349,7 @@ async fn respond_to_question(
             last_seen_unix_ms: sighting.last_seen_unix_ms,
             note: String::new(),
             refused: String::new(),
+            platform: bowery_proto::platform_key(),
         },
         crate::whisper_qa::LocalKnowledge::Insufficient { binaries, age } => {
             debug!(
@@ -367,6 +368,7 @@ async fn respond_to_question(
                     "observed {binaries} binaries over {}h; too little to say whether this is rare",
                     age.as_secs() / 3600
                 ),
+                platform: bowery_proto::platform_key(),
                 ..Default::default()
             }
         }

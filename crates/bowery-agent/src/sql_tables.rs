@@ -395,7 +395,8 @@ impl BoweryTable for BoweryAlertsTable {
                 peers_asked       INTEGER,
                 peers_unseen      INTEGER,
                 peers_seen        INTEGER,
-                peers_refused     INTEGER
+                peers_refused     INTEGER,
+                peers_incomparable INTEGER
             );",
         )?;
         let (alerts, _) = self.inbox.read_since(0, usize::MAX);
@@ -404,8 +405,9 @@ impl BoweryTable for BoweryAlertsTable {
             "INSERT INTO bowery_alerts (originator_fp_hex, episode_id, rule_id,
                                          exe_sha256_hex, exe_path, suspicion, rationale,
                                          ts_unix_ms, backend, confirmed, peers_asked,
-                                         peers_unseen, peers_seen, peers_refused)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                         peers_unseen, peers_seen, peers_refused,
+                                         peers_incomparable)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )?;
         for a in alerts {
             let originator_hex = hex_lower(&a.originator_fp);
@@ -431,6 +433,7 @@ impl BoweryTable for BoweryAlertsTable {
                 // would not (or honestly could not) speak to it. Held
                 // apart from peers_seen/unseen because it is neither.
                 a.confirmation.map(|c| i64::from(c.peers_refused)),
+                a.confirmation.map(|c| i64::from(c.peers_incomparable)),
             ])?;
         }
         Ok(())
@@ -1425,6 +1428,7 @@ mod alerts_view_tests {
                 peers_seen: 0,
                 peers_no_reply: 2,
                 peers_refused: 1,
+                peers_incomparable: 0,
                 quorum: 1,
                 confirmed: true,
             }),

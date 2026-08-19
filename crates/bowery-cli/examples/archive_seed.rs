@@ -46,6 +46,7 @@ fn main() {
         peers_unseen: 3,
         peers_seen: 0,
         peers_no_reply: 0,
+        peers_incomparable: 0,
         peers_refused: 0,
         quorum: 2,
         confirmed: true,

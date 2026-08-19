@@ -410,6 +410,12 @@ impl AlertsPane {
             lines.push(Line::from(Span::styled(
                 if c.confirmed {
                     "neighbourhood: CONFIRMED"
+                } else if c.comparable() == 0 && c.peers_incomparable > 0 {
+                    // Not a verdict. Every peer that answered runs a
+                    // different platform, so none of them could have
+                    // had this binary — "not confirmed" would read as a
+                    // check that came back clean.
+                    "neighbourhood: COULD NOT CHECK (no comparable peer)"
                 } else {
                     "neighbourhood: not confirmed"
                 },
@@ -435,6 +441,16 @@ impl AlertsPane {
             lines.push(kv("  recorded", c.peers_seen.to_string()));
             if c.peers_refused > 0 {
                 lines.push(kv("  declined", c.peers_refused.to_string()));
+            }
+            // A healthy, willing peer whose answer cannot mean what the
+            // question needs it to mean. Shown even at zero when the
+            // round found nothing comparable, because "0 of 0 peers had
+            // a record" is the reading that has to be prevented.
+            if c.peers_incomparable > 0 {
+                lines.push(kv(
+                    "  can't cmp",
+                    format!("{} (different platform)", c.peers_incomparable),
+                ));
             }
             lines.push(kv("  no reply", c.peers_no_reply.to_string()));
             lines.push(kv("  asked", c.peers_asked.to_string()));
@@ -686,6 +702,7 @@ mod render_tests {
                 peers_seen: asked - unseen,
                 peers_no_reply: 0,
                 peers_refused: 0,
+                peers_incomparable: 0,
                 quorum: 2,
                 confirmed,
             }),

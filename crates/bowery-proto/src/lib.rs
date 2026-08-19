@@ -339,6 +339,18 @@ pub struct Question {
     /// log-bloat reasons). Empty string means "no note".
     #[prost(string, tag = "4")]
     pub note: String,
+
+    /// The asker's platform, as `arch/os` (e.g. `x86_64/linux`).
+    ///
+    /// A responder on a different architecture cannot have the asker's
+    /// binary under any circumstances — the same program is a different
+    /// build and therefore a different hash. Sent so the responder can
+    /// say *"I cannot compare"* instead of *"never seen it"*, which are
+    /// opposite claims that this protocol used to conflate.
+    ///
+    /// Empty from peers built before this field existed.
+    #[prost(string, tag = "5")]
+    pub asker_platform: String,
 }
 
 /// Phase-5 whisper answer to a [`Question`]. Echoes the asker's
@@ -395,6 +407,26 @@ pub struct Answer {
     /// askers.
     #[prost(string, tag = "7")]
     pub refused: String,
+
+    /// The responder's own platform, as `arch/os`.
+    ///
+    /// The companion to [`Question::asker_platform`], and the field that
+    /// makes an answer interpretable at all. Measured on a live fleet:
+    /// an x86-64 host shared **zero** of its 366 baseline hashes with
+    /// either of two aarch64 hosts. "I have never seen this hash" was
+    /// true of every binary in existence on those peers, including
+    /// `/usr/bin/dash`, and a quorum of it confirmed every alert.
+    ///
+    /// `refused` fixed the case where a responder was not watching.
+    /// This fixes the case where it is watching something incomparable,
+    /// which no amount of local coverage can detect.
+    ///
+    /// Empty from older peers, and an unknown platform is treated as
+    /// **incomparable** rather than comparable — the safe direction,
+    /// since the cost is a confirmation that does not happen rather
+    /// than an alert that is not raised.
+    #[prost(string, tag = "8")]
+    pub platform: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +582,45 @@ pub struct AlertConfirmation {
     /// didn't happen".
     #[prost(uint32, tag = "7")]
     pub peers_refused: u32,
+
+    /// Answered, but could not be compared against — a different
+    /// architecture, or a peer too old to say which it is.
+    ///
+    /// Held apart from every other bucket because it is not a weaker
+    /// form of any of them. A refusal is a peer choosing not to answer;
+    /// no-reply is a peer that could not be reached; *incomparable* is
+    /// a healthy, willing, fully-observing peer whose answer cannot
+    /// mean what the question needs it to mean.
+    ///
+    /// Never counts toward a quorum, and when it accounts for every
+    /// peer asked, [`Self::confirmed`] is false and
+    /// [`Self::comparable`] is zero — the honest rendering of which is
+    /// "this could not be checked", not "this was checked and found
+    /// clean".
+    #[prost(uint32, tag = "8")]
+    pub peers_incomparable: u32,
+}
+
+/// `arch/os` for this build, e.g. `x86_64/linux`.
+///
+/// Compile-time constants: the agent runs natively on the host it
+/// monitors, so the binary's target *is* the platform. Nothing to read,
+/// nothing to fail.
+#[must_use]
+pub fn platform_key() -> String {
+    format!("{}/{}", std::env::consts::ARCH, std::env::consts::OS)
+}
+
+impl AlertConfirmation {
+    /// Peers whose answer could actually be weighed.
+    ///
+    /// Confirmation requires this to be non-zero *before* any count of
+    /// denials means anything. Without that gate, a fleet where nobody
+    /// can compare confirms everything, which is what shipped.
+    #[must_use]
+    pub fn comparable(&self) -> u32 {
+        self.peers_unseen.saturating_add(self.peers_seen)
+    }
 }
 
 /// Operator-issued request to drain the agent's local inbox. Sent on a
@@ -1706,6 +1777,7 @@ mod tests {
     #[test]
     fn question_roundtrip() {
         let q = Question {
+            asker_platform: "x86_64/linux".into(),
             episode_id: vec![0xab; 16],
             tier1_fp: vec![0xcd; 8],
             ttl_ms: 60_000,
@@ -1723,6 +1795,7 @@ mod tests {
     #[test]
     fn answer_roundtrip() {
         let a = Answer {
+            platform: "x86_64/linux".into(),
             episode_id: vec![0xab; 16],
             tier1_fp: vec![0xcd; 8],
             seen_count: 3,
@@ -1754,6 +1827,7 @@ mod tests {
             ts_unix_ms: 1_730_000_000_000,
             backend: "mock/echo".into(),
             confirmation: Some(AlertConfirmation {
+                peers_incomparable: 0,
                 peers_asked: 5,
                 peers_unseen: 4,
                 peers_seen: 1,

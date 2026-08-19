@@ -493,9 +493,15 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
                         "  CONFIRMED by {}/{} peers with no record of it",
                         c.peers_unseen, c.peers_asked
                     ),
+                    // Said differently from "not confirmed" on purpose:
+                    // no peer could compare, so nothing was checked.
+                    Some(c) if c.comparable() == 0 && c.peers_incomparable > 0 => format!(
+                        "  (NOT CHECKED: {}/{} peers run a different platform)",
+                        c.peers_incomparable, c.peers_asked
+                    ),
                     Some(c) => format!(
-                        "  (not confirmed: {}/{} unseen, {} refused)",
-                        c.peers_unseen, c.peers_asked, c.peers_refused
+                        "  (not confirmed: {}/{} unseen, {} refused, {} incomparable)",
+                        c.peers_unseen, c.peers_asked, c.peers_refused, c.peers_incomparable
                     ),
                     None => String::new(),
                 }
@@ -700,13 +706,26 @@ fn confirmation_badge(a: &Alert) -> String {
                 c.peers_unseen, c.peers_asked
             ),
         )
+    } else if c.comparable() == 0 && c.peers_incomparable > 0 {
+        // Amber, not grey. A round that could not run is a gap in
+        // coverage, and rendering it the same as a clean result is how
+        // the gap stays invisible.
+        (
+            "#fef7e0",
+            "#8a6116",
+            format!(
+                "NOT CHECKED — {}/{} peers run a different platform, so they could not \
+                 have this binary either way",
+                c.peers_incomparable, c.peers_asked
+            ),
+        )
     } else {
         (
             "#f1f3f4",
             "#5f6368",
             format!(
-                "not confirmed — {}/{} unseen, {} refused",
-                c.peers_unseen, c.peers_asked, c.peers_refused
+                "not confirmed — {}/{} unseen, {} refused, {} incomparable",
+                c.peers_unseen, c.peers_asked, c.peers_refused, c.peers_incomparable
             ),
         )
     };
@@ -1468,6 +1487,7 @@ mod tests {
                 peers_seen: 0,
                 peers_no_reply: 0,
                 peers_refused: 0,
+                peers_incomparable: 0,
                 quorum: 2,
                 confirmed: true,
             }),
@@ -1724,6 +1744,7 @@ mod tests {
             peers_seen: 1,
             peers_no_reply: 1,
             peers_refused: 0,
+            peers_incomparable: 0,
             quorum: 2,
             confirmed: false,
         });
@@ -1807,6 +1828,48 @@ password_file = "/dev/null"
         // Alert text must not have reached a header.
         let headers = &wire[..wire.find("\r\n\r\n").unwrap_or(wire.len())];
         assert!(!headers.contains("0.92"), "body leaked into headers");
+    }
+
+    /// A `\`-continued string literal that loses its continuation
+    /// collapses into a run of padding spaces, which reaches the reader
+    /// as a gap mid-sentence. Cheap to assert, invisible in review, and
+    /// it has now happened once.
+    #[test]
+    fn no_rendered_text_carries_source_indentation() {
+        let mut a = alert("ep-1", 0.9, false);
+        a.confirmation = Some(AlertConfirmation {
+            peers_asked: 2,
+            peers_unseen: 0,
+            peers_seen: 0,
+            peers_no_reply: 0,
+            peers_refused: 0,
+            peers_incomparable: 2,
+            quorum: 2,
+            confirmed: false,
+        });
+        let hosts = vec![HostAlerts {
+            host: "otter1".into(),
+            alerts: vec![a],
+        }];
+        let html = body_html(&hosts, &VerdictMap::new());
+        // Each text node on its own: joining them would introduce runs
+        // of spaces that are an artefact of the check, not the page.
+        let nodes: Vec<&str> = html
+            .split('>')
+            .filter_map(|chunk| chunk.split('<').next())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        for node in &nodes {
+            assert!(
+                !node.contains("  "),
+                "a rendered string carries source indentation: {node:?}"
+            );
+        }
+        assert!(
+            nodes.iter().any(|n| n.contains("NOT CHECKED")),
+            "badge missing from {nodes:?}"
+        );
     }
 
     /// A flood must not become a megabyte of HTML either.

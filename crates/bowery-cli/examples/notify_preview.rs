@@ -57,6 +57,7 @@ fn main() {
                         peers_unseen: 3,
                         peers_seen: 0,
                         peers_no_reply: 0,
+                        peers_incomparable: 0,
                         peers_refused: 0,
                         quorum: 2,
                         confirmed: true,
@@ -75,10 +76,11 @@ fn main() {
                     "Write-intent open of /dev/watchdog0. Disarming the hardware watchdog removes the \
                     thing that would reboot this host if it stopped responding",
                     Some(AlertConfirmation {
-                        peers_asked: 3,
-                        peers_unseen: 1,
-                        peers_seen: 2,
+                        peers_asked: 2,
+                        peers_unseen: 0,
+                        peers_seen: 0,
                         peers_no_reply: 0,
+                        peers_incomparable: 2,
                         peers_refused: 0,
                         quorum: 2,
                         confirmed: false,

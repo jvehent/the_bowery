@@ -466,6 +466,38 @@ own bookkeeping.
 | Which rules are producing the noise? | `SELECT rule_id, COUNT(*) FROM bowery_alerts GROUP BY rule_id ORDER BY 2 DESC` |
 | What am I not being told about? | `SELECT id, rule_id, weight, matched, reason FROM bowery_silences ORDER BY matched DESC` |
 
+### When the mesh cannot check something
+
+The neighbourhood watch asks peers whether they have seen a binary's
+hash, and a quorum of "never" is what confirms an alert. That question
+only means something between hosts that *could* have the same file. The
+same program compiled for a different architecture is a different file,
+so an aarch64 peer asked about an x86-64 binary has never seen it,
+never will, and saying so is not evidence.
+
+Measured on a three-host fleet: the x86-64 host shared **zero** of its
+366 baseline hashes with either aarch64 host. Every alert that ran a
+round was confirmed, including one on `/usr/bin/dash`.
+
+Questions and answers now carry the sender's platform. A peer that
+cannot be compared against goes in its own bucket and never counts
+toward a quorum:
+
+```sql
+SELECT episode_id, rule_id, confirmed, peers_unseen, peers_incomparable
+FROM bowery_alerts
+```
+
+A round where nothing could be compared reads as **"could not check"**,
+not "not confirmed" — in the console, the digest and the audit trail.
+Those are opposite facts and they had been sharing a word. If you see it
+constantly, your fleet cannot corroborate itself, and that is worth
+knowing before an incident rather than during one.
+
+Same-architecture is necessary, not sufficient — the two aarch64 hosts
+above still share only 5 of ~100 hashes. Narrowing that is what the
+remaining slices in `DESIGN-FUZZY-CORROBORATION.md` cover.
+
 ### Alert history, and why it is operator-side
 
 An agent's inbox is an in-memory ring with a 72-hour TTL that dies with
