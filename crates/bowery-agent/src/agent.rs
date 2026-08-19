@@ -717,7 +717,10 @@ impl Agent {
         // corroboration engine hold the *same* handle. A view fed by a
         // different counter than the engine increments would be worse
         // than no view at all.
-        let corroboration_stats = Arc::new(crate::corroboration::stats::CorroborationStats::new());
+        let corroboration_stats =
+            Arc::new(crate::corroboration::stats::CorroborationStats::with_kinds(
+                crate::corroboration::KINDS,
+            ));
         let sql_engine = bowery_sql::Sql::new()
             .with_concurrency_cap(config.sql.max_concurrent_queries)
             .override_default_table("processes")

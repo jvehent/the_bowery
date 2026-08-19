@@ -887,6 +887,65 @@ async fn every_catalogue_example_runs_on_a_real_agent() {
          {missing:?}\nlive tables: {live:?}"
     );
 
+    // Every corroboration kind must be a row, including ones that have
+    // raised nothing.
+    //
+    // The unit test for this asserted `CorroborationStats::with_kinds`
+    // seeds zero rows, passed, and said nothing about whether the agent
+    // ever called it — which it did not, for a whole deploy. The view
+    // shipped showing `net.inbound_connect` and omitting `file.access`
+    // entirely, which is the ambiguity it exists to remove: absent
+    // reads as "not present on this host", so a detector that stopped
+    // raising claims looks like one that was never compiled in.
+    //
+    // Asked of a real agent, because that is where the wiring is.
+    {
+        let cmd = OperatorCommand {
+            forwarded_from_operator: Vec::new(),
+            request_id: "corroboration-kinds".into(),
+            timeout_ms: 5_000,
+            command: Some(OperatorCommandBody::Sql(SqlQuery {
+                sql: "SELECT kind FROM bowery_corroboration_status".into(),
+                fanout: false,
+                peers: Vec::new(),
+            })),
+        };
+        let outbound = sealer.seal_for(&agent_fp, &WhisperPayload::operator_command(cmd));
+        conn.send_envelope(&outbound).await.expect("send");
+
+        let mut kinds: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let bytes = tokio::time::timeout(timeout, conn.recv_envelope())
+                .await
+                .expect("recv in time")
+                .expect("recv");
+            let opened = envelope_verifier.open(&bytes).expect("verify");
+            let Some(Body::OperatorResult(result)) = opened.payload.body else {
+                panic!("unexpected body")
+            };
+            let Some(OperatorResultBody::SqlChunk(chunk)) = result.result else {
+                panic!("expected SqlChunk")
+            };
+            for row in &chunk.rows {
+                if let Some(SqlValueKind::Text(k)) = &row.values[0].value {
+                    kinds.push(k.clone());
+                }
+            }
+            if chunk.end {
+                break;
+            }
+        }
+        for kind in bowery_agent::corroboration::KINDS {
+            assert!(
+                kinds.iter().any(|k| k == kind),
+                "{kind} is missing from bowery_corroboration_status; an idle kind must be \
+                 a zero row, not an absent one. Present: {kinds:?}"
+            );
+        }
+    }
+
     // And the other direction. A table an operator can query but
     // cannot discover is capability that may as well not exist — this
     // check is what caught the console documenting the `bowery_*`
