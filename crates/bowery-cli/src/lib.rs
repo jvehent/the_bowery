@@ -18,7 +18,9 @@
 //! `bowery-console` will wire them into ratatui panes.
 
 pub mod alerts;
+pub mod archive;
 pub mod audit;
+pub mod catalog;
 pub mod doctor;
 pub mod exec;
 pub mod mesh_trust;

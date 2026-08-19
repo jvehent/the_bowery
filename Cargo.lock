@@ -359,6 +359,7 @@ dependencies = [
  "lettre",
  "prost",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

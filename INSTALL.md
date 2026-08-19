@@ -1248,6 +1248,12 @@ Polls every agent in `~/.bowery/peers.toml`, prints the exact message,
 and **does not advance the cursors** — so you can run it repeatedly
 while tuning `min_suspicion`. Needs no SMTP credential.
 
+Every alert polled is also archived to `~/.bowery/alerts.db`, which is
+what `bowery alerts history` and the console's Alerts pane read. It is
+the only alert view that outlives an agent — the inbox on each host is
+an in-memory ring with a 72-hour TTL. Disable with `--no-archive`, or
+relocate with `--archive <path>`.
+
 `--html-out` also writes the HTML alternative, which is the only way to
 see what a digest will look like without mailing one to yourself. It
 works without `--dry-run` too. To see the layout with no fleet at all:

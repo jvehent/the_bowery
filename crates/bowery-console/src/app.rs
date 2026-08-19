@@ -99,11 +99,12 @@ pub(crate) enum EngineEvent {
         result: Result<CollectSink, String>,
         latency: Duration,
     },
-    AlertsBatch {
-        items: Vec<bowery_proto::Alert>,
-        cursor_unix_ms: u64,
+    /// A poll cycle over the whole manifest finished: how many rows it
+    /// added to the archive, and which agents could not be reached.
+    AlertsArchived {
+        stored: usize,
+        errors: Vec<String>,
     },
-    AlertsError(String),
     /// How many held alerts the pending silence would cover.
     SilenceRadius {
         result: Result<Vec<String>, String>,
@@ -353,6 +354,35 @@ impl App {
             return true;
         }
 
+        // The Query pane's idle screen is the reference, not a row list;
+        // arrows scroll it. Without this the browser consumes them and
+        // only the first screenful is ever reachable.
+        if pane_mode
+            && input_empty
+            && self.current_pane == PaneId::Query
+            && self.query_pane.showing_catalog()
+        {
+            match key.code {
+                KeyCode::Down => {
+                    self.query_pane.scroll_catalog(1);
+                    return true;
+                }
+                KeyCode::Up => {
+                    self.query_pane.scroll_catalog(-1);
+                    return true;
+                }
+                KeyCode::PageDown => {
+                    self.query_pane.scroll_catalog(10);
+                    return true;
+                }
+                KeyCode::PageUp => {
+                    self.query_pane.scroll_catalog(-10);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
         if pane_mode && input_empty && self.current_pane.is_browsable() {
             let page = 10;
             match (key.code, key.modifiers) {
@@ -437,6 +467,13 @@ impl App {
                     self.engine_tx.clone(),
                 );
             }
+            PaneId::Alerts => {
+                // A submitted line is a search. `:` clears it, which is
+                // the one thing an operator needs to be able to do
+                // without thinking after narrowing too far.
+                let spec = if trimmed == ":" { "" } else { trimmed };
+                self.status_message = Some(self.alerts_pane.set_filter(spec));
+            }
             PaneId::Chat => {
                 if let Some(msg) = self.chat_pane.submit(trimmed, self.engine_tx.clone()) {
                     self.status_message = Some(msg);
@@ -505,6 +542,26 @@ impl App {
                     Ok(n) => format!("exported {n} rows to {path}"),
                     Err(e) => format!("export failed: {e:#}"),
                 });
+            }
+            Ok(PaletteCommand::Schema { table }) => {
+                // Runs as an ordinary query, so it lands in the Query
+                // pane's result table with the same paging and detail
+                // overlay as anything else — and the operator can edit
+                // it, which is how they learn the surface is just SQL.
+                let sql = match table {
+                    Some(t) => format!("SELECT * FROM pragma_table_info({})", sql_literal(&t)),
+                    None => "SELECT type, name FROM sqlite_master \
+                             WHERE type IN ('table','view') ORDER BY name"
+                        .to_string(),
+                };
+                self.current_pane = PaneId::Query;
+                self.query_pane.submit(
+                    &sql,
+                    self.relay.clone(),
+                    self.operator_key.clone(),
+                    self.default_timeout,
+                    self.engine_tx.clone(),
+                );
             }
             Err(e) => {
                 self.status_message = Some(e);
@@ -688,6 +745,7 @@ impl App {
                 // Picks up peers added since launch, so a newly-named
                 // agent stops showing as a bare fingerprint.
                 self.alerts_pane.reload_agent_names();
+                self.alerts_pane.refresh_from_archive();
             }
             PaneId::Audit => {
                 self.audit_pane.refresh(
@@ -731,11 +789,9 @@ impl App {
                 result,
                 latency,
             } => self.query_pane.on_done(sql, result, latency),
-            EngineEvent::AlertsBatch {
-                items,
-                cursor_unix_ms,
-            } => self.alerts_pane.on_batch(items, cursor_unix_ms),
-            EngineEvent::AlertsError(e) => self.alerts_pane.on_error(e),
+            EngineEvent::AlertsArchived { stored, errors } => {
+                self.alerts_pane.on_archived(stored, &errors);
+            }
             EngineEvent::SilenceRadius { result } => {
                 if let Some(d) = self.silence_draft.as_mut() {
                     match result {

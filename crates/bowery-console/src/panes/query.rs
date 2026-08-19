@@ -52,6 +52,10 @@ pub(crate) struct QueryPane {
     /// rejected loudly. Same lock the engine task takes when it
     /// publishes the result.
     in_flight: Arc<Mutex<()>>,
+    /// Scroll offset for the idle catalogue, which is far taller than
+    /// any pane. Without it only the first screenful is reachable and
+    /// the reference is only a reference to its own first page.
+    idle_scroll: u16,
 }
 
 impl QueryPane {
@@ -60,7 +64,19 @@ impl QueryPane {
             status: QueryStatus::Idle,
             browser: Browser::default(),
             in_flight: Arc::new(Mutex::new(())),
+            idle_scroll: 0,
         }
+    }
+
+    /// Is the catalogue on screen? Arrow keys scroll it rather than
+    /// moving a row cursor that has no rows to move over.
+    pub(crate) fn showing_catalog(&self) -> bool {
+        matches!(self.status, QueryStatus::Idle)
+    }
+
+    pub(crate) fn scroll_catalog(&mut self, delta: i32) {
+        let next = i64::from(self.idle_scroll) + i64::from(delta);
+        self.idle_scroll = u16::try_from(next.max(0)).unwrap_or(u16::MAX);
     }
 
     pub(crate) fn render(&mut self, f: &mut Frame<'_>, area: Rect) {
@@ -124,11 +140,16 @@ impl QueryPane {
                 );
             }
             QueryStatus::Idle => {
+                // An empty prompt is where "querying is hard" actually
+                // bites: the operator knows SQL and does not know that
+                // `bowery_events` exists or that `ts_unix_ms` is
+                // milliseconds. So the idle screen is the reference,
+                // shown at the one moment somebody is looking for
+                // something to type.
                 f.render_widget(
-                    Paragraph::new(
-                        "Type a SELECT statement at the prompt below and press Enter.\nExamples:\n  SELECT pretty_name FROM os_version;\n  SELECT pid, name, rss_bytes FROM processes ORDER BY rss_bytes DESC LIMIT 10;\n  SELECT bowery_file_sha256_hex('/usr/bin/sshd');",
-                    )
-                    .style(theme::dim()),
+                    Paragraph::new(catalog_lines())
+                        .scroll((self.idle_scroll, 0))
+                        .wrap(ratatui::widgets::Wrap { trim: false }),
                     chunks[1],
                 );
             }
@@ -264,4 +285,29 @@ fn truncate(s: &str, max: usize) -> String {
         let head: String = iter.by_ref().take(max - 1).collect();
         format!("{head}…")
     }
+}
+
+/// The catalogue, laid out for reading: questions first, because that
+/// is how somebody arrives at it, then the schema they will need once
+/// they start editing one.
+fn catalog_lines() -> String {
+    use bowery_cli::catalog::{EXAMPLES, TABLES, squash};
+    use std::fmt::Write as _;
+
+    let mut out = String::from(
+        "Type a SELECT at the prompt below. ↑↓ scrolls this reference.\n\n\
+         ── questions, and the query that answers each ──\n\n",
+    );
+    for ex in EXAMPLES {
+        let _ = writeln!(out, "  {}\n    {}\n", ex.question, squash(ex.sql));
+    }
+    out.push_str("── tables ──\n\n");
+    for t in TABLES {
+        let _ = writeln!(out, "  {}  — {}\n    {}\n", t.name, t.about, t.columns);
+    }
+    out.push_str(
+        "`:schema` asks this agent for its live table list, which is authoritative if the\n\
+         above has drifted.\n",
+    );
+    out
 }

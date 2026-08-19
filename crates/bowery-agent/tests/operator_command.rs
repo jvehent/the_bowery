@@ -778,3 +778,145 @@ async fn bowery_peers_table_surfaces_pinned_peers() {
     agent_alpha.shutdown().await.expect("shutdown alpha");
     agent_beta.shutdown().await.expect("shutdown beta");
 }
+
+/// The Query pane's catalogue names tables an operator is told to
+/// query. This asserts every one of them exists on a real agent.
+///
+/// The catalogue lives in `bowery-cli` because the console renders it;
+/// the registry lives here. Nothing structural connects the two, so
+/// renaming or dropping a table would leave the console cheerfully
+/// advertising a `SELECT` that errors — which reads to an operator as
+/// the tool being broken, at exactly the moment they were reaching for
+/// it because they didn't know what to type.
+///
+/// Asked over the operator transport rather than by inspecting the
+/// registry directly, so what is checked is what an operator can
+/// actually reach: a table registered but rejected by the authorizer
+/// would fail here, as it should.
+#[allow(clippy::too_many_lines)] // the operator-transport fixture is inherently long
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_query_catalogue_names_only_tables_that_exist() {
+    let workdir = TempDir::new().unwrap();
+    let operator_id = Arc::new(Identity::generate());
+    let operator_pubkey_b64 = BASE64.encode(operator_id.verifying_key().as_bytes());
+
+    let cfg = build_agent_config(
+        workdir.path(),
+        reserve_udp_port(),
+        operator_pubkey_b64.clone(),
+    );
+    let agent_id = Arc::new(Identity::generate());
+    let agent_fp = agent_id.fingerprint();
+    let agent_vk = agent_id.verifying_key();
+
+    let agent = Agent::start(cfg, agent_id, Box::new(NoopEventSource))
+        .await
+        .expect("start agent");
+    let agent_whisper_addr = agent.whisper_addr().expect("whisper addr");
+
+    let mut resolver = StaticResolver::new();
+    resolver.insert(agent_vk);
+    let resolver = Arc::new(resolver);
+    let accept_verifier = Arc::new(PinnedCertVerifier::new(resolver.clone()));
+    let operator_endpoint =
+        BoweryEndpoint::bind(operator_id.clone(), accept_verifier, loopback_ephemeral())
+            .expect("bind operator endpoint");
+    let dial_verifier = Arc::new(PinnedCertVerifier::expecting(resolver.clone(), agent_fp));
+    let conn = operator_endpoint
+        .dial(dial_verifier, agent_whisper_addr)
+        .await
+        .expect("operator dial");
+
+    let operator_fp = operator_id.fingerprint();
+    let sealer = Sealer::new(operator_id.clone());
+    let envelope_verifier = Verifier::new(resolver.clone(), operator_fp);
+
+    let cmd = OperatorCommand {
+        forwarded_from_operator: Vec::new(),
+        request_id: "catalogue".into(),
+        timeout_ms: 5_000,
+        command: Some(OperatorCommandBody::Sql(SqlQuery {
+            sql: "SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name"
+                .into(),
+            fanout: false,
+            peers: Vec::new(),
+        })),
+    };
+    let outbound = sealer.seal_for(&agent_fp, &WhisperPayload::operator_command(cmd));
+    conn.send_envelope(&outbound).await.expect("send");
+
+    let mut live: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let bytes = tokio::time::timeout(timeout, conn.recv_envelope())
+            .await
+            .expect("recv in time")
+            .expect("recv");
+        let opened = envelope_verifier.open(&bytes).expect("verify");
+        let result = match opened.payload.body {
+            Some(Body::OperatorResult(r)) => r,
+            other => panic!("unexpected body: {other:?}"),
+        };
+        let chunk = match result.result {
+            Some(OperatorResultBody::SqlChunk(c)) => c,
+            other => panic!("expected SqlChunk, got {other:?}"),
+        };
+        for row in &chunk.rows {
+            if let Some(SqlValueKind::Text(name)) = &row.values[0].value {
+                live.push(name.clone());
+            }
+        }
+        if chunk.end {
+            break;
+        }
+    }
+
+    assert!(
+        live.len() > 5,
+        "the schema query returned almost nothing ({live:?}); the check would pass vacuously"
+    );
+
+    let missing: Vec<&str> = bowery_cli::catalog::table_names()
+        .into_iter()
+        .filter(|t| !live.iter().any(|l| l == t))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the console's query catalogue advertises tables this agent does not have: \
+         {missing:?}\nlive tables: {live:?}"
+    );
+
+    // And the other direction. A table an operator can query but
+    // cannot discover is capability that may as well not exist — this
+    // check is what caught the console documenting the `bowery_*`
+    // tables while saying nothing about `processes`, `listening_ports`,
+    // `crontab` or `systemd_units`, which is half the surface.
+    //
+    // `sqlite_sequence` is SQLite's own bookkeeping, not ours.
+    let undocumented: Vec<&String> = live
+        .iter()
+        .filter(|l| !l.starts_with("sqlite_"))
+        .filter(|l| !bowery_cli::catalog::table_names().contains(&l.as_str()))
+        .collect();
+    assert!(
+        undocumented.is_empty(),
+        "these tables are queryable but absent from the console's catalogue, so nobody \
+         will find them: {undocumented:?}"
+    );
+
+    // Every table an example actually SELECTs from, too — the catalogue
+    // list and the example SQL can drift apart from each other.
+    let bad_examples: Vec<&str> = bowery_cli::catalog::tables_referenced_by_examples()
+        .into_iter()
+        .filter(|t| !live.iter().any(|l| l == t))
+        .collect();
+    assert!(
+        bad_examples.is_empty(),
+        "example queries reference missing tables: {bad_examples:?}"
+    );
+
+    drop(conn);
+    operator_endpoint.close().await;
+    agent.shutdown().await.expect("shutdown");
+}

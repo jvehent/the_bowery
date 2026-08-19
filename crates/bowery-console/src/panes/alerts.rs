@@ -1,14 +1,35 @@
-//! Live alerts pane — long-polls the agent's operator inbox via
-//! `bowery_cli::alerts::poll_once` on a 5-second cadence and
-//! displays the newest entries on top.
+//! Alerts pane — the fleet's alert history, searchable.
 //!
-//! Sliding window: we keep the most recent `MAX_ALERTS` so a long
-//! operator session doesn't grow unbounded.
+//! # Why this reads from an archive and not from the agents
+//!
+//! An agent's inbox is a bounded in-memory ring with a 72-hour TTL that
+//! dies with the process, so "show me last week" was not a feature that
+//! had been left out — the data did not exist to show. Worse, the pane
+//! polled only the *currently connected* relay, so seeing another
+//! host's alerts meant `:connect`-ing away from this one.
+//!
+//! The poller now drains **every agent in the peer manifest** and writes
+//! what it gets to the operator-side archive
+//! (`bowery_cli::archive`); the pane renders a query against that. The
+//! consequences that matter:
+//!
+//! - History outlives the agent, so a host that restarts — or is
+//!   restarted by whoever just rooted it — no longer takes the record of
+//!   its own alerts with it.
+//! - Every host is in one list, sorted by time, without reconnecting.
+//! - What is on screen is a *filter*, so searching is the same
+//!   mechanism as browsing rather than a separate mode.
+//!
+//! `bowery notify` writes to the same archive on its timer, so the
+//! console shows alerts that arrived while it was closed.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use std::path::PathBuf;
+
 use bowery_cli::alerts;
+use bowery_cli::archive::{Archive, Filter};
 use bowery_proto::Alert;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
@@ -24,7 +45,10 @@ use crate::browse::Browser;
 use crate::panes::{hex_lower, kv, split_hint};
 use crate::theme;
 
-const MAX_ALERTS: usize = 500;
+/// Rows held in memory for rendering. The archive holds everything;
+/// this only bounds what one screenful of scrollback can reach, and a
+/// tighter filter is the way to see past it.
+const MAX_ALERTS: usize = 2000;
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// RFC3339 in UTC with millisecond precision. Spelled out rather than
@@ -39,7 +63,6 @@ const TS_FORMAT: &[BorrowedFormatItem<'_>] =
 #[derive(Debug, Default)]
 pub(crate) struct AlertsPane {
     pub(crate) alerts: Vec<Alert>,
-    pub(crate) cursor_unix_ms: u64,
     pub(crate) poller_started: bool,
     pub(crate) last_error: Option<String>,
     /// fingerprint-hex → operator-assigned name, from
@@ -48,13 +71,134 @@ pub(crate) struct AlertsPane {
     agent_names: HashMap<String, String>,
     /// Cursor + viewport over `alerts`.
     browser: Browser,
+    /// Read handle on the archive. `None` when it could not be opened —
+    /// the pane degrades to whatever the poller reports rather than
+    /// showing nothing.
+    archive: Option<Archive>,
+    archive_path: Option<PathBuf>,
+    /// The live query. Editing it is how an operator searches.
+    filter: Filter,
+    /// What the operator typed, kept for display.
+    filter_text: String,
+    /// Total archived rows, so the pane can say "12 of 4,318" instead
+    /// of implying the filtered set is everything there is.
+    total_rows: u64,
 }
 
 impl AlertsPane {
     pub(crate) fn new() -> Self {
         let mut pane = Self::default();
         pane.reload_agent_names();
+        pane.filter.limit = MAX_ALERTS;
+        pane.open_archive();
+        pane.refresh_from_archive();
         pane
+    }
+
+    /// Build a pane over a supplied archive. Tests only — the real
+    /// constructor opens `~/.bowery/alerts.db`, and a test that reached
+    /// for the operator's own archive would both pollute it and depend
+    /// on its contents.
+    #[cfg(test)]
+    pub(crate) fn with_archive(archive: Archive) -> Self {
+        let mut pane = Self {
+            archive: Some(archive),
+            ..Self::default()
+        };
+        pane.filter.limit = MAX_ALERTS;
+        pane.refresh_from_archive();
+        pane
+    }
+
+    /// Open the archive read handle, remembering why if it fails.
+    ///
+    /// A missing archive is not an error state: on a fresh install
+    /// nothing has polled yet. It becomes visible in the pane title as
+    /// "0 archived" rather than as a failure, because the distinction
+    /// between "nothing happened" and "nothing is recording" is one the
+    /// operator has to be able to make.
+    fn open_archive(&mut self) {
+        let Ok(path) = bowery_cli::archive::default_path() else {
+            return;
+        };
+        match Archive::open(&path) {
+            Ok(a) => {
+                self.archive = Some(a);
+                self.archive_path = Some(path);
+            }
+            Err(e) => {
+                self.last_error = Some(format!("archive: {e:#}"));
+            }
+        }
+    }
+
+    /// Re-run the current filter against the archive.
+    ///
+    /// Cheap enough to call on every poll tick: the archive is indexed
+    /// on `ts_unix_ms` and the query is capped at `MAX_ALERTS`.
+    pub(crate) fn refresh_from_archive(&mut self) {
+        let Some(archive) = &self.archive else {
+            return;
+        };
+        match archive.query(&self.filter) {
+            Ok(rows) => {
+                self.alerts = rows
+                    .iter()
+                    .map(bowery_cli::archive::Row::to_alert)
+                    .collect();
+                self.total_rows = archive.stats().map_or(0, |s| s.rows);
+                self.browser.set_len(self.alerts.len());
+            }
+            Err(e) => self.last_error = Some(format!("archive query: {e:#}")),
+        }
+    }
+
+    /// Apply a search string typed at the prompt.
+    ///
+    /// Bare words are a substring search across path, rationale, rule,
+    /// episode and context. `key:value` terms narrow structurally, so
+    /// the common questions — one host, one rule, only confirmed, only
+    /// serious — do not require remembering a query language.
+    ///
+    /// Returns a line describing what is now in force, for the status
+    /// bar: a filter that silently drops rows is how an operator comes
+    /// to believe a quiet fleet.
+    pub(crate) fn set_filter(&mut self, text: &str) -> String {
+        self.filter_text = text.trim().to_string();
+        let mut filter = Filter {
+            limit: MAX_ALERTS,
+            ..Filter::default()
+        };
+        let mut words: Vec<&str> = Vec::new();
+        for token in self.filter_text.split_whitespace() {
+            match token.split_once(':') {
+                Some(("agent" | "host", v)) => filter.agent = Some(v.to_string()),
+                Some(("rule", v)) => filter.rule_id = Some(v.to_string()),
+                Some(("min", v)) => filter.min_suspicion = v.parse().ok(),
+                Some(("since", v)) => {
+                    filter.since_unix_ms = parse_since(v);
+                }
+                Some(("confirmed", v)) => filter.confirmed_only = matches!(v, "1" | "true" | "yes"),
+                Some(("all", v)) => filter.all_versions = matches!(v, "1" | "true" | "yes"),
+                _ => words.push(token),
+            }
+        }
+        if !words.is_empty() {
+            filter.text = Some(words.join(" "));
+        }
+        self.filter = filter;
+        self.browser.home();
+        self.refresh_from_archive();
+        if self.filter_text.is_empty() {
+            format!("filter cleared — {} alert(s)", self.alerts.len())
+        } else {
+            format!(
+                "filter {:?} — {} of {} archived",
+                self.filter_text,
+                self.alerts.len(),
+                self.total_rows
+            )
+        }
     }
 
     /// (Re)load the fingerprint → name map from the operator's peer
@@ -90,8 +234,19 @@ impl AlertsPane {
     pub(crate) fn render(&mut self, f: &mut Frame<'_>, area: Rect) {
         let title = if let Some(e) = &self.last_error {
             format!("Alerts (poll error: {})", truncate(e, 40))
+        } else if self.filter_text.is_empty() {
+            format!("Alerts ({} archived)", self.total_rows)
         } else {
-            format!("Alerts ({} buffered)", self.alerts.len())
+            // Always the pair, never the filtered count alone. "12
+            // alerts" reads as the whole story; "12 of 4318" is the
+            // only version that tells an operator a filter is hiding
+            // things from them.
+            format!(
+                "Alerts ({} of {} — filter: {})",
+                self.alerts.len(),
+                self.total_rows,
+                truncate(&self.filter_text, 40)
+            )
         };
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
@@ -99,13 +254,10 @@ impl AlertsPane {
         self.browser.set_len(self.alerts.len());
 
         if self.alerts.is_empty() {
-            let body = if self.poller_started {
-                "waiting for alerts… (polling every 5s)"
-            } else {
-                "press 2 to switch to this pane and start the poller"
-            };
             f.render_widget(
-                ratatui::widgets::Paragraph::new(body).style(theme::dim()),
+                ratatui::widgets::Paragraph::new(self.empty_state())
+                    .style(theme::dim())
+                    .wrap(ratatui::widgets::Wrap { trim: false }),
                 inner,
             );
             return;
@@ -171,9 +323,43 @@ impl AlertsPane {
         let mut state = TableState::default().with_selected(self.browser.selected_in_view());
         f.render_stateful_widget(table, list_area, &mut state);
         f.render_widget(
-            Paragraph::new("↑↓ move  ⏎ detail  s silence  r refresh").style(theme::hint()),
+            Paragraph::new(
+                "↑↓ move  ⏎ detail  s silence  r refresh  \
+                 type to search (agent: rule: min: since: confirmed:1 all:1, ':' clears)",
+            )
+            .style(theme::hint()),
             hint_area,
         );
+    }
+
+    /// What to say when there is nothing to list.
+    ///
+    /// Three different emptinesses, deliberately worded apart:
+    /// over-filtered, archived-but-not-loaded, and genuinely nothing
+    /// recorded. Collapsing them into "no alerts" is how an operator
+    /// concludes a fleet is quiet when it is unmonitored — the failure
+    /// this whole system exists to avoid.
+    fn empty_state(&self) -> String {
+        if !self.filter_text.is_empty() {
+            return format!(
+                "no alert matches {:?}.\n\n{} alert(s) are archived — submit an empty \
+                 filter (just ':') to see them all.",
+                self.filter_text, self.total_rows
+            );
+        }
+        if self.total_rows > 0 {
+            return format!(
+                "{} archived, none loaded — press r to refresh.",
+                self.total_rows
+            );
+        }
+        if self.poller_started {
+            return "no alerts archived yet.\n\nPolling every agent in ~/.bowery/peers.toml \
+                    every 5s. An empty archive means nothing has been reported since this \
+                    console or `bowery notify` last ran — not that nothing happened."
+                .to_string();
+        }
+        "press 2 to switch to this pane and start the poller".to_string()
     }
 
     /// Full-screen detail for the selected alert.
@@ -295,9 +481,15 @@ impl AlertsPane {
 
     /// Spawn the polling task on first activation. Subsequent calls
     /// no-op — the task drains until the channel closes.
+    ///
+    /// Polls **every** agent in the peer manifest, not the connected
+    /// relay. The relay is where operator *commands* go; alerts are
+    /// something every agent has, and tying the alert view to the
+    /// current connection meant an operator investigating one host was
+    /// blind to the rest of the fleet for as long as they looked.
     pub(crate) fn ensure_poller(
         &mut self,
-        relay: Relay,
+        _relay: Relay,
         operator_key: std::path::PathBuf,
         engine_tx: mpsc::Sender<EngineEvent>,
     ) {
@@ -305,27 +497,55 @@ impl AlertsPane {
             return;
         }
         self.poller_started = true;
-        let mut cursor = self.cursor_unix_ms;
+        let archive_path = self.archive_path.clone();
         tokio::spawn(async move {
+            // The poller owns its own archive handle. SQLite is in WAL
+            // mode, so this writer and the pane's reader coexist; a
+            // shared connection would have to be held across await
+            // points instead.
+            let mut archive = archive_path.as_ref().and_then(|p| Archive::open(p).ok());
+            // Per-agent cursors, seeded from what is already archived so
+            // a reopened console does not refetch a whole retention
+            // window on every start.
+            let mut cursors: HashMap<String, u64> = HashMap::new();
+
             loop {
-                let outcome = alerts::poll_once(
-                    &operator_key,
-                    relay.addr,
-                    &relay.fp_hex,
-                    &relay.pubkey_b64,
-                    cursor,
-                )
-                .await;
-                let event = match outcome {
-                    Ok((items, next)) => {
-                        cursor = next;
-                        EngineEvent::AlertsBatch {
-                            items,
-                            cursor_unix_ms: next,
+                let peers = load_peers();
+                let mut stored = 0usize;
+                let mut errors: Vec<String> = Vec::new();
+
+                for peer in &peers {
+                    let Some(addr) = peer.addr.as_deref().and_then(|a| a.parse().ok()) else {
+                        continue; // fan-out-only entry, nothing to dial
+                    };
+                    let fp_key = peer.fp.to_ascii_lowercase();
+                    let since = match cursors.get(&fp_key) {
+                        Some(c) => *c,
+                        None => archive
+                            .as_ref()
+                            .and_then(|a| a.cursor_for(&fp_key).ok())
+                            .unwrap_or(0),
+                    };
+                    match alerts::poll_once(&operator_key, addr, &peer.fp, &peer.pubkey_b64, since)
+                        .await
+                    {
+                        Ok((items, next)) => {
+                            cursors.insert(fp_key, next);
+                            if let Some(a) = archive.as_mut() {
+                                match a.record(&items, Some(&peer.name)) {
+                                    Ok(n) => stored += n,
+                                    Err(e) => errors.push(format!("{}: archive {e}", peer.name)),
+                                }
+                            }
                         }
+                        // One unreachable host must not stop the rest.
+                        // It is named, though: a silently skipped agent
+                        // is indistinguishable from a quiet one.
+                        Err(e) => errors.push(format!("{}: {e}", peer.name)),
                     }
-                    Err(e) => EngineEvent::AlertsError(format!("{e:#}")),
-                };
+                }
+
+                let event = EngineEvent::AlertsArchived { stored, errors };
                 if engine_tx.send(event).await.is_err() {
                     break;
                 }
@@ -334,50 +554,22 @@ impl AlertsPane {
         });
     }
 
-    pub(crate) fn on_batch(&mut self, items: Vec<Alert>, cursor_unix_ms: u64) {
-        self.last_error = None;
-        if cursor_unix_ms > self.cursor_unix_ms {
-            self.cursor_unix_ms = cursor_unix_ms;
-        }
-        // Dedup by episode_id: an episode can produce several alerts —
-        // the initial one, an LLM-refined one, and a quorum-confirmed
-        // one — and the later ones supersede rather than accompany the
-        // first. Without this the same finding renders two or three
-        // times, which is exactly the noise an operator doesn't need.
-        //
-        // Batches arrive oldest-first, so a later entry always supersedes
-        // an earlier one for the same episode. Collapse within the batch
-        // first: a single batch routinely carries both the original and
-        // its superseding alert, and prepending them one at a time would
-        // let the *older* one land on top.
-        //
-        // An empty episode_id is not an identity — those never dedup,
-        // or every one of them would collapse into a single row.
-        let mut batch: Vec<Alert> = Vec::with_capacity(items.len());
-        for a in items {
-            match batch
-                .iter_mut()
-                .find(|e| !a.episode_id.is_empty() && e.episode_id == a.episode_id)
-            {
-                Some(slot) => *slot = a,
-                None => batch.push(a),
+    /// A poll cycle finished. Re-read the archive so anything new shows.
+    pub(crate) fn on_archived(&mut self, stored: usize, errors: &[String]) {
+        self.last_error = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        };
+        if stored > 0 || self.alerts.is_empty() {
+            self.refresh_from_archive();
+        } else {
+            // Keep the total fresh even when this cycle stored nothing,
+            // so `notify` writing in the background is visible here.
+            if let Some(a) = &self.archive {
+                self.total_rows = a.stats().map_or(self.total_rows, |s| s.rows);
             }
         }
-        // Newest at the top; slide the window.
-        for a in batch.into_iter().rev() {
-            if !a.episode_id.is_empty() {
-                self.alerts.retain(|e| e.episode_id != a.episode_id);
-            }
-            self.alerts.insert(0, a);
-        }
-        if self.alerts.len() > MAX_ALERTS {
-            self.alerts.truncate(MAX_ALERTS);
-        }
-        self.browser.set_len(self.alerts.len());
-    }
-
-    pub(crate) fn on_error(&mut self, message: String) {
-        self.last_error = Some(message);
     }
 }
 
@@ -559,39 +751,160 @@ mod render_tests {
         assert!(out.contains("world-writable"), "rationale missing");
     }
 
+    /// The pane renders the archive, so history predates the session:
+    /// alerts that arrived while the console was closed (via `bowery
+    /// notify`, or a previous run) must be on screen at startup. That
+    /// was the whole complaint — the old pane started empty every time
+    /// and could only ever show what it watched arrive.
+    #[test]
+    fn the_pane_opens_showing_history_it_did_not_witness() {
+        let mut archive = Archive::open_in_memory().unwrap();
+        archive
+            .record(
+                &[sample(1).remove(0), confirmed("ep-old", 4, 5, true)],
+                Some("otter1"),
+            )
+            .unwrap();
+
+        let mut pane = AlertsPane::with_archive(archive);
+        assert_eq!(pane.alerts.len(), 2, "history must load without polling");
+        let out = draw(&mut pane, false);
+        assert!(out.contains("ep-old"), "archived alert not rendered: {out}");
+    }
+
+    /// A superseding alert replaces its episode rather than duplicating
+    /// it — now enforced by the archive's `alerts_latest` view, so the
+    /// pane inherits it. Asserted here too because the pane is where the
+    /// duplication would be *seen*.
     #[test]
     fn superseding_alert_replaces_its_episode_instead_of_duplicating() {
-        let mut pane = AlertsPane::default();
-        // The original and its confirmation arrive in one drained batch,
-        // oldest first — the case that made the naive prepend keep the
-        // *older* row.
-        pane.on_batch(vec![sample(1).remove(0), confirmed("ep-0", 4, 5, true)], 1);
+        let mut archive = Archive::open_in_memory().unwrap();
+        let mut original = sample(1).remove(0);
+        original.episode_id = "ep-0".into();
+        original.ts_unix_ms = 1000;
+        let mut later = confirmed("ep-0", 4, 5, true);
+        later.ts_unix_ms = 2000;
+        archive.record(&[original, later], Some("otter1")).unwrap();
+
+        let pane = AlertsPane::with_archive(archive);
         assert_eq!(pane.alerts.len(), 1, "one episode must be one row");
         assert!(
             pane.alerts[0].confirmation.is_some(),
             "the superseding alert must win, not the original"
         );
-
-        // ... and again when they arrive in separate polls.
-        let mut pane = AlertsPane::default();
-        pane.on_batch(vec![sample(1).remove(0)], 1);
-        pane.on_batch(vec![confirmed("ep-0", 4, 5, true)], 2);
-        assert_eq!(pane.alerts.len(), 1);
-        assert!(pane.alerts[0].confirmation.is_some());
     }
 
+    /// Alerts with no episode id are unrelated to one another, so
+    /// collapsing on it would fold them all into one row.
     #[test]
     fn empty_episode_ids_never_collapse_together() {
-        let mut pane = AlertsPane::default();
+        let mut archive = Archive::open_in_memory().unwrap();
         let mut a = sample(1).remove(0);
         let mut b = sample(1).remove(0);
         a.episode_id = String::new();
+        a.ts_unix_ms = 1000;
         b.episode_id = String::new();
-        pane.on_batch(vec![a, b], 1);
+        b.ts_unix_ms = 2000;
+        archive.record(&[a, b], Some("otter1")).unwrap();
+
+        let pane = AlertsPane::with_archive(archive);
         assert_eq!(
             pane.alerts.len(),
             2,
             "an empty episode_id is not an identity"
+        );
+    }
+
+    /// Searching is the same mechanism as browsing, so a filter must
+    /// narrow the rendered set and be reversible.
+    #[test]
+    fn a_filter_narrows_the_list_and_clears_again() {
+        let mut archive = Archive::open_in_memory().unwrap();
+        let mut watchdog = sample(1).remove(0);
+        watchdog.episode_id = "ep-watchdog".into();
+        watchdog.exe_path = "/usr/bin/dd".into();
+        watchdog.rationale = "write-intent open of /dev/watchdog0".into();
+        watchdog.ts_unix_ms = 2000;
+        let mut other = sample(1).remove(0);
+        other.episode_id = "ep-other".into();
+        other.ts_unix_ms = 1000;
+        archive.record(&[watchdog, other], Some("otter1")).unwrap();
+
+        let mut pane = AlertsPane::with_archive(archive);
+        assert_eq!(pane.alerts.len(), 2);
+
+        let msg = pane.set_filter("watchdog");
+        assert_eq!(pane.alerts.len(), 1, "free text must narrow");
+        assert_eq!(pane.alerts[0].episode_id, "ep-watchdog");
+        // The status line has to name both numbers: a filtered count on
+        // its own reads as the whole fleet being quiet.
+        assert!(
+            msg.contains("1 of 2"),
+            "status must show both counts: {msg}"
+        );
+
+        assert!(
+            !pane.set_filter("").is_empty(),
+            "clearing must report what it did"
+        );
+        assert_eq!(pane.alerts.len(), 2, "clearing restores everything");
+    }
+
+    /// `key:value` terms exist so the routine questions don't require a
+    /// query language. Structural terms must not also be matched as
+    /// free text, or `rule:x` would find nothing.
+    #[test]
+    fn structural_filter_terms_are_parsed_not_searched() {
+        let mut archive = Archive::open_in_memory().unwrap();
+        let mut high = sample(1).remove(0);
+        high.episode_id = "ep-high".into();
+        high.rule_id = "cred.read_aws".into();
+        high.suspicion = 0.95;
+        high.ts_unix_ms = 2000;
+        let mut low = sample(1).remove(0);
+        low.episode_id = "ep-low".into();
+        low.rule_id = "net.beacon".into();
+        low.suspicion = 0.2;
+        low.ts_unix_ms = 1000;
+        archive.record(&[high, low], Some("otter1")).unwrap();
+
+        let mut pane = AlertsPane::with_archive(archive);
+        pane.set_filter("rule:cred.read_aws");
+        assert_eq!(pane.alerts.len(), 1, "rule: must filter structurally");
+        assert_eq!(pane.alerts[0].episode_id, "ep-high");
+
+        pane.set_filter("min:0.5");
+        assert_eq!(pane.alerts.len(), 1);
+        assert_eq!(pane.alerts[0].episode_id, "ep-high");
+
+        pane.set_filter("agent:otter1");
+        assert_eq!(pane.alerts.len(), 2, "both are from this agent");
+
+        pane.set_filter("agent:nosuchhost");
+        assert!(pane.alerts.is_empty(), "an unknown agent matches nothing");
+    }
+
+    /// An empty list has three causes and they mean different things.
+    /// Reporting "no alerts" for a filter that hid them is how an
+    /// operator concludes a fleet is quiet.
+    #[test]
+    fn an_empty_list_says_which_emptiness_it_is() {
+        let empty = AlertsPane::with_archive(Archive::open_in_memory().unwrap());
+        let mut empty = empty;
+        let out = draw(&mut empty, false);
+        assert!(
+            out.contains("no alerts archived yet") || out.contains("press 2"),
+            "an empty archive must say so: {out}"
+        );
+
+        let mut archive = Archive::open_in_memory().unwrap();
+        archive.record(&sample(1), Some("otter1")).unwrap();
+        let mut pane = AlertsPane::with_archive(archive);
+        pane.set_filter("nothingmatchesthis");
+        let filtered = draw(&mut pane, false);
+        assert!(
+            filtered.contains("no alert matches"),
+            "a filter hiding everything must say so, not report silence: {filtered}"
         );
     }
 
@@ -636,4 +949,32 @@ mod render_tests {
         // Must not panic when nothing is selected.
         let _ = draw(&mut pane, true);
     }
+}
+
+/// Peers from `~/.bowery/peers.toml`, re-read each cycle so `:peers add`
+/// takes effect without restarting the console.
+fn load_peers() -> Vec<bowery_cli::peers::Peer> {
+    bowery_cli::peers::default_path()
+        .ok()
+        .and_then(|p| bowery_cli::peers::Manifest::load(&p).ok())
+        .map(|m| m.peers)
+        .unwrap_or_default()
+}
+
+/// `since:2h` / `since:7d` / `since:30m` → an absolute epoch bound.
+fn parse_since(spec: &str) -> Option<u64> {
+    let (value, unit) = spec.split_at(spec.len().checked_sub(1)?);
+    let n: u64 = value.parse().ok()?;
+    let secs = match unit {
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        "w" => n * 604_800,
+        _ => return None,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    u64::try_from(now).ok()?.checked_sub(secs * 1000)
 }

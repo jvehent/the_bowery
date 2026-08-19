@@ -1032,6 +1032,103 @@ pub struct RunArgs {
     /// Write the HTML alternative here as well as (or instead of)
     /// sending it.
     pub html_out: Option<PathBuf>,
+    /// Where to archive every polled alert. `None` disables archiving.
+    pub archive_path: Option<PathBuf>,
+}
+
+/// Open the alert archive, or explain why not and carry on.
+///
+/// A failure here must never stop the mail going out. This runs on a
+/// timer with nobody watching, and the notification is the load-bearing
+/// part: losing history is bad, losing the alert is worse.
+fn open_archive(path: Option<&Path>) -> Option<crate::archive::Archive> {
+    let path = path?;
+    match crate::archive::Archive::open(path) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            eprintln!("notify: alert archive unavailable ({e}); continuing without it");
+            None
+        }
+    }
+}
+
+/// What one sweep of the fleet produced.
+#[derive(Debug, Default)]
+struct PollOutcome {
+    hosts: Vec<HostAlerts>,
+    /// Per-agent cursor to persist, but only after a successful send.
+    advanced: BTreeMap<String, u64>,
+    poll_failures: usize,
+}
+
+/// Drain every agent in the manifest into `hosts`, archiving as it goes.
+///
+/// Polling failures are counted and reported per agent rather than
+/// returned: one unreachable host must not suppress alerts from the
+/// rest of the fleet, which is precisely when the mail matters most.
+async fn poll_fleet(
+    args: &RunArgs,
+    cfg: &NotifyConfig,
+    manifest: &Manifest,
+    cursors: &Cursors,
+    mut archive: Option<&mut crate::archive::Archive>,
+    out: &mut PollOutcome,
+) {
+    let PollOutcome {
+        hosts,
+        advanced,
+        poll_failures,
+    } = out;
+    for peer in &manifest.peers {
+        let Some(addr_str) = peer.addr.as_deref() else {
+            continue; // fan-out-only entry, nothing to dial
+        };
+        let addr = match addr_str.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("notify: peer {} has an unusable addr: {e}", peer.name);
+                *poll_failures += 1;
+                continue;
+            }
+        };
+        let since = cursors.since(&peer.fp);
+        match crate::alerts::poll_once(&args.operator_key, addr, &peer.fp, &peer.pubkey_b64, since)
+            .await
+        {
+            Ok((alerts, cursor)) => {
+                // Archive first, and archive *everything* — before the
+                // operator's filter and before the episode collapse.
+                //
+                // The filter says what is worth waking someone for; the
+                // archive says what was observed. Conflating them means
+                // raising `min_suspicion` silently erases history, and
+                // the low-scoring alert nobody wanted emailed is
+                // routinely the one that matters in hindsight.
+                if let Some(a) = archive.as_deref_mut()
+                    && let Err(e) = a.record(&alerts, Some(&peer.name))
+                {
+                    eprintln!("notify: archiving {} failed: {e}", peer.name);
+                }
+                let kept: Vec<Alert> = dedup_by_episode(
+                    alerts
+                        .into_iter()
+                        .filter(|a| passes(a, &cfg.filter))
+                        .collect(),
+                );
+                advanced.insert(peer.fp.clone(), cursor);
+                if !kept.is_empty() {
+                    hosts.push(HostAlerts {
+                        host: peer.name.clone(),
+                        alerts: kept,
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("notify: polling {} failed: {e}", peer.name);
+                *poll_failures += 1;
+            }
+        }
+    }
 }
 
 /// Poll every agent in the manifest, and email whatever is new.
@@ -1054,47 +1151,24 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         );
     }
 
-    let mut hosts: Vec<HostAlerts> = Vec::new();
-    let mut advanced: BTreeMap<String, u64> = BTreeMap::new();
-    let mut poll_failures = 0usize;
+    let mut outcome = PollOutcome::default();
 
-    for peer in &manifest.peers {
-        let Some(addr_str) = peer.addr.as_deref() else {
-            continue; // fan-out-only entry, nothing to dial
-        };
-        let addr = match addr_str.parse() {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("notify: peer {} has an unusable addr: {e}", peer.name);
-                poll_failures += 1;
-                continue;
-            }
-        };
-        let since = cursors.since(&peer.fp);
-        match crate::alerts::poll_once(&args.operator_key, addr, &peer.fp, &peer.pubkey_b64, since)
-            .await
-        {
-            Ok((alerts, cursor)) => {
-                let kept: Vec<Alert> = dedup_by_episode(
-                    alerts
-                        .into_iter()
-                        .filter(|a| passes(a, &cfg.filter))
-                        .collect(),
-                );
-                advanced.insert(peer.fp.clone(), cursor);
-                if !kept.is_empty() {
-                    hosts.push(HostAlerts {
-                        host: peer.name.clone(),
-                        alerts: kept,
-                    });
-                }
-            }
-            Err(e) => {
-                eprintln!("notify: polling {} failed: {e}", peer.name);
-                poll_failures += 1;
-            }
-        }
-    }
+    let mut archive = open_archive(args.archive_path.as_deref());
+
+    poll_fleet(
+        args,
+        &cfg,
+        &manifest,
+        &cursors,
+        archive.as_mut(),
+        &mut outcome,
+    )
+    .await;
+    let PollOutcome {
+        mut hosts,
+        advanced,
+        poll_failures,
+    } = outcome;
 
     if hosts.is_empty() {
         // Still advance cursors: alerts below the filter were seen and

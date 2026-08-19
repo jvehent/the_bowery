@@ -419,6 +419,15 @@ a clean result file.
 
 ## 8. Useful queries
 
+**Don't memorise any of this.** `bowery tables` prints every queryable
+table with its columns, plus a set of questions and the query that
+answers each; the console's Query pane shows the same reference on its
+idle screen (↑↓ scrolls it), and `:schema` / `:schema <table>` asks the
+connected agent directly, which is authoritative if the reference has
+drifted. A test in `bowery-agent` fails the build if the two disagree in
+either direction — including a table you can query but that nothing
+tells you about.
+
 **Start here: has each detection ever actually fired?**
 
 ```sql
@@ -454,6 +463,44 @@ own bookkeeping.
 | What is alerting? | `SELECT episode_id, rule_id, suspicion, confirmed, exe_path FROM bowery_alerts` |
 | Which rules are producing the noise? | `SELECT rule_id, COUNT(*) FROM bowery_alerts GROUP BY rule_id ORDER BY 2 DESC` |
 | What am I not being told about? | `SELECT id, rule_id, weight, matched, reason FROM bowery_silences ORDER BY matched DESC` |
+
+### Alert history, and why it is operator-side
+
+An agent's inbox is an in-memory ring with a 72-hour TTL that dies with
+the process. It is a delivery buffer, not a record — so "what did this
+host alert on last week" was not a missing feature, the data did not
+exist. And a record kept only on the machine it accuses is one that
+machine's owner can revoke: whoever roots a host can erase every alert
+about themselves by waiting three days or restarting a service.
+
+So `bowery notify` and the console both write every alert they poll to
+`~/.bowery/alerts.db` as they drain it. That archive is the only view
+that outlives an agent.
+
+```bash
+bowery alerts history                        # newest verdict per episode
+bowery alerts history watchdog               # substring: path, rationale, rule, context
+bowery alerts history --agent otter1 --since 7d
+bowery alerts history --rule cred.read_aws --confirmed
+bowery alerts history --all-versions         # keep superseded verdicts
+bowery alerts history --stats                # what the archive covers
+bowery alerts history --json                 # one object per line
+```
+
+Everything polled is archived — *before* `min_suspicion` and before the
+episode collapse. The notification filter says what is worth waking
+someone for; the archive says what was observed. Conflating them would
+mean raising a threshold silently erases history, and the low-scoring
+alert nobody wanted emailed is routinely the one that matters later.
+
+`--all-versions` exists because a verdict *moves*: the pre-filter raises
+it, the LLM refines it, a quorum confirms it, corroboration can
+downgrade it. "Raised at 0.9, downgraded to 0.3 when four peers said
+they all do that" is a different story from "0.3", and only one of them
+survives if you keep the last write.
+
+Turn it off with `bowery notify --no-archive`, or point it elsewhere
+with `--archive <path>`.
 
 ### Silencing a benign alert
 

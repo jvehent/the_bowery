@@ -102,12 +102,23 @@ enum Command {
         /// advancing cursors. Needs no SMTP credential.
         #[arg(long)]
         dry_run: bool,
+        /// Do not archive polled alerts to `~/.bowery/alerts.db`.
+        #[arg(long)]
+        no_archive: bool,
+        /// Archive polled alerts here instead of the default path.
+        #[arg(long)]
+        archive: Option<PathBuf>,
         /// Also write the HTML alternative here, to open in a browser.
         /// The only way to see what a digest will actually look like
         /// without mailing one to yourself.
         #[arg(long)]
         html_out: Option<PathBuf>,
     },
+
+    /// List the queryable tables and some queries worth starting from.
+    ///
+    /// The same reference the console shows on its idle Query pane.
+    Tables,
 
     /// Fetch and validate LLM model artifacts (GGUF files) from a
     /// curated registry. Models are written to a local cache directory
@@ -456,6 +467,49 @@ enum ModelCommand {
 
 #[derive(Subcommand, Debug)]
 enum AlertsCommand {
+    /// Search the operator-side alert archive.
+    ///
+    /// Reads `~/.bowery/alerts.db`, which `bowery notify` and the
+    /// console fill in as they poll. This is the only view that
+    /// outlives an agent: an inbox is an in-memory ring with a 72-hour
+    /// TTL, so a host that restarts — or is restarted by whoever just
+    /// rooted it — takes its own alert history with it.
+    History {
+        /// Substring match across path, rationale, rule, episode id,
+        /// hash and context. Taken literally, wildcards included.
+        query: Option<String>,
+        /// Archive file. Defaults to `~/.bowery/alerts.db`.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// Only alerts at or above this suspicion.
+        #[arg(long)]
+        min_suspicion: Option<f64>,
+        /// Only this rule id.
+        #[arg(long)]
+        rule: Option<String>,
+        /// Only this agent, by manifest name or fingerprint hex.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Only alerts a peer quorum confirmed.
+        #[arg(long)]
+        confirmed: bool,
+        /// How far back to look.
+        #[arg(long, value_parser = parse_duration)]
+        since: Option<Duration>,
+        /// Show superseded versions too, rather than the newest verdict
+        /// per episode. How a verdict *moved* is often the story.
+        #[arg(long)]
+        all_versions: bool,
+        /// Maximum rows.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// One JSON object per line.
+        #[arg(long)]
+        json: bool,
+        /// Print row/episode/agent counts and the covered window.
+        #[arg(long)]
+        stats: bool,
+    },
     /// Print every alert in the agent's inbox since the cursor, then exit
     /// (or, with --follow, re-poll every `--interval`).
     Tail {
@@ -698,7 +752,45 @@ impl Cli {
                 ))?;
                 Ok(ExitCode::SUCCESS)
             }
+            Command::Tables => {
+                print!("{}", bowery_cli::catalog::render());
+                Ok(ExitCode::SUCCESS)
+            }
             Command::Doctor { json } => doctor_cmd(json),
+            Command::Alerts {
+                sub:
+                    AlertsCommand::History {
+                        query,
+                        archive,
+                        min_suspicion,
+                        rule,
+                        agent,
+                        confirmed,
+                        since,
+                        all_versions,
+                        limit,
+                        json,
+                        stats,
+                    },
+            } => {
+                let path = match archive {
+                    Some(p) => notify::expand_tilde(&p),
+                    None => bowery_cli::archive::default_path()?,
+                };
+                alerts_history(&bowery_cli::archive::HistoryArgs {
+                    path,
+                    query,
+                    min_suspicion,
+                    rule,
+                    agent,
+                    confirmed,
+                    since,
+                    all_versions,
+                    limit,
+                    json,
+                    stats,
+                })
+            }
             Command::Alerts {
                 sub:
                     AlertsCommand::Unsilence {
@@ -853,6 +945,8 @@ impl Cli {
                 cursor_file,
                 dry_run,
                 html_out,
+                no_archive,
+                archive,
             } => {
                 tracing_subscriber::fmt()
                     .with_env_filter(
@@ -877,6 +971,14 @@ impl Cli {
                     cursor_path: notify::expand_tilde(&cursor_file),
                     dry_run,
                     html_out: html_out.as_deref().map(notify::expand_tilde),
+                    archive_path: if no_archive {
+                        None
+                    } else {
+                        Some(match archive {
+                            Some(p) => notify::expand_tilde(&p),
+                            None => bowery_cli::archive::default_path()?,
+                        })
+                    },
                 }))?;
                 Ok(ExitCode::SUCCESS)
             }
@@ -1063,6 +1165,39 @@ fn key_info(path: &PathBuf) -> Result<()> {
     println!("fingerprint: {}", identity.fingerprint());
     println!("pubkey_b64:  {pubkey_b64}");
     Ok(())
+}
+
+/// `bowery alerts history` — read the operator-side archive.
+fn alerts_history(args: &bowery_cli::archive::HistoryArgs) -> Result<ExitCode> {
+    use bowery_cli::archive::{Archive, render, render_stats};
+
+    let archive = Archive::open(&args.path)?;
+    let stats = archive.stats()?;
+    if args.stats {
+        print!("{}", render_stats(&stats, &args.path));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let rows = archive.query(&args.filter())?;
+    if rows.is_empty() {
+        // Say which of the two empties this is. "No matches in 400
+        // archived alerts" and "nothing has ever been archived" look
+        // the same on stdout and mean opposite things.
+        if args.json {
+            return Ok(ExitCode::SUCCESS);
+        }
+        if stats.rows == 0 {
+            print!("{}", render_stats(&stats, &args.path));
+        } else {
+            println!("no alerts matched; {} row(s) archived", stats.rows);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    print!("{}", render(&rows, args.json));
+    if !args.json {
+        println!("\n{} row(s) shown of {} archived.", rows.len(), stats.rows);
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn doctor_cmd(json: bool) -> Result<ExitCode> {

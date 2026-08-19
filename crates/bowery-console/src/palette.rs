@@ -33,6 +33,15 @@ pub(crate) enum PaletteCommand {
     ExportQuery {
         path: String,
     },
+    /// `:schema [table]` — ask the agent what it actually has.
+    ///
+    /// The console ships a catalogue, and a catalogue can drift. This
+    /// asks the connected agent directly, so an operator always has a
+    /// way to get the authoritative answer rather than having to trust
+    /// the documentation.
+    Schema {
+        table: Option<String>,
+    },
 }
 
 impl PaletteCommand {
@@ -49,6 +58,9 @@ impl PaletteCommand {
                 let addr = parts.next().map(str::to_string);
                 Ok(Self::Connect { target, addr })
             }
+            "schema" => Ok(Self::Schema {
+                table: parts.next().map(str::to_string),
+            }),
             "quit" | "q" => Ok(Self::Quit),
             "peers" => {
                 let sub = parts
