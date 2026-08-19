@@ -520,6 +520,9 @@ impl Agent {
             whisper_addr,
             AGENT_VERSION,
         );
+        // Same source as the whisper answer's platform, so what the
+        // mesh advertises and what a round compares can never disagree.
+        mesh_cfg.platform = bowery_proto::platform_key();
         if let Some(advertise) = config.mesh.advertise_addr {
             mesh_cfg.advertise_addr = advertise;
         } else {

@@ -346,6 +346,7 @@ mod tests {
         let key = SigningKey::from_bytes(&[seed; 32]);
         let verifying_key = key.verifying_key();
         PeerInfo {
+            platform: bowery_proto::platform_key(),
             fingerprint: Fingerprint::from_verifying_key(&verifying_key),
             verifying_key,
             whisper_addr: "127.0.0.1:9902".parse().unwrap(),

@@ -234,9 +234,11 @@ irreversibly.
    which need an ELF reader.
 4. **Retire `whisper_qa.rs`'s exact-match path** once (3) covers it.
 5. **Port the other kinds** to fuzzy dimensions, one per slice.
-6. **Operator surface**: `incomparable` in `bowery_alerts`, the console
-   and the digest; a fleet-comparability view so a mesh that cannot
-   corroborate is visible before an incident, not during one.
+6. ~~**Operator surface.**~~ **Done.** `peers_incomparable` and
+   `peers_familiar` in `bowery_alerts`, distinct wording in the console
+   and the digest, and the platform gossiped so
+   `bowery_mesh_peers.platform` / `.comparable` answer "can this mesh
+   corroborate itself" without running a round.
 
 ## 5. What I would not do
 

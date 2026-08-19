@@ -262,6 +262,13 @@ impl BoweryTable for BoweryMeshPeersTable {
                 fingerprint_hex   TEXT,
                 whisper_addr      TEXT,
                 agent_version     TEXT,
+                platform          TEXT,
+                -- 1 when this peer runs our platform, so its answers
+                -- about our binaries can mean something. 0 when it runs
+                -- another architecture or is too old to say which.
+                -- Not a health signal: an incomparable peer is working
+                -- perfectly and simply cannot speak to our hashes.
+                comparable        INTEGER,
                 pinned            INTEGER,
                 has_role_vector   INTEGER,
                 has_bloom_advert  INTEGER,
@@ -273,9 +280,9 @@ impl BoweryTable for BoweryMeshPeersTable {
         let pinned = self.kn.fingerprints();
         let mut stmt = conn.prepare(
             "INSERT INTO bowery_mesh_peers
-                (fingerprint_hex, whisper_addr, agent_version, pinned,
+                (fingerprint_hex, whisper_addr, agent_version, platform, comparable, pinned,
                  has_role_vector, has_bloom_advert, grant_state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
         for peer in self.peers_rx.borrow().iter() {
             let is_pinned = i64::from(pinned.contains(&peer.fingerprint));
@@ -285,6 +292,10 @@ impl BoweryTable for BoweryMeshPeersTable {
                 peer.fingerprint.to_string(),
                 peer.whisper_addr.to_string(),
                 peer.agent_version,
+                peer.platform,
+                i64::from(
+                    !peer.platform.is_empty() && peer.platform == bowery_proto::platform_key(),
+                ),
                 is_pinned,
                 has_role,
                 has_bloom,
@@ -1335,6 +1346,116 @@ impl BoweryTable for BoweryEventLogStatusTable {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mesh_peers_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Registering the table with at least one peer present.
+    ///
+    /// The reason this test exists: `bowery_mesh_peers` gained two
+    /// columns and the INSERT's placeholder list was not extended with
+    /// them — nine columns, seven `?`s. That compiles, because `SQLite`
+    /// only binds at run time, and every existing test registered the
+    /// table with an *empty* peer list, so the INSERT never executed
+    /// and nothing failed. It would have surfaced as a broken view on a
+    /// live agent and nowhere else.
+    #[test]
+    fn the_view_populates_with_a_peer_present() {
+        let peer = bowery_mesh::PeerInfo {
+            fingerprint: bowery_crypto::Fingerprint::from_bytes([7u8; 32]),
+            verifying_key: ed25519_dalek::VerifyingKey::from_bytes(&[
+                0x3a, 0x4f, 0x77, 0x16, 0xd5, 0x3e, 0x9c, 0x6c, 0x76, 0x4b, 0x44, 0x49, 0x12, 0x91,
+                0xfa, 0x9d, 0x6f, 0x1b, 0xea, 0x4d, 0x21, 0x66, 0xa2, 0xa6, 0xc5, 0xe4, 0xa1, 0xab,
+                0x6b, 0x06, 0xc9, 0x07,
+            ])
+            .expect("valid pubkey"),
+            whisper_addr: "127.0.0.1:9902".parse().unwrap(),
+            agent_version: "0.2.0+abcdef1".into(),
+            platform: bowery_proto::platform_key(),
+            role_vector: None,
+            bloom_advert: None,
+            membership_grant: None,
+            log_report: None,
+        };
+        let (_tx, rx) = watch::channel(vec![peer]);
+        let dir = tempfile::tempdir().unwrap();
+        let kn = Arc::new(
+            KnownNeighbors::open(dir.path().join("kn.json"), Duration::from_mins(1)).unwrap(),
+        );
+        let table = BoweryMeshPeersTable::new(rx, kn);
+
+        let conn = Connection::open_in_memory().expect("sqlite");
+        table
+            .register(&conn)
+            .expect("register must bind every column");
+
+        let (version, platform, comparable): (String, String, i64) = conn
+            .query_row(
+                "SELECT agent_version, platform, comparable FROM bowery_mesh_peers",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("the row must be readable");
+        assert_eq!(version, "0.2.0+abcdef1");
+        assert_eq!(platform, bowery_proto::platform_key());
+        assert_eq!(comparable, 1, "a peer on our own platform is comparable");
+    }
+
+    /// A peer on another architecture is reachable, healthy, and unable
+    /// to speak to our binaries. That has to be visible *before* an
+    /// incident, which is the whole reason this column exists.
+    #[test]
+    fn a_cross_platform_peer_reads_as_not_comparable() {
+        let mut peer = bowery_mesh::PeerInfo {
+            fingerprint: bowery_crypto::Fingerprint::from_bytes([8u8; 32]),
+            verifying_key: ed25519_dalek::VerifyingKey::from_bytes(&[
+                0x3a, 0x4f, 0x77, 0x16, 0xd5, 0x3e, 0x9c, 0x6c, 0x76, 0x4b, 0x44, 0x49, 0x12, 0x91,
+                0xfa, 0x9d, 0x6f, 0x1b, 0xea, 0x4d, 0x21, 0x66, 0xa2, 0xa6, 0xc5, 0xe4, 0xa1, 0xab,
+                0x6b, 0x06, 0xc9, 0x07,
+            ])
+            .expect("valid pubkey"),
+            whisper_addr: "127.0.0.1:9903".parse().unwrap(),
+            agent_version: "0.2.0+abcdef1".into(),
+            platform: "s390x/linux".into(),
+            role_vector: None,
+            bloom_advert: None,
+            membership_grant: None,
+            log_report: None,
+        };
+        let (_tx, rx) = watch::channel(vec![peer.clone()]);
+        let dir = tempfile::tempdir().unwrap();
+        let kn = Arc::new(
+            KnownNeighbors::open(dir.path().join("kn.json"), Duration::from_mins(1)).unwrap(),
+        );
+        let conn = Connection::open_in_memory().expect("sqlite");
+        BoweryMeshPeersTable::new(rx, kn.clone())
+            .register(&conn)
+            .expect("register");
+        let comparable: i64 = conn
+            .query_row("SELECT comparable FROM bowery_mesh_peers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(comparable, 0, "another architecture cannot compare");
+
+        // A peer too old to publish a platform is unknown, and unknown
+        // is treated as incomparable rather than assumed compatible.
+        peer.platform = String::new();
+        let (_tx2, rx2) = watch::channel(vec![peer]);
+        let conn2 = Connection::open_in_memory().expect("sqlite");
+        BoweryMeshPeersTable::new(rx2, kn)
+            .register(&conn2)
+            .expect("register");
+        let unknown: i64 = conn2
+            .query_row("SELECT comparable FROM bowery_mesh_peers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            unknown, 0,
+            "an unstated platform must not read as compatible"
+        );
     }
 }
 

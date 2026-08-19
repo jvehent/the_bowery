@@ -89,7 +89,8 @@ pub const TABLES: &[Table] = &[
     Table {
         name: "bowery_mesh_peers",
         about: "live gossip view of the mesh — who is up, and what role they claim",
-        columns: "fingerprint_hex, whisper_addr, agent_version, pinned, has_role_vector, has_bloom_advert, grant_state",
+        columns: "fingerprint_hex, whisper_addr, agent_version, platform, comparable, pinned, \
+                  has_role_vector, has_bloom_advert, grant_state",
     },
     Table {
         name: "bowery_net_destinations",
@@ -228,6 +229,11 @@ pub const EXAMPLES: &[Example] = &[
         sql: "SELECT probe, watching, attached, emitted, parse_failed, kernel_drops, \
               stopped_reason, datetime(last_event_unix_ms/1000,'unixepoch') AS last_event \
               FROM bowery_probe_status",
+    },
+    Example {
+        question: "Can this mesh actually corroborate itself?",
+        sql: "SELECT platform, COUNT(*) AS peers, SUM(comparable) AS can_compare \
+              FROM bowery_mesh_peers GROUP BY platform",
     },
     Example {
         question: "Which detections have never fired? (coverage you do not have)",

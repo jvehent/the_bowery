@@ -27,6 +27,15 @@ use tokio::sync::watch;
 use tracing::warn;
 
 const KEY_VERSION: &str = "version";
+/// `arch/os` of the publishing agent.
+///
+/// Gossiped rather than asked for, so an operator can see whether the
+/// mesh is *able* to corroborate itself before an incident rather than
+/// during one. Two hosts on different architectures never share a
+/// binary hash, so a peer on another platform can never answer "have
+/// you seen this binary" with anything but a meaningless no — measured
+/// on the reference fleet, zero shared hashes out of 366.
+const KEY_PLATFORM: &str = "platform";
 const KEY_WHISPER_ADDR: &str = "whisper_addr";
 const KEY_VERIFYING_KEY: &str = "verifying_key";
 /// Key under which each node publishes its base64-encoded role vector.
@@ -67,6 +76,9 @@ pub struct PeerInfo {
     pub verifying_key: VerifyingKey,
     pub whisper_addr: SocketAddr,
     pub agent_version: String,
+    /// `arch/os` the peer published. Empty from peers too old to say,
+    /// which is treated as unknown and never as compatible.
+    pub platform: String,
     /// Base64-encoded role vector published by the peer, if any. Decode
     /// with `bowery_analysis::RoleVector::from_base64`.
     pub role_vector: Option<String>,
@@ -98,6 +110,12 @@ pub struct MeshConfig {
     /// Address peers should dial for whisper RPC (QUIC).
     pub whisper_addr: SocketAddr,
     pub agent_version: String,
+    /// `arch/os` of this agent. Supplied by the caller rather than
+    /// derived here, so it is the *same* value the whisper comparability
+    /// check uses — deriving it twice would let the two drift, and a
+    /// mesh that advertises one platform while answering as another is
+    /// worse than one that says nothing.
+    pub platform: String,
     pub cluster_id: String,
     pub gossip_interval: Duration,
 }
@@ -116,6 +134,7 @@ impl MeshConfig {
             seed_nodes: Vec::new(),
             whisper_addr,
             agent_version: agent_version.into(),
+            platform: String::new(),
             cluster_id: DEFAULT_CLUSTER_ID.to_string(),
             gossip_interval: Duration::from_millis(500),
         }
@@ -145,6 +164,7 @@ impl Mesh {
 
         let initial_kvs = vec![
             (KEY_VERSION.to_string(), config.agent_version.clone()),
+            (KEY_PLATFORM.to_string(), config.platform.clone()),
             (
                 KEY_WHISPER_ADDR.to_string(),
                 config.whisper_addr.to_string(),
@@ -252,6 +272,9 @@ fn build_peer_infos(
                 return None;
             }
             let agent_version = state.get(KEY_VERSION)?.to_string();
+            // Absent from older peers. Empty means unknown, and
+            // comparability treats unknown as incomparable.
+            let platform = state.get(KEY_PLATFORM).unwrap_or_default().to_string();
             let whisper_addr = state.get(KEY_WHISPER_ADDR)?.parse().ok()?;
             let vk_b64 = state.get(KEY_VERIFYING_KEY)?;
             let bytes = BASE64.decode(vk_b64.as_bytes()).ok()?;
@@ -272,6 +295,7 @@ fn build_peer_infos(
                 verifying_key: vk,
                 whisper_addr,
                 agent_version,
+                platform,
                 role_vector,
                 bloom_advert,
                 membership_grant,

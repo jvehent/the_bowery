@@ -1322,6 +1322,7 @@ mod tests {
         };
         let b64 = BASE64.encode(advert.encode_to_vec());
         PeerInfo {
+            platform: bowery_proto::platform_key(),
             fingerprint: bowery_crypto::Fingerprint::from_bytes([0xab; 32]),
             verifying_key: ed25519_dalek::VerifyingKey::from_bytes(&[
                 // Arbitrary valid Ed25519 public key; the helper

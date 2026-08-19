@@ -989,6 +989,7 @@ mod tests {
 
     fn peer(fp_byte: u8, addr: &str) -> PeerInfo {
         PeerInfo {
+            platform: bowery_proto::platform_key(),
             fingerprint: Fingerprint::from_bytes([fp_byte; 32]),
             verifying_key: ed25519_dalek::VerifyingKey::from_bytes(&[
                 0x3a, 0x4f, 0x77, 0x16, 0xd5, 0x3e, 0x9c, 0x6c, 0x76, 0x4b, 0x44, 0x49, 0x12, 0x91,

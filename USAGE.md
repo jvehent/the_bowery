@@ -521,6 +521,28 @@ Those are opposite facts and they had been sharing a word. If you see it
 constantly, your fleet cannot corroborate itself, and that is worth
 knowing before an incident rather than during one.
 
+Ask whether the mesh can corroborate itself at all:
+
+```sql
+SELECT platform, COUNT(*) AS peers, SUM(comparable) AS can_compare
+FROM bowery_mesh_peers GROUP BY platform
+```
+
+`comparable = 0` is not a fault. That peer is reachable, healthy, and
+simply on another architecture, so its answers about your binaries
+cannot mean anything. Worth knowing before an incident rather than
+during one — which is why the platform is gossiped rather than
+discovered a round at a time.
+
+Peers that run the same *program* at a different build now say so, and
+that answer counts as recognition rather than denial:
+
+```sql
+SELECT episode_id, rule_id, confirmed, peers_unseen, peers_familiar,
+       peers_incomparable
+FROM bowery_alerts
+```
+
 Same-architecture is necessary, not sufficient — the two aarch64 hosts
 above still share only 5 of ~100 hashes. Narrowing that is what the
 remaining slices in `DESIGN-FUZZY-CORROBORATION.md` cover.

@@ -336,6 +336,7 @@ mod tests {
 
     fn peer_info(fp: Fingerprint, addr: SocketAddr) -> PeerInfo {
         PeerInfo {
+            platform: bowery_proto::platform_key(),
             fingerprint: fp,
             verifying_key: ed25519_dalek::VerifyingKey::from_bytes(&[
                 0x3a, 0x4f, 0x77, 0x16, 0xd5, 0x3e, 0x9c, 0x6c, 0x76, 0x4b, 0x44, 0x49, 0x12, 0x91,
