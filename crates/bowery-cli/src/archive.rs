@@ -120,6 +120,45 @@ CREATE INDEX IF NOT EXISTS alerts_by_rule  ON alerts (rule_id, ts_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS alerts_by_sha   ON alerts (exe_sha256);
 ";
 
+/// Columns added to `alerts` after the first release, in the order
+/// they appeared. `CREATE TABLE IF NOT EXISTS` does not touch a table
+/// that already exists, so a file created before one of these was added
+/// keeps the old shape forever and every insert naming the new column
+/// fails.
+///
+/// That is not hypothetical. Adding `peers_incomparable` and
+/// `peers_familiar` broke archiving on a live fleet: the file had been
+/// created hours earlier, `INSERT` began naming columns it did not
+/// have, and because archiving is deliberately non-fatal — the mail
+/// must go out even when history cannot be written — the failure landed
+/// on an hourly cron job's stderr and nowhere else. Six hours of alerts
+/// were simply not recorded.
+const ADDED_COLUMNS: &[(&str, &str)] = &[
+    ("peers_incomparable", "INTEGER"),
+    ("peers_familiar", "INTEGER"),
+];
+
+/// Bring an existing archive up to the current schema.
+///
+/// Idempotent, and additive only: `ADD COLUMN` on `SQLite` is a
+/// metadata change, so this costs nothing on a large archive and
+/// existing rows read `NULL` — which is the correct value for them,
+/// since those alerts genuinely carried no such count.
+fn migrate(conn: &Connection) -> Result<()> {
+    let existing: std::collections::HashSet<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('alerts')")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (name, ty) in ADDED_COLUMNS {
+        if existing.contains(*name) {
+            continue;
+        }
+        conn.execute_batch(&format!("ALTER TABLE alerts ADD COLUMN {name} {ty}"))
+            .with_context(|| format!("adding column {name}"))?;
+    }
+    Ok(())
+}
+
 /// A local `SQLite` file holding every alert this operator has seen.
 #[derive(Debug)]
 pub struct Archive {
@@ -151,12 +190,14 @@ impl Archive {
         conn.pragma_update(None, "synchronous", "NORMAL")
             .context("setting synchronous")?;
         conn.execute_batch(SCHEMA).context("applying schema")?;
+        migrate(&conn).context("migrating archive schema")?;
         conn.execute_batch(LATEST_VIEW)
             .context("creating alerts_latest")?;
         Ok(Self { conn, path })
     }
 
     /// In-memory archive, for tests.
+    ///
     ///
     /// # Errors
     ///
@@ -992,6 +1033,88 @@ mod tests {
         );
     }
 
+    /// An archive written by an older build must keep working.
+    ///
+    /// This is not a theoretical migration concern. Adding two columns
+    /// broke archiving on a live fleet for six hours: the file predated
+    /// them, `CREATE TABLE IF NOT EXISTS` left it alone, every insert
+    /// failed with "preparing archive insert", and because archiving is
+    /// non-fatal by design the only trace was an hourly cron job's
+    /// stderr.
+    #[test]
+    fn an_archive_missing_newer_columns_is_migrated_not_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alerts.db");
+
+        // Build the pre-migration shape by hand: today's schema minus
+        // the columns that were added later.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let mut ddl = String::new();
+            for line in SCHEMA.lines() {
+                if ADDED_COLUMNS
+                    .iter()
+                    .any(|(n, _)| line.trim().starts_with(n))
+                {
+                    continue;
+                }
+                ddl.push_str(line);
+                ddl.push('\n');
+            }
+            conn.execute_batch(&ddl).expect("old schema applies");
+            let cols: Vec<String> = conn
+                .prepare("SELECT name FROM pragma_table_info('alerts')")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            for (name, _) in ADDED_COLUMNS {
+                assert!(
+                    !cols.contains(&(*name).to_string()),
+                    "precondition: {name} must be absent from the old shape"
+                );
+            }
+        }
+
+        // Opening migrates it, and recording works again.
+        let mut archive = Archive::open(&path).expect("open must migrate");
+        let mut a = alert(1, "ep-1", 1000, 0.9);
+        a.confirmation = Some(AlertConfirmation {
+            peers_asked: 2,
+            peers_unseen: 0,
+            peers_seen: 0,
+            peers_no_reply: 0,
+            peers_refused: 0,
+            peers_incomparable: 0,
+            peers_familiar: 2,
+            quorum: 2,
+            confirmed: false,
+        });
+        assert_eq!(
+            archive.record(&[a], Some("otter1")).unwrap(),
+            1,
+            "recording into a migrated archive must succeed"
+        );
+        let row = &archive.query(&Filter::default()).unwrap()[0];
+        assert_eq!(row.peers_familiar, Some(2));
+    }
+
+    /// Migration runs on every open and must be a no-op the second
+    /// time.
+    #[test]
+    fn migrating_an_already_current_archive_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alerts.db");
+        {
+            let mut a = Archive::open(&path).unwrap();
+            a.record(&[alert(1, "ep-1", 1000, 0.9)], Some("otter1"))
+                .unwrap();
+        }
+        let reopened = Archive::open(&path).expect("second open must not fail");
+        assert_eq!(reopened.stats().unwrap().rows, 1);
+    }
+
     #[test]
     fn an_archive_survives_reopening_the_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1119,11 +1242,18 @@ pub fn render(rows: &[Row], json: bool) -> String {
             // two: confirmed, asked-and-not-confirmed, and never asked.
             // A blank where "no round ran" belongs would read as a
             // negative verdict.
-            // Four states, not three. `?` is a round that ran and could
-            // compare nothing — distinct from one that compared and
-            // found nothing, which is what `·` means.
+            // Five states, because they mean different things and the
+            // console and digest already distinguish them:
+            //   ✓  a quorum has no record of it — the finding
+            //   ~  peers run the same program, built differently
+            //   ?  the round ran and could compare nothing
+            //   ·  peers compared and found nothing
+            //   "" no round ran at all
             let conf = match (r.confirmed, r.peers_unseen, r.peers_asked) {
                 (Some(true), Some(u), Some(t)) => format!("✓{u}/{t}"),
+                (Some(false), _, Some(t)) if r.peers_familiar.is_some_and(|n| n > 0) => {
+                    format!("~{}/{t}", r.peers_familiar.unwrap_or(0))
+                }
                 (Some(false), Some(0), Some(t)) if r.peers_incomparable.is_some_and(|n| n > 0) => {
                     format!("?0/{t}")
                 }

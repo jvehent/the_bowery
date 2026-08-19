@@ -1070,6 +1070,31 @@ pub struct RunArgs {
     pub archive_path: Option<PathBuf>,
 }
 
+/// Fail the run when the archive stopped working entirely.
+///
+/// Archiving is deliberately non-fatal per agent: the notification is
+/// the load-bearing part, and one bad write must not stop the mail.
+/// That is right, and it is also how six hours of history went missing
+/// on a live fleet without anyone noticing — a schema change made every
+/// insert fail, and the only trace was an hourly cron job's stderr.
+///
+/// So a *systematic* failure is reported as a failed run. One agent
+/// failing is a blip; every agent failing means the archive is broken,
+/// and the archive exists precisely because losing history quietly is
+/// the thing to avoid.
+fn archive_verdict(failures: usize, attempted: usize) -> Result<()> {
+    if failures > 0 && failures == attempted {
+        bail!(
+            "sent, but archiving failed for all {attempted} agent(s); \
+             no history was recorded for this run"
+        );
+    }
+    if failures > 0 {
+        eprintln!("notify: archiving failed for {failures} of {attempted} agent(s)");
+    }
+    Ok(())
+}
+
 /// Open the alert archive, or explain why not and carry on.
 ///
 /// A failure here must never stop the mail going out. This runs on a
@@ -1090,6 +1115,12 @@ fn open_archive(path: Option<&Path>) -> Option<crate::archive::Archive> {
 #[derive(Debug, Default)]
 struct PollOutcome {
     hosts: Vec<HostAlerts>,
+    /// Agents whose alerts could not be archived, and how many were
+    /// polled at all. Losing history quietly is the failure the archive
+    /// exists to prevent, so a sweep where *every* write failed is
+    /// reported as a broken run even though the mail still goes out.
+    archive_failures: usize,
+    archived_agents: usize,
     /// Per-agent cursor to persist, but only after a successful send.
     advanced: BTreeMap<String, u64>,
     poll_failures: usize,
@@ -1112,6 +1143,8 @@ async fn poll_fleet(
         hosts,
         advanced,
         poll_failures,
+        archive_failures,
+        archived_agents,
     } = out;
     for peer in &manifest.peers {
         let Some(addr_str) = peer.addr.as_deref() else {
@@ -1138,10 +1171,12 @@ async fn poll_fleet(
                 // raising `min_suspicion` silently erases history, and
                 // the low-scoring alert nobody wanted emailed is
                 // routinely the one that matters in hindsight.
-                if let Some(a) = archive.as_deref_mut()
-                    && let Err(e) = a.record(&alerts, Some(&peer.name))
-                {
-                    eprintln!("notify: archiving {} failed: {e}", peer.name);
+                if let Some(a) = archive.as_deref_mut() {
+                    *archived_agents += 1;
+                    if let Err(e) = a.record(&alerts, Some(&peer.name)) {
+                        eprintln!("notify: archiving {} failed: {e:#}", peer.name);
+                        *archive_failures += 1;
+                    }
                 }
                 let kept: Vec<Alert> = dedup_by_episode(
                     alerts
@@ -1202,6 +1237,8 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         mut hosts,
         advanced,
         poll_failures,
+        archive_failures,
+        archived_agents,
     } = outcome;
 
     if hosts.is_empty() {
@@ -1212,6 +1249,7 @@ pub async fn run(args: &RunArgs) -> Result<()> {
             cursors.by_fp.insert(fp, cursor);
         }
         cursors.save(&args.cursor_path)?;
+        archive_verdict(archive_failures, archived_agents)?;
         if poll_failures > 0 {
             bail!("no alerts to send, but {poll_failures} agent(s) could not be polled");
         }
@@ -1264,6 +1302,7 @@ pub async fn run(args: &RunArgs) -> Result<()> {
 
     let total: usize = hosts.iter().map(|h| h.alerts.len()).sum();
     println!("notify: emailed {total} alert(s) to {}", cfg.email.to.len());
+    archive_verdict(archive_failures, archived_agents)?;
     if poll_failures > 0 {
         bail!("sent, but {poll_failures} agent(s) could not be polled");
     }
@@ -1888,6 +1927,31 @@ password_file = "/dev/null"
             nodes.iter().any(|n| n.contains("NOT CHECKED")),
             "badge missing from {nodes:?}"
         );
+    }
+
+    /// One agent failing to archive is a blip; every agent failing is a
+    /// broken archive, and that must not exit zero.
+    ///
+    /// A schema change once made every insert fail on a live fleet. The
+    /// mail kept going out — correctly, that is the load-bearing part —
+    /// and six hours of history was lost with no signal anywhere except
+    /// an hourly cron job's stderr.
+    #[test]
+    fn a_systematic_archive_failure_fails_the_run() {
+        assert!(archive_verdict(0, 3).is_ok(), "nothing failed");
+        assert!(
+            archive_verdict(1, 3).is_ok(),
+            "one agent failing must not stop the run"
+        );
+        let err = archive_verdict(3, 3).expect_err("all three failing is a broken archive");
+        let text = err.to_string();
+        assert!(text.contains("archiving failed"), "{text}");
+        assert!(
+            text.contains("no history was recorded"),
+            "the message must say what was lost: {text}"
+        );
+        // Nothing attempted, nothing failed: archiving is off.
+        assert!(archive_verdict(0, 0).is_ok());
     }
 
     /// A flood must not become a megabyte of HTML either.

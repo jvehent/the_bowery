@@ -585,6 +585,23 @@ survives if you keep the last write.
 Turn it off with `bowery notify --no-archive`, or point it elsewhere
 with `--archive <path>`.
 
+An archive created by an older build is migrated on open — columns are
+added, existing rows read `NULL`, nothing is rewritten. If archiving
+fails for **every** agent in a run, `bowery notify` exits non-zero even
+though the mail went out: one agent failing is a blip, all of them
+failing means no history is being recorded, and that is the exact thing
+the archive exists to prevent.
+
+The confirmation marker in `bowery alerts history` has five states:
+
+| | |
+|---|---|
+| `✓4/5` | a quorum has no record of it — the finding |
+| `~2/2` | peers run the same program, built differently |
+| `?0/2` | the round ran and could compare nothing |
+| `·1/3` | peers compared and found nothing |
+| blank | no round ran |
+
 ### Silencing a benign alert
 
 ```bash
