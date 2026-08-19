@@ -73,6 +73,16 @@ impl Provenance {
 #[derive(Debug, Default)]
 pub struct PackageIndex {
     by_path: HashMap<PathBuf, [u8; 16]>,
+    /// Path → owning package name.
+    ///
+    /// Free to collect: the name is the `.md5sums` filename that was
+    /// already being read. Retained because it is the one identity that
+    /// survives an architecture boundary — two hosts running the same
+    /// distro have `dash` from package `dash` whether they are x86-64 or
+    /// aarch64, while the file's hash differs on both. That makes it the
+    /// first dimension the fuzzy corroboration work can actually compare
+    /// across a mixed fleet; see DESIGN-FUZZY-CORROBORATION.md §3.1.
+    pkg_by_path: HashMap<PathBuf, String>,
     /// False when no package database was found, which makes every
     /// answer [`Provenance::Unknown`] rather than
     /// [`Provenance::Unpackaged`]. Reporting "no package owns this" on a
@@ -176,11 +186,20 @@ impl PackageIndex {
             return Self::unavailable();
         };
         let mut by_path = HashMap::new();
+        let mut pkg_by_path: HashMap<PathBuf, String> = HashMap::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_none_or(|e| e != "md5sums") {
                 continue;
             }
+            // `coreutils.md5sums` and `coreutils:amd64.md5sums` both
+            // name the package `coreutils`; the architecture qualifier
+            // is exactly what must not be part of an identity meant to
+            // compare across architectures.
+            let pkg = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.split(':').next().unwrap_or(s).to_string());
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -194,16 +213,24 @@ impl PackageIndex {
                 let Some(md5) = parse_md5(digest) else {
                     continue;
                 };
-                by_path.insert(PathBuf::from("/").join(rel), md5);
+                let abs = PathBuf::from("/").join(rel);
+                if let Some(pkg) = pkg.clone() {
+                    pkg_by_path.insert(abs.clone(), pkg);
+                }
+                by_path.insert(abs, md5);
                 // ...and again under merged-`/usr`, which is how the
                 // file will actually be named when we look it up.
                 if let Some(alias) = merged_usr_alias(rel) {
+                    if let Some(pkg) = pkg.clone() {
+                        pkg_by_path.insert(alias.clone(), pkg);
+                    }
                     by_path.insert(alias, md5);
                 }
             }
         }
         Self {
             by_path,
+            pkg_by_path,
             available: true,
         }
     }
@@ -237,6 +264,20 @@ impl PackageIndex {
                 }
             }
         }
+    }
+
+    /// The package that owns `path`, if any.
+    ///
+    /// `None` covers both "no package owns it" and "there is no package
+    /// database", which are different facts — [`Self::classify`] is
+    /// where that distinction is drawn, and it stays there rather than
+    /// being duplicated with a third spelling here.
+    #[must_use]
+    pub fn package_for(&self, path: &Path) -> Option<&str> {
+        if !self.available {
+            return None;
+        }
+        self.pkg_by_path.get(path).map(String::as_str)
     }
 }
 
@@ -380,6 +421,20 @@ impl ProvenanceCache {
             memo.insert(path.to_path_buf(), (*sha, provenance));
         }
         provenance
+    }
+
+    /// The package owning `path`, as far as the loaded index knows.
+    ///
+    /// `None` while the index is still loading, which is why callers
+    /// must treat it as "not known yet" and never as "unpackaged" — the
+    /// index takes seconds to read on a large host, and most of what a
+    /// booting machine executes runs inside that window.
+    #[must_use]
+    pub fn package_for(&self, path: &Path) -> Option<String> {
+        self.index
+            .read()
+            .ok()
+            .and_then(|i| i.package_for(path).map(str::to_string))
     }
 }
 
@@ -805,6 +860,7 @@ mod tests {
         by_path.insert(bin.clone(), md5);
         let index = PackageIndex {
             by_path,
+            pkg_by_path: HashMap::new(),
             available: true,
         };
         let cache = ProvenanceCache::new(index);
@@ -849,6 +905,7 @@ mod tests {
         by_path.insert(bin.clone(), md5);
         cache.install(PackageIndex {
             by_path,
+            pkg_by_path: HashMap::new(),
             available: true,
         });
 
@@ -873,6 +930,7 @@ mod tests {
         let mut by_path = HashMap::new();
         by_path.insert(bin.clone(), md5);
         let cache = ProvenanceCache::new(PackageIndex {
+            pkg_by_path: HashMap::new(),
             by_path,
             available: true,
         });

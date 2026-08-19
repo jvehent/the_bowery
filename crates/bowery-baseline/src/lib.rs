@@ -17,13 +17,43 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_V1: &str = r"
+const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS binaries (
     sha256 BLOB PRIMARY KEY,
     first_seen INTEGER NOT NULL,
     last_seen INTEGER NOT NULL,
     seen_count INTEGER NOT NULL DEFAULT 0
 );
+
+-- What a hash *was*, as opposed to merely that it was seen.
+--
+-- `binaries` is keyed on the sha256 and records nothing else, which
+-- means the agent cannot say which program a hash belonged to. That is
+-- fine for "has this run here before" and useless for the question the
+-- mesh actually needs answered: *do you have this same program, at a
+-- different hash?* On a mixed-architecture fleet the hash never matches
+-- — measured, zero overlap between x86-64 and aarch64 — so every
+-- comparison has to happen on something else.
+--
+-- Separate from `binaries` rather than widening it: the upsert on
+-- `binaries` runs on every exec and stays a two-column write, while
+-- this is filled once per new hash and may be filled late or not at
+-- all. A NULL here means "not recorded", never "not packaged".
+CREATE TABLE IF NOT EXISTS binary_descriptors (
+    sha256      BLOB PRIMARY KEY,
+    exe_path    TEXT,
+    size_bytes  INTEGER,
+    -- Owning package name, architecture qualifier stripped. The one
+    -- identity that survives a cross-architecture comparison.
+    pkg         TEXT,
+    -- `arch/os` of the agent that recorded it, so a descriptor is
+    -- interpretable without asking which host it came from.
+    platform    TEXT,
+    recorded    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_descriptor_path ON binary_descriptors(exe_path);
+CREATE INDEX IF NOT EXISTS idx_descriptor_pkg ON binary_descriptors(pkg);
 
 CREATE TABLE IF NOT EXISTS process_lineage (
     parent_sha BLOB NOT NULL,
@@ -74,7 +104,7 @@ CREATE TABLE IF NOT EXISTS net_destinations (
     last_seen  INTEGER NOT NULL,
     seen_count INTEGER NOT NULL DEFAULT 0
 );
-";
+"#;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -90,6 +120,24 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// What a binary hash *was*, as far as this host could tell.
+///
+/// Every field is optional, and `None` means "not recorded" — never a
+/// negative claim. `pkg: None` in particular does **not** mean
+/// unpackaged: the package index loads asynchronously at startup, so an
+/// exec during that window legitimately cannot know, and treating it as
+/// "no package owns this" would invert the meaning of the field for
+/// exactly the binaries a booting host runs most.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BinaryDescriptor {
+    pub exe_path: Option<String>,
+    pub size_bytes: Option<u64>,
+    /// Owning package name, architecture qualifier stripped.
+    pub pkg: Option<String>,
+    /// `arch/os` of the host that recorded it.
+    pub platform: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpsertOutcome {
@@ -188,6 +236,130 @@ impl Baseline {
     /// Record an observation of a binary by its SHA-256. Increments
     /// `seen_count` and updates `last_seen` if already present, inserts
     /// otherwise.
+    /// Record what a hash *was*: path, size, owning package, platform.
+    ///
+    /// Idempotent and last-writer-wins on a given hash. A binary at a
+    /// new path with the same contents is the same artifact, so the
+    /// path recorded is simply the most recent one observed — this is a
+    /// description of the artifact, not an index of every place it has
+    /// been seen.
+    ///
+    /// Failure is not propagated to the caller's hot path: the
+    /// descriptor is an enrichment, and an exec must still be recorded
+    /// and scored when it cannot be written.
+    ///
+    /// # Errors
+    ///
+    /// If the write fails.
+    pub fn record_descriptor(&self, sha: &[u8; 32], d: &BinaryDescriptor) -> Result<()> {
+        let now = system_time_to_secs(SystemTime::now());
+        let conn = self.inner.lock().expect("baseline mutex poisoned");
+        conn.execute(
+            "INSERT INTO binary_descriptors (sha256, exe_path, size_bytes, pkg, platform, recorded)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(sha256) DO UPDATE SET
+                 exe_path = excluded.exe_path,
+                 size_bytes = excluded.size_bytes,
+                 -- Never overwrite a known package with NULL: the index
+                 -- loads asynchronously at startup, so an early exec can
+                 -- legitimately not know the package for a binary a
+                 -- later one does.
+                 pkg = COALESCE(excluded.pkg, binary_descriptors.pkg),
+                 platform = excluded.platform,
+                 recorded = excluded.recorded",
+            params![
+                &sha[..],
+                d.exe_path.as_deref(),
+                d.size_bytes.map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                d.pkg.as_deref(),
+                d.platform.as_deref(),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The descriptor for a hash, if one was recorded.
+    ///
+    /// # Errors
+    ///
+    /// If the query fails.
+    pub fn descriptor(&self, sha: &[u8; 32]) -> Result<Option<BinaryDescriptor>> {
+        let conn = self.inner.lock().expect("baseline mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT exe_path, size_bytes, pkg, platform
+                 FROM binary_descriptors WHERE sha256 = ?1",
+                params![&sha[..]],
+                |r| {
+                    Ok(BinaryDescriptor {
+                        exe_path: r.get(0)?,
+                        size_bytes: r
+                            .get::<_, Option<i64>>(1)?
+                            .map(|v| u64::try_from(v).unwrap_or(0)),
+                        pkg: r.get(2)?,
+                        platform: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Hashes this host has for a given package, newest first.
+    ///
+    /// The query the mesh needs: *"you asked about a hash I do not
+    /// have; do I have that package at all?"* An answer here is what
+    /// distinguishes "this program is unknown to me" from "I have this
+    /// program, built differently".
+    ///
+    /// # Errors
+    ///
+    /// If the query fails.
+    pub fn hashes_for_package(&self, pkg: &str, limit: usize) -> Result<Vec<[u8; 32]>> {
+        let conn = self.inner.lock().expect("baseline mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT sha256 FROM binary_descriptors
+             WHERE pkg = ?1 ORDER BY recorded DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![pkg, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |r| r.get::<_, Vec<u8>>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+            .collect())
+    }
+
+    /// Does this host have anything at `path`, whatever its hash?
+    ///
+    /// The weaker companion to [`Self::hashes_for_package`], for the
+    /// unpackaged case where a path is all there is to compare.
+    ///
+    /// # Errors
+    ///
+    /// If the query fails.
+    pub fn hashes_for_path(&self, path: &str, limit: usize) -> Result<Vec<[u8; 32]>> {
+        let conn = self.inner.lock().expect("baseline mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT sha256 FROM binary_descriptors
+             WHERE exe_path = ?1 ORDER BY recorded DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![path, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |r| r.get::<_, Vec<u8>>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+            .collect())
+    }
+
     pub fn upsert_binary(&self, sha: &[u8; 32]) -> Result<UpsertOutcome> {
         let now = system_time_to_secs(SystemTime::now());
         let conn = self.inner.lock().expect("baseline mutex poisoned");
@@ -676,6 +848,111 @@ mod net_destination_tests {
             UpsertOutcome::Updated { seen_count: 2 },
             "a restart must not make every destination look new again"
         );
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+
+    fn sha(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    fn desc(path: &str, pkg: Option<&str>) -> BinaryDescriptor {
+        BinaryDescriptor {
+            exe_path: Some(path.into()),
+            size_bytes: Some(1234),
+            pkg: pkg.map(str::to_string),
+            platform: Some("x86_64/linux".into()),
+        }
+    }
+
+    /// The gap this table closes: `binaries` records that a hash ran and
+    /// nothing about what it was, so the agent could not answer "do you
+    /// have this program at a different hash" — the only question that
+    /// works across architectures.
+    #[test]
+    fn a_descriptor_round_trips() {
+        let b = Baseline::open_in_memory().unwrap();
+        b.upsert_binary(&sha(1)).unwrap();
+        b.record_descriptor(&sha(1), &desc("/usr/bin/dash", Some("dash")))
+            .unwrap();
+
+        let got = b.descriptor(&sha(1)).unwrap().expect("recorded");
+        assert_eq!(got.exe_path.as_deref(), Some("/usr/bin/dash"));
+        assert_eq!(got.pkg.as_deref(), Some("dash"));
+        assert_eq!(got.size_bytes, Some(1234));
+        assert_eq!(got.platform.as_deref(), Some("x86_64/linux"));
+    }
+
+    #[test]
+    fn an_undescribed_hash_reads_as_none_not_as_empty() {
+        let b = Baseline::open_in_memory().unwrap();
+        b.upsert_binary(&sha(9)).unwrap();
+        assert_eq!(b.descriptor(&sha(9)).unwrap(), None);
+    }
+
+    /// The package index loads asynchronously, so the first exec of a
+    /// binary can legitimately not know its package while a later one
+    /// does. Overwriting a known package with NULL would lose it
+    /// permanently for exactly the binaries a booting host runs.
+    #[test]
+    fn a_later_write_never_clears_a_known_package() {
+        let b = Baseline::open_in_memory().unwrap();
+        b.record_descriptor(&sha(1), &desc("/usr/bin/dash", Some("dash")))
+            .unwrap();
+        b.record_descriptor(&sha(1), &desc("/usr/bin/dash", None))
+            .unwrap();
+        assert_eq!(
+            b.descriptor(&sha(1)).unwrap().unwrap().pkg.as_deref(),
+            Some("dash"),
+            "a NULL package must not erase a known one"
+        );
+    }
+
+    #[test]
+    fn a_rerecorded_descriptor_takes_the_newest_path() {
+        let b = Baseline::open_in_memory().unwrap();
+        b.record_descriptor(&sha(1), &desc("/tmp/copy", None))
+            .unwrap();
+        b.record_descriptor(&sha(1), &desc("/usr/bin/dash", Some("dash")))
+            .unwrap();
+        let got = b.descriptor(&sha(1)).unwrap().unwrap();
+        assert_eq!(got.exe_path.as_deref(), Some("/usr/bin/dash"));
+        assert_eq!(got.pkg.as_deref(), Some("dash"));
+    }
+
+    /// The lookup the mesh needs: asked about a hash this host does not
+    /// have, can it still say "I have that package"?
+    #[test]
+    fn hashes_are_findable_by_package_and_by_path() {
+        let b = Baseline::open_in_memory().unwrap();
+        b.record_descriptor(&sha(1), &desc("/usr/bin/dash", Some("dash")))
+            .unwrap();
+        b.record_descriptor(&sha(2), &desc("/usr/bin/dash", Some("dash")))
+            .unwrap();
+        b.record_descriptor(&sha(3), &desc("/usr/bin/curl", Some("curl")))
+            .unwrap();
+
+        let by_pkg = b.hashes_for_package("dash", 10).unwrap();
+        assert_eq!(by_pkg.len(), 2, "two builds of the same package");
+        assert!(by_pkg.contains(&sha(1)) && by_pkg.contains(&sha(2)));
+
+        let by_path = b.hashes_for_path("/usr/bin/curl", 10).unwrap();
+        assert_eq!(by_path, vec![sha(3)]);
+
+        assert!(b.hashes_for_package("nosuch", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_package_lookup_is_bounded() {
+        let b = Baseline::open_in_memory().unwrap();
+        for i in 0..20u8 {
+            b.record_descriptor(&sha(i), &desc("/usr/bin/dash", Some("dash")))
+                .unwrap();
+        }
+        assert_eq!(b.hashes_for_package("dash", 5).unwrap().len(), 5);
     }
 }
 

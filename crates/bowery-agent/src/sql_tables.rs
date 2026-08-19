@@ -327,7 +327,15 @@ impl BoweryTable for BoweryBaselineBinariesTable {
                 sha256_hex      TEXT,
                 first_seen_unix INTEGER,
                 last_seen_unix  INTEGER,
-                seen_count      INTEGER
+                seen_count      INTEGER,
+                -- Descriptor columns. NULL for any hash first seen
+                -- before descriptors existed, or recorded while the
+                -- package index was still loading. NULL is 'not
+                -- recorded', never 'not packaged'.
+                exe_path        TEXT,
+                size_bytes      INTEGER,
+                pkg             TEXT,
+                platform        TEXT
             );",
         )?;
         // SECURITY-AUDIT-PHASE9 F-9: snapshot the binaries first so
@@ -337,15 +345,29 @@ impl BoweryTable for BoweryBaselineBinariesTable {
         // else in `bowery-tables`.
         let snapshot = self.baseline.snapshot_binaries().unwrap_or_default();
         let mut stmt = conn.prepare(
-            "INSERT INTO bowery_baseline_binaries (sha256_hex, first_seen_unix, last_seen_unix, seen_count)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO bowery_baseline_binaries
+                (sha256_hex, first_seen_unix, last_seen_unix, seen_count,
+                 exe_path, size_bytes, pkg, platform)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         for rec in &snapshot {
             let sha_hex = hex_lower(&rec.sha256);
             let first = unix_secs(rec.first_seen);
             let last = unix_secs(rec.last_seen);
             let count = i64::try_from(rec.seen_count).unwrap_or(i64::MAX);
-            let _ = stmt.execute(params![sha_hex, first, last, count]);
+            let d = self.baseline.descriptor(&rec.sha256).ok().flatten();
+            let _ = stmt.execute(params![
+                sha_hex,
+                first,
+                last,
+                count,
+                d.as_ref().and_then(|d| d.exe_path.clone()),
+                d.as_ref()
+                    .and_then(|d| d.size_bytes)
+                    .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+                d.as_ref().and_then(|d| d.pkg.clone()),
+                d.as_ref().and_then(|d| d.platform.clone()),
+            ]);
         }
         Ok(())
     }

@@ -224,6 +224,27 @@ async fn process_event(ctx: &PipelineContext, event: Event) {
 /// rule names is exempt, on the same two-condition footing as the
 /// credential readers.
 ///
+/// What this host can say about the binary it just recorded.
+///
+/// Deliberately cheap: a `stat`, a map lookup, and two compile-time
+/// constants. Anything requiring a file parse belongs in a later slice
+/// — this runs inside the exec path, and the descriptor exists to make
+/// cross-host comparison possible, not to make exec slower.
+fn describe_binary(
+    exec: &bowery_events::ProcessExec,
+    ctx: &PipelineContext,
+) -> bowery_baseline::BinaryDescriptor {
+    let path = exec.exe_path.as_ref();
+    bowery_baseline::BinaryDescriptor {
+        exe_path: path.map(|p| p.display().to_string()),
+        size_bytes: path
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len()),
+        pkg: path.and_then(|p| ctx.packages.package_for(p)),
+        platform: Some(bowery_proto::platform_key()),
+    }
+}
+
 /// Resolving the caller's provenance costs a sha256, and it runs only
 /// here, on a syscall the kernel filter has already made rare.
 async fn process_ptrace(ctx: &PipelineContext, t: &bowery_events::Ptrace) {
@@ -1232,6 +1253,27 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
                 return;
             }
         };
+
+    // Record what this hash *was*, the first time we see it.
+    //
+    // Only on `Inserted`: the descriptor describes an artifact, not an
+    // execution, so rewriting it on every subsequent exec would be pure
+    // write amplification on the hottest path in the agent.
+    //
+    // Failure is logged and swallowed. This is enrichment for the mesh;
+    // an exec that could not be described must still be scored and
+    // alerted on, and a monitor that stops working because an
+    // enrichment write failed is the failure this codebase keeps
+    // finding.
+    if matches!(outcome, bowery_baseline::UpsertOutcome::Inserted) {
+        let descriptor = describe_binary(&exec, ctx);
+        let baseline = ctx.baseline.clone();
+        if let Ok(Err(e)) =
+            tokio::task::spawn_blocking(move || baseline.record_descriptor(&sha, &descriptor)).await
+        {
+            debug!(pid = exec.pid, error = %e, "binary descriptor write failed");
+        }
+    }
 
     let _ = ctx
         .events_tx

@@ -53,10 +53,12 @@ pub const TABLES: &[Table] = &[
     },
     Table {
         name: "bowery_baseline_binaries",
-        about: "every binary hash this host has executed, with first/last seen and a count. \
-                Keyed on the hash alone — it stores no path, so it cannot say *which \
-                program* a hash was; join bowery_events on exe_path for that",
-        columns: "sha256_hex, first_seen_unix, last_seen_unix, seen_count",
+        about: "every binary hash this host has executed, with first/last seen, a count, \
+                and what the hash was: path, size, owning package, platform. Descriptor \
+                columns are NULL for hashes first seen before they existed, which means \
+                'not recorded' and never 'not packaged'",
+        columns: "sha256_hex, first_seen_unix, last_seen_unix, seen_count, exe_path, \
+                  size_bytes, pkg, platform",
     },
     Table {
         name: "bowery_detections",
@@ -196,6 +198,17 @@ pub const EXAMPLES: &[Example] = &[
         sql: "SELECT datetime(ts_unix_ms/1000,'unixepoch') AS t, exe_path, args \
               FROM bowery_events WHERE kind = 'exec' \
               AND ts_unix_ms > (strftime('%s','now') - 3600) * 1000 ORDER BY seq DESC",
+    },
+    Example {
+        question: "Does any host have this program, whatever its build?",
+        sql: "SELECT pkg, exe_path, platform, COUNT(*) AS builds, SUM(seen_count) AS execs \
+              FROM bowery_baseline_binaries WHERE pkg IS NOT NULL \
+              GROUP BY pkg, exe_path ORDER BY builds DESC LIMIT 50",
+    },
+    Example {
+        question: "Which binaries has nothing described? (recorded before descriptors, or unpackaged)",
+        sql: "SELECT sha256_hex, seen_count FROM bowery_baseline_binaries \
+              WHERE exe_path IS NULL ORDER BY seen_count DESC LIMIT 50",
     },
     Example {
         question: "Has this binary ever run here before?",

@@ -1,6 +1,6 @@
 # Fuzzy corroboration — making the neighbourhood watch mean something
 
-**Status:** slice 1 implemented (`Incomparable`); slices 2–6 proposed.
+**Status:** slices 1–2 implemented; slices 3–6 proposed.
 
 ## 1. The finding
 
@@ -192,9 +192,27 @@ irreversibly.
    and `Dropped::NotComparable` in the audit trail. A round that could
    compare nothing also warns every time, because the only moment
    anyone would otherwise notice is during an incident.
-2. **Give the baseline a descriptor.** Add path, size, package
-   identity, build-id, `DT_NEEDED` hash to the binaries table. Backfill
-   lazily on next exec. Nothing queries it yet.
+2. ~~**Give the baseline a descriptor.**~~ **Partly done.** A
+   `binary_descriptors` table records path, size, owning package name
+   and platform per hash, written once on first sight so the per-exec
+   upsert stays a two-column write. `bowery_baseline_binaries` gained
+   those columns, so the view can finally say *which program* a hash
+   was.
+
+   Package name comes free from the `.md5sums` filename the provenance
+   index already reads, with the architecture qualifier stripped —
+   `coreutils`, not `coreutils:amd64` — because an identity meant to
+   cross architectures must not carry one. `Baseline::hashes_for_package`
+   and `hashes_for_path` are the lookups a responder needs.
+
+   NULL means *not recorded*, never *not packaged*: the package index
+   loads asynchronously, so a write during startup can legitimately not
+   know, and a later write never clears a known package with NULL.
+
+   **Still outstanding for this slice:** package *version*, build-id and
+   `DT_NEEDED` — all three need either `/var/lib/dpkg/status` parsing or
+   an ELF reader, and neither belongs on the exec path without
+   measurement first.
 3. **Evidence-vector answers** for `bin.identity` over the generic
    corroboration framework, with graded verdicts.
 4. **Retire `whisper_qa.rs`'s exact-match path** once (3) covers it.
