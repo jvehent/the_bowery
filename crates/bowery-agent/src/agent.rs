@@ -1012,6 +1012,16 @@ impl Agent {
         // call sites in the right order, and three bugs in one session
         // came from exactly that.
         let pipeline_ctx = crate::pipeline::PipelineContext {
+            // Half an hour: long enough that describing a hash is
+            // once-per-hash in practice, short enough that a descriptor
+            // written before the package index finished loading gets
+            // filled in the same session rather than at next restart.
+            // Capped well above the few thousand distinct binaries a
+            // host runs, so it bounds a pathological case only.
+            described: Arc::new(crate::seen::RecentlySeen::new(
+                Duration::from_mins(30),
+                8192,
+            )),
             baseline: baseline.clone(),
             analyzer: analyzer.clone(),
             packages,

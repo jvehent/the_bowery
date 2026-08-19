@@ -319,3 +319,92 @@ async fn a_directly_scored_finding_explains_itself_in_the_alert() {
 
     agent.shutdown().await.expect("shutdown");
 }
+
+/// A binary the baseline already knows must still get a descriptor.
+///
+/// The first version of this gated descriptor writes on
+/// `UpsertOutcome::Inserted`, which is correct-looking, passes every
+/// unit test, and describes almost nothing in production: on a host
+/// whose baseline already held 366 hashes, exactly one was ever
+/// described, because every later exec of a known binary is an
+/// `Updated`. The descriptor table stayed empty on precisely the
+/// long-lived hosts it exists to serve, and slice 3 would have had
+/// nothing to compare.
+///
+/// So the hash is seeded first, making the exec an `Updated`. Without
+/// the fix this test finds no descriptor at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_binary_already_in_the_baseline_still_gets_described() {
+    let workdir = TempDir::new().unwrap();
+    let bin = workdir.path().join("described-payload");
+    std::fs::write(&bin, b"payload contents").unwrap();
+
+    // The sha the pipeline will compute for this file.
+    let sha: [u8; 32] = {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(std::fs::read(&bin).unwrap());
+        h.finalize().into()
+    };
+
+    let (source, gate) =
+        MockEventSource::new(vec![make_exec(1, vec!["described-payload"], bin.clone())]).gated();
+
+    let identity = Arc::new(Identity::generate());
+    let cfg = build_config(
+        workdir.path(),
+        reserve_udp_port(),
+        Duration::from_millis(200),
+    );
+    let agent = Agent::start(cfg, identity, Box::new(source))
+        .await
+        .expect("start");
+
+    // Seed it, so the pipeline's upsert reports `Updated` rather than
+    // `Inserted` — the case the original gate skipped.
+    agent.baseline().upsert_binary(&sha).expect("seed");
+    assert!(
+        agent.baseline().descriptor(&sha).unwrap().is_none(),
+        "precondition: nothing described yet"
+    );
+
+    let mut events = agent.subscribe();
+    gate.open();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!timeout.is_zero(), "timed out waiting for the exec");
+        match tokio::time::timeout(timeout, events.recv()).await {
+            Ok(Ok(AgentEvent::BinaryRecorded { .. })) => break,
+            Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
+            Ok(Err(RecvError::Closed)) => panic!("event channel closed early"),
+            Err(tokio::time::error::Elapsed { .. }) => {
+                panic!("timed out waiting for BinaryRecorded")
+            }
+        }
+    }
+
+    // The descriptor is written on a spawn_blocking after the event, so
+    // give it a moment to land rather than racing it.
+    let mut described = None;
+    for _ in 0..50 {
+        if let Some(d) = agent.baseline().descriptor(&sha).unwrap() {
+            described = Some(d);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let described = described.expect("an already-known binary must still be described");
+    assert_eq!(
+        described.exe_path.as_deref(),
+        Some(bin.to_str().unwrap()),
+        "the descriptor must name the program"
+    );
+    assert_eq!(
+        described.platform.as_deref(),
+        Some(bowery_proto::platform_key()).as_deref()
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}

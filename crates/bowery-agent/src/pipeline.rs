@@ -56,6 +56,9 @@ use crate::whisper_qa::WhisperQaTrigger;
 pub(crate) struct PipelineContext {
     // -- stores and engines -------------------------------------------
     pub baseline: Arc<Baseline>,
+    /// Keeps per-hash enrichment (the binary descriptor) to once per
+    /// hash per TTL rather than once per exec.
+    pub described: Arc<crate::seen::RecentlySeen>,
     pub analyzer: Arc<Analyzer>,
     pub packages: Arc<bowery_analysis::provenance::ProvenanceCache>,
     pub eventlog: Option<EventLogHandle>,
@@ -1254,18 +1257,30 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
             }
         };
 
-    // Record what this hash *was*, the first time we see it.
+    // Record what this hash *was*.
     //
-    // Only on `Inserted`: the descriptor describes an artifact, not an
-    // execution, so rewriting it on every subsequent exec would be pure
-    // write amplification on the hottest path in the agent.
+    // Gating this on `Inserted` was wrong, and wrong in the way that
+    // does not show up in a test: on a host whose baseline already held
+    // 366 hashes, exactly one of them ever got described, because every
+    // other exec is an `Updated`. The descriptor table would stay empty
+    // on precisely the long-lived hosts it exists to serve.
+    //
+    // So it runs for any hash not described recently, with a TTL'd set
+    // keeping it to once per hash per half hour rather than once per
+    // exec. The TTL is deliberate rather than a permanent "done" flag:
+    // the package index loads asynchronously, so an early write can
+    // legitimately not know the package, and expiry is what lets a
+    // later exec fill it in.
     //
     // Failure is logged and swallowed. This is enrichment for the mesh;
     // an exec that could not be described must still be scored and
     // alerted on, and a monitor that stops working because an
     // enrichment write failed is the failure this codebase keeps
     // finding.
-    if matches!(outcome, bowery_baseline::UpsertOutcome::Inserted) {
+    if ctx
+        .described
+        .check_and_record("descriptor", &sha_to_hex(&sha))
+    {
         let descriptor = describe_binary(&exec, ctx);
         let baseline = ctx.baseline.clone();
         if let Ok(Err(e)) =
