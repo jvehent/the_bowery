@@ -56,6 +56,22 @@ impl CorroborationStats {
         Self::default()
     }
 
+    /// Start with a zero row for every kind this build can raise.
+    ///
+    /// An idle kind must be visible as `0`, not absent. Absent reads as
+    /// "this does not exist here", which is the reading that hides a
+    /// detector that has silently stopped raising anything.
+    #[must_use]
+    pub fn with_kinds(kinds: &[&'static str]) -> Self {
+        let s = Self::default();
+        if let Ok(mut g) = s.inner.lock() {
+            for k in kinds {
+                g.entry(k).or_default();
+            }
+        }
+        s
+    }
+
     fn bump(&self, kind: &'static str, f: impl FnOnce(&mut Counters)) {
         if let Ok(mut g) = self.inner.lock() {
             f(g.entry(kind).or_default());
@@ -161,5 +177,25 @@ mod tests {
     #[test]
     fn an_engine_that_has_done_nothing_reports_nothing() {
         assert!(CorroborationStats::new().snapshot().is_empty());
+    }
+
+    /// A kind that has raised nothing must still be a row.
+    ///
+    /// Absent reads as "not present on this host", which is how a
+    /// detector that quietly stopped raising claims would hide. The
+    /// same line `bowery_detections` holds for rules.
+    #[test]
+    fn an_idle_kind_is_a_zero_row_not_a_missing_one() {
+        let s = CorroborationStats::with_kinds(&["file.access", "net.inbound_connect"]);
+        s.raised("net.inbound_connect");
+        s.no_audience("net.inbound_connect");
+
+        let snap = s.snapshot();
+        assert_eq!(snap.len(), 2, "both kinds present: {snap:?}");
+        let idle = snap
+            .iter()
+            .find(|(k, _)| *k == "file.access")
+            .expect("an idle kind must still appear");
+        assert_eq!(idle.1, Counters::default(), "and read as all zeroes");
     }
 }

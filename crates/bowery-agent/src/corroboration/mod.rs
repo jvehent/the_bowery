@@ -83,6 +83,16 @@ use crate::inbox::AlertInbox;
 // Claims
 // ---------------------------------------------------------------------------
 
+/// Every claim kind this build knows how to raise.
+///
+/// Exists so the status view can show a kind that has raised *nothing*
+/// as a zero row rather than an absent one. `bowery_detections` already
+/// holds that line for rules — "a detection that has never fired is a
+/// visible 0, not a missing row" — and a status table that silently
+/// omits an idle kind reintroduces exactly the ambiguity it was built
+/// to remove, one level up.
+pub const KINDS: &[&str] = &[file_access::KIND, net_inbound::KIND];
+
 /// The ATT&CK-registry id for a claim kind.
 ///
 /// Kinds are wire strings (`net.inbound_connect`) chosen for the
@@ -911,6 +921,29 @@ pub fn window_around(at: SystemTime, half_width: Duration) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `KINDS` must list every kind this build can raise.
+    ///
+    /// It drives the status view's zero rows, so a kind missing here is
+    /// a kind that reads as absent rather than idle — the exact
+    /// ambiguity that view exists to remove. Anchored to the same list
+    /// the mapping test uses, so adding a kind fails both together
+    /// rather than passing quietly in one.
+    #[test]
+    fn every_claim_kind_is_listed_for_the_status_view() {
+        for kind in [net_inbound::KIND, file_access::KIND] {
+            assert!(
+                KINDS.contains(&kind),
+                "{kind} can be raised but is absent from KINDS, so it would show as a \
+                 missing row rather than an idle one"
+            );
+        }
+        assert_eq!(
+            KINDS.len(),
+            2,
+            "a new kind needs a zero row here as well as a rule id"
+        );
+    }
 
     /// Every claim kind must map to an id the registry knows.
     ///

@@ -530,7 +530,11 @@ FROM bowery_corroboration_status ORDER BY raised DESC
 
 `bowery_detections` will usually show these kinds at zero fires, and
 zero is ambiguous: nothing happened, or every claim was thrown away
-before anyone could be asked. `no_audience` is the difference. On a
+before anyone could be asked. `no_audience` is the difference. A kind that has raised nothing appears
+as a row of zeroes rather than not at all, for the same reason
+`bowery_detections` lists rules that have never fired: absent reads as
+"not present on this host", which is how a detector that quietly
+stopped raising claims would hide. On a
 host whose inbound connections come from workstations outside the mesh,
 `net.inbound_connect` raises a claim per connection and drops all of
 them — 87 in six hours on the reference fleet — because only the host
