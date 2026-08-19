@@ -5,6 +5,15 @@
 //! Subsequent phases add `query`, `hunt`, `alerts tail`, `action ...`,
 //! `authorization grant`, `model push`, etc.
 
+/// Crate version plus the commit it was built from.
+///
+/// The commit is the half that identifies a build: a crate version
+/// alone cannot tell two builds of the same release apart, which is
+/// exactly the question asked when checking a rollout. `-dirty` means
+/// the tree had uncommitted changes, so the named commit does not
+/// describe this binary.
+const BOWERY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("BOWERY_GIT_COMMIT"));
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,7 +30,7 @@ use bowery_cli::{alerts, audit, doctor, exec, mesh_trust, model, notify, peers, 
 #[derive(Parser, Debug)]
 #[command(
     name = "bowery",
-    version,
+    version = BOWERY_VERSION,
     about = "The Bowery operator CLI",
     long_about = None
 )]

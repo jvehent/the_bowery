@@ -28,7 +28,7 @@ pub mod sql_tables;
 pub mod whisper_qa;
 pub mod yara_store;
 
-pub use agent::{Agent, AgentError, AgentEvent};
+pub use agent::{AGENT_VERSION, Agent, AgentError, AgentEvent};
 pub use config::Config;
 pub use inbox::AlertInbox;
 pub use whisper_qa::{PeerSighting, WhisperContext};

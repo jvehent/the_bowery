@@ -46,7 +46,17 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 
-const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Version plus the commit it was built from, e.g. `0.2.0+2bff539`.
+///
+/// The commit is the load-bearing half. A crate version alone cannot
+/// distinguish two builds of the same release, which is exactly the
+/// question asked when checking whether a rollout landed. A `-dirty`
+/// suffix means the tree had uncommitted changes, so the named commit
+/// does not describe what is running.
+///
+/// Gossiped to peers and surfaced as `bowery_mesh_peers.agent_version`,
+/// which turns "is the fleet on the same build" into one query.
+pub const AGENT_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("BOWERY_GIT_COMMIT"));
 const EVENT_CHANNEL_CAPACITY: usize = 4096;
 /// Buffer for operator file-watch events. Smaller than the kernel event
 /// channel: inotify fires on a handful of explicitly-watched paths, not

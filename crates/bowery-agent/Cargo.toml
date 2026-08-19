@@ -168,3 +168,6 @@ fi
 post_uninstall_script = """
 systemctl daemon-reload || true
 """
+
+[build-dependencies]
+bowery-buildinfo = { workspace = true }

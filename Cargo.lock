@@ -278,13 +278,14 @@ dependencies = [
 
 [[package]]
 name = "bowery-agent"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "bowery-analysis",
  "bowery-baseline",
+ "bowery-buildinfo",
  "bowery-cli",
  "bowery-crypto",
  "bowery-ebpf-loader",
@@ -318,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-analysis"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bowery-baseline",
@@ -333,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-baseline"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -342,12 +343,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bowery-buildinfo"
+version = "0.2.0"
+
+[[package]]
 name = "bowery-cli"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bowery-analysis",
+ "bowery-buildinfo",
  "bowery-crypto",
  "bowery-proto",
  "bowery-response",
@@ -373,10 +379,11 @@ dependencies = [
 
 [[package]]
 name = "bowery-console"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bowery-analysis",
+ "bowery-buildinfo",
  "bowery-cli",
  "bowery-crypto",
  "bowery-llm",
@@ -397,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-crypto"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -414,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-ebpf-loader"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "aya",
@@ -431,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-eventlog"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "bowery-events",
  "rusqlite",
@@ -442,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-events"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "sha2",
@@ -454,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-llm"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bowery-analysis",
@@ -470,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-mesh"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bowery-crypto",
@@ -485,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-proto"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "prost",
@@ -493,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-prove"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "bowery-analysis",
  "libc",
@@ -501,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-response"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bowery-crypto",
@@ -520,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-sql"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "bowery-tables",
  "rusqlite",
@@ -533,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-tables"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "procfs",
  "rusqlite",
@@ -544,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-whisper"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bowery-crypto",
@@ -571,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "bowery-yara"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.18",

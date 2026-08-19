@@ -466,6 +466,33 @@ own bookkeeping.
 | Which rules are producing the noise? | `SELECT rule_id, COUNT(*) FROM bowery_alerts GROUP BY rule_id ORDER BY 2 DESC` |
 | What am I not being told about? | `SELECT id, rule_id, weight, matched, reason FROM bowery_silences ORDER BY matched DESC` |
 
+### Which build is running where
+
+Every binary reports its crate version plus the commit it was built
+from, and `-dirty` when the tree had uncommitted changes:
+
+```bash
+bowery --version            # bowery 0.2.0+2bff539
+bowery-agent --version
+bowery-console --version
+```
+
+The commit is the half that matters. A crate version alone cannot tell
+two builds of the same release apart, which is the only question anyone
+asks it during a rollout. `-dirty` means the named commit does **not**
+describe that binary — treat it as unidentified rather than as that
+commit.
+
+The agent gossips this, so fleet-wide skew is one query rather than an
+ssh loop:
+
+```sql
+SELECT fingerprint_hex, agent_version FROM bowery_mesh_peers
+```
+
+Pair it with `SELECT DISTINCT object_sha256 FROM bowery_probe_status
+--fanout`, which catches the same skew in the eBPF object.
+
 ### When the mesh cannot check something
 
 The neighbourhood watch asks peers whether they have seen a binary's

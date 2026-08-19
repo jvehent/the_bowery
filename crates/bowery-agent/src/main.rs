@@ -16,7 +16,7 @@ use tracing::{error, info};
 const DEFAULT_CONFIG_PATH: &str = "/etc/bowery/agent.toml";
 
 #[derive(Parser, Debug)]
-#[command(version, about = "The Bowery agent daemon", long_about = None)]
+#[command(version = bowery_agent::AGENT_VERSION, about = "The Bowery agent daemon", long_about = None)]
 struct Args {
     /// Path to the agent configuration file.
     #[arg(long, default_value = DEFAULT_CONFIG_PATH)]

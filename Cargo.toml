@@ -26,7 +26,7 @@ members = [
 exclude = ["crates/bowery-ebpf", "fuzz"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MPL-2.0"
@@ -37,21 +37,22 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Internal
-bowery-analysis = { path = "crates/bowery-analysis", version = "0.0.1" }
-bowery-baseline = { path = "crates/bowery-baseline", version = "0.0.1" }
-bowery-cli = { path = "crates/bowery-cli", version = "0.0.1" }
-bowery-eventlog = { path = "crates/bowery-eventlog", version = "0.0.1" }
-bowery-crypto = { path = "crates/bowery-crypto", version = "0.0.1" }
-bowery-ebpf-loader = { path = "crates/bowery-ebpf-loader", version = "0.0.1" }
-bowery-events = { path = "crates/bowery-events", version = "0.0.1" }
-bowery-llm = { path = "crates/bowery-llm", version = "0.0.1" }
-bowery-mesh = { path = "crates/bowery-mesh", version = "0.0.1" }
-bowery-proto = { path = "crates/bowery-proto", version = "0.0.1" }
-bowery-response = { path = "crates/bowery-response", version = "0.0.1" }
-bowery-sql = { path = "crates/bowery-sql", version = "0.0.1" }
-bowery-tables = { path = "crates/bowery-tables", version = "0.0.1" }
-bowery-whisper = { path = "crates/bowery-whisper", version = "0.0.1" }
-bowery-yara = { path = "crates/bowery-yara", version = "0.0.1" }
+bowery-analysis = { path = "crates/bowery-analysis", version = "0.2.0" }
+bowery-baseline = { path = "crates/bowery-baseline", version = "0.2.0" }
+bowery-buildinfo = { path = "crates/bowery-buildinfo", version = "0.2.0" }
+bowery-cli = { path = "crates/bowery-cli", version = "0.2.0" }
+bowery-eventlog = { path = "crates/bowery-eventlog", version = "0.2.0" }
+bowery-crypto = { path = "crates/bowery-crypto", version = "0.2.0" }
+bowery-ebpf-loader = { path = "crates/bowery-ebpf-loader", version = "0.2.0" }
+bowery-events = { path = "crates/bowery-events", version = "0.2.0" }
+bowery-llm = { path = "crates/bowery-llm", version = "0.2.0" }
+bowery-mesh = { path = "crates/bowery-mesh", version = "0.2.0" }
+bowery-proto = { path = "crates/bowery-proto", version = "0.2.0" }
+bowery-response = { path = "crates/bowery-response", version = "0.2.0" }
+bowery-sql = { path = "crates/bowery-sql", version = "0.2.0" }
+bowery-tables = { path = "crates/bowery-tables", version = "0.2.0" }
+bowery-whisper = { path = "crates/bowery-whisper", version = "0.2.0" }
+bowery-yara = { path = "crates/bowery-yara", version = "0.2.0" }
 
 # Crypto
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize", "pkcs8"] }

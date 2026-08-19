@@ -84,3 +84,6 @@ assets = [
   { source = "target/release/bowery",         dest = "/usr/bin/bowery",                 mode = "755" },
   { source = "target/release/pkg/README.md",  dest = "/usr/share/doc/bowery/README.md", mode = "644", doc = true },
 ]
+
+[build-dependencies]
+bowery-buildinfo = { workspace = true }

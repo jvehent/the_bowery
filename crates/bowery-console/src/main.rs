@@ -33,8 +33,11 @@ use app::{App, AppArgs};
 /// CLI flags the console accepts at launch. Most are agent-targeting
 /// — same as `bowery exec sql` — and act as the initial relay.
 /// Operators can switch relays at runtime via `:connect`.
+/// Crate version plus build commit; `-dirty` means uncommitted changes.
+const CONSOLE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("BOWERY_GIT_COMMIT"));
+
 #[derive(Parser, Debug)]
-#[command(version, about = "The Bowery interactive operator console", long_about = None)]
+#[command(version = CONSOLE_VERSION, about = "The Bowery interactive operator console", long_about = None)]
 struct Args {
     /// Path to the operator identity key.
     #[arg(long, default_value = "~/.bowery/operator.key")]
