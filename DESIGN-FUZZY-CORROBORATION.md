@@ -230,6 +230,14 @@ irreversibly.
    package is an identity the distribution assigned, a path is a
    location an attacker picks.
 
+   A responder answers from **two** sources: its descriptor store (what
+   it has run) and its package database (what is installed). The second
+   was added after the first live round exposed the gap — a peer asked
+   about `/usr/bin/hostname` had the file and had never executed it, so
+   it answered "never seen it". `pkg_builds: 0` alongside `pkg_match`
+   is the honest distinction between "we run this too" and "we have it
+   on disk".
+
    Still on the evidence-vector list: build-id and `DT_NEEDED`, both of
    which need an ELF reader.
 4. **Retire `whisper_qa.rs`'s exact-match path** once (3) covers it.

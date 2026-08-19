@@ -225,11 +225,13 @@ pub enum LocalKnowledge {
 /// the distribution assigned.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProgramKnowledge {
-    /// This host has the same package, at some build.
+    /// This host has the same package, installed or executed.
     pub pkg_match: bool,
-    /// Distinct hashes held for that package.
+    /// Distinct hashes held for that package — how many builds of it
+    /// this host has actually *run*. Zero with `pkg_match` set means
+    /// installed but never executed, which is still a real answer.
     pub pkg_builds: u32,
-    /// This host has something at the same path, at some hash.
+    /// This host has something at the same path.
     pub path_match: bool,
 }
 
@@ -237,20 +239,40 @@ pub struct ProgramKnowledge {
 ///
 /// Both lookups are indexed and bounded; neither scans the baseline.
 #[must_use]
-pub fn program_knowledge(baseline: &Baseline, pkg: &str, exe_path: &str) -> ProgramKnowledge {
+pub fn program_knowledge(
+    baseline: &Baseline,
+    packages: &bowery_analysis::provenance::ProvenanceCache,
+    pkg: &str,
+    exe_path: &str,
+) -> ProgramKnowledge {
     let mut out = ProgramKnowledge::default();
-    if !pkg.is_empty()
-        && let Ok(hashes) = baseline.hashes_for_package(pkg, 64)
-        && !hashes.is_empty()
-    {
-        out.pkg_match = true;
-        out.pkg_builds = u32::try_from(hashes.len()).unwrap_or(u32::MAX);
+    if !pkg.is_empty() {
+        // Two sources, and the second is the one that matters. The
+        // baseline knows what this host has *run*; the package database
+        // knows what is *installed*. Asked about /usr/bin/hostname on a
+        // live fleet, a peer that had the file but had never executed it
+        // answered "never seen it" — true of the hash, useless as an
+        // answer, and exactly the failure this whole line of work is
+        // about, one level further in.
+        if let Ok(hashes) = baseline.hashes_for_package(pkg, 64)
+            && !hashes.is_empty()
+        {
+            out.pkg_match = true;
+            out.pkg_builds = u32::try_from(hashes.len()).unwrap_or(u32::MAX);
+        }
+        if !out.pkg_match && packages.has_package(pkg) {
+            // Installed, never run. `pkg_builds` stays 0, which is the
+            // honest distinction between "we run this too" and "we have
+            // it on disk".
+            out.pkg_match = true;
+        }
     }
-    if !exe_path.is_empty()
-        && let Ok(hashes) = baseline.hashes_for_path(exe_path, 8)
-        && !hashes.is_empty()
-    {
-        out.path_match = true;
+    if !exe_path.is_empty() {
+        let path = std::path::Path::new(exe_path);
+        out.path_match = baseline
+            .hashes_for_path(exe_path, 8)
+            .is_ok_and(|h| !h.is_empty())
+            || packages.has_path(path);
     }
     out
 }
@@ -1590,6 +1612,56 @@ mod quorum_tests {
         assert_eq!(v.peers_incomparable, 2);
         assert_eq!(v.peers_unseen, 0, "an incomparable peer is not a denial");
         assert_eq!(v.comparable(), 0, "nothing could be weighed");
+    }
+
+    /// Installed-but-never-executed must still count as having the
+    /// program.
+    ///
+    /// Found on the live fleet: otter1 asked its peers about
+    /// `/usr/bin/hostname`, from package `hostname`. Both peers have
+    /// that file on disk. Neither had ever *executed* it, so neither
+    /// had a descriptor for it, so both answered "never seen it" — a
+    /// true statement about a hash and a useless answer, which is the
+    /// same failure this work exists to fix, one level further in.
+    ///
+    /// The baseline knows what ran; the package database knows what is
+    /// installed. The second is the honest source for "do you have this
+    /// program".
+    #[test]
+    fn a_program_installed_but_never_run_is_still_recognised() {
+        use bowery_analysis::provenance::{PackageIndex, ProvenanceCache};
+
+        let baseline = Baseline::open_in_memory().unwrap();
+        // Nothing has executed here, so the descriptor store is empty.
+        assert!(
+            baseline
+                .hashes_for_package("hostname", 8)
+                .unwrap()
+                .is_empty()
+        );
+
+        let cache = ProvenanceCache::new(PackageIndex::load_system());
+        // The host running this test has coreutils; if it does not, the
+        // package index is unavailable and the assertion below would be
+        // vacuous, so skip rather than pass for the wrong reason.
+        if !cache.has_package("coreutils") {
+            eprintln!("no usable package database here; skipping");
+            return;
+        }
+
+        let known = program_knowledge(&baseline, &cache, "coreutils", "");
+        assert!(
+            known.pkg_match,
+            "an installed package must be recognised even with an empty baseline"
+        );
+        assert_eq!(
+            known.pkg_builds, 0,
+            "0 builds means installed-but-never-run, which is a different claim from \
+             having executed it"
+        );
+
+        let unknown = program_knowledge(&baseline, &cache, "no-such-package-here", "");
+        assert!(!unknown.pkg_match, "and it must not recognise everything");
     }
 
     /// A peer that has the program at another build.

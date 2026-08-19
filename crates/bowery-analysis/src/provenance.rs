@@ -279,6 +279,29 @@ impl PackageIndex {
         }
         self.pkg_by_path.get(path).map(String::as_str)
     }
+
+    /// Is this package installed here at all?
+    ///
+    /// Answers from the package database rather than from what has
+    /// executed, and that difference is the point. A host's baseline
+    /// only knows programs it has *run*: measured on the fleet, a peer
+    /// asked about `/usr/bin/hostname` could not recognise it despite
+    /// having the file, because it had never executed it. The package
+    /// database knows what is *installed*, which is the honest answer
+    /// to "do you have this program".
+    #[must_use]
+    pub fn has_package(&self, name: &str) -> bool {
+        if !self.available || name.is_empty() {
+            return false;
+        }
+        self.pkg_by_path.values().any(|p| p == name)
+    }
+
+    /// Is anything installed at this path?
+    #[must_use]
+    pub fn has_path(&self, path: &Path) -> bool {
+        self.available && self.by_path.contains_key(path)
+    }
 }
 
 /// md5 of a file's current contents, for comparison against the digest
@@ -435,6 +458,18 @@ impl ProvenanceCache {
             .read()
             .ok()
             .and_then(|i| i.package_for(path).map(str::to_string))
+    }
+
+    /// Is this package installed on this host?
+    #[must_use]
+    pub fn has_package(&self, name: &str) -> bool {
+        self.index.read().is_ok_and(|i| i.has_package(name))
+    }
+
+    /// Is anything installed at this path?
+    #[must_use]
+    pub fn has_path(&self, path: &Path) -> bool {
+        self.index.read().is_ok_and(|i| i.has_path(path))
     }
 }
 

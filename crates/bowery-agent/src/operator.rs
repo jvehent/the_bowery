@@ -59,6 +59,10 @@ pub(crate) struct ServerContext {
     pub operators: Arc<StaticResolver>,
     pub sealer: Arc<Sealer>,
     pub baseline: Arc<Baseline>,
+    /// The package database, so a responder can answer "I have that
+    /// program" for something it has installed but never executed —
+    /// which the baseline alone cannot.
+    pub packages: Arc<bowery_analysis::provenance::ProvenanceCache>,
     pub inbox: Arc<AlertInbox>,
     pub op_router: Arc<OperatorCommandRouter>,
     pub events_tx: broadcast::Sender<AgentEvent>,
@@ -263,6 +267,7 @@ async fn handle_bi_stream_loop(
                     reply,
                     &ctx.sealer,
                     &ctx.baseline,
+                    &ctx.packages,
                     env.sender,
                     q,
                     ctx.coverage_bar,
@@ -287,6 +292,7 @@ async fn respond_to_question(
     reply: bowery_whisper::transport::Reply,
     sealer: &Sealer,
     baseline: &Arc<Baseline>,
+    packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
     asker: Fingerprint,
     question: bowery_proto::Question,
     coverage_bar: crate::whisper_qa::CoverageBar,
@@ -325,6 +331,7 @@ async fn respond_to_question(
     let target = Tier1Fingerprint::from_bytes(fp_bytes);
 
     let baseline_for_scan = baseline.clone();
+    let packages = packages.clone();
     // The program lookup runs alongside the hash scan in the same
     // blocking hop: two indexed reads, no extra round trip, and the
     // answer needs both to distinguish "I do not have that program"
@@ -333,7 +340,8 @@ async fn respond_to_question(
     let asked_path = question.exe_path.clone();
     let knowledge = match tokio::task::spawn_blocking(move || {
         let k = crate::whisper_qa::local_knowledge(&baseline_for_scan, target, coverage_bar);
-        let p = crate::whisper_qa::program_knowledge(&baseline_for_scan, &pkg, &asked_path);
+        let p =
+            crate::whisper_qa::program_knowledge(&baseline_for_scan, &packages, &pkg, &asked_path);
         (k, p)
     })
     .await

@@ -830,7 +830,14 @@ impl Agent {
         // Assembled once: the accept loop and the pooled-connection
         // handler serve the same requests from the same state, and used
         // to restate it as twelve and eleven positional arguments.
+        // Constructed here rather than beside its loader task below: the
+        // whisper responder needs it to answer "do you have this
+        // program", and the responder context is assembled first. The
+        // cache is empty until the index lands, which is the same
+        // not-yet-known state every other consumer already handles.
+        let packages = Arc::new(bowery_analysis::provenance::ProvenanceCache::empty());
         let server_ctx = crate::operator::ServerContext {
+            packages: packages.clone(),
             operators: operators.clone(),
             sealer: sealer.clone(),
             baseline: baseline.clone(),
@@ -958,7 +965,6 @@ impl Agent {
         // files it was configured to watch. An optimisation must not
         // gate the sensors. Until the index arrives, provenance answers
         // Unknown, which damps nothing.
-        let packages = Arc::new(bowery_analysis::provenance::ProvenanceCache::empty());
         {
             let packages = packages.clone();
             tokio::task::spawn_blocking(move || {
