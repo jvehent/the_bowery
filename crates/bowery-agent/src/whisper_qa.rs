@@ -909,6 +909,83 @@ fn incomparable_note(c: &AlertConfirmation, platforms: &[String]) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// How far a recognised program's score is damped.
+///
+/// Proportional to how much of the neighbourhood recognised it, and
+/// never to zero: "everyone runs this program" is a strong explanation
+/// and still not proof that *this copy* is the one they run.
+fn explained_suspicion(pre: f32, c: AlertConfirmation) -> f32 {
+    let fraction = f32::from(u16::try_from(c.peers_familiar).unwrap_or(u16::MAX))
+        / f32::from(u16::try_from(c.peers_asked.max(1)).unwrap_or(u16::MAX));
+    pre * (1.0 - 0.6 * fraction.clamp(0.0, 1.0))
+}
+
+/// Supersede an alert the neighbourhood recognised, at a lower score.
+///
+/// Without this the answer is thrown away: only a *confirmation*
+/// supersedes, so a round ending in recognition left the original alert
+/// with `confirmation: None` and every peer column NULL. Observed on
+/// the fleet — two peers replied "we have that program, built
+/// differently" about `/usr/bin/hostname` and the alert recorded
+/// nothing at all.
+///
+/// Superseding rather than suppressing, and that is not cosmetic.
+/// Recognition says the *program* is fleet-normal; it says nothing
+/// about whether this copy of it is intact. A binary planted at a path
+/// a package owns is exactly the `PackagedModified` case provenance
+/// already scores, and this must not talk over it.
+fn append_recognition_alert(
+    ctx: &AnalysisContext,
+    context: &WhisperContext,
+    pre_suspicion: f32,
+    verdict: AlertConfirmation,
+    events_tx: &broadcast::Sender<AgentEvent>,
+    confirm: &ConfirmSink,
+) {
+    if verdict.confirmed || verdict.peers_familiar == 0 || pre_suspicion < confirm.alert_threshold {
+        return;
+    }
+    let explained = explained_suspicion(pre_suspicion, verdict);
+    let alert = crate::alert_builder::AlertBuilder::new(
+        confirm.originator_fp,
+        &confirm.backend_label,
+        leading_rule_id(&ctx.pre_verdict),
+        context.episode_id.clone(),
+        explained,
+        format!(
+            "{} of {} peers asked run this same program built differently, so it is \
+             fleet-normal software rather than something only this host has. Their copies \
+             are not this copy: provenance, not prevalence, is what says whether this one \
+             was tampered with.",
+            verdict.peers_familiar, verdict.peers_asked
+        ),
+    )
+    .subject(
+        ctx.exe_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+    )
+    .exe_sha256_hex(ctx.exe_sha256_hex.clone().unwrap_or_default())
+    .confirmation(verdict)
+    .build();
+    info!(
+        episode = %context.episode_id,
+        familiar = verdict.peers_familiar,
+        asked = verdict.peers_asked,
+        from = pre_suspicion,
+        to = explained,
+        "the neighbourhood recognises this program; superseding with a lower score"
+    );
+    let appended = confirm.inbox.append(alert);
+    if appended.stored() {
+        let _ = events_tx.send(AgentEvent::AlertEmitted {
+            episode_id: context.episode_id.clone(),
+            suspicion: explained,
+        });
+    }
+}
+
 fn finish_round(
     trigger: WhisperQaTrigger,
     context: WhisperContext,
@@ -989,6 +1066,8 @@ fn finish_round(
             });
         }
     }
+
+    append_recognition_alert(&ctx, &context, pre_suspicion, verdict, events_tx, confirm);
 
     if verdict.confirmed && pre_suspicion >= confirm.alert_threshold {
         let alert = crate::alert_builder::AlertBuilder::new(
@@ -1612,6 +1691,39 @@ mod quorum_tests {
         assert_eq!(v.peers_incomparable, 2);
         assert_eq!(v.peers_unseen, 0, "an incomparable peer is not a denial");
         assert_eq!(v.comparable(), 0, "nothing could be weighed");
+    }
+
+    /// Recognition has to reach the operator.
+    ///
+    /// Only a confirmation used to supersede, so a round that ended in
+    /// recognition left the original alert with `confirmation: None`
+    /// and every peer column NULL. Seen on the fleet: two peers replied
+    /// "we have that program, built differently" about
+    /// `/usr/bin/hostname` and the alert recorded nothing.
+    #[test]
+    fn recognition_damps_the_score_without_erasing_it() {
+        let full = quorum_verdict(&[familiar(1, 0), familiar(2, 0)], 2);
+        assert_eq!(full.peers_familiar, 2);
+        assert_eq!(full.peers_asked, 2);
+        assert!(!full.confirmed);
+
+        let whole_fleet = explained_suspicion(0.75, full);
+        assert!(
+            whole_fleet < 0.75,
+            "unanimous recognition must lower the score"
+        );
+        assert!(
+            whole_fleet > 0.0,
+            "and must not zero it: their copies are not this copy, and a binary planted \
+             at a packaged path is exactly what provenance scores"
+        );
+
+        // Partial recognition damps less than unanimous.
+        let partial = quorum_verdict(&[familiar(1, 0), unseen(2)], 2);
+        assert!(
+            explained_suspicion(0.75, partial) > whole_fleet,
+            "one peer recognising it is weaker evidence than two"
+        );
     }
 
     /// Installed-but-never-executed must still count as having the

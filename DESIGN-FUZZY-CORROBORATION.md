@@ -238,6 +238,16 @@ irreversibly.
    is the honest distinction between "we run this too" and "we have it
    on disk".
 
+   A recognised program **supersedes its alert at a lower score**,
+   reusing the downgrade shape the `file.access` corroboration already
+   had. Without it the answer was discarded: only a confirmation
+   superseded, so a round ending in recognition left the alert with
+   `confirmation: None` and every peer column NULL. Damping is
+   proportional to how much of the neighbourhood recognised it and
+   never reaches zero — recognition says the *program* is fleet-normal
+   and says nothing about whether this copy is intact, which is
+   provenance's job.
+
    Still on the evidence-vector list: build-id and `DT_NEEDED`, both of
    which need an ELF reader.
 4. **Retire `whisper_qa.rs`'s exact-match path** once (3) covers it.
