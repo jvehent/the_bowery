@@ -102,6 +102,11 @@ enum Command {
         /// advancing cursors. Needs no SMTP credential.
         #[arg(long)]
         dry_run: bool,
+        /// Also write the HTML alternative here, to open in a browser.
+        /// The only way to see what a digest will actually look like
+        /// without mailing one to yourself.
+        #[arg(long)]
+        html_out: Option<PathBuf>,
     },
 
     /// Fetch and validate LLM model artifacts (GGUF files) from a
@@ -847,6 +852,7 @@ impl Cli {
                 manifest,
                 cursor_file,
                 dry_run,
+                html_out,
             } => {
                 tracing_subscriber::fmt()
                     .with_env_filter(
@@ -870,6 +876,7 @@ impl Cli {
                     manifest_path,
                     cursor_path: notify::expand_tilde(&cursor_file),
                     dry_run,
+                    html_out: html_out.as_deref().map(notify::expand_tilde),
                 }))?;
                 Ok(ExitCode::SUCCESS)
             }

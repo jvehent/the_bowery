@@ -3,7 +3,7 @@
 //! periodically updates mesh state.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -109,11 +109,23 @@ async fn analyzer_fires_per_episode_with_expected_suspicion() {
     std::fs::write(&suspicious_bin, b"sus content").unwrap();
 
     // For the "normal" exec we need a real on-disk binary whose path is
-    // NOT under /tmp. The current test executable always satisfies that.
-    let normal_bin = std::env::current_exe().expect("current_exe");
+    // NOT under /tmp. This used to be `current_exe()`, which satisfies
+    // that and is also a ~95 MB debug binary: the pipeline hashes what
+    // it is handed, and under a full `cargo test --workspace` — fifteen
+    // test binaries competing for the page cache — hashing it took just
+    // under six seconds against this loop's five-second deadline. The
+    // test passed alone and failed about one workspace run in three.
+    //
+    // Nothing here needs a large binary, only a small one somewhere
+    // other than /tmp.
+    let normal_bin = ["/bin/true", "/usr/bin/true", "/bin/sh"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .expect("no small system binary found outside /tmp");
     assert!(
         !normal_bin.starts_with("/tmp/"),
-        "current_exe ({}) is under /tmp; the writable-path rule will misfire",
+        "{} is under /tmp; the writable-path rule will misfire",
         normal_bin.display()
     );
 

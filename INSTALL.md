@@ -1241,11 +1241,20 @@ is just the documented first case.
 
 ```bash
 bowery notify --dry-run
+bowery notify --dry-run --html-out /tmp/digest.html   # then open it
 ```
 
 Polls every agent in `~/.bowery/peers.toml`, prints the exact message,
 and **does not advance the cursors** — so you can run it repeatedly
 while tuning `min_suspicion`. Needs no SMTP credential.
+
+`--html-out` also writes the HTML alternative, which is the only way to
+see what a digest will look like without mailing one to yourself. It
+works without `--dry-run` too. To see the layout with no fleet at all:
+
+```bash
+cargo run -p bowery-cli --example notify_preview -- /tmp/digest.html
+```
 
 ### 4. Put it on a timer
 
@@ -1290,10 +1299,34 @@ construction rather than by escaping, because `exe_path` is whatever an
 attacker managed to execute.
 
 The **body** carries the detail you need to triage from a phone
-(suspicion, episode, path, sha, rationale), with control characters
-stripped, every field length-capped, `text/plain` only, and a footer
-saying plainly that those fields came from the monitored host and are
-leads rather than facts. Verify against the signed source before acting.
+(suspicion, rule, episode, path, sha, rationale), with control
+characters stripped, every field length-capped, and a footer saying
+plainly that those fields came from the monitored host and are leads
+rather than facts. Verify against the signed source before acting.
+
+It goes out as `multipart/alternative` — the whole digest as text, plus
+an HTML rendering for clients that will show it. A client that refuses
+HTML loses the formatting and nothing else.
+
+Two properties of that HTML are worth knowing about:
+
+- **Every interpolated value is escaped**, and sanitising happens first,
+  capping second, escaping last. Before HTML, "the body is plain text"
+  was what stopped a crafted `rationale` rendering as markup; now the
+  escaping is the only thing holding that line.
+- **It fetches nothing** — no image, stylesheet or font, every style
+  inline. A remote fetch would tell whoever serves it the moment you
+  opened an alert, and the alert may be about the person who would
+  learn that.
+
+Each alert shows its **episode id and a `bowery alerts silence` command
+with the id and the agent fingerprint already filled in**, so quieting a
+recurring false positive does not mean retyping 64 hex characters off a
+phone screen. Add your usual `--operator-key` / `--agent-addr` /
+`--agent-pubkey-b64` / `--cluster-id` and a real reason — the reason
+placeholder is deliberately one a shell rejects, so pasting the line
+unedited fails instead of signing a fleet-wide silence that nobody can
+later justify.
 
 Alerts that supersede each other — the pre-filter's, the LLM's
 refinement, the quorum's confirmation — collapse to one entry per

@@ -379,7 +379,12 @@ for the Gmail app-password setup and the systemd timer:
 
 ```bash
 bowery notify --dry-run
+bowery notify --dry-run --html-out /tmp/digest.html   # preview the HTML
 ```
+
+The digest goes out as text *and* HTML; each alert carries its episode
+id and a pre-filled `bowery alerts silence` command, so a recurring
+false positive can be quieted from the mail itself.
 
 **Check a hash against VirusTotal** (operator-side only; see
 [INSTALL.md](INSTALL.md) for the optional `bowery notify` filter):
