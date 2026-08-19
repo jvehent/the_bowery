@@ -779,8 +779,8 @@ async fn bowery_peers_table_surfaces_pinned_peers() {
     agent_beta.shutdown().await.expect("shutdown beta");
 }
 
-/// The Query pane's catalogue names tables an operator is told to
-/// query. This asserts every one of them exists on a real agent.
+/// The Query pane's catalogue tells an operator what to query. This
+/// runs all of it against a real agent.
 ///
 /// The catalogue lives in `bowery-cli` because the console renders it;
 /// the registry lives here. Nothing structural connects the two, so
@@ -795,7 +795,7 @@ async fn bowery_peers_table_surfaces_pinned_peers() {
 /// would fail here, as it should.
 #[allow(clippy::too_many_lines)] // the operator-transport fixture is inherently long
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_query_catalogue_names_only_tables_that_exist() {
+async fn every_catalogue_example_runs_on_a_real_agent() {
     let workdir = TempDir::new().unwrap();
     let operator_id = Arc::new(Identity::generate());
     let operator_pubkey_b64 = BASE64.encode(operator_id.verifying_key().as_bytes());
@@ -905,16 +905,59 @@ async fn the_query_catalogue_names_only_tables_that_exist() {
          will find them: {undocumented:?}"
     );
 
-    // Every table an example actually SELECTs from, too — the catalogue
-    // list and the example SQL can drift apart from each other.
-    let bad_examples: Vec<&str> = bowery_cli::catalog::tables_referenced_by_examples()
-        .into_iter()
-        .filter(|t| !live.iter().any(|l| l == t))
-        .collect();
-    assert!(
-        bad_examples.is_empty(),
-        "example queries reference missing tables: {bad_examples:?}"
-    );
+    // Every example is *executed*, not name-checked.
+    //
+    // The first version of this test compared table names and passed
+    // while nine of seventeen example queries errored on a real agent —
+    // wrong column names throughout, because they were written from
+    // memory rather than from the schema. Comparing names is the
+    // obvious check and it is the one that proves nothing: an operator
+    // does not run a table name, they run a query, and a reference that
+    // hands them a broken one reads as the tool being broken at exactly
+    // the moment they reached for it.
+    for ex in bowery_cli::catalog::EXAMPLES {
+        let sql = bowery_cli::catalog::squash(ex.sql);
+        let cmd = OperatorCommand {
+            forwarded_from_operator: Vec::new(),
+            request_id: format!("ex-{}", ex.question),
+            timeout_ms: 5_000,
+            command: Some(OperatorCommandBody::Sql(SqlQuery {
+                sql: sql.clone(),
+                fanout: false,
+                peers: Vec::new(),
+            })),
+        };
+        let outbound = sealer.seal_for(&agent_fp, &WhisperPayload::operator_command(cmd));
+        conn.send_envelope(&outbound).await.expect("send");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let bytes = tokio::time::timeout(timeout, conn.recv_envelope())
+                .await
+                .expect("recv in time")
+                .expect("recv");
+            let opened = envelope_verifier.open(&bytes).expect("verify");
+            let result = match opened.payload.body {
+                Some(Body::OperatorResult(r)) => r,
+                other => panic!("unexpected body: {other:?}"),
+            };
+            match result.result {
+                Some(OperatorResultBody::SqlChunk(c)) => {
+                    if c.end {
+                        break;
+                    }
+                }
+                // The failure this test exists for. Zero rows is fine —
+                // an idle agent has no logins — but an error means the
+                // query cannot be run at all.
+                other => panic!(
+                    "example {:?} does not run:\n  {sql}\n  {other:?}",
+                    ex.question
+                ),
+            }
+        }
+    }
 
     drop(conn);
     operator_endpoint.close().await;

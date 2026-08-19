@@ -423,10 +423,12 @@ a clean result file.
 table with its columns, plus a set of questions and the query that
 answers each; the console's Query pane shows the same reference on its
 idle screen (↑↓ scrolls it), and `:schema` / `:schema <table>` asks the
-connected agent directly, which is authoritative if the reference has
-drifted. A test in `bowery-agent` fails the build if the two disagree in
-either direction — including a table you can query but that nothing
-tells you about.
+connected agent directly.
+
+A test in `bowery-agent` **runs every example against a real agent**, so
+a query that cannot execute fails the build. It also checks the table
+list in both directions — an entry naming a table that does not exist,
+and a table you can query that nothing documents.
 
 **Start here: has each detection ever actually fired?**
 

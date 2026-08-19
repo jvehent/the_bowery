@@ -49,72 +49,70 @@ pub const TABLES: &[Table] = &[
         name: "bowery_alerts",
         about: "the agent's live inbox — bounded and 72h, so use the operator-side \
                 archive (`bowery alerts history`) for anything older",
-        columns: "ts_unix_ms, episode_id, rule_id, suspicion, exe_path, exe_sha256_hex, \
-                  rationale, confirmed, peers_unseen, peers_seen, peers_asked",
+        columns: "originator_fp_hex, episode_id, rule_id, exe_sha256_hex, exe_path, suspicion, rationale, ts_unix_ms, backend, confirmed, peers_asked, peers_unseen, peers_seen, peers_refused",
     },
     Table {
         name: "bowery_baseline_binaries",
-        about: "every binary this host has executed, with first/last seen and a count — \
-                the basis for 'has this ever run here before'",
-        columns: "sha256_hex, exe_path, first_seen_unix, last_seen_unix, seen_count",
+        about: "every binary hash this host has executed, with first/last seen and a count. \
+                Keyed on the hash alone — it stores no path, so it cannot say *which \
+                program* a hash was; join bowery_events on exe_path for that",
+        columns: "sha256_hex, first_seen_unix, last_seen_unix, seen_count",
     },
     Table {
         name: "bowery_detections",
         about: "the detection rules this agent has compiled in, and how often each fired",
-        columns: "rule_id, severity, technique, fired, fired_since_install, last_unix_ms",
+        columns: "rule_id, fired, fired_since_install, last_fired_unix_ms, since_unix_ms",
     },
     Table {
         name: "bowery_probe_status",
         about: "sensor self-attestation: attached, emitted, parse failures, kernel drops. \
                 Where you look to tell a quiet host from a blind one",
-        columns: "probe, attached, events_emitted, parse_failures, kernel_drops, \
-                  last_event_unix_ms, object_sha256",
+        columns: "probe, watching, attached, emitted, parse_failed, kernel_drops, last_event_unix_ms, stopped_reason, object_path, object_sha256",
     },
     Table {
         name: "bowery_silences",
         about: "silences in force, with the pattern each covers and who signed it",
-        columns: "silence_id, rule_id, exe_sha256_hex, exe_path, weight_permille, reason, \
-                  expires_unix_ms, matches",
+        columns: "id, rule_id, exe_sha256_hex, exe_path, host_fp_hex, weight, reason, operator_fp_hex, issued_unix_ms, expires_unix_ms, matched, last_matched_unix_ms",
     },
     Table {
         name: "bowery_audit",
         about: "what the response engine did, or would have done",
-        columns: "seq, ts_unix_ms, episode_id, action_id, outcome_kind, detail",
+        columns: "seq, ts_unix_ms, episode_id, action_id, outcome_kind",
     },
     Table {
         name: "bowery_peers",
         about: "pinned neighbours this agent knows, by fingerprint",
-        columns: "fp_hex, first_seen_unix, last_seen_unix, addr",
+        columns: "fingerprint_hex",
     },
     Table {
         name: "bowery_mesh_peers",
         about: "live gossip view of the mesh — who is up, and what role they claim",
-        columns: "node_id, fp_hex, addr, role, last_heartbeat_unix_ms",
+        columns: "fingerprint_hex, whisper_addr, agent_version, pinned, has_role_vector, has_bloom_advert, grant_state",
     },
     Table {
         name: "bowery_net_destinations",
         about: "outbound destinations seen, aggregated — for 'who does this host talk to'",
-        columns: "dst_addr, dst_port, first_seen_unix, last_seen_unix, conn_count",
+        columns: "dst_key, addr, port, first_seen_unix, last_seen_unix, seen_count",
     },
     Table {
         name: "bowery_monitor_rules",
         about: "operator-configured file watches and process detections",
-        columns: "kind, pattern, severity, description",
+        columns: "kind, rule_id, pattern, ops, severity",
     },
     Table {
         name: "bowery_yara_rules",
         about: "YARA rules loaded, and whether each compiled",
-        columns: "rule_id, source, compiled, error",
+        columns: "rule_id, bytes, received_unix, source_operator_fp, request_id",
     },
     Table {
         name: "bowery_revocations",
         about: "revoked peer identities, so a burned key stays burned",
-        columns: "fp_hex, revoked_unix_ms, reason",
+        columns: "fingerprint_hex, issued_unix_ms, reason, operator_fp_hex",
     },
     Table {
         name: "bowery_eventlog_status",
         about: "event log health: how far back it reaches, and whether it has gaps",
-        columns: "rows, oldest_unix_ms, newest_unix_ms, bytes, covers_since",
+        columns: "recording, queryable, path, rows, oldest_ts_unix_ms, newest_ts_unix_ms, highest_seq, dropped, write_failed, last_error",
     },
     // ---- live host state, read at query time ----
     Table {
@@ -201,31 +199,33 @@ pub const EXAMPLES: &[Example] = &[
     },
     Example {
         question: "Has this binary ever run here before?",
-        sql: "SELECT exe_path, seen_count, datetime(first_seen_unix,'unixepoch') AS first_seen \
-              FROM bowery_baseline_binaries WHERE exe_path LIKE '%curl%'",
+        sql: "SELECT b.sha256_hex, b.seen_count, \
+              datetime(b.first_seen_unix,'unixepoch') AS first_seen, e.exe_path \
+              FROM bowery_baseline_binaries b JOIN bowery_events e \
+              ON e.kind = 'exec' AND e.exe_path LIKE '%curl%' GROUP BY b.sha256_hex LIMIT 20",
     },
     Example {
         question: "What has only ever run once? (the shape of a one-shot payload)",
-        sql: "SELECT exe_path, sha256_hex, datetime(first_seen_unix,'unixepoch') AS seen \
+        sql: "SELECT sha256_hex, datetime(first_seen_unix,'unixepoch') AS seen \
               FROM bowery_baseline_binaries WHERE seen_count = 1 \
               ORDER BY first_seen_unix DESC LIMIT 50",
     },
     Example {
         question: "Is this host actually being monitored?",
-        sql: "SELECT probe, attached, events_emitted, kernel_drops, \
-              datetime(last_event_unix_ms/1000,'unixepoch') AS last_event \
+        sql: "SELECT probe, watching, attached, emitted, parse_failed, kernel_drops, \
+              stopped_reason, datetime(last_event_unix_ms/1000,'unixepoch') AS last_event \
               FROM bowery_probe_status",
     },
     Example {
         question: "Which detections have never fired? (coverage you do not have)",
-        sql: "SELECT rule_id, severity, technique FROM bowery_detections \
-              WHERE fired_since_install = 0 ORDER BY severity DESC",
+        sql: "SELECT rule_id, fired, fired_since_install FROM bowery_detections \
+              WHERE fired_since_install = 0 ORDER BY rule_id",
     },
     Example {
         question: "Who does this host talk to?",
-        sql: "SELECT dst_addr, dst_port, conn_count, \
+        sql: "SELECT addr, port, seen_count, \
               datetime(last_seen_unix,'unixepoch') AS last_seen \
-              FROM bowery_net_destinations ORDER BY conn_count DESC LIMIT 50",
+              FROM bowery_net_destinations ORDER BY seen_count DESC LIMIT 50",
     },
     Example {
         question: "What did this process do? (pivot from an alert's pid)",
@@ -244,13 +244,15 @@ pub const EXAMPLES: &[Example] = &[
     },
     Example {
         question: "What is currently silenced, and why?",
-        sql: "SELECT silence_id, rule_id, exe_path, weight_permille, reason, \
+        sql: "SELECT id, rule_id, exe_path, weight, reason, matched, \
               datetime(expires_unix_ms/1000,'unixepoch') AS expires FROM bowery_silences",
     },
     Example {
         question: "How far back does this host's history actually reach?",
-        sql: "SELECT rows, datetime(oldest_unix_ms/1000,'unixepoch') AS oldest, \
-              datetime(newest_unix_ms/1000,'unixepoch') AS newest FROM bowery_eventlog_status",
+        sql: "SELECT recording, queryable, rows, dropped, \
+              datetime(oldest_ts_unix_ms/1000,'unixepoch') AS oldest, \
+              datetime(newest_ts_unix_ms/1000,'unixepoch') AS newest \
+              FROM bowery_eventlog_status",
     },
     Example {
         question: "What is listening, and who owns it?",
@@ -265,10 +267,10 @@ pub const EXAMPLES: &[Example] = &[
               WHERE exec_start IS NOT NULL AND exec_start <> ''",
     },
     Example {
-        question: "Which running process has no package provenance? (join live to history)",
-        sql: "SELECT p.pid, p.exe_path, b.seen_count FROM processes p \
-              LEFT JOIN bowery_baseline_binaries b ON b.exe_path = p.exe_path \
-              WHERE b.seen_count IS NULL OR b.seen_count <= 2",
+        question: "Which running process is rare on this host? (join live to history)",
+        sql: "SELECT p.pid, p.exe_path, COUNT(e.seq) AS execs FROM processes p \
+              LEFT JOIN bowery_events e ON e.kind = 'exec' AND e.exe_path = p.exe_path \
+              GROUP BY p.pid, p.exe_path HAVING execs <= 2 ORDER BY execs LIMIT 50",
     },
     Example {
         question: "Which accounts have a real shell?",
