@@ -202,6 +202,15 @@ install -m 0644 deploy/systemd/bowery.slice              "$STAGE/bowery.slice"
 install -m 0644 deploy/remote/10-remote-node.conf        "$STAGE/10-remote-node.conf"
 install -m 0644 deploy/remote/agent.toml                 "$STAGE/agent.toml"
 install -m 0755 deploy/remote/install-agent.sh           "$STAGE/install-agent.sh"
+
+# Name the .deb this tarball ships, so the installer does not have to
+# guess. It used to guess with `ls | head -1`, and since `tar` leaves
+# previously-extracted .debs in place, the oldest version won on every
+# upgrade — three deployments in a row installed 0.0.1 over 0.0.1 and
+# reported success.
+printf 'BOWERY_DEB=%s\nBOWERY_VERSION=%s\n' \
+    "$(basename "$DEB")" "$DEB_VERSION" > "$STAGE/manifest.env"
+chmod 0644 "$STAGE/manifest.env"
 install -m 0644 deploy/remote/README.md                  "$STAGE/README.md"
 # Ship the .deb inside the tarball: install-agent.sh prefers it when
 # dpkg is present, which is what stops the agent alerting on its own

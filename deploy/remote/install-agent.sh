@@ -71,7 +71,43 @@ done
 # The tarball path below stays for hosts without dpkg.
 # ---------------------------------------------------------------------------
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEB="$(ls "$SRC_DIR"/bowery-agent_*.deb 2>/dev/null | head -1 || true)"
+
+# Which .deb to install, chosen deliberately rather than alphabetically.
+#
+# `ls bowery-agent_*.deb | head -1` used to pick it, and that silently
+# installed a stale build for three consecutive deployments. `tar xzf`
+# does not remove files the archive lacks, so every previously-shipped
+# .deb stays in the extract directory forever, and `ls` sorts
+# lexicographically: once 0.0.1 was there, it beat 0.2.0 every time.
+# dpkg then dutifully reported "Unpacking bowery-agent (0.0.1) over
+# (0.0.1)" and the service restarted, so the deploy *looked* successful
+# on every host.
+#
+# `manifest.env` records the exact filename the tarball was built with,
+# so the choice is made at package time by something that knows the
+# answer, not guessed at install time.
+DEB=""
+if [[ -f "$SRC_DIR/manifest.env" ]]; then
+    # shellcheck source=/dev/null
+    . "$SRC_DIR/manifest.env"
+    if [[ -n "${BOWERY_DEB:-}" ]]; then
+        DEB="$SRC_DIR/$BOWERY_DEB"
+        [[ -f "$DEB" ]] || die "manifest names $BOWERY_DEB but it is not in $SRC_DIR"
+    fi
+fi
+if [[ -z "$DEB" ]]; then
+    # Older tarball with no manifest. Refuse to guess when there is more
+    # than one candidate: installing the wrong one is worse than not
+    # installing, because it reports success.
+    mapfile -t _debs < <(ls "$SRC_DIR"/bowery-agent_*.deb 2>/dev/null || true)
+    if (( ${#_debs[@]} > 1 )); then
+        printf 'candidates:\n' >&2
+        printf '  %s\n' "${_debs[@]}" >&2
+        die "several .debs in $SRC_DIR and no manifest.env to say which is current;
+     remove the stale ones (or delete $SRC_DIR and re-extract) and re-run"
+    fi
+    DEB="${_debs[0]:-}"
+fi
 if [[ -n "$DEB" && -f "$DEB" ]] && command -v dpkg >/dev/null 2>&1; then
     echo "==> installing $DEB via dpkg"
     was_active=no

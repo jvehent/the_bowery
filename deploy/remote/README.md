@@ -199,6 +199,32 @@ newer than the Pi's. `package-agent.sh` now defaults to a **static musl
 target** (no glibc dependency, runs on any Pi OS version) — re-run it
 and redeploy. `file bowery-agent` should say `statically linked`.
 
+## If a deploy reports success but the version does not change
+
+`tar xzf` does not remove files the archive lacks, so every `.deb` a
+previous tarball shipped stays in the extract directory. `install-agent.sh`
+used to choose with `ls … | head -1`, which sorts lexicographically —
+once `bowery-agent_0.0.1_arm64.deb` was there it beat `0.2.0` on every
+later upgrade, and dpkg reported `Unpacking bowery-agent (0.0.1) over
+(0.0.1)` while the service restarted normally. Three deployments in a
+row installed a stale build and looked fine.
+
+The tarball now ships `manifest.env` naming the exact `.deb` it was
+built with, and the installer uses that. Without a manifest (an older
+tarball) it refuses when there is more than one candidate rather than
+guessing, because installing the wrong one is worse than not installing
+— it reports success.
+
+Check what actually landed:
+
+```bash
+for h in host1 host2; do echo -n "$h "; ssh $h 'bowery-agent --version'; done
+```
+
+Every binary reports `<version>+<commit>`, so this answers the question
+directly. A `-dirty` suffix means the tree had uncommitted changes and
+the named commit does not describe that binary.
+
 ## Upgrading
 
 Re-run steps 2–3. The installer overwrites the binary and reloads
