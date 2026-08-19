@@ -270,6 +270,32 @@ irreversibly.
 - **Not** treating `Incomparable` as mildly suspicious. It is the
   absence of a measurement.
 
+## 5a. Known gap: the mesh verdict and the LLM score do not compose
+
+Several paths append a superseding alert for one episode and the last
+one wins at display time. The whisper round knows what the
+neighbourhood said; the LLM refinement knows what the model said;
+neither waits for the other.
+
+The *verdict* no longer gets lost — the inbox carries a confirmation
+forward onto a later alert that carries none, since an alert that says
+nothing about the mesh is not asserting the mesh said nothing.
+
+The **score** is a different matter and is not solved. A recognition
+downgrade (0.75 → 0.30) is overwritten by an LLM refinement that
+re-scores from the pre-filter, so with the mock backend — which echoes
+the pre-filter — the damp is visible in the log and not in the final
+alert. That is honest but unhelpful: the operator sees 0.75 with a
+"2 of 2 peers recognise this" block attached.
+
+Fixing it properly means deciding how mesh evidence and model judgement
+compose, rather than letting arrival order decide. Options: pass the
+confirmation into the analysis context so the model can weigh it (needs
+`bowery-llm` to know the type); apply the damp to whatever score lands
+last; or make the round the final writer for its episode. None is
+obviously right, which is why it is written down rather than guessed
+at.
+
 ## 6. Open questions
 
 - Does `quorum` stay a count, or become a confidence threshold? A count

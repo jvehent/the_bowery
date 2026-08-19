@@ -61,6 +61,38 @@ impl Appended {
     }
 }
 
+/// Carry a whisper verdict forward onto a later alert for the episode.
+///
+/// An episode produces several alerts and the last one wins at display
+/// time. They are written by different paths that know different
+/// things: the whisper round knows what the neighbourhood said, the LLM
+/// refinement knows what the model said, and neither waits for the
+/// other. Observed on the fleet — a round concluded "2 of 2 peers run
+/// this same program built differently", and the LLM alert landed
+/// afterwards with no confirmation block, so the operator's view showed
+/// the episode with every peer column NULL.
+///
+/// A later alert carrying no confirmation is **not** asserting that the
+/// mesh said nothing. It did not ask. Dropping the verdict on that
+/// basis is the same conflation this whole area keeps producing:
+/// absence of a statement read as a negative statement.
+///
+/// Only ever fills a hole — an alert that carries its own confirmation
+/// keeps it, so a later round can still correct an earlier one.
+fn inherit_confirmation(items: &VecDeque<Alert>, mut alert: Alert) -> Alert {
+    if alert.confirmation.is_some() || alert.episode_id.is_empty() {
+        return alert;
+    }
+    if let Some(prior) = items
+        .iter()
+        .rev()
+        .find(|e| e.episode_id == alert.episode_id && e.confirmation.is_some())
+    {
+        alert.confirmation = prior.confirmation;
+    }
+    alert
+}
+
 /// Bounded ring of [`Alert`]s with TTL retention.
 #[derive(Debug)]
 pub struct AlertInbox {
@@ -142,6 +174,7 @@ impl AlertInbox {
             Err(silence_id) => return Appended::Suppressed { silence_id },
         };
         let mut g = self.inner.lock().expect("inbox poisoned");
+        let alert = inherit_confirmation(&g.items, alert);
         if g.items.len() >= g.capacity {
             g.items.pop_front();
         }
@@ -150,6 +183,7 @@ impl AlertInbox {
     }
 
     /// Damp an alert, or refuse it outright.
+    ///
     ///
     /// `Err(silence_id)` means the damped score fell below the alert
     /// threshold. A damped alert that still clears the bar is kept, and
@@ -275,6 +309,128 @@ fn hex_lower(bytes: &[u8]) -> String {
         let _ = write!(acc, "{b:02x}");
         acc
     })
+}
+
+#[cfg(test)]
+mod inheritance_tests {
+    use bowery_proto::AlertConfirmation;
+
+    use super::*;
+
+    fn alert(episode: &str, suspicion: f32, conf: Option<AlertConfirmation>) -> Alert {
+        Alert {
+            originator_fp: vec![1u8; 32],
+            rule_id: "discovery.recon_burst".into(),
+            episode_id: episode.into(),
+            suspicion,
+            confirmation: conf,
+            // Current time: the inbox sweeps by TTL on read, so an
+            // epoch-1970 fixture is retained by nothing.
+            ts_unix_ms: current_unix_ms(),
+            ..Default::default()
+        }
+    }
+
+    fn familiar_verdict() -> AlertConfirmation {
+        AlertConfirmation {
+            peers_asked: 2,
+            peers_unseen: 0,
+            peers_seen: 0,
+            peers_no_reply: 0,
+            peers_refused: 0,
+            peers_incomparable: 0,
+            peers_familiar: 2,
+            quorum: 2,
+            confirmed: false,
+        }
+    }
+
+    /// The failure this exists for, as it happened on the fleet.
+    ///
+    /// A whisper round concluded "2 of 2 peers run this same program
+    /// built differently" and appended a superseding alert carrying
+    /// that verdict. The LLM refinement alert landed afterwards with no
+    /// confirmation, and because the newest alert per episode is what
+    /// operators see, the whole answer vanished — the SQL view showed
+    /// the episode with every peer column NULL.
+    #[test]
+    fn a_later_alert_does_not_erase_the_whisper_verdict() {
+        let inbox = AlertInbox::new(16, Duration::from_hours(72));
+        assert!(inbox.append(alert("ep-1", 0.75, None)).stored());
+        assert!(
+            inbox
+                .append(alert("ep-1", 0.30, Some(familiar_verdict())))
+                .stored()
+        );
+        // The LLM path: knows nothing about the mesh, says nothing.
+        assert!(inbox.append(alert("ep-1", 0.75, None)).stored());
+
+        let (alerts, _) = inbox.read_since(0, usize::MAX);
+        let newest = alerts.last().expect("three alerts");
+        let c = newest
+            .confirmation
+            .expect("the neighbourhood's answer must survive a later alert");
+        assert_eq!(c.peers_familiar, 2);
+        assert_eq!(c.peers_asked, 2);
+    }
+
+    /// Inheritance fills a hole; it must never overwrite a verdict an
+    /// alert brought with it, or a later round could not correct an
+    /// earlier one.
+    #[test]
+    fn an_alert_with_its_own_verdict_keeps_it() {
+        let inbox = AlertInbox::new(16, Duration::from_hours(72));
+        assert!(
+            inbox
+                .append(alert("ep-1", 0.30, Some(familiar_verdict())))
+                .stored()
+        );
+        let mut corrected = familiar_verdict();
+        corrected.peers_familiar = 0;
+        corrected.peers_unseen = 2;
+        corrected.confirmed = true;
+        assert!(inbox.append(alert("ep-1", 0.9, Some(corrected))).stored());
+
+        let (alerts, _) = inbox.read_since(0, usize::MAX);
+        let c = alerts.last().unwrap().confirmation.unwrap();
+        assert!(
+            c.confirmed,
+            "a later round must be able to correct an earlier one"
+        );
+        assert_eq!(c.peers_familiar, 0);
+    }
+
+    /// Episodes must not borrow each other's verdicts.
+    #[test]
+    fn a_verdict_never_crosses_episodes() {
+        let inbox = AlertInbox::new(16, Duration::from_hours(72));
+        assert!(
+            inbox
+                .append(alert("ep-1", 0.30, Some(familiar_verdict())))
+                .stored()
+        );
+        assert!(inbox.append(alert("ep-2", 0.75, None)).stored());
+
+        let (alerts, _) = inbox.read_since(0, usize::MAX);
+        assert!(
+            alerts.last().unwrap().confirmation.is_none(),
+            "a different episode has no claim on that answer"
+        );
+    }
+
+    /// An empty episode id is not an identity, so it cannot inherit.
+    #[test]
+    fn an_unkeyed_alert_inherits_nothing() {
+        let inbox = AlertInbox::new(16, Duration::from_hours(72));
+        assert!(
+            inbox
+                .append(alert("", 0.30, Some(familiar_verdict())))
+                .stored()
+        );
+        assert!(inbox.append(alert("", 0.75, None)).stored());
+        let (alerts, _) = inbox.read_since(0, usize::MAX);
+        assert!(alerts.last().unwrap().confirmation.is_none());
+    }
 }
 
 #[cfg(test)]
