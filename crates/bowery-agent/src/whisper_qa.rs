@@ -111,6 +111,24 @@ pub enum PeerReply {
     /// Carries the responder's platform so an operator reading the
     /// alert can see *why* it could not speak.
     Incomparable { platform: String },
+    /// Does not have this file, and does have this program.
+    ///
+    /// The answer the round could not previously express. A peer on
+    /// another architecture will never hold the asker's hash, but it
+    /// holds `dash` from package `dash` just the same — measured on the
+    /// reference fleet, three hosts share zero hashes and seven
+    /// packages. Treating that as "never seen it" is what confirmed the
+    /// system shell as an anomaly.
+    ///
+    /// Not a sighting either: the file genuinely differs, and saying so
+    /// keeps "I have this exact binary" distinct from "I have this
+    /// program". Only the first is an identity claim about a file.
+    Familiar {
+        pkg_builds: u32,
+        /// Matched on the path rather than the package — weaker, since
+        /// a path is a location an attacker picks.
+        by_path_only: bool,
+    },
     /// Timed out, failed to dial, or replied unintelligibly.
     Silent,
 }
@@ -121,7 +139,9 @@ impl PeerReply {
     pub fn observed(&self) -> Option<qa::LocalSighting> {
         match self {
             Self::Observed(s) => Some(*s),
-            Self::Refused(_) | Self::Incomparable { .. } | Self::Silent => None,
+            Self::Refused(_) | Self::Incomparable { .. } | Self::Familiar { .. } | Self::Silent => {
+                None
+            }
         }
     }
 }
@@ -190,6 +210,49 @@ pub enum LocalKnowledge {
     /// Too little observed to have an opinion. Carries both measures so
     /// the refusal can say which bound it missed.
     Insufficient { binaries: u64, age: Duration },
+}
+
+/// What this host knows about a program it does not have the file for.
+///
+/// Answered from the descriptor store, which is why slice 2 had to come
+/// first: `binaries` is keyed on the hash and records nothing about
+/// what a hash *was*, so before descriptors existed the only possible
+/// answer to "do you have this program" was the hash comparison that
+/// already failed.
+///
+/// Package before path, and never path alone as an explanation: a path
+/// is a location an attacker chooses, while a package is an identity
+/// the distribution assigned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProgramKnowledge {
+    /// This host has the same package, at some build.
+    pub pkg_match: bool,
+    /// Distinct hashes held for that package.
+    pub pkg_builds: u32,
+    /// This host has something at the same path, at some hash.
+    pub path_match: bool,
+}
+
+/// Look up a program by package, then by path.
+///
+/// Both lookups are indexed and bounded; neither scans the baseline.
+#[must_use]
+pub fn program_knowledge(baseline: &Baseline, pkg: &str, exe_path: &str) -> ProgramKnowledge {
+    let mut out = ProgramKnowledge::default();
+    if !pkg.is_empty()
+        && let Ok(hashes) = baseline.hashes_for_package(pkg, 64)
+        && !hashes.is_empty()
+    {
+        out.pkg_match = true;
+        out.pkg_builds = u32::try_from(hashes.len()).unwrap_or(u32::MAX);
+    }
+    if !exe_path.is_empty()
+        && let Ok(hashes) = baseline.hashes_for_path(exe_path, 8)
+        && !hashes.is_empty()
+    {
+        out.path_match = true;
+    }
+    out
 }
 
 /// Scan the baseline once, answering both "how much have I observed?"
@@ -380,6 +443,37 @@ async fn run_round(
 ) {
     let tier1 = Tier1Fingerprint::derive(&trigger.sha);
     let pre_suspicion = trigger.ctx.pre_verdict.suspicion;
+
+    // What this binary is, from our own descriptor store — the record
+    // slice 2 writes on first sight. Asking peers about the hash alone
+    // is the question that cannot be answered across architectures;
+    // this is what lets them answer "same program, different build".
+    //
+    // Falls back to the exec's path when no descriptor exists yet,
+    // which is the case for a binary whose very first execution
+    // triggered this round.
+    let subject = std::sync::Arc::new({
+        let sha = trigger.sha;
+        let baseline = baseline.clone();
+        let d = tokio::task::spawn_blocking(move || baseline.descriptor(&sha))
+            .await
+            .ok()
+            .and_then(std::result::Result::ok)
+            .flatten();
+        ProgramSubject {
+            pkg: d.as_ref().and_then(|d| d.pkg.clone()).unwrap_or_default(),
+            exe_path: d
+                .and_then(|d| d.exe_path)
+                .or_else(|| {
+                    trigger
+                        .ctx
+                        .exe_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                })
+                .unwrap_or_default(),
+        }
+    });
     debug!(
         episode = %trigger.episode_id,
         suspicion = pre_suspicion,
@@ -499,6 +593,7 @@ async fn run_round(
     let asks = ranked
         .into_iter()
         .map(|(peer, similarity)| {
+            let subject = subject.clone();
             let pool = pool.clone();
             let kn = kn.clone();
             let sealer = sealer.clone();
@@ -506,13 +601,16 @@ async fn run_round(
             let timeout = qa_cfg.timeout;
             async move {
                 let outcome = ask_one(
-                    &pool,
-                    kn,
-                    &sealer,
-                    &envelope_verifier,
+                    AskCtx {
+                        pool: &pool,
+                        kn,
+                        sealer: &sealer,
+                        envelope_verifier: &envelope_verifier,
+                        tier1,
+                        subject: subject.as_ref(),
+                        timeout,
+                    },
                     &peer,
-                    tier1,
-                    timeout,
                 )
                 .await;
                 (peer, similarity, outcome)
@@ -567,6 +665,27 @@ async fn run_round(
             // Failing this direction costs a confirmation that does not
             // happen. Failing the other way is what confirmed
             // /usr/bin/dash 2/2 on a live fleet.
+            // Recognised the program, just not this build. Checked
+            // before comparability, because it is an answer a
+            // cross-architecture peer *can* give — and the only useful
+            // one it has. A peer that says "I have dash too, mine is
+            // aarch64" has told us something; demoting it to
+            // incomparable would throw away the whole point of asking.
+            Ok(answer) if answer.pkg_match || answer.path_match => {
+                debug!(
+                    peer = %peer.fingerprint,
+                    pkg_builds = answer.pkg_builds,
+                    by_path_only = !answer.pkg_match,
+                    "peer has the same program at a different build"
+                );
+                (
+                    PeerReply::Familiar {
+                        pkg_builds: answer.pkg_builds,
+                        by_path_only: !answer.pkg_match,
+                    },
+                    answer.note,
+                )
+            }
             Ok(answer) if !comparable(&asker_platform, &answer.platform) => {
                 debug!(
                     peer = %peer.fingerprint,
@@ -660,12 +779,14 @@ pub fn quorum_verdict(peers: &[PeerSighting], quorum: usize) -> AlertConfirmatio
     let mut no_reply = 0u32;
     let mut refused = 0u32;
     let mut incomparable = 0u32;
+    let mut familiar = 0u32;
     for p in peers {
         match &p.reply {
             PeerReply::Observed(s) if s.seen_count > 0 => seen += 1,
             PeerReply::Observed(_) => unseen += 1,
             PeerReply::Refused(_) => refused += 1,
             PeerReply::Incomparable { .. } => incomparable += 1,
+            PeerReply::Familiar { .. } => familiar += 1,
             PeerReply::Silent => no_reply += 1,
         }
     }
@@ -677,6 +798,7 @@ pub fn quorum_verdict(peers: &[PeerSighting], quorum: usize) -> AlertConfirmatio
         peers_no_reply: no_reply,
         peers_refused: refused,
         peers_incomparable: incomparable,
+        peers_familiar: familiar,
         quorum: quorum_u32,
         // Two gates, and the second one is the fix.
         //
@@ -723,6 +845,13 @@ fn confirmation_rationale(c: &AlertConfirmation) -> String {
             s,
             ", {} could not say (too little observed)",
             c.peers_refused
+        );
+    }
+    if c.peers_familiar > 0 {
+        let _ = write!(
+            s,
+            ", {} have the same program built differently",
+            c.peers_familiar
         );
     }
     if c.peers_incomparable > 0 {
@@ -921,6 +1050,18 @@ pub(crate) fn inject_whisper_context(ctx: &mut AnalysisContext, ctx_in: &Whisper
     }
 }
 
+/// What the asker can say about the binary beyond its hash.
+///
+/// Empty fields are "not known", never "does not exist": the package
+/// index loads asynchronously, and an unpackaged binary legitimately
+/// has no package. A responder treats an empty field as no constraint
+/// rather than as a negative claim.
+#[derive(Debug, Clone, Default)]
+pub struct ProgramSubject {
+    pub pkg: String,
+    pub exe_path: String,
+}
+
 /// First 16 hex chars of a fingerprint — short enough for log lines
 /// and prompt entries, long enough to disambiguate within a fleet.
 fn short_fp(fp: &Fingerprint) -> String {
@@ -928,21 +1069,38 @@ fn short_fp(fp: &Fingerprint) -> String {
     s.chars().take(16).collect()
 }
 
-async fn ask_one(
-    pool: &PeerConnections,
+/// The per-round context every `ask_one` call shares.
+struct AskCtx<'a> {
+    pool: &'a PeerConnections,
     kn: Arc<KnownNeighbors>,
-    sealer: &Sealer,
-    envelope_verifier: &Verifier<Arc<KnownNeighbors>>,
-    peer: &PeerInfo,
+    sealer: &'a Sealer,
+    envelope_verifier: &'a Verifier<Arc<KnownNeighbors>>,
     tier1: Tier1Fingerprint,
+    subject: &'a ProgramSubject,
     timeout: Duration,
-) -> Result<bowery_proto::Answer, AskError> {
+}
+
+async fn ask_one(ctx: AskCtx<'_>, peer: &PeerInfo) -> Result<bowery_proto::Answer, AskError> {
+    let AskCtx {
+        pool,
+        kn,
+        sealer,
+        envelope_verifier,
+        tier1,
+        subject,
+        timeout,
+    } = ctx;
     let dial_verifier = Arc::new(PinnedCertVerifier::expecting(kn, peer.fingerprint));
     let conn = pool
         .get_or_dial(peer.fingerprint, peer.whisper_addr, dial_verifier)
         .await
         .map_err(AskError::Transport)?;
-    let question = qa::build_question(tier1, timeout, "");
+    let mut question = qa::build_question(tier1, timeout, "");
+    // Say what the binary *is*, not only what it hashes to. Without
+    // this a peer can only compare hashes, and across architectures
+    // that comparison has no information in it.
+    question.pkg = subject.pkg.clone();
+    question.exe_path = subject.exe_path.clone();
     let answer = match qa::ask(
         &conn,
         sealer,
@@ -1431,6 +1589,80 @@ mod quorum_tests {
         assert_eq!(v.peers_incomparable, 2);
         assert_eq!(v.peers_unseen, 0, "an incomparable peer is not a denial");
         assert_eq!(v.comparable(), 0, "nothing could be weighed");
+    }
+
+    /// A peer that has the program at another build.
+    fn familiar(b: u8, builds: u32) -> PeerSighting {
+        PeerSighting {
+            peer: fp(b),
+            similarity: 0.9,
+            reply: PeerReply::Familiar {
+                pkg_builds: builds,
+                by_path_only: false,
+            },
+            note: String::new(),
+        }
+    }
+
+    /// The `/usr/bin/dash` case, answered properly rather than merely
+    /// declined.
+    ///
+    /// Slice 1 stopped cross-architecture peers confirming it by
+    /// refusing to count them. That is correct and it throws away what
+    /// they know: measured on the reference fleet, those same three
+    /// hosts share zero binary hashes and seven packages, `dash` among
+    /// them. A peer that says "I have dash too, mine is built for
+    /// aarch64" has answered the question.
+    #[test]
+    fn a_peer_with_the_same_package_is_not_a_denial() {
+        let peers = vec![familiar(1, 1), familiar(2, 1)];
+        let v = quorum_verdict(&peers, 2);
+        assert!(
+            !v.confirmed,
+            "peers that run the same program must not confirm it as unknown"
+        );
+        assert_eq!(v.peers_familiar, 2);
+        assert_eq!(v.peers_unseen, 0, "familiar is not a denial");
+        assert_eq!(v.recognised(), 2, "the fleet recognised this program");
+        assert_eq!(v.comparable(), 2, "and those answers were weighable");
+    }
+
+    /// Familiarity has to break a quorum that denials would otherwise
+    /// reach — otherwise it is decorative.
+    #[test]
+    fn familiarity_denies_a_quorum_the_denials_would_have_met() {
+        let peers = vec![unseen(1), familiar(2, 2)];
+        let v = quorum_verdict(&peers, 2);
+        assert!(
+            !v.confirmed,
+            "one denial and one recognition is not two denials"
+        );
+        assert_eq!(v.peers_unseen, 1);
+        assert_eq!(v.peers_familiar, 1);
+    }
+
+    /// A genuinely unknown binary must still confirm. The point is to
+    /// stop confirming fleet-normal software, not to stop confirming.
+    #[test]
+    fn an_unrecognised_binary_still_confirms() {
+        let peers = vec![unseen(1), unseen(2), familiar(3, 1)];
+        let v = quorum_verdict(&peers, 2);
+        assert!(
+            v.confirmed,
+            "two peers that know nothing of it is still evidence"
+        );
+        assert_eq!(v.peers_unseen, 2);
+        assert_eq!(v.peers_familiar, 1);
+    }
+
+    #[test]
+    fn the_rationale_names_the_familiar_peers() {
+        let v = quorum_verdict(&[unseen(1), unseen(2), familiar(3, 2)], 2);
+        let text = confirmation_rationale(&v);
+        assert!(
+            text.contains("1 have the same program built differently"),
+            "{text}"
+        );
     }
 
     /// Comparable peers still confirm. The gate must remove meaningless

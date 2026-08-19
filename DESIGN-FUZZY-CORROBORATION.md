@@ -1,6 +1,6 @@
 # Fuzzy corroboration — making the neighbourhood watch mean something
 
-**Status:** slices 1–2 implemented; slices 3–6 proposed.
+**Status:** slices 1–3 implemented; slices 4–6 proposed.
 
 ## 1. The finding
 
@@ -213,8 +213,25 @@ irreversibly.
    `DT_NEEDED` — all three need either `/var/lib/dpkg/status` parsing or
    an ELF reader, and neither belongs on the exec path without
    measurement first.
-3. **Evidence-vector answers** for `bin.identity` over the generic
-   corroboration framework, with graded verdicts.
+3. ~~**Evidence-vector answers.**~~ **Done for package + path.** The
+   question now carries `pkg` and `exe_path` alongside the tier-1
+   fingerprint, and the answer carries `pkg_match`, `pkg_builds` and
+   `path_match`. A peer that lacks the file but has the program replies
+   `PeerReply::Familiar`, which is neither a sighting nor a denial and
+   never counts toward a quorum.
+
+   Measured on the reference fleet the day this landed: three hosts
+   share **zero** binary hashes across x86-64/aarch64 and **seven**
+   packages — `bash`, `coreutils`, `dash`, `systemd`, `openssh-server`,
+   `debianutils`, `bowery-agent`. Every one of those was previously
+   unrecognisable to every peer.
+
+   Package before path, and path never explains a finding on its own: a
+   package is an identity the distribution assigned, a path is a
+   location an attacker picks.
+
+   Still on the evidence-vector list: build-id and `DT_NEEDED`, both of
+   which need an ELF reader.
 4. **Retire `whisper_qa.rs`'s exact-match path** once (3) covers it.
 5. **Port the other kinds** to fuzzy dimensions, one per slice.
 6. **Operator surface**: `incomparable` in `bowery_alerts`, the console

@@ -86,7 +86,7 @@ const LATEST_VIEW: &str = "CREATE VIEW IF NOT EXISTS alerts_latest AS
 const SELECT_COLUMNS: &str = "agent_fp, agent_name, episode_id, ts_unix_ms, archived_ms, \
                               rule_id, suspicion, exe_path, exe_sha256, rationale, backend, \
                               confirmed, peers_asked, peers_unseen, peers_seen, \
-                              peers_incomparable, context_json";
+                              peers_incomparable, peers_familiar, context_json";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS alerts (
@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     peers_unseen    INTEGER,
     peers_seen      INTEGER,
     peers_incomparable INTEGER,
+    peers_familiar  INTEGER,
     peers_no_reply  INTEGER,
     peers_refused   INTEGER,
     quorum          INTEGER,
@@ -202,9 +203,9 @@ impl Archive {
                         agent_fp, agent_name, episode_id, ts_unix_ms, archived_ms,
                         rule_id, suspicion, exe_path, exe_sha256, rationale, backend,
                         confirmed, peers_asked, peers_unseen, peers_seen,
-                        peers_no_reply, peers_refused, peers_incomparable, quorum,
-                        context_json, actions_json
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                        peers_no_reply, peers_refused, peers_incomparable, peers_familiar,
+                        quorum, context_json, actions_json
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
                 )
                 .context("preparing archive insert")?;
             for a in alerts {
@@ -229,6 +230,7 @@ impl Archive {
                         c.map(|c| c.peers_no_reply),
                         c.map(|c| c.peers_refused),
                         c.map(|c| c.peers_incomparable),
+                        c.map(|c| c.peers_familiar),
                         c.map(|c| c.quorum),
                         context_json(a),
                         actions_json(a),
@@ -438,6 +440,9 @@ pub struct Row {
     /// from a row archived before the field existed — which is not the
     /// same as zero, and the distinction is the point of the field.
     pub peers_incomparable: Option<u32>,
+    /// Peers that had the same program at a different build. `NULL`
+    /// from a row archived before the field existed.
+    pub peers_familiar: Option<u32>,
     pub context_json: String,
 }
 
@@ -460,7 +465,8 @@ impl Row {
             peers_unseen: opt_u32(r, 13)?,
             peers_seen: opt_u32(r, 14)?,
             peers_incomparable: opt_u32(r, 15)?,
-            context_json: r.get(16)?,
+            peers_familiar: opt_u32(r, 16)?,
+            context_json: r.get(17)?,
         })
     }
 
@@ -495,6 +501,7 @@ impl Row {
                     peers_no_reply: 0,
                     peers_refused: 0,
                     peers_incomparable: self.peers_incomparable.unwrap_or(0),
+                    peers_familiar: self.peers_familiar.unwrap_or(0),
                     quorum: 0,
                     confirmed,
                 }),
@@ -943,6 +950,7 @@ mod tests {
             peers_no_reply: 0,
             peers_refused: 0,
             peers_incomparable: 0,
+            peers_familiar: 0,
             quorum: 2,
             confirmed: true,
         });
@@ -1202,6 +1210,7 @@ mod roundtrip_tests {
                 peers_no_reply: 0,
                 peers_refused: 0,
                 peers_incomparable: 0,
+                peers_familiar: 0,
                 quorum: 2,
                 confirmed: true,
             }),

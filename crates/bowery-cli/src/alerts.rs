@@ -347,6 +347,7 @@ mod json_tests {
         let mut a = base();
         a.confirmation = Some(bowery_proto::AlertConfirmation {
             peers_incomparable: 0,
+            peers_familiar: 0,
             peers_asked: 5,
             peers_unseen: 4,
             peers_seen: 1,

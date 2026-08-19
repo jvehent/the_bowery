@@ -284,6 +284,10 @@ impl Tally {
             // §3.3. Reporting a fabricated non-zero here would be worse
             // than reporting none.
             peers_incomparable: 0,
+            // Same reasoning as `peers_incomparable`: "same program,
+            // different build" is a question about binaries, and these
+            // kinds ask about paths and endpoints.
+            peers_familiar: 0,
             quorum: u32::try_from(rule.deny_quorum).unwrap_or(u32::MAX),
             confirmed,
         }

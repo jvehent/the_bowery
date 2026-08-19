@@ -495,6 +495,10 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
                     ),
                     // Said differently from "not confirmed" on purpose:
                     // no peer could compare, so nothing was checked.
+                    Some(c) if c.peers_familiar > 0 && c.peers_unseen == 0 => format!(
+                        "  (known program: {}/{} peers have it built differently)",
+                        c.peers_familiar, c.peers_asked
+                    ),
                     Some(c) if c.comparable() == 0 && c.peers_incomparable > 0 => format!(
                         "  (NOT CHECKED: {}/{} peers run a different platform)",
                         c.peers_incomparable, c.peers_asked
@@ -704,6 +708,17 @@ fn confirmation_badge(a: &Alert) -> String {
             format!(
                 "CONFIRMED — {}/{} peers have no record of this binary",
                 c.peers_unseen, c.peers_asked
+            ),
+        )
+    } else if c.peers_familiar > 0 && c.peers_unseen == 0 {
+        // Green: the neighbourhood explained the finding rather than
+        // failing to check it.
+        (
+            "#e6f4ea",
+            "#137333",
+            format!(
+                "KNOWN PROGRAM — {}/{} peers run this same program, built differently",
+                c.peers_familiar, c.peers_asked
             ),
         )
     } else if c.comparable() == 0 && c.peers_incomparable > 0 {
@@ -1488,6 +1503,7 @@ mod tests {
                 peers_no_reply: 0,
                 peers_refused: 0,
                 peers_incomparable: 0,
+                peers_familiar: 0,
                 quorum: 2,
                 confirmed: true,
             }),
@@ -1745,6 +1761,7 @@ mod tests {
             peers_no_reply: 1,
             peers_refused: 0,
             peers_incomparable: 0,
+            peers_familiar: 0,
             quorum: 2,
             confirmed: false,
         });
@@ -1844,6 +1861,7 @@ password_file = "/dev/null"
             peers_no_reply: 0,
             peers_refused: 0,
             peers_incomparable: 2,
+            peers_familiar: 0,
             quorum: 2,
             confirmed: false,
         });

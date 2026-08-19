@@ -208,6 +208,7 @@ mod tests {
                 peers_no_reply: 0,
                 peers_refused: 0,
                 peers_incomparable: 0,
+                peers_familiar: 0,
                 quorum: 2,
                 confirmed: true,
             })

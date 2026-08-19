@@ -324,9 +324,17 @@ async fn respond_to_question(
     fp_bytes.copy_from_slice(&question.tier1_fp);
     let target = Tier1Fingerprint::from_bytes(fp_bytes);
 
-    let baseline = baseline.clone();
+    let baseline_for_scan = baseline.clone();
+    // The program lookup runs alongside the hash scan in the same
+    // blocking hop: two indexed reads, no extra round trip, and the
+    // answer needs both to distinguish "I do not have that program"
+    // from "I have it, built differently".
+    let pkg = question.pkg.clone();
+    let asked_path = question.exe_path.clone();
     let knowledge = match tokio::task::spawn_blocking(move || {
-        crate::whisper_qa::local_knowledge(&baseline, target, coverage_bar)
+        let k = crate::whisper_qa::local_knowledge(&baseline_for_scan, target, coverage_bar);
+        let p = crate::whisper_qa::program_knowledge(&baseline_for_scan, &pkg, &asked_path);
+        (k, p)
     })
     .await
     {
@@ -340,6 +348,7 @@ async fn respond_to_question(
     // Refusing is the whole point of the coverage check: a host that has
     // observed nothing must not answer "never seen it", because a quorum
     // of those is what confirms an alert on the asker.
+    let (knowledge, program) = knowledge;
     let answer = match knowledge {
         crate::whisper_qa::LocalKnowledge::Observed(sighting) => bowery_proto::Answer {
             episode_id: question.episode_id,
@@ -350,6 +359,9 @@ async fn respond_to_question(
             note: String::new(),
             refused: String::new(),
             platform: bowery_proto::platform_key(),
+            pkg_match: program.pkg_match,
+            pkg_builds: program.pkg_builds,
+            path_match: program.path_match,
         },
         crate::whisper_qa::LocalKnowledge::Insufficient { binaries, age } => {
             debug!(

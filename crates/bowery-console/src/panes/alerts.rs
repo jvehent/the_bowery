@@ -410,6 +410,12 @@ impl AlertsPane {
             lines.push(Line::from(Span::styled(
                 if c.confirmed {
                     "neighbourhood: CONFIRMED"
+                } else if c.peers_familiar > 0 && c.peers_unseen == 0 {
+                    // The fleet recognised the program. Different from
+                    // "not confirmed", which reads as an absence of
+                    // evidence rather than the presence of an
+                    // explanation.
+                    "neighbourhood: KNOWN PROGRAM (different build)"
                 } else if c.comparable() == 0 && c.peers_incomparable > 0 {
                     // Not a verdict. Every peer that answered runs a
                     // different platform, so none of them could have
@@ -446,6 +452,14 @@ impl AlertsPane {
             // question needs it to mean. Shown even at zero when the
             // round found nothing comparable, because "0 of 0 peers had
             // a record" is the reading that has to be prevented.
+            // The most useful thing a mixed fleet can say, so it is
+            // shown before the negative buckets.
+            if c.peers_familiar > 0 {
+                lines.push(kv(
+                    "  same prog",
+                    format!("{} (different build)", c.peers_familiar),
+                ));
+            }
             if c.peers_incomparable > 0 {
                 lines.push(kv(
                     "  can't cmp",
@@ -703,6 +717,7 @@ mod render_tests {
                 peers_no_reply: 0,
                 peers_refused: 0,
                 peers_incomparable: 0,
+                peers_familiar: 0,
                 quorum: 2,
                 confirmed,
             }),

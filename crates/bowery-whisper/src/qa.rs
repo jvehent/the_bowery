@@ -114,6 +114,10 @@ pub fn build_question(fp: Tier1Fingerprint, ttl: Duration, note: impl Into<Strin
         ttl_ms: ttl_deadline_ms(ttl_ms),
         note: note.into(),
         asker_platform: bowery_proto::platform_key(),
+        // Filled in by the caller when it knows what the binary is;
+        // `build_question` deals only in fingerprints.
+        pkg: String::new(),
+        exe_path: String::new(),
     }
 }
 
@@ -297,6 +301,11 @@ where
             note: note.to_string(),
             refused: String::new(),
             platform: bowery_proto::platform_key(),
+            // This responder path answers from a caller-supplied hash
+            // lookup only; the agent's own responder fills these in.
+            pkg_match: false,
+            pkg_builds: 0,
+            path_match: false,
         },
         LocalAnswer::Refused(reason) => Answer {
             episode_id: question.episode_id.clone(),

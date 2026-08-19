@@ -351,6 +351,29 @@ pub struct Question {
     /// Empty from peers built before this field existed.
     #[prost(string, tag = "5")]
     pub asker_platform: String,
+
+    /// Owning package of the binary in question, if the asker knows it.
+    ///
+    /// The dimension that survives an architecture boundary. Measured
+    /// on the reference fleet: three hosts share **zero** binary hashes
+    /// across x86-64/aarch64 and seven packages — `bash`, `coreutils`,
+    /// `dash`, `systemd`, `openssh-server` among them. Asking only
+    /// about the hash makes every one of those look unknown to every
+    /// peer; asking about the package makes them recognisable.
+    ///
+    /// Empty when unpackaged or not yet resolved, which is not a claim
+    /// that no package owns it.
+    #[prost(string, tag = "6")]
+    pub pkg: String,
+
+    /// Resolved path of the binary, as a weaker fallback when there is
+    /// no package — most of `/usr/local` and every build output.
+    ///
+    /// Discloses more than a truncated hash, and deliberately so: peers
+    /// are pinned and authenticated, and the `file.access`
+    /// corroboration path already sends real paths between them.
+    #[prost(string, tag = "7")]
+    pub exe_path: String,
 }
 
 /// Phase-5 whisper answer to a [`Question`]. Echoes the asker's
@@ -427,6 +450,32 @@ pub struct Answer {
     /// than an alert that is not raised.
     #[prost(string, tag = "8")]
     pub platform: String,
+
+    /// The responder has the asker's package, at some build.
+    ///
+    /// The answer the protocol could not previously express: *"I do not
+    /// have that file, and I do have that program."* Reported alongside
+    /// a zero `seen_count` rather than folded into it, because they are
+    /// different facts — one is about a file, the other about software
+    /// — and a quorum is built from the first.
+    #[prost(bool, tag = "9")]
+    pub pkg_match: bool,
+
+    /// Distinct hashes the responder holds for that package.
+    ///
+    /// More than one is normal and informative: it means the fleet
+    /// legitimately runs several builds of the same program, which is
+    /// the situation that made hash-equality useless here.
+    #[prost(uint32, tag = "10")]
+    pub pkg_builds: u32,
+
+    /// The responder has something at the asker's path, at some hash.
+    ///
+    /// Weaker than [`Self::pkg_match`] and kept separate: a path is a
+    /// location, not an identity, and an attacker chooses where to
+    /// write. Never sufficient on its own to explain a finding away.
+    #[prost(bool, tag = "11")]
+    pub path_match: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -599,6 +648,18 @@ pub struct AlertConfirmation {
     /// clean".
     #[prost(uint32, tag = "8")]
     pub peers_incomparable: u32,
+
+    /// Peers that do not have this exact file but do have the same
+    /// program — the same package, at a different build.
+    ///
+    /// Not a denial, and not a sighting. The neighbourhood is saying
+    /// *"we all run that, ours is just built differently"*, which is
+    /// the most useful thing it can say about a cross-architecture
+    /// fleet and the one this protocol had no way to express. Kept out
+    /// of `peers_unseen` because counting it there is what confirmed
+    /// `/usr/bin/dash` on three hosts that all ship `dash`.
+    #[prost(uint32, tag = "9")]
+    pub peers_familiar: u32,
 }
 
 /// `arch/os` for this build, e.g. `x86_64/linux`.
@@ -619,7 +680,18 @@ impl AlertConfirmation {
     /// can compare confirms everything, which is what shipped.
     #[must_use]
     pub fn comparable(&self) -> u32 {
-        self.peers_unseen.saturating_add(self.peers_seen)
+        self.peers_unseen
+            .saturating_add(self.peers_seen)
+            .saturating_add(self.peers_familiar)
+    }
+
+    /// Peers that recognised the program, by file or by package.
+    ///
+    /// What an operator reads to decide whether a finding is fleet-
+    /// normal software they had simply never hashed before.
+    #[must_use]
+    pub fn recognised(&self) -> u32 {
+        self.peers_seen.saturating_add(self.peers_familiar)
     }
 }
 
@@ -1778,6 +1850,8 @@ mod tests {
     fn question_roundtrip() {
         let q = Question {
             asker_platform: "x86_64/linux".into(),
+            pkg: "coreutils".into(),
+            exe_path: "/usr/bin/ls".into(),
             episode_id: vec![0xab; 16],
             tier1_fp: vec![0xcd; 8],
             ttl_ms: 60_000,
@@ -1796,6 +1870,9 @@ mod tests {
     fn answer_roundtrip() {
         let a = Answer {
             platform: "x86_64/linux".into(),
+            pkg_match: true,
+            pkg_builds: 2,
+            path_match: true,
             episode_id: vec![0xab; 16],
             tier1_fp: vec![0xcd; 8],
             seen_count: 3,
@@ -1828,6 +1905,7 @@ mod tests {
             backend: "mock/echo".into(),
             confirmation: Some(AlertConfirmation {
                 peers_incomparable: 0,
+                peers_familiar: 0,
                 peers_asked: 5,
                 peers_unseen: 4,
                 peers_seen: 1,
