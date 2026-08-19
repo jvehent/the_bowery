@@ -61,6 +61,40 @@ impl Appended {
     }
 }
 
+/// Lower a score the neighbourhood explained.
+///
+/// Recognition — peers holding the same program at a different build —
+/// is evidence that the *program* is fleet-normal. It is not evidence
+/// that this copy is intact, which is provenance's job, so the damp is
+/// proportional to how much of the neighbourhood recognised it and
+/// never reaches zero. A binary planted at a path a package owns is
+/// exactly the `PackagedModified` case, and prevalence must not talk
+/// over provenance.
+///
+/// Idempotent: the note it appends is also the marker that it has
+/// already run, because an alert can pass through here once as itself
+/// and again as an inherited verdict on a later write.
+fn damp_for_recognition(mut alert: Alert) -> Alert {
+    const MARKER: &str = "the neighbourhood recognises this program";
+    let Some(c) = alert.confirmation else {
+        return alert;
+    };
+    if c.confirmed || c.peers_familiar == 0 || alert.rationale.contains(MARKER) {
+        return alert;
+    }
+    let fraction = f32::from(u16::try_from(c.peers_familiar).unwrap_or(u16::MAX))
+        / f32::from(u16::try_from(c.peers_asked.max(1)).unwrap_or(u16::MAX));
+    let from = alert.suspicion;
+    alert.suspicion = from * (1.0 - 0.6 * fraction.clamp(0.0, 1.0));
+    alert.rationale = format!(
+        "{} | {MARKER}: {} of {} peers run it built differently, so {from:.2} was lowered \
+         to {:.2}. Their copies are not this copy — provenance, not prevalence, says \
+         whether this one was tampered with.",
+        alert.rationale, c.peers_familiar, c.peers_asked, alert.suspicion
+    );
+    alert
+}
+
 /// Carry a whisper verdict forward onto a later alert for the episode.
 ///
 /// An episode produces several alerts and the last one wins at display
@@ -175,6 +209,17 @@ impl AlertInbox {
         };
         let mut g = self.inner.lock().expect("inbox poisoned");
         let alert = inherit_confirmation(&g.items, alert);
+        // Applied here, after inheritance, so it reaches *every* writer
+        // for the episode rather than only the round that discovered
+        // it. Several paths append a superseding alert and the last one
+        // wins at display time; before this, a recognition downgrade
+        // was silently undone by an LLM refinement that re-scored from
+        // the pre-filter and knew nothing about the mesh.
+        //
+        // Rescoring at append is not new here — `apply_silences` above
+        // already does it, for the same reason: this is the one place
+        // every alert passes through.
+        let alert = damp_for_recognition(alert);
         if g.items.len() >= g.capacity {
             g.items.pop_front();
         }
@@ -372,6 +417,85 @@ mod inheritance_tests {
             .expect("the neighbourhood's answer must survive a later alert");
         assert_eq!(c.peers_familiar, 2);
         assert_eq!(c.peers_asked, 2);
+    }
+
+    /// The gap DESIGN-FUZZY-CORROBORATION.md §5a recorded: the verdict
+    /// survived a later alert, and the *score* did not.
+    ///
+    /// Several paths append for one episode and the last wins. The LLM
+    /// refinement re-scores from the pre-filter and knows nothing about
+    /// the mesh, so on the fleet the operator saw 0.75 with a "2 of 2
+    /// peers recognise this" block attached — evidence present, number
+    /// contradicting it. Damping at the inbox reaches every writer.
+    #[test]
+    fn recognition_lowers_the_score_for_a_later_writer_too() {
+        let inbox = AlertInbox::new(16, Duration::from_hours(72));
+        assert!(inbox.append(alert("ep-1", 0.75, None)).stored());
+        assert!(
+            inbox
+                .append(alert("ep-1", 0.75, Some(familiar_verdict())))
+                .stored()
+        );
+        // The LLM path: re-scores from the pre-filter, says nothing
+        // about the mesh.
+        assert!(inbox.append(alert("ep-1", 0.75, None)).stored());
+
+        let (alerts, _) = inbox.read_since(0, usize::MAX);
+        let newest = alerts.last().unwrap();
+        assert!(
+            newest.suspicion < 0.75,
+            "an unanimously recognised program must not still read 0.75, got {}",
+            newest.suspicion
+        );
+        assert!(
+            newest.suspicion > 0.0,
+            "and must not be zeroed: their copies are not this copy"
+        );
+        assert!(
+            newest.rationale.contains("recognises this program"),
+            "the damp has to explain itself: {}",
+            newest.rationale
+        );
+    }
+
+    /// Damping must be applied once, however many times an alert passes
+    /// through — it is written by one path and inherited by the next.
+    #[test]
+    fn the_damp_is_not_applied_twice() {
+        let inbox = AlertInbox::new(16, Duration::from_hours(72));
+        assert!(
+            inbox
+                .append(alert("ep-1", 0.75, Some(familiar_verdict())))
+                .stored()
+        );
+        let once = inbox.read_since(0, usize::MAX).0[0].suspicion;
+
+        // Re-append the already-damped alert, as an inheriting writer
+        // would produce.
+        let mut again = alert("ep-1", once, Some(familiar_verdict()));
+        again.rationale = inbox.read_since(0, usize::MAX).0[0].rationale.clone();
+        assert!(inbox.append(again).stored());
+        let twice = inbox.read_since(0, usize::MAX).0.last().unwrap().suspicion;
+        assert!(
+            (twice - once).abs() < 1e-6,
+            "damping twice compounds into a suppression nobody asked for: {once} -> {twice}"
+        );
+    }
+
+    /// A confirmed alert is the opposite finding and must not be damped.
+    #[test]
+    fn a_confirmed_alert_is_never_damped() {
+        let inbox = AlertInbox::new(16, Duration::from_hours(72));
+        let mut c = familiar_verdict();
+        c.peers_familiar = 0;
+        c.peers_unseen = 2;
+        c.confirmed = true;
+        assert!(inbox.append(alert("ep-1", 0.9, Some(c))).stored());
+        let stored = inbox.read_since(0, usize::MAX).0[0].suspicion;
+        assert!(
+            (stored - 0.9).abs() < 1e-6,
+            "a quorum-confirmed alert must keep its score, got {stored}"
+        );
     }
 
     /// Inheritance fills a hole; it must never overwrite a verdict an

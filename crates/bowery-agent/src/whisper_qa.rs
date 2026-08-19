@@ -945,18 +945,17 @@ fn append_recognition_alert(
     if verdict.confirmed || verdict.peers_familiar == 0 || pre_suspicion < confirm.alert_threshold {
         return;
     }
-    let explained = explained_suspicion(pre_suspicion, verdict);
+    // Built at the *undamped* score: the inbox lowers it, uniformly for
+    // every writer on this episode, so the round must not do it twice.
     let alert = crate::alert_builder::AlertBuilder::new(
         confirm.originator_fp,
         &confirm.backend_label,
         leading_rule_id(&ctx.pre_verdict),
         context.episode_id.clone(),
-        explained,
+        pre_suspicion,
         format!(
             "{} of {} peers asked run this same program built differently, so it is \
-             fleet-normal software rather than something only this host has. Their copies \
-             are not this copy: provenance, not prevalence, is what says whether this one \
-             was tampered with.",
+             fleet-normal software rather than something only this host has.",
             verdict.peers_familiar, verdict.peers_asked
         ),
     )
@@ -974,14 +973,14 @@ fn append_recognition_alert(
         familiar = verdict.peers_familiar,
         asked = verdict.peers_asked,
         from = pre_suspicion,
-        to = explained,
+        to = explained_suspicion(pre_suspicion, verdict),
         "the neighbourhood recognises this program; superseding with a lower score"
     );
     let appended = confirm.inbox.append(alert);
     if appended.stored() {
         let _ = events_tx.send(AgentEvent::AlertEmitted {
             episode_id: context.episode_id.clone(),
-            suspicion: explained,
+            suspicion: explained_suspicion(pre_suspicion, verdict),
         });
     }
 }

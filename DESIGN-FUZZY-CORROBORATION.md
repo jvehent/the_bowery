@@ -270,31 +270,36 @@ irreversibly.
 - **Not** treating `Incomparable` as mildly suspicious. It is the
   absence of a measurement.
 
-## 5a. Known gap: the mesh verdict and the LLM score do not compose
+## 5a. Where mesh evidence is applied
 
 Several paths append a superseding alert for one episode and the last
 one wins at display time. The whisper round knows what the
 neighbourhood said; the LLM refinement knows what the model said;
-neither waits for the other.
+neither waits for the other. Arrival order decided the outcome, which
+meant a recognition downgrade was silently undone by a refinement that
+re-scored from the pre-filter.
 
-The *verdict* no longer gets lost — the inbox carries a confirmation
-forward onto a later alert that carries none, since an alert that says
-nothing about the mesh is not asserting the mesh said nothing.
+Both halves are now applied at the **inbox**, the one place every alert
+passes through:
 
-The **score** is a different matter and is not solved. A recognition
-downgrade (0.75 → 0.30) is overwritten by an LLM refinement that
-re-scores from the pre-filter, so with the mock backend — which echoes
-the pre-filter — the damp is visible in the log and not in the final
-alert. That is honest but unhelpful: the operator sees 0.75 with a
-"2 of 2 peers recognise this" block attached.
+- The verdict is carried forward onto a later alert that has none. An
+  alert saying nothing about the mesh is not asserting the mesh said
+  nothing — it did not ask.
+- The score is damped there too, so it reaches every writer for the
+  episode rather than only the round that discovered the recognition.
 
-Fixing it properly means deciding how mesh evidence and model judgement
-compose, rather than letting arrival order decide. Options: pass the
-confirmation into the analysis context so the model can weigh it (needs
-`bowery-llm` to know the type); apply the damp to whatever score lands
-last; or make the round the final writer for its episode. None is
-obviously right, which is why it is written down rather than guessed
-at.
+Rescoring at append is not novel here: silences already work this way,
+for the same reason.
+
+The damp is idempotent — an alert passes through once as itself and
+again as an inherited verdict, and compounding turns a 0.75 into 0.12,
+which is a suppression nobody asked for. The explanatory note is also
+the marker that it has already run.
+
+What remains open is whether the *model* should see the mesh verdict
+and weigh it directly, rather than having the damp applied around it.
+That needs `bowery-llm` to know the type, and it is a genuine question
+about where judgement belongs rather than a missing patch.
 
 ## 6. Open questions
 
