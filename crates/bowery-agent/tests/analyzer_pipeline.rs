@@ -408,3 +408,139 @@ async fn a_binary_already_in_the_baseline_still_gets_described() {
 
     agent.shutdown().await.expect("shutdown");
 }
+
+/// A privilege transition through an exec-in-place set-id helper must
+/// not alert — and the same transition without one must.
+///
+/// `pkexec` does not fork. It execs its target inside the same pid, so
+/// at the moment of the transition the parent is whatever launched
+/// pkexec (not set-id) and the current binary is the target (not
+/// set-id). Observed on a live host:
+///
+///   pid 563558  uid 1000  /usr/bin/pkexec
+///   pid 563558  uid 0     /usr/bin/dash
+///
+/// The helper is only visible as the pid's own previous exec. Both
+/// halves are asserted here because the exemption is only worth having
+/// if the rule still fires without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exec_in_place_setid_helper_explains_a_root_transition() {
+    // A real packaged setuid-root helper on this host. Without one the
+    // exemption cannot be exercised, and passing would mean nothing.
+    let helper = ["/usr/bin/pkexec", "/usr/bin/sudo", "/bin/su", "/usr/bin/su"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| {
+            p.is_file()
+                && bowery_analysis::provenance::setid_bits(p).is_some_and(|(setuid, _)| setuid)
+        });
+    let Some(helper) = helper else {
+        eprintln!("no packaged setuid-root helper here; skipping");
+        return;
+    };
+
+    // The transition target: root, not set-id, parented by this test
+    // process (which is not root).
+    let target = PathBuf::from("/usr/bin/env");
+    if !target.is_file() {
+        eprintln!("no /usr/bin/env here; skipping");
+        return;
+    }
+    let ppid = std::process::id();
+    let subject_pid = 999_001;
+
+    let root_exec = |exe: &PathBuf, uid: u32| {
+        Event::ProcessExec(ProcessExec {
+            pid: subject_pid,
+            ppid,
+            parent_comm: "update-notifier".into(),
+            uid,
+            comm: "victim".into(),
+            exe_path: Some(exe.clone()),
+            args: vec!["victim".into()],
+            ts: SystemTime::now(),
+        })
+    };
+
+    // Run 1: helper first, then the transition. The exemption applies.
+    let exempted =
+        uid_transition_alerts(vec![root_exec(&helper, 1000), root_exec(&target, 0)]).await;
+
+    // Run 2: the same transition with no helper before it. Must alert,
+    // or run 1 proves nothing.
+    let bare = uid_transition_alerts(vec![root_exec(&target, 0)]).await;
+
+    assert!(
+        bare > 0,
+        "a root transition with no set-id helper anywhere must still alert, \
+         otherwise the exemption below is untested"
+    );
+    assert_eq!(
+        exempted,
+        0,
+        "a transition whose pid exec'd {} immediately before came through the \
+         sanctioned path and must not alert",
+        helper.display()
+    );
+}
+
+/// Drive the pipeline over `events` and count uid-transition alerts.
+async fn uid_transition_alerts(events: Vec<Event>) -> usize {
+    let workdir = TempDir::new().unwrap();
+    let (source, gate) = MockEventSource::new(events).gated();
+    let identity = Arc::new(Identity::generate());
+    let cfg = build_config(
+        workdir.path(),
+        reserve_udp_port(),
+        Duration::from_millis(200),
+    );
+    let agent = Agent::start(cfg, identity, Box::new(source))
+        .await
+        .expect("start");
+
+    let mut rx = agent.subscribe();
+    // Wait for the real precondition, not a guessed interval. The
+    // package index loads on a background task — seconds on a large
+    // host — and until it lands every classification is Unknown, which
+    // silently disables every exemption anchored on packaging. Sleeping
+    // a fixed amount here would be the same flake shape this suite
+    // already had once.
+    let ready_by = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !agent.provenance_ready() {
+        assert!(
+            tokio::time::Instant::now() < ready_by,
+            "package index never loaded; the exemption cannot be tested without it"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    gate.open();
+
+    // Drain until the pipeline goes quiet, counting uid-transition
+    // hits. Draining rather than waiting for one: the exempted run is
+    // supposed to produce none, so "wait until a hit arrives" would
+    // hang on exactly the case under test.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut analysed = 0usize;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left.min(Duration::from_millis(1200)), rx.recv()).await {
+            Ok(Ok(AgentEvent::EpisodeAnalyzed { verdict })) => {
+                if verdict
+                    .rule_hits
+                    .iter()
+                    .any(|h| h.rule_id.starts_with("privesc.uid_transition"))
+                {
+                    analysed += 1;
+                }
+            }
+            Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
+            // Quiet, or the channel closed: everything has been seen.
+            Ok(Err(RecvError::Closed)) | Err(tokio::time::error::Elapsed { .. }) => break,
+        }
+    }
+    agent.shutdown().await.expect("shutdown");
+    analysed
+}

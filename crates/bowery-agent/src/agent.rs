@@ -196,6 +196,12 @@ pub struct Agent {
     fingerprint: Fingerprint,
     known_neighbors: Arc<KnownNeighbors>,
     baseline: Arc<Baseline>,
+    /// Kept so callers can tell whether provenance answers are
+    /// meaningful yet. The index loads on a background task — seconds
+    /// on a large host — and until it lands every classification is
+    /// `Unknown`, which silently disables every exemption anchored on
+    /// packaging.
+    packages: Arc<bowery_analysis::provenance::ProvenanceCache>,
     analyzer: Arc<Analyzer>,
     endpoint: BoweryEndpoint,
     mesh: Arc<Mesh>,
@@ -1033,7 +1039,7 @@ impl Agent {
             )),
             baseline: baseline.clone(),
             analyzer: analyzer.clone(),
-            packages,
+            packages: packages.clone(),
             eventlog: eventlog_handle.clone(),
             eventlog_store: eventlog_store.clone(),
             inbox: inbox.clone(),
@@ -1155,6 +1161,7 @@ impl Agent {
             fingerprint,
             known_neighbors,
             baseline,
+            packages,
             analyzer,
             endpoint,
             mesh,
@@ -1209,6 +1216,17 @@ impl Agent {
 
     pub fn baseline(&self) -> &Arc<Baseline> {
         &self.baseline
+    }
+
+    /// Has the package index finished loading?
+    ///
+    /// Until it has, `classify` answers `Unknown` for everything, so
+    /// any rule exempting a *packaged* binary cannot fire its exemption
+    /// — including the set-id privilege helpers. Exposed so a test can
+    /// wait for the real precondition instead of sleeping and hoping.
+    #[must_use]
+    pub fn provenance_ready(&self) -> bool {
+        self.packages.is_ready()
     }
 
     pub fn analyzer(&self) -> &Arc<Analyzer> {
