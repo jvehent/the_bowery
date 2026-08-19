@@ -1179,7 +1179,14 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
             // a timer.
             match self_exec_privilege_helper(ctx, &exec).await {
                 Some(check) => check,
-                None => parent_privilege_helper(exec.ppid, &ctx.packages).await,
+                None => {
+                    parent_privilege_helper(
+                        exec.ppid,
+                        &ctx.packages,
+                        ctx.procs.exe_at(exec.ppid, exec.ts),
+                    )
+                    .await
+                }
             }
         } else {
             crate::agent::HelperCheck::Helper

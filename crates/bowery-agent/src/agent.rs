@@ -2067,8 +2067,21 @@ impl HelperCheck {
 pub(crate) async fn parent_privilege_helper(
     ppid: u32,
     packages: &Arc<bowery_analysis::provenance::ProvenanceCache>,
+    remembered: Option<std::path::PathBuf>,
 ) -> HelperCheck {
-    let Some(exe) = bowery_events::enrich::pid_exe_path(ppid) else {
+    // `/proc/<ppid>/exe` first, then the agent's own record of what that
+    // pid exec'd.
+    //
+    // The race is not rare. Once the exec-in-place shape was exempted,
+    // *every* remaining fire of this rule on the reference fleet was
+    // `ParentGone` — four in forty-three minutes — because a short-lived
+    // `sudo` exits between the uid read that decides this check is worth
+    // making and the exe read it depends on. The agent watched that
+    // parent exec; racing /proc for something it already knows is what
+    // turned a sanctioned escalation into an alert.
+    //
+    // Same idiom the file-open attribution path already uses.
+    let Some(exe) = bowery_events::enrich::pid_exe_path(ppid).or(remembered) else {
         return HelperCheck::ParentGone;
     };
     let Some((setuid, _)) = bowery_analysis::provenance::setid_bits(&exe) else {
@@ -2809,6 +2822,102 @@ pub(crate) async fn send_silence_report(
     };
     let outbound = sealer.seal_for(operator, &WhisperPayload::operator_result(response));
     conn.send_envelope(&outbound).await
+}
+
+#[cfg(test)]
+mod remembered_parent_tests {
+    use super::*;
+
+    /// A pid `/proc` will not answer for.
+    const GONE: u32 = 4_194_300;
+
+    fn a_real_helper() -> Option<std::path::PathBuf> {
+        ["/usr/bin/sudo", "/usr/bin/pkexec", "/bin/su", "/usr/bin/su"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| {
+                p.is_file()
+                    && bowery_analysis::provenance::setid_bits(p).is_some_and(|(setuid, _)| setuid)
+            })
+    }
+
+    fn loaded_packages() -> Option<Arc<bowery_analysis::provenance::ProvenanceCache>> {
+        let cache = Arc::new(bowery_analysis::provenance::ProvenanceCache::new(
+            bowery_analysis::provenance::PackageIndex::load_system(),
+        ));
+        cache.is_ready().then_some(cache)
+    }
+
+    /// The race this fallback exists for.
+    ///
+    /// `sudo` forks, the child execs as root, and `sudo` can exit
+    /// between the uid read that decides this check is worth making and
+    /// the `/proc/<ppid>/exe` read it depends on. Once the
+    /// exec-in-place shape was exempted, *every* remaining fire of
+    /// `privesc.uid_transition_no_helper` on the reference fleet was
+    /// `ParentGone` — four in forty-three minutes.
+    ///
+    /// Driven directly rather than through the pipeline, because the
+    /// condition cannot be fabricated there: a pid `/proc` cannot answer
+    /// for has no readable uid either, and the rule needs one before it
+    /// reaches this check. Here the two inputs vary independently.
+    #[tokio::test]
+    async fn a_remembered_parent_exec_survives_a_lost_race_with_proc() {
+        let (Some(helper), Some(packages)) = (a_real_helper(), loaded_packages()) else {
+            eprintln!("no packaged setuid-root helper or package database here; skipping");
+            return;
+        };
+        assert!(
+            bowery_events::enrich::pid_exe_path(GONE).is_none(),
+            "precondition: /proc must not answer for {GONE}"
+        );
+
+        let raced = parent_privilege_helper(GONE, &packages, None).await;
+        assert!(
+            matches!(raced, HelperCheck::ParentGone),
+            "an unidentifiable parent must report exactly that, got {raced:?}"
+        );
+        assert!(!raced.is_helper(), "and must never be read as an exemption");
+
+        let remembered = parent_privilege_helper(GONE, &packages, Some(helper.clone())).await;
+        assert!(
+            remembered.is_helper(),
+            "the agent watched {} exec as this parent; losing a race with /proc must not \
+             manufacture an escalation, got {remembered:?}",
+            helper.display()
+        );
+    }
+
+    /// The fallback must not become a way to vouch for anything.
+    #[tokio::test]
+    async fn a_remembered_parent_that_granted_nothing_still_declines() {
+        let Some(packages) = loaded_packages() else {
+            eprintln!("no package database here; skipping");
+            return;
+        };
+        let plain = std::path::PathBuf::from("/usr/bin/env");
+        if !plain.is_file() {
+            eprintln!("no /usr/bin/env here; skipping");
+            return;
+        }
+        let check = parent_privilege_helper(GONE, &packages, Some(plain)).await;
+        assert!(
+            matches!(check, HelperCheck::NotSetuid { .. }),
+            "a remembered parent that is not setuid granted nothing, got {check:?}"
+        );
+
+        // A binary merely *called* sudo is the finding, not the
+        // exemption — the same anchoring on provenance the parent check
+        // already uses.
+        let dir = tempfile::tempdir().unwrap();
+        let impostor = dir.path().join("sudo");
+        std::fs::write(&impostor, b"not really sudo").unwrap();
+        let check = parent_privilege_helper(GONE, &packages, Some(impostor)).await;
+        assert!(
+            !check.is_helper(),
+            "an unpackaged parent must not exempt: {check:?}"
+        );
+    }
 }
 
 #[cfg(test)]
