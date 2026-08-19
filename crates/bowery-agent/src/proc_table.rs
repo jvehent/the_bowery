@@ -57,9 +57,17 @@ use std::time::{Duration, SystemTime};
 pub const DEFAULT_TTL: Duration = Duration::from_mins(5);
 
 /// Recent execs, so an exited process can still be named.
+/// What a pid has exec'd: its current binary, and the one before it.
+#[derive(Debug, Clone)]
+struct Entry {
+    current: (PathBuf, SystemTime),
+    /// The exec immediately before `current`, when there was one.
+    previous: Option<(PathBuf, SystemTime)>,
+}
+
 #[derive(Debug)]
 pub struct ProcTable {
-    inner: Mutex<HashMap<u32, (PathBuf, SystemTime)>>,
+    inner: Mutex<HashMap<u32, Entry>>,
     ttl: Duration,
     max_tracked: usize,
 }
@@ -93,7 +101,44 @@ impl ProcTable {
             // miss alerts rather than exempting.
             guard.clear();
         }
-        guard.insert(pid, (exe.to_path_buf(), ts));
+        // Keep one step of history. A pid can exec more than once, and
+        // the *previous* exec is what explains a privilege transition
+        // that happened in place: `pkexec` does not fork, so
+        //
+        //     pid 563558  uid 1000  /usr/bin/pkexec   <- setuid helper
+        //     pid 563558  uid 0     /usr/bin/dash     <- the transition
+        //
+        // is one process. Looking at the parent finds `update-notifier`,
+        // which is not a helper, and looking at the current exe finds
+        // `dash`, which is not setuid. The helper is only visible here.
+        let previous = guard.get(&pid).map(|e| e.current.clone());
+        guard.insert(
+            pid,
+            Entry {
+                current: (exe.to_path_buf(), ts),
+                previous,
+            },
+        );
+    }
+
+    /// The binary this pid ran *before* its current one, if we saw both.
+    ///
+    /// Deliberately one deep. Two consecutive execs is the shape of an
+    /// exec-in-place privilege helper; a longer chain is not something
+    /// this exists to reconstruct, and keeping more would turn a lookup
+    /// table into a history store.
+    #[must_use]
+    pub fn previous_exe(&self, pid: u32, at: SystemTime) -> Option<PathBuf> {
+        let guard = self.inner.lock().ok()?;
+        let entry = guard.get(&pid)?;
+        let (exe, ts) = entry.previous.as_ref()?;
+        if *ts > at {
+            return None;
+        }
+        if at.duration_since(*ts).ok()? > self.ttl {
+            return None;
+        }
+        Some(exe.clone())
     }
 
     /// The binary `pid` was running at `at`, if we saw it exec.
@@ -106,7 +151,7 @@ impl ProcTable {
     #[must_use]
     pub fn exe_at(&self, pid: u32, at: SystemTime) -> Option<PathBuf> {
         let guard = self.inner.lock().ok()?;
-        let (exe, ts) = guard.get(&pid)?;
+        let (exe, ts) = &guard.get(&pid)?.current;
         if *ts > at {
             return None;
         }
@@ -211,5 +256,83 @@ mod tests {
             t.record(pid, Path::new("/bin/sh"), at(1000));
         }
         assert!(t.len() <= 8192);
+    }
+}
+
+#[cfg(test)]
+mod previous_exec_tests {
+    use super::*;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// The `pkexec` shape, which is why this exists.
+    ///
+    /// Observed on a live host:
+    ///
+    ///   pid 563558  uid 1000  /usr/bin/pkexec
+    ///   pid 563558  uid 0     /usr/bin/dash
+    ///
+    /// One process. The parent is `update-notifier` (not set-id) and the
+    /// current binary is `dash` (not set-id), so the only place the
+    /// set-id helper is visible is the previous exec of this same pid.
+    #[test]
+    fn the_previous_exec_of_a_pid_is_recoverable() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record(563_558, Path::new("/usr/bin/pkexec"), at(1000));
+        t.record(563_558, Path::new("/usr/bin/dash"), at(1001));
+
+        assert_eq!(
+            t.exe_at(563_558, at(1002)).as_deref(),
+            Some(Path::new("/usr/bin/dash")),
+            "the current exe is still the current exe"
+        );
+        assert_eq!(
+            t.previous_exe(563_558, at(1002)).as_deref(),
+            Some(Path::new("/usr/bin/pkexec")),
+            "and the helper that granted the privilege is recoverable"
+        );
+    }
+
+    #[test]
+    fn a_pid_that_exec_d_once_has_no_previous() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record(4242, Path::new("/usr/bin/dash"), at(1000));
+        assert!(t.previous_exe(4242, at(1001)).is_none());
+        assert!(t.previous_exe(9999, at(1001)).is_none(), "unknown pid");
+    }
+
+    /// Only one step. A longer chain is not what this reconstructs, and
+    /// keeping more would turn a lookup table into a history store.
+    #[test]
+    fn only_one_step_of_history_is_kept() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record(4242, Path::new("/usr/bin/first"), at(1000));
+        t.record(4242, Path::new("/usr/bin/pkexec"), at(1001));
+        t.record(4242, Path::new("/usr/bin/dash"), at(1002));
+        assert_eq!(
+            t.previous_exe(4242, at(1003)).as_deref(),
+            Some(Path::new("/usr/bin/pkexec"))
+        );
+    }
+
+    /// The TTL and the not-yet-happened guard apply here too: a stale
+    /// record must not vouch for a privilege transition, and neither
+    /// must one from the future after a pid was reused.
+    #[test]
+    fn a_stale_or_future_previous_exec_explains_nothing() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record(4242, Path::new("/usr/bin/pkexec"), at(1000));
+        t.record(4242, Path::new("/usr/bin/dash"), at(1001));
+
+        assert!(
+            t.previous_exe(4242, at(1000 + 600)).is_none(),
+            "past the TTL it must not vouch for anything"
+        );
+        assert!(
+            t.previous_exe(4242, at(999)).is_none(),
+            "an exec that had not happened yet cannot have granted privilege"
+        );
     }
 }

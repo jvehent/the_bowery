@@ -2002,6 +2002,10 @@ async fn send_heartbeat(
 /// declined, so the cause could only be guessed at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HelperCheck {
+    /// The privilege came through a set-id helper this same pid ran
+    /// immediately before — `pkexec`, which execs in place rather than
+    /// forking.
+    SelfExecHelper { exe: String },
     /// The parent is a packaged, unmodified setuid helper. Exempt.
     Helper,
     /// `/proc/<ppid>/exe` could not be read — almost always because the
@@ -2019,14 +2023,14 @@ pub(crate) enum HelperCheck {
 
 impl HelperCheck {
     pub(crate) fn is_helper(&self) -> bool {
-        matches!(self, Self::Helper)
+        matches!(self, Self::Helper | Self::SelfExecHelper { .. })
     }
 
     /// One clause for the alert rationale, so a reader can tell an
     /// escalation from a lost race.
     pub(crate) fn why(&self) -> String {
         match self {
-            Self::Helper => String::new(),
+            Self::Helper | Self::SelfExecHelper { .. } => String::new(),
             Self::ParentGone => " The parent had already exited when this was checked, so \
                  whether it was a sanctioned helper could not be established — a short-lived \
                  `sudo` running a fast command looks exactly like this."

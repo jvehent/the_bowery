@@ -101,6 +101,12 @@ pub fn uid_transition(
     // The other shape: executing a setuid-root binary the distribution
     // ships. Kept for a direct exec of such a helper that does reach
     // this point.
+    //
+    // A third shape exists and is not visible from here: `pkexec` execs
+    // its target *in place*, so the set-id helper is neither the parent
+    // nor the current binary but the pid's own previous exec. The agent
+    // resolves that before calling in and reports it through
+    // `parent_is_privilege_helper`; see `self_exec_privilege_helper`.
     if exe_is_setuid && provenance == Provenance::PackagedIntact {
         return None;
     }

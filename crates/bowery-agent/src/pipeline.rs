@@ -227,6 +227,34 @@ async fn process_event(ctx: &PipelineContext, event: Event) {
 /// rule names is exempt, on the same two-condition footing as the
 /// credential readers.
 ///
+/// Did this pid become root by exec'ing a set-id helper in place?
+///
+/// `Some` only when the previous exec of this same pid was a packaged,
+/// unmodified set-id-root binary — the `pkexec` shape. `None` means
+/// "this does not apply", leaving the parent check to answer, and never
+/// "this is suspicious": an unknown previous exec is not evidence.
+async fn self_exec_privilege_helper(
+    ctx: &PipelineContext,
+    exec: &bowery_events::ProcessExec,
+) -> Option<crate::agent::HelperCheck> {
+    let previous = ctx.procs.previous_exe(exec.pid, exec.ts)?;
+    let (setuid, _) = bowery_analysis::provenance::setid_bits(&previous)?;
+    if !setuid {
+        return None;
+    }
+    let packages = ctx.packages.clone();
+    tokio::task::spawn_blocking(move || {
+        let shown = previous.display().to_string();
+        let sha = bowery_events::enrich::sha256_file(&previous).ok()?;
+        let provenance = packages.classify(&previous, &sha);
+        bowery_analysis::provenance::is_privilege_helper(true, provenance)
+            .then_some(crate::agent::HelperCheck::SelfExecHelper { exe: shown })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// What this host can say about the binary it just recorded.
 ///
 /// Deliberately cheap: a `stat`, a map lookup, and two compile-time
@@ -1135,7 +1163,24 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
         // half runs only where an alert was otherwise about to be
         // raised.
         let helper = if parent_uid.is_some_and(|u| u != 0) {
-            parent_privilege_helper(exec.ppid, &ctx.packages).await
+            // Two sanctioned shapes, and the second was missing.
+            //
+            // `sudo` forks, so the helper is the parent. `pkexec` execs
+            // in place, so the helper is *this pid's previous exec* and
+            // neither the parent nor the current binary is set-id:
+            //
+            //   pid 563558  uid 1000  /usr/bin/pkexec  <- the helper
+            //   pid 563558  uid 0     /usr/bin/dash    <- the transition
+            //
+            // The parent there is `update-notifier`, which is not set-id,
+            // so the rule fired. On this fleet that shape accounts for a
+            // large share of `privesc.uid_transition_no_helper` — 206
+            // fires in a fortnight, and Ubuntu's update-notifier runs on
+            // a timer.
+            match self_exec_privilege_helper(ctx, &exec).await {
+                Some(check) => check,
+                None => parent_privilege_helper(exec.ppid, &ctx.packages).await,
+            }
         } else {
             crate::agent::HelperCheck::Helper
         };
