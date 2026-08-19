@@ -147,7 +147,7 @@ responder declare which dimensions it can speak to. Then:
 | claim kind | fuzzy question |
 |---|---|
 | `bin.identity` (new; replaces the tier-1 Q&A) | same program, any build? |
-| `file.access` (exists) | does *your* copy of this software touch this path? — currently exact-path |
+| `file.access` (exists) | does *your* copy of this software touch this path? — **done**: the claim carries the owning package, and a responder also checks the paths it holds that package at |
 | `net.destination` | does anyone reach this ASN/domain, not just this IP? |
 | `lineage.pair` | does this parent→child shape occur anywhere, by program identity rather than hash? |
 | `persist.unit` | does an equivalent unit/cron entry exist elsewhere? |

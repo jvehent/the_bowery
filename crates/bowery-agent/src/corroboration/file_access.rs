@@ -55,6 +55,18 @@ pub const ATTR_PATH: &str = "path";
 /// having seen the other.
 pub const ATTR_ACCESS: &str = "access";
 
+/// Owning package of the accessing binary, when the asker knows it.
+///
+/// Lets a responder recognise *the same program* installed somewhere
+/// else. Matching the exe path exactly asks "does your copy, at exactly
+/// my path, touch this file", and two hosts running the same daemon
+/// from different prefixes answer no to a question they could have
+/// answered yes to.
+///
+/// Empty means unpackaged or not yet resolved — never a claim that no
+/// package owns it.
+pub const ATTR_PKG: &str = "pkg";
+
 /// Longest history a peer may be asked to search.
 ///
 /// Wider than the connection kind's ten minutes because the question is
@@ -87,8 +99,10 @@ const FANOUT: usize = 3;
 /// about a binary neither can name, and asking anyway would collect
 /// agreement about the empty string.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // a claim is a wide record by nature
 pub fn claim_for(
     exe: Option<&str>,
+    pkg: Option<&str>,
     path: &str,
     is_read: bool,
     episode_id: String,
@@ -110,6 +124,7 @@ pub fn claim_for(
         kind: KIND,
         subject: vec![
             Attribute::new(ATTR_EXE, exe.to_string()),
+            Attribute::new(ATTR_PKG, pkg.unwrap_or_default().to_string()),
             Attribute::new(ATTR_PATH, path.to_string()),
             Attribute::new(ATTR_ACCESS, access.to_string()),
         ],
@@ -141,16 +156,48 @@ pub fn claim_for(
 // Responder side
 // ---------------------------------------------------------------------------
 
+/// Every path this host has run the given package from.
+///
+/// Bounded, and empty when nothing is known — an empty list means
+/// "match the exact path only", never "this host has no such program".
+fn paths_for_package(baseline: &bowery_baseline::Baseline, pkg: &str) -> Vec<String> {
+    let Ok(hashes) = baseline.hashes_for_package(pkg, 32) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = hashes
+        .iter()
+        .filter_map(|sha| baseline.descriptor(sha).ok().flatten())
+        .filter_map(|d| d.exe_path)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Answers `file.access` from this host's own file-open history.
 #[derive(Debug)]
 pub struct FileAccessResponder {
     log: Arc<bowery_eventlog::EventLog>,
+    /// This host's own record of what it has run, used to find the
+    /// paths it holds the asker's *package* at.
+    baseline: Option<Arc<bowery_baseline::Baseline>>,
 }
 
 impl FileAccessResponder {
     #[must_use]
     pub fn new(log: Arc<bowery_eventlog::EventLog>) -> Self {
-        Self { log }
+        Self {
+            log,
+            baseline: None,
+        }
+    }
+
+    /// Answer about the same program installed elsewhere, not only the
+    /// same path.
+    #[must_use]
+    pub fn with_baseline(mut self, baseline: Arc<bowery_baseline::Baseline>) -> Self {
+        self.baseline = Some(baseline);
+        self
     }
 }
 
@@ -200,6 +247,21 @@ impl super::CorroborationResponder for FileAccessResponder {
             .window_start_unix_ms
             .max(end.saturating_sub(MAX_WINDOW_MS));
 
+        // Where else this host holds the asker's package. Resolved from
+        // the descriptor store, which records what a hash *was* — the
+        // reason slice 2 had to come before any of this.
+        let pkg = attribute(&query.subject, ATTR_PKG).unwrap_or_default();
+        let also: Vec<String> = match (&self.baseline, pkg.is_empty()) {
+            (Some(baseline), false) => {
+                let baseline = baseline.clone();
+                let pkg = pkg.to_string();
+                tokio::task::spawn_blocking(move || paths_for_package(&baseline, &pkg))
+                    .await
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+
         let log = self.log.clone();
         let exe_owned = exe.to_string();
         let path_owned = path.to_string();
@@ -222,7 +284,8 @@ impl super::CorroborationResponder for FileAccessResponder {
             if !log.covers_since(start).unwrap_or(false) {
                 return None;
             }
-            log.file_access_evidence(&exe_owned, &path_owned, is_read, start, end)
+            let also: Vec<&str> = also.iter().map(String::as_str).collect();
+            log.file_access_evidence(&exe_owned, &also, &path_owned, is_read, start, end)
                 .ok()
         })
         .await;
@@ -259,6 +322,7 @@ mod tests {
     fn claim() -> Option<Claim> {
         claim_for(
             Some("/usr/sbin/sshd"),
+            Some("openssh-server"),
             "/etc/shadow",
             true,
             "file-cred.read_shadow-1".into(),
@@ -311,6 +375,7 @@ mod tests {
         assert!(
             claim_for(
                 None,
+                Some("openssh-server"),
                 "/etc/shadow",
                 true,
                 "ep".into(),
@@ -323,6 +388,7 @@ mod tests {
         assert!(
             claim_for(
                 Some(""),
+                Some("openssh-server"),
                 "/etc/shadow",
                 true,
                 "ep".into(),
@@ -344,6 +410,7 @@ mod tests {
         assert_eq!(a.dedup_key, b.dedup_key);
         let other = claim_for(
             Some("/usr/sbin/sshd"),
+            Some("openssh-server"),
             "/etc/shadow",
             false,
             "ep".into(),

@@ -497,6 +497,9 @@ impl EventLog {
     pub fn file_access_evidence(
         &self,
         exe: &str,
+        // Other paths this host holds the same program at, tried after
+        // the exact one. Empty means "exact match only".
+        also_exe: &[&str],
         path: &str,
         is_read: bool,
         window_start_unix_ms: u64,
@@ -507,16 +510,33 @@ impl EventLog {
         let start = i64::try_from(window_start_unix_ms).unwrap_or(0);
         let end = i64::try_from(window_end_unix_ms).unwrap_or(i64::MAX);
 
-        let seen: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM events
-                 WHERE kind = ?1 AND exe_path = ?2 AND path = ?3 AND file_op = ?4
-                   AND ts_unix_ms BETWEEN ?5 AND ?6
-                 LIMIT 1",
-                params![KIND_FILE_ACCESS, exe, path, op, start, end],
-                |row| row.get(0),
-            )
-            .optional()?;
+        // Exact exe path first, then any of `also_exe` — the other
+        // paths this host has for the *same program*.
+        //
+        // Matching only the exact path asks "does your copy of this
+        // software, installed exactly where mine is, touch this file".
+        // Two hosts running the same daemon from different prefixes, or
+        // one where the binary moved between releases, answer no to a
+        // question they could have answered yes to. The asker supplies
+        // the alternatives; this side does not guess.
+        let mut candidates: Vec<&str> = vec![exe];
+        candidates.extend(also_exe.iter().copied());
+        let mut seen: Option<i64> = None;
+        for candidate in &candidates {
+            seen = conn
+                .query_row(
+                    "SELECT 1 FROM events
+                     WHERE kind = ?1 AND exe_path = ?2 AND path = ?3 AND file_op = ?4
+                       AND ts_unix_ms BETWEEN ?5 AND ?6
+                     LIMIT 1",
+                    params![KIND_FILE_ACCESS, candidate, path, op, start, end],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if seen.is_some() {
+                break;
+            }
+        }
         if seen.is_some() {
             return Ok(AccessEvidence::Seen);
         }
@@ -1196,7 +1216,7 @@ mod correlation_tests {
         );
         let (s, e) = window();
         assert_eq!(
-            log.file_access_evidence("/usr/sbin/sshd", "/etc/shadow", true, s, e)
+            log.file_access_evidence("/usr/sbin/sshd", &[], "/etc/shadow", true, s, e)
                 .unwrap(),
             AccessEvidence::Seen
         );
@@ -1227,10 +1247,79 @@ mod correlation_tests {
         .unwrap();
         let (s, e) = window();
         assert_eq!(
-            log.file_access_evidence("/usr/sbin/sshd", "/etc/shadow", true, s, e)
+            log.file_access_evidence("/usr/sbin/sshd", &[], "/etc/shadow", true, s, e)
                 .unwrap(),
             AccessEvidence::CannotAttribute,
             "silence from a host that cannot attribute is not evidence"
+        );
+    }
+
+    /// The same program installed somewhere else must still count.
+    ///
+    /// Matching only the exact exe path asks "does your copy, at
+    /// exactly my path, touch this file". Two hosts running the same
+    /// daemon from different prefixes answer no to a question they
+    /// could have answered yes to — the same shape as comparing binary
+    /// hashes across architectures, one level down.
+    #[test]
+    fn an_alternative_path_for_the_same_program_corroborates() {
+        let log = EventLog::open_in_memory().unwrap();
+        record_access(
+            &log,
+            "/usr/local/sbin/sshd",
+            "/etc/shadow",
+            true,
+            SystemTime::now(),
+        );
+        let (s, e) = window();
+
+        assert_eq!(
+            log.file_access_evidence("/usr/sbin/sshd", &[], "/etc/shadow", true, s, e)
+                .unwrap(),
+            AccessEvidence::NotSeen,
+            "exact-path matching cannot see the other prefix"
+        );
+        assert_eq!(
+            log.file_access_evidence(
+                "/usr/sbin/sshd",
+                &["/usr/local/sbin/sshd"],
+                "/etc/shadow",
+                true,
+                s,
+                e
+            )
+            .unwrap(),
+            AccessEvidence::Seen,
+            "the same program at another path is still the same program"
+        );
+    }
+
+    /// The alternatives widen nothing else: a different file, or the
+    /// other access direction, must still not match.
+    #[test]
+    fn alternative_paths_do_not_widen_the_question() {
+        let log = EventLog::open_in_memory().unwrap();
+        record_access(
+            &log,
+            "/usr/local/sbin/sshd",
+            "/etc/shadow",
+            true,
+            SystemTime::now(),
+        );
+        let (s, e) = window();
+        let also = ["/usr/local/sbin/sshd"];
+
+        assert_eq!(
+            log.file_access_evidence("/usr/sbin/sshd", &also, "/etc/gshadow", true, s, e)
+                .unwrap(),
+            AccessEvidence::NotSeen,
+            "a different file must not corroborate"
+        );
+        assert_eq!(
+            log.file_access_evidence("/usr/sbin/sshd", &also, "/etc/shadow", false, s, e)
+                .unwrap(),
+            AccessEvidence::NotSeen,
+            "a write must not be answered with a read"
         );
     }
 
@@ -1248,7 +1337,7 @@ mod correlation_tests {
         );
         let (s, e) = window();
         assert_eq!(
-            log.file_access_evidence("/usr/sbin/sshd", "/etc/shadow", true, s, e)
+            log.file_access_evidence("/usr/sbin/sshd", &[], "/etc/shadow", true, s, e)
                 .unwrap(),
             AccessEvidence::NotSeen
         );
@@ -1267,7 +1356,7 @@ mod correlation_tests {
         );
         let (s, e) = window();
         assert_eq!(
-            log.file_access_evidence("/usr/sbin/sshd", "/etc/shadow", false, s, e)
+            log.file_access_evidence("/usr/sbin/sshd", &[], "/etc/shadow", false, s, e)
                 .unwrap(),
             AccessEvidence::NotSeen
         );
@@ -1288,7 +1377,7 @@ mod correlation_tests {
         );
         let (s, e) = window();
         assert_eq!(
-            log.file_access_evidence("/tmp/harvest", "/etc/shadow", true, s, e)
+            log.file_access_evidence("/tmp/harvest", &[], "/etc/shadow", true, s, e)
                 .unwrap(),
             AccessEvidence::NotSeen
         );

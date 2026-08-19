@@ -822,6 +822,13 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
     if let Some(claims) = ctx.claims.as_ref()
         && let Some(claim) = crate::corroboration::file_access::claim_for(
             exe_str.as_deref(),
+            // What program this is, so a peer can recognise its own
+            // copy wherever that copy lives.
+            exe_str
+                .as_deref()
+                .map(std::path::Path::new)
+                .and_then(|p| ctx.packages.package_for(p))
+                .as_deref(),
             &path,
             open.sensitive_read,
             episode_id,

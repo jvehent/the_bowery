@@ -667,7 +667,8 @@ impl Agent {
             // file here" is only evidence from a host whose history
             // covers the window.
             responders = responders.with(Arc::new(
-                crate::corroboration::file_access::FileAccessResponder::new(log.clone()),
+                crate::corroboration::file_access::FileAccessResponder::new(log.clone())
+                    .with_baseline(baseline.clone()),
             ));
         }
         let responders = Arc::new(responders);
