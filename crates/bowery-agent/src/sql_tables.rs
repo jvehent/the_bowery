@@ -1119,6 +1119,86 @@ impl BoweryTable for BoweryRevocationsTable {
 }
 
 // ---------------------------------------------------------------------------
+// bowery_corroboration_status — why the mesh rounds produced nothing.
+// ---------------------------------------------------------------------------
+
+/// `bowery_corroboration_status` — one row per claim kind.
+///
+/// `bowery_detections` reports how often each rule fired, and for the
+/// corroboration kinds the answer is usually zero. Zero is ambiguous in
+/// the way this codebase keeps paying for: nothing suspicious happened,
+/// or every claim was discarded before anyone was asked.
+///
+/// Measured over six hours on the reference fleet: 87 claims raised for
+/// `net.inbound_connect`, 87 dropped because the connecting host was a
+/// workstation no mesh peer can answer for, and a detection count of
+/// `0`. The engine was working perfectly and had nothing it could ask,
+/// and there was no way to tell that from a quiet network.
+///
+/// The same role `bowery_probe_status` plays for the sensors.
+#[derive(Debug)]
+pub struct BoweryCorroborationStatusTable {
+    stats: Option<Arc<crate::corroboration::stats::CorroborationStats>>,
+}
+
+impl BoweryCorroborationStatusTable {
+    #[must_use]
+    pub fn new(stats: Option<Arc<crate::corroboration::stats::CorroborationStats>>) -> Self {
+        Self { stats }
+    }
+}
+
+impl BoweryTable for BoweryCorroborationStatusTable {
+    fn name(&self) -> &'static str {
+        "bowery_corroboration_status"
+    }
+
+    fn register(&self, conn: &Connection) -> Result<(), TableError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bowery_corroboration_status (
+                kind         TEXT,
+                raised       INTEGER,
+                -- Dropped because no pinned peer could speak to it. On a
+                -- host whose inbound connections come from outside the
+                -- mesh this is nearly all of them, and it is not a fault.
+                no_audience  INTEGER,
+                deduped      INTEGER,
+                shed         INTEGER,
+                rounds       INTEGER,
+                corroborated INTEGER,
+                denied       INTEGER,
+                refused      INTEGER,
+                no_reply     INTEGER
+            );",
+        )?;
+        let Some(stats) = self.stats.as_ref() else {
+            return Ok(());
+        };
+        let mut stmt = conn.prepare(
+            "INSERT INTO bowery_corroboration_status
+                (kind, raised, no_audience, deduped, shed, rounds,
+                 corroborated, denied, refused, no_reply)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?;
+        for (kind, c) in stats.snapshot() {
+            let _ = stmt.execute(params![
+                kind,
+                i64::try_from(c.raised).unwrap_or(i64::MAX),
+                i64::try_from(c.no_audience).unwrap_or(i64::MAX),
+                i64::try_from(c.deduped).unwrap_or(i64::MAX),
+                i64::try_from(c.shed).unwrap_or(i64::MAX),
+                i64::try_from(c.rounds).unwrap_or(i64::MAX),
+                i64::try_from(c.corroborated).unwrap_or(i64::MAX),
+                i64::try_from(c.denied).unwrap_or(i64::MAX),
+                i64::try_from(c.refused).unwrap_or(i64::MAX),
+                i64::try_from(c.no_reply).unwrap_or(i64::MAX),
+            ]);
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bowery_events — the append-only local history.
 // ---------------------------------------------------------------------------
 
@@ -1346,6 +1426,78 @@ impl BoweryTable for BoweryEventLogStatusTable {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod corroboration_status_tests {
+    use super::*;
+    use crate::corroboration::stats::CorroborationStats;
+
+    fn query(table: &BoweryCorroborationStatusTable, sql: &str) -> Vec<Vec<String>> {
+        let conn = Connection::open_in_memory().expect("sqlite");
+        table
+            .register(&conn)
+            .expect("register must bind every column");
+        let mut stmt = conn.prepare(sql).expect("prepare");
+        let n = stmt.column_count();
+        stmt.query_map([], |r| {
+            (0..n)
+                .map(|i| {
+                    r.get::<_, rusqlite::types::Value>(i)
+                        .map(|v| format!("{v:?}"))
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .expect("query")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("rows")
+    }
+
+    /// The shape seen on the fleet, made answerable.
+    ///
+    /// 87 claims raised for `net.inbound_connect`, 87 dropped for want
+    /// of anyone to ask, and `bowery_detections` reading 0. Without
+    /// this view an operator cannot tell that from a quiet network.
+    #[test]
+    fn a_starved_kind_is_distinguishable_from_a_quiet_one() {
+        let stats = Arc::new(CorroborationStats::new());
+        for _ in 0..87 {
+            stats.raised("net.inbound_connect");
+            stats.no_audience("net.inbound_connect");
+        }
+        stats.raised("file.access");
+        stats.round("file.access", 1, 0, 0, 2);
+
+        let table = BoweryCorroborationStatusTable::new(Some(stats));
+        let rows = query(
+            &table,
+            "SELECT kind, raised, no_audience, rounds FROM bowery_corroboration_status \
+             ORDER BY kind",
+        );
+        assert_eq!(rows.len(), 2, "one row per kind");
+        assert!(rows[0][0].contains("file.access"), "{rows:?}");
+        assert!(
+            rows[0][3].contains('1'),
+            "file.access ran a round: {rows:?}"
+        );
+        assert!(rows[1][0].contains("net.inbound_connect"), "{rows:?}");
+        assert!(rows[1][1].contains("87"), "raised: {rows:?}");
+        assert!(rows[1][2].contains("87"), "no_audience: {rows:?}");
+        assert!(
+            rows[1][3].contains('0'),
+            "and no round was ever run: {rows:?}"
+        );
+    }
+
+    /// An agent with corroboration disabled has no counters, and an
+    /// empty table is the honest rendering — not zeros, which would
+    /// claim the engine ran and found nothing.
+    #[test]
+    fn an_engine_that_never_started_reports_no_rows() {
+        let table = BoweryCorroborationStatusTable::new(None);
+        let rows = query(&table, "SELECT kind FROM bowery_corroboration_status");
+        assert!(rows.is_empty());
     }
 }
 

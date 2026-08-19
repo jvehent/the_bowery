@@ -50,6 +50,7 @@
 
 pub mod file_access;
 pub mod net_inbound;
+pub mod stats;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -326,6 +327,9 @@ pub struct RoundOutcome {
 pub struct ClaimSink {
     tx: mpsc::Sender<Claim>,
     shed: Arc<AtomicU64>,
+    /// Per-kind outcomes, so an operator can tell "nothing suspicious"
+    /// from "nothing askable".
+    stats: Arc<stats::CorroborationStats>,
 }
 
 impl std::fmt::Debug for ClaimSink {
@@ -339,9 +343,12 @@ impl std::fmt::Debug for ClaimSink {
 impl ClaimSink {
     /// Offer a claim. Never blocks; returns `false` if it was shed.
     pub fn raise(&self, claim: Claim) -> bool {
+        let kind = claim.kind;
+        self.stats.raised(kind);
         match self.tx.try_send(claim) {
             Ok(()) => true,
             Err(e) => {
+                self.stats.shed(kind);
                 let n = self.shed.fetch_add(1, Ordering::Relaxed) + 1;
                 // Every drop, not every Nth: this counter is how an
                 // operator finds out the mesh is the bottleneck.
@@ -349,6 +356,12 @@ impl ClaimSink {
                 false
             }
         }
+    }
+
+    /// Per-kind claim outcomes.
+    #[must_use]
+    pub fn stats(&self) -> Arc<stats::CorroborationStats> {
+        self.stats.clone()
     }
 
     /// Claims dropped because the queue was full.
@@ -487,6 +500,10 @@ pub struct CorroborationContext {
     pub backend_label: String,
     pub config: CorroborationConfig,
     pub events_tx: broadcast::Sender<AgentEvent>,
+    /// Per-kind claim outcomes. Filled by `spawn`; detectors never set
+    /// it, and the sink hands back the same handle so the SQL surface
+    /// and the engine cannot diverge.
+    pub stats: Arc<stats::CorroborationStats>,
 }
 
 /// Start the engine. Returns the sink detectors publish to, plus the
@@ -496,9 +513,11 @@ pub fn spawn(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> (ClaimSink, JoinHandle<()>) {
     let (tx, mut claims) = mpsc::channel::<Claim>(ctx.config.queue_capacity.max(1));
+    let stats = ctx.stats.clone();
     let sink = ClaimSink {
         tx,
         shed: Arc::new(AtomicU64::new(0)),
+        stats: stats.clone(),
     };
 
     let task = tokio::spawn(async move {
@@ -544,6 +563,7 @@ pub fn spawn(
                         resolve_audience(&claim.audience, &peers, local_fp, &is_pinned)
                     };
                     if targets.is_empty() {
+                        stats.no_audience(claim.kind);
                         debug!(
                             kind = claim.kind,
                             dedup_key = %claim.dedup_key,
@@ -553,6 +573,7 @@ pub fn spawn(
                     }
 
                     if !seen.check_and_record(claim.kind, &claim.dedup_key) {
+                        stats.deduped(claim.kind);
                         debug!(
                             kind = claim.kind,
                             dedup_key = %claim.dedup_key,
@@ -685,6 +706,14 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
         }
         tally.record(corroboration);
     }
+
+    ctx.stats.round(
+        claim.kind,
+        tally.corroborated as u64,
+        tally.denied as u64,
+        tally.refused as u64,
+        tally.no_reply as u64,
+    );
 
     let confirmed = claim.rule.confirms(&tally);
     info!(

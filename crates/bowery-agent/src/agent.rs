@@ -713,6 +713,11 @@ impl Agent {
             })
         };
 
+        // Built before the SQL engine so the status view and the
+        // corroboration engine hold the *same* handle. A view fed by a
+        // different counter than the engine increments would be worse
+        // than no view at all.
+        let corroboration_stats = Arc::new(crate::corroboration::stats::CorroborationStats::new());
         let sql_engine = bowery_sql::Sql::new()
             .with_concurrency_cap(config.sql.max_concurrent_queries)
             .override_default_table("processes")
@@ -767,6 +772,11 @@ impl Agent {
             .with_extra_table(Arc::new(crate::sql_tables::BoweryEventsTable::new(
                 eventlog_store.clone(),
             )))
+            .with_extra_table(Arc::new(
+                crate::sql_tables::BoweryCorroborationStatusTable::new(Some(
+                    corroboration_stats.clone(),
+                )),
+            ))
             .with_extra_table(Arc::new(crate::sql_tables::BoweryProbeStatusTable::new(
                 probe_health.clone(),
             )))
@@ -991,9 +1001,11 @@ impl Agent {
         // picks an audience, asks, tallies, and alerts. Kind-agnostic:
         // it is started once and every present and future detection
         // shares it.
+        //
         let (claims, corroboration_task) = if config.whisper.corroboration.enabled {
             let (sink, task) = crate::corroboration::spawn(
                 crate::corroboration::CorroborationContext {
+                    stats: corroboration_stats.clone(),
                     pool: peer_connections.clone(),
                     known_neighbors: known_neighbors.clone(),
                     sealer: sealer.clone(),

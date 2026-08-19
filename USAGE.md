@@ -521,6 +521,23 @@ Those are opposite facts and they had been sharing a word. If you see it
 constantly, your fleet cannot corroborate itself, and that is worth
 knowing before an incident rather than during one.
 
+Ask why the cross-host corroboration rounds produced what they did:
+
+```sql
+SELECT kind, raised, no_audience, rounds, corroborated, denied
+FROM bowery_corroboration_status ORDER BY raised DESC
+```
+
+`bowery_detections` will usually show these kinds at zero fires, and
+zero is ambiguous: nothing happened, or every claim was thrown away
+before anyone could be asked. `no_audience` is the difference. On a
+host whose inbound connections come from workstations outside the mesh,
+`net.inbound_connect` raises a claim per connection and drops all of
+them — 87 in six hours on the reference fleet — because only the host
+at the other end can say whether it made the connection, and an
+unmanaged host cannot answer for itself. That is the design working,
+and it is worth being able to see rather than infer.
+
 Ask whether the mesh can corroborate itself at all:
 
 ```sql

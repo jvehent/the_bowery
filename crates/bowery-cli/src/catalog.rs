@@ -66,6 +66,14 @@ pub const TABLES: &[Table] = &[
         columns: "rule_id, fired, fired_since_install, last_fired_unix_ms, since_unix_ms",
     },
     Table {
+        name: "bowery_corroboration_status",
+        about: "why the cross-host corroboration rounds produced what they did, per claim \
+                kind. A rule at zero fires may mean nothing happened or that every claim \
+                was dropped before anyone could be asked — `no_audience` is the difference",
+        columns: "kind, raised, no_audience, deduped, shed, rounds, corroborated, denied, \
+                  refused, no_reply",
+    },
+    Table {
         name: "bowery_probe_status",
         about: "sensor self-attestation: attached, emitted, parse failures, kernel drops. \
                 Where you look to tell a quiet host from a blind one",
@@ -229,6 +237,11 @@ pub const EXAMPLES: &[Example] = &[
         sql: "SELECT probe, watching, attached, emitted, parse_failed, kernel_drops, \
               stopped_reason, datetime(last_event_unix_ms/1000,'unixepoch') AS last_event \
               FROM bowery_probe_status",
+    },
+    Example {
+        question: "Is corroboration doing anything, or is there nobody to ask?",
+        sql: "SELECT kind, raised, no_audience, rounds, corroborated, denied \
+              FROM bowery_corroboration_status ORDER BY raised DESC",
     },
     Example {
         question: "Can this mesh actually corroborate itself?",
