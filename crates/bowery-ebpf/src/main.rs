@@ -376,30 +376,59 @@ fn try_exec(_ctx: &TracePointContext) -> Result<(), i64> {
     Ok(())
 }
 
-/// `sched_process_fork` format, stable across the kernels this targets:
-///   offset  8: char parent_comm[16]
-///   offset 24: pid_t parent_pid
-///   offset 28: char child_comm[16]
-///   offset 44: pid_t child_pid
+/// `sched_process_fork` has two layouts in the wild, and which one a
+/// host has is not guessable from its architecture.
 ///
-/// Only `child_pid` is read from the record; the parent is taken from
-/// `bpf_get_current_pid_tgid`, which is the forking task. Reading one
-/// field instead of two halves the exposure to a layout that does not
-/// match, and the loader verifies this offset against the kernel's own
-/// published format before attaching.
-const FORK_CHILD_PID_OFFSET: usize = 44;
+/// Older kernels give the comms as fixed arrays:
+///
+///     offset  8: char parent_comm[16]
+///     offset 24: pid_t parent_pid
+///     offset 28: char child_comm[16]
+///     offset 44: pid_t child_pid
+///
+/// Newer ones make them `__data_loc` descriptors, four bytes each,
+/// which moves everything after them:
+///
+///     offset  8: __data_loc char[] parent_comm
+///     offset 12: pid_t parent_pid
+///     offset 16: __data_loc char[] child_comm
+///     offset 20: pid_t child_pid
+///
+/// Measured across a three-host fleet: 6.8 and 6.12 have the first,
+/// 6.18 has the second. Two aarch64 hosts disagreed with each other, so
+/// this is a kernel-version difference and not an architectural one.
+///
+/// Shipped as two programs rather than one program with a runtime
+/// offset: each read stays a compile-time constant the verifier can
+/// check, the loader attaches exactly the one matching the kernel's own
+/// published format, and a host whose layout is neither gets no probe
+/// at all rather than a plausible-looking wrong pid.
+const FORK_CHILD_PID_FIXED_COMM: usize = 44;
+const FORK_CHILD_PID_DATA_LOC: usize = 20;
 
 #[tracepoint]
 pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
-    match try_fork(&ctx) {
+    match try_fork(&ctx, FORK_CHILD_PID_FIXED_COMM) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
-fn try_fork(ctx: &TracePointContext) -> Result<(), i64> {
+/// The same probe for kernels whose comm fields are `__data_loc`.
+/// Exactly one of these two is ever attached.
+#[tracepoint]
+pub fn sched_process_fork_dataloc(ctx: TracePointContext) -> u32 {
+    match try_fork(&ctx, FORK_CHILD_PID_DATA_LOC) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_fork(ctx: &TracePointContext, child_pid_offset: usize) -> Result<(), i64> {
     let parent_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let child_pid: u32 = unsafe { ctx.read_at(FORK_CHILD_PID_OFFSET)? };
+    // Both call sites pass a constant, so each read is a constant the
+    // verifier can bound.
+    let child_pid: u32 = unsafe { ctx.read_at(child_pid_offset)? };
 
     // Reject anything implausible rather than record it.
     //

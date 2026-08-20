@@ -412,22 +412,23 @@ async fn run(
     // used to *exempt* a privilege transition, so a wrong offset would
     // be a missed escalation rather than lost data. Unattached, the
     // transition rule behaves exactly as it does now.
-    let fork_probe = match verify_fork_layout() {
-        Ok(()) => attach_tp(
-            &mut ebpf,
-            "sched_process_fork",
-            "sched",
-            "sched_process_fork",
-        )
-        .inspect(|()| health.mark_attached(PROBE_FORK))
-        .map_err(|e| warn!(error = %e, "fork probe unavailable"))
-        .is_ok(),
+    let fork_probe = match fork_program_for_kernel() {
+        Ok(program) => {
+            info!(
+                program,
+                "fork probe matched to this kernel's tracepoint layout"
+            );
+            attach_tp(&mut ebpf, program, "sched", "sched_process_fork")
+                .inspect(|()| health.mark_attached(PROBE_FORK))
+                .map_err(|e| warn!(error = %e, "fork probe unavailable"))
+                .is_ok()
+        }
         Err(reason) => {
             error!(
                 reason = %reason,
-                "refusing to attach the fork probe: the kernel's tracepoint layout does \
-                 not match what the BPF program reads, and a wrong pid here would exempt \
-                 a privilege transition that nothing granted"
+                "refusing to attach the fork probe: this kernel's tracepoint layout \
+                 matches neither program, and a wrong pid here would exempt a privilege \
+                 transition that nothing granted"
             );
             false
         }
@@ -671,7 +672,24 @@ const MODLOAD_EXPECTED: [(&str, usize); 2] = [("taints", 8), ("name", 12)];
 /// a helper that did not grant it. A proven mismatch leaves the probe
 /// unattached, and the transition rule then behaves exactly as it does
 /// today — it alerts and says the parent could not be established.
-const FORK_EXPECTED: [(&str, usize); 1] = [("child_pid", 44)];
+/// The two `sched:sched_process_fork` layouts seen in the wild, and the
+/// BPF program that reads each.
+///
+/// Older kernels declare the comms as `char[16]`; newer ones make them
+/// `__data_loc` descriptors of four bytes, which moves `child_pid` from
+/// 44 to 20. Measured across a three-host fleet: 6.8 and 6.12 have the
+/// first, 6.18 the second — and the two hosts that disagreed share an
+/// architecture, so this is a kernel-version difference and not an
+/// architectural one.
+///
+/// A layout that is neither gets no probe. The transition rule then
+/// behaves as it did before the probe existed, which is noisy and
+/// correct; attaching anyway would read a pid from the wrong bytes and
+/// use it to *exempt* a privilege transition.
+const FORK_LAYOUTS: [(usize, &str); 2] = [
+    (44, "sched_process_fork"),
+    (20, "sched_process_fork_dataloc"),
+];
 
 /// `sys_enter_ptrace` argument offsets. Structural for any 64-bit
 /// syscall tracepoint, and checked anyway: a wrong offset here would
@@ -785,17 +803,49 @@ fn verify_ptrace_layout() -> Result<(), String> {
     Ok(())
 }
 
-/// Same check as [`verify_openat_layout`], for
-/// `sched:sched_process_fork`.
-fn verify_fork_layout() -> Result<(), String> {
-    verify_tracepoint_layout(
-        "sched_process_fork",
-        &[
-            "/sys/kernel/tracing/events/sched/sched_process_fork/format",
-            "/sys/kernel/debug/tracing/events/sched/sched_process_fork/format",
-        ],
-        &FORK_EXPECTED,
-    )
+/// Which fork program this kernel's layout calls for.
+///
+/// Unlike the other probes there is no single expected offset, so this
+/// selects rather than verifies — but it fails the same way: an offset
+/// matching neither known layout yields `Err` and no probe, because a
+/// `child_pid` read from the wrong bytes would *exempt* a privilege
+/// transition.
+///
+/// An unreadable format file is an inability to check rather than a
+/// mismatch, so it falls back to the layout every kernel had before the
+/// change.
+fn fork_program_for_kernel() -> Result<&'static str, String> {
+    let candidates = [
+        "/sys/kernel/tracing/events/sched/sched_process_fork/format",
+        "/sys/kernel/debug/tracing/events/sched/sched_process_fork/format",
+    ];
+    let Some(text) = candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+    else {
+        warn!("could not read the sched_process_fork format; assuming the fixed-comm layout");
+        return Ok(FORK_LAYOUTS[0].1);
+    };
+    fork_program_for_format(&text)
+}
+
+/// The selection itself, split out so it can be tested against real
+/// format files rather than only against whatever kernel is running.
+fn fork_program_for_format(text: &str) -> Result<&'static str, String> {
+    let Some(actual) = parse_field_offset(text, "child_pid") else {
+        return Err("child_pid absent from the sched_process_fork format".to_string());
+    };
+    FORK_LAYOUTS
+        .iter()
+        .find(|(offset, _)| *offset == actual)
+        .map(|(_, program)| *program)
+        .ok_or_else(|| {
+            format!(
+                "sched_process_fork.child_pid is at offset {actual}, which matches neither \
+                 known layout ({} or {})",
+                FORK_LAYOUTS[0].0, FORK_LAYOUTS[1].0
+            )
+        })
 }
 
 /// Same check as [`verify_openat_layout`], for `module:module_load`.
@@ -1506,6 +1556,83 @@ fn comm_key(comm: &str) -> [u8; 16] {
     let n = bytes.len().min(15);
     key[..n].copy_from_slice(&bytes[..n]);
     key
+}
+
+#[cfg(test)]
+mod fork_layout_tests {
+    use super::*;
+
+    /// Verbatim from a kernel 6.12 aarch64 host.
+    const FIXED_COMM: &str = "\
+name: sched_process_fork
+ID: 240
+format:
+\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;
+\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;
+
+\tfield:char parent_comm[16];\toffset:8;\tsize:16;\tsigned:0;
+\tfield:pid_t parent_pid;\toffset:24;\tsize:4;\tsigned:1;
+\tfield:char child_comm[16];\toffset:28;\tsize:16;\tsigned:0;
+\tfield:pid_t child_pid;\toffset:44;\tsize:4;\tsigned:1;
+";
+
+    /// Verbatim from a kernel 6.18 aarch64 host — same architecture as
+    /// the one above, different layout.
+    const DATA_LOC: &str = "\
+name: sched_process_fork
+ID: 240
+format:
+\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;
+\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;
+
+\tfield:__data_loc char[] parent_comm;\toffset:8;\tsize:4;\tsigned:0;
+\tfield:pid_t parent_pid;\toffset:12;\tsize:4;\tsigned:1;
+\tfield:__data_loc char[] child_comm;\toffset:16;\tsize:4;\tsigned:0;
+\tfield:pid_t child_pid;\toffset:20;\tsize:4;\tsigned:1;
+";
+
+    /// Both real layouts select their own program.
+    ///
+    /// This is not hypothetical portability work: shipping only the
+    /// offset-44 program left one host of three without the probe, and
+    /// the two that disagreed were both aarch64 — so architecture is
+    /// not the discriminator, kernel version is.
+    #[test]
+    fn each_real_kernel_layout_selects_its_own_program() {
+        assert_eq!(
+            fork_program_for_format(FIXED_COMM).unwrap(),
+            "sched_process_fork"
+        );
+        assert_eq!(
+            fork_program_for_format(DATA_LOC).unwrap(),
+            "sched_process_fork_dataloc"
+        );
+    }
+
+    /// An unknown offset must yield no probe.
+    ///
+    /// The record is used to *exempt* a privilege transition, so a
+    /// `child_pid` read from the wrong bytes is a missed escalation
+    /// rather than lost data. Refusing leaves the rule as noisy as it
+    /// was before the probe existed, which is the safe direction.
+    #[test]
+    fn an_unknown_layout_selects_nothing() {
+        let odd = FIXED_COMM.replace("offset:44", "offset:36");
+        let err = fork_program_for_format(&odd).expect_err("36 matches neither layout");
+        assert!(err.contains("offset 36"), "{err}");
+        assert!(err.contains("neither known layout"), "{err}");
+
+        let absent = FIXED_COMM.replace("child_pid", "something_else");
+        assert!(fork_program_for_format(&absent).is_err());
+    }
+
+    /// The two layouts must not collapse onto one program, or the
+    /// selection is decorative.
+    #[test]
+    fn the_layouts_map_to_distinct_programs() {
+        assert_ne!(FORK_LAYOUTS[0].0, FORK_LAYOUTS[1].0);
+        assert_ne!(FORK_LAYOUTS[0].1, FORK_LAYOUTS[1].1);
+    }
 }
 
 #[cfg(test)]
