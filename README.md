@@ -112,7 +112,7 @@ RUSTFLAGS='-C target-cpu=native' \
 
 <!-- BEGIN GENERATED: capabilities — edit crates/bowery-analysis/src/attack.rs, then BOWERY_UPDATE_DOCS=1 cargo test -p bowery-analysis -->
 
-The agent watches 6 kernel probes and scores what they produce against 63 detections, mapped onto 30 ATT&CK techniques — **12 covered well, 16 partially, 2 not at all**.
+The agent watches 7 kernel probes and scores what they produce against 63 detections, mapped onto 30 ATT&CK techniques — **12 covered well, 16 partially, 2 not at all**.
 
 **Initial Access** — 1 uncovered  
 Valid Accounts

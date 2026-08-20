@@ -68,6 +68,10 @@ struct Entry {
 #[derive(Debug)]
 pub struct ProcTable {
     inner: Mutex<HashMap<u32, Entry>>,
+    /// child pid → (parent pid, when). Separate from `inner` because a
+    /// forked pid has no exec of its own to hang an entry on — that
+    /// absence is the entire reason this map exists.
+    forks: Mutex<HashMap<u32, (u32, SystemTime)>>,
     ttl: Duration,
     max_tracked: usize,
 }
@@ -83,6 +87,7 @@ impl ProcTable {
     pub fn new(ttl: Duration) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            forks: Mutex::new(HashMap::new()),
             ttl,
             // A busy host has a few thousand live processes; this bounds
             // a fork storm rather than a real workload.
@@ -141,6 +146,49 @@ impl ProcTable {
         Some(exe.clone())
     }
 
+    /// Remember that `child` was forked from `parent`.
+    ///
+    /// The only way to identify a pid that never execs. `sudo` forks
+    /// before its child execs, and the fork inherits an image without
+    /// exec-ing, so it appears in no exec event — which is why a
+    /// privilege transition through `sudo` could not be attributed to
+    /// the helper that granted it once the intermediate pid exited.
+    pub fn record_fork(&self, parent: u32, child: u32, ts: SystemTime) {
+        let Ok(mut guard) = self.forks.lock() else {
+            return;
+        };
+        if guard.len() >= self.max_tracked && !guard.contains_key(&child) {
+            // Same crude eviction as the exec table: losing the map
+            // costs an attribution, and a missed attribution alerts
+            // rather than exempts.
+            guard.clear();
+        }
+        guard.insert(child, (parent, ts));
+    }
+
+    /// The pid `child` was forked from, if we saw the fork.
+    ///
+    /// One level only. `sudo` is parent → fork → exec, and following
+    /// further would start attributing a transition to something two
+    /// removes away that never granted it.
+    ///
+    /// The TTL and the not-yet-happened guard matter more here than
+    /// anywhere else in this type: this answer *exempts* a privilege
+    /// transition, so a stale entry for a reused pid would be a missed
+    /// escalation.
+    #[must_use]
+    pub fn forked_from(&self, child: u32, at: SystemTime) -> Option<u32> {
+        let guard = self.forks.lock().ok()?;
+        let (parent, ts) = guard.get(&child)?;
+        if *ts > at {
+            return None;
+        }
+        if at.duration_since(*ts).ok()? > self.ttl {
+            return None;
+        }
+        Some(*parent)
+    }
+
     /// The binary `pid` was running at `at`, if we saw it exec.
     ///
     /// `None` when the pid is unknown, when the record has aged past the
@@ -167,6 +215,9 @@ impl ProcTable {
     /// the reuse window as soon as the kernel tells us, rather than
     /// minutes later.
     pub fn forget(&self, pid: u32) {
+        if let Ok(mut guard) = self.forks.lock() {
+            guard.remove(&pid);
+        }
         if let Ok(mut guard) = self.inner.lock() {
             guard.remove(&pid);
         }
@@ -256,6 +307,99 @@ mod tests {
             t.record(pid, Path::new("/bin/sh"), at(1000));
         }
         assert!(t.len() <= 8192);
+    }
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// The exact shape from the fleet, which nothing could previously
+    /// answer.
+    ///
+    ///     578630  ppid=577587  uid=1000  /usr/bin/sudo
+    ///     578632  ppid=578631  uid=0     /usr/bin/install
+    ///
+    /// pid 578631 is in no exec event — `sudo` forks and the fork
+    /// inherits an image without exec-ing. Every remaining fire of
+    /// `privesc.uid_transition_no_helper` was this, and the fallback
+    /// added for it could not reach it because there was nothing to
+    /// look up.
+    #[test]
+    fn a_forked_parent_resolves_to_the_binary_it_came_from() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record(578_630, Path::new("/usr/bin/sudo"), at(1000));
+        t.record_fork(578_630, 578_631, at(1001));
+
+        // The forked pid still has no exec of its own.
+        assert!(
+            t.exe_at(578_631, at(1002)).is_none(),
+            "a fork execs nothing, so it has no binary of its own"
+        );
+        // But it can be traced back to the one that does.
+        let origin = t
+            .forked_from(578_631, at(1002))
+            .expect("the fork was observed");
+        assert_eq!(origin, 578_630);
+        assert_eq!(
+            t.exe_at(origin, at(1002)).as_deref(),
+            Some(Path::new("/usr/bin/sudo")),
+            "and that pid is the helper that granted the privilege"
+        );
+    }
+
+    #[test]
+    fn an_unobserved_fork_resolves_to_nothing() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        assert!(t.forked_from(578_631, at(1002)).is_none());
+    }
+
+    /// This answer *exempts* a privilege transition, so a stale entry
+    /// for a reused pid would be a missed escalation — the one
+    /// direction that must not happen quietly.
+    #[test]
+    fn a_stale_or_future_fork_vouches_for_nothing() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record_fork(578_630, 578_631, at(1000));
+
+        assert!(
+            t.forked_from(578_631, at(1000 + 600)).is_none(),
+            "past the TTL the pid may have been reused"
+        );
+        assert!(
+            t.forked_from(578_631, at(999)).is_none(),
+            "a fork that had not happened yet cannot have granted privilege"
+        );
+    }
+
+    /// An exiting pid closes its own reuse window immediately.
+    #[test]
+    fn forgetting_a_pid_drops_its_fork_record() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record_fork(578_630, 578_631, at(1000));
+        t.forget(578_631);
+        assert!(t.forked_from(578_631, at(1001)).is_none());
+    }
+
+    /// Only one level. Following further would attribute a transition
+    /// to something two removes away that never granted it.
+    #[test]
+    fn resolution_does_not_walk_a_chain() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record(100, Path::new("/usr/bin/sudo"), at(1000));
+        t.record_fork(100, 200, at(1001));
+        t.record_fork(200, 300, at(1002));
+
+        assert_eq!(t.forked_from(300, at(1003)), Some(200));
+        assert!(
+            t.exe_at(200, at(1003)).is_none(),
+            "the intermediate fork has no binary, and this type does not \
+             chase the chain further on its own"
+        );
     }
 }
 

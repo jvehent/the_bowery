@@ -37,6 +37,11 @@ pub enum Event {
     ModuleLoad(ModuleLoad),
     /// One process took control of another via `ptrace`.
     Ptrace(Ptrace),
+    /// A process forked. Carried so a pid that never execs can still be
+    /// attributed to the process it came from — `sudo` forks before its
+    /// child execs, and the fork inherits an image without ever
+    /// exec-ing, so it appears in no other event.
+    Fork(Fork),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +63,19 @@ pub struct ProcessExec {
     /// follow `/proc/<pid>/exe` (e.g. very short-lived process).
     pub exe_path: Option<PathBuf>,
     pub args: Vec<String>,
+    pub ts: SystemTime,
+}
+
+/// One process forking another.
+///
+/// The only record of a pid that never execs. Used to attribute a
+/// privilege transition to the helper that granted it: `sudo` forks,
+/// the fork execs the target as root, and the intermediate pid is in no
+/// exec event at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fork {
+    pub parent_pid: u32,
+    pub child_pid: u32,
     pub ts: SystemTime,
 }
 
@@ -255,6 +273,7 @@ impl Event {
             Event::NetworkConnect(e) => e.pid,
             Event::ModuleLoad(e) => e.pid,
             Event::Ptrace(e) => e.pid,
+            Event::Fork(e) => e.child_pid,
             Event::FileChange(_) => 0,
         }
     }
@@ -267,6 +286,7 @@ impl Event {
             Event::NetworkConnect(e) => e.ts,
             Event::ModuleLoad(e) => e.ts,
             Event::Ptrace(e) => e.ts,
+            Event::Fork(e) => e.ts,
             Event::FileChange(e) => e.ts,
         }
     }

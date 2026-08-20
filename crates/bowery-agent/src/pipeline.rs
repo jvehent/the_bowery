@@ -165,6 +165,12 @@ async fn process_event(ctx: &PipelineContext, event: Event) {
                 ctx.procs.record(e.pid, exe, e.ts);
             }
         }
+        // Recorded and not otherwise processed: a fork is not an
+        // observation about behaviour, it is the only record that a pid
+        // which never execs came from one that did.
+        Event::Fork(e) => {
+            ctx.procs.record_fork(e.parent_pid, e.child_pid, e.ts);
+        }
         // Close the pid-reuse window as soon as the kernel tells us,
         // rather than waiting out the TTL.
         Event::ProcessExit(e) => {
@@ -194,8 +200,10 @@ async fn process_event(ctx: &PipelineContext, event: Event) {
         Event::FileOpen(open) => {
             process_file_open(ctx, &open).await;
         }
-        // Recorded to the event log above; no ctx.analyzer path yet.
-        Event::ProcessExit(_) => {}
+        // Both are recorded above and have no analyzer path. A fork is
+        // attribution for something that execs later, not an
+        // observation about behaviour; an exit is history.
+        Event::ProcessExit(_) | Event::Fork(_) => {}
     }
 }
 
@@ -1184,16 +1192,24 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
             // large share of `privesc.uid_transition_no_helper` — 206
             // fires in a fortnight, and Ubuntu's update-notifier runs on
             // a timer.
-            match self_exec_privilege_helper(ctx, &exec).await {
-                Some(check) => check,
-                None => {
-                    parent_privilege_helper(
-                        exec.ppid,
-                        &ctx.packages,
-                        ctx.procs.exe_at(exec.ppid, exec.ts),
-                    )
-                    .await
-                }
+            if let Some(check) = self_exec_privilege_helper(ctx, &exec).await {
+                check
+            } else {
+                // The parent's binary, from three sources in order
+                // of directness: /proc while it lives, the exec we
+                // watched for that pid, and — for a pid that never
+                // exec'd at all — the fork that created it.
+                //
+                // That last one is the `sudo` shape and it is the
+                // whole of what remained: sudo forks, the fork
+                // execs the target as root, and the intermediate
+                // pid is in no exec event because inheriting an
+                // image through fork is not an exec.
+                let remembered = ctx.procs.exe_at(exec.ppid, exec.ts).or_else(|| {
+                    let origin = ctx.procs.forked_from(exec.ppid, exec.ts)?;
+                    ctx.procs.exe_at(origin, exec.ts)
+                });
+                parent_privilege_helper(exec.ppid, &ctx.packages, remembered).await
             }
         } else {
             crate::agent::HelperCheck::Helper

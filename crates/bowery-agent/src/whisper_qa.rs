@@ -966,6 +966,7 @@ fn append_recognition_alert(
             .unwrap_or_default(),
     )
     .exe_sha256_hex(ctx.exe_sha256_hex.clone().unwrap_or_default())
+    .context(peer_attributes(context))
     .confirmation(verdict)
     .build();
     info!(
@@ -1084,6 +1085,7 @@ fn finish_round(
                 .unwrap_or_default(),
         )
         .exe_sha256_hex(ctx.exe_sha256_hex.clone().unwrap_or_default())
+        .context(peer_attributes(&context))
         .confirmation(verdict)
         .build();
         info!(
@@ -1134,20 +1136,62 @@ pub(crate) fn inject_whisper_context(ctx: &mut AnalysisContext, ctx_in: &Whisper
     );
     ctx.extra.push(("neighborhood".to_string(), summary));
 
-    for peer in &ctx_in.peers {
-        let Some(sighting) = peer.reply.observed() else {
-            continue;
-        };
-        if sighting.seen_count == 0 {
-            continue;
-        }
-        let key = format!("peer.{}", short_fp(&peer.peer));
-        let value = format!(
-            "seen {} times (similarity {:.2})",
-            sighting.seen_count, peer.similarity,
-        );
+    for (key, value) in peer_verdicts(ctx_in) {
         ctx.extra.push((key, value));
     }
+}
+
+/// What each peer actually said, one entry per peer asked.
+///
+/// Previously only peers that *had* seen the binary were recorded,
+/// which is the least interesting answer and the rarest. Everything
+/// that makes a round worth running — a peer that has no record, one
+/// that cannot compare, one that recognises the program at another
+/// build, one that declined — was dropped before it reached the
+/// operator, who saw a bare count and no way to tell which host said
+/// what.
+pub(crate) fn peer_verdicts(ctx: &WhisperContext) -> Vec<(String, String)> {
+    ctx.peers
+        .iter()
+        .map(|peer| {
+            let verdict = match &peer.reply {
+                PeerReply::Observed(s) if s.seen_count > 0 => {
+                    format!("has this exact binary ({} times)", s.seen_count)
+                }
+                PeerReply::Observed(_) => "no record of this binary".to_string(),
+                PeerReply::Familiar {
+                    pkg_builds,
+                    by_path_only,
+                } => {
+                    let how = if *by_path_only {
+                        "same path, different binary".to_string()
+                    } else if *pkg_builds == 0 {
+                        "same package, installed but never run here".to_string()
+                    } else {
+                        format!("same package, {pkg_builds} build(s) run here")
+                    };
+                    format!("has this program, built differently — {how}")
+                }
+                PeerReply::Incomparable { platform } => {
+                    format!("cannot compare: runs {platform}")
+                }
+                PeerReply::Refused(reason) => format!("declined: {reason}"),
+                PeerReply::Silent => "did not reply".to_string(),
+            };
+            (
+                format!("peer.{}", short_fp(&peer.peer)),
+                format!("{verdict} (similarity {:.2})", peer.similarity),
+            )
+        })
+        .collect()
+}
+
+/// The same verdicts as alert context attributes.
+pub(crate) fn peer_attributes(ctx: &WhisperContext) -> Vec<bowery_proto::Attribute> {
+    peer_verdicts(ctx)
+        .into_iter()
+        .map(|(k, v)| bowery_proto::Attribute::new(k, v))
+        .collect()
 }
 
 /// What the asker can say about the binary beyond its hash.
@@ -1543,14 +1587,35 @@ mod tests {
         assert!(nbr.1.contains("1 corroborating"));
         assert!(nbr.1.contains("12"));
 
-        let peer_keys: Vec<&str> = ctx
+        // Every peer asked, not only the corroborating one.
+        //
+        // Recording just the peers that *had* seen it kept the rarest
+        // and least interesting answer and dropped the rest: an
+        // operator was given a count and no way to tell which host said
+        // what, on the only question the round exists to ask.
+        let peers: Vec<(&str, &str)> = ctx
             .extra
             .iter()
-            .filter_map(|(k, _)| k.strip_prefix("peer."))
+            .filter_map(|(k, v)| Some((k.strip_prefix("peer.")?, v.as_str())))
             .collect();
-        // Only the corroborating peer (seen_count > 0) shows up.
-        assert_eq!(peer_keys.len(), 1);
-        assert!(peer_keys[0].starts_with(&corroborating.to_string()[..16]));
+        assert_eq!(peers.len(), 3, "one entry per peer asked: {peers:?}");
+
+        let corroborator = peers
+            .iter()
+            .find(|(k, _)| k.starts_with(&corroborating.to_string()[..16]))
+            .expect("the corroborating peer");
+        assert!(
+            corroborator.1.contains("has this exact binary"),
+            "{corroborator:?}"
+        );
+        assert!(
+            peers.iter().any(|(_, v)| v.contains("no record")),
+            "the peer that looked and found nothing must be reported: {peers:?}"
+        );
+        assert!(
+            peers.iter().any(|(_, v)| v.contains("did not reply")),
+            "and so must silence, which is not the same as a denial: {peers:?}"
+        );
     }
 }
 

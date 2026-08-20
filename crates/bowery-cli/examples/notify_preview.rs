@@ -13,6 +13,7 @@
 use bowery_cli::notify::{HostAlerts, VerdictMap, body, body_html};
 use bowery_proto::{Alert, AlertConfirmation, Attribute};
 
+#[allow(clippy::too_many_lines)] // fixture data, deliberately explicit
 fn main() {
     let mk = |ep: &str,
               rule: &str,
@@ -81,13 +82,23 @@ fn main() {
                         peers_unseen: 0,
                         peers_seen: 0,
                         peers_no_reply: 0,
-                        peers_incomparable: 2,
-                        peers_familiar: 0,
+                        peers_incomparable: 0,
+                        peers_familiar: 2,
                         peers_refused: 0,
                         quorum: 2,
                         confirmed: false,
                     }),
-                    vec![("argv", "dd if=/dev/zero of=/dev/watchdog0")],
+                    vec![
+                        ("argv", "dd if=/dev/zero of=/dev/watchdog0"),
+                        (
+                            "peer.b923ba65a0834160",
+                            "has this program, built differently — same package, installed but never run here (similarity 0.91)",
+                        ),
+                        (
+                            "peer.afb9902484e6f4ba",
+                            "has this program, built differently — same package, 1 build(s) run here (similarity 0.88)",
+                        ),
+                    ],
                 ),
             ],
         },

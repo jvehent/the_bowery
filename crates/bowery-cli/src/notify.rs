@@ -503,10 +503,7 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
                         "  (NOT CHECKED: {}/{} peers run a different platform)",
                         c.peers_incomparable, c.peers_asked
                     ),
-                    Some(c) => format!(
-                        "  (not confirmed: {}/{} unseen, {} refused, {} incomparable)",
-                        c.peers_unseen, c.peers_asked, c.peers_refused, c.peers_incomparable
-                    ),
+                    Some(c) => format!("  (not confirmed: {})", tally(c)),
                     None => String::new(),
                 }
             );
@@ -697,6 +694,41 @@ fn card_header(a: &Alert) -> String {
 /// The quorum verdict, when there is one. Confirmed and not-confirmed
 /// are different enough to deserve different weight on the page; empty
 /// when no round ran, because a missing verdict is not a negative one.
+/// Every bucket a round produced, in one line.
+///
+/// The badge used to name whichever bucket decided the verdict and drop
+/// the rest, so an operator was told "CONFIRMED 3/3" or "not confirmed"
+/// and could not see that two peers had declined or that one had
+/// recognised the program. All of it is evidence about the same
+/// question and it is cheap to say.
+///
+/// Zero buckets are omitted rather than printed as `0`: this is a
+/// sentence, not a table, and the per-peer lines below carry the detail
+/// for anything that needs following up.
+fn tally(c: bowery_proto::AlertConfirmation) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut add = |n: u32, what: &str| {
+        if n > 0 {
+            parts.push(format!("{n} {what}"));
+        }
+    };
+    add(c.peers_unseen, "no record");
+    add(c.peers_seen, "have it");
+    add(c.peers_familiar, "same program, other build");
+    add(c.peers_incomparable, "could not compare");
+    add(c.peers_refused, "declined");
+    add(c.peers_no_reply, "did not reply");
+    if parts.is_empty() {
+        return format!("{} peer(s) asked", c.peers_asked);
+    }
+    format!(
+        "{} of {} asked (quorum {})",
+        parts.join(", "),
+        c.peers_asked,
+        c.quorum
+    )
+}
+
 fn confirmation_badge(a: &Alert) -> String {
     let Some(c) = a.confirmation else {
         return String::new();
@@ -738,10 +770,7 @@ fn confirmation_badge(a: &Alert) -> String {
         (
             "#f1f3f4",
             "#5f6368",
-            format!(
-                "not confirmed — {}/{} unseen, {} refused, {} incomparable",
-                c.peers_unseen, c.peers_asked, c.peers_refused, c.peers_incomparable
-            ),
+            format!("not confirmed — {}", tally(c)),
         )
     };
     format!(
@@ -749,6 +778,43 @@ fn confirmation_badge(a: &Alert) -> String {
          padding:5px 8px;border-radius:4px;margin-bottom:8px\">{}</div>",
         esc(&text)
     )
+}
+
+/// What each neighbour said, one line per peer.
+///
+/// The agent records a `peer.<fp>` context attribute per peer asked —
+/// recognised, no record, could not compare, declined, silent — and
+/// without this they render as anonymous rows in the generic context
+/// table, indistinguishable from a command line. A quorum is an
+/// aggregate of these, and the aggregate is what an operator is
+/// currently asked to trust.
+fn neighbour_block(a: &Alert) -> String {
+    use std::fmt::Write as _;
+    let peers: Vec<&bowery_proto::Attribute> = a
+        .context
+        .iter()
+        .filter(|attr| attr.key.starts_with("peer."))
+        .collect();
+    if peers.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "<div style=\"background:#f8f9fa;border-radius:4px;padding:8px 10px;margin-bottom:8px\">\
+         <div style=\"color:#5f6368;font-size:11px;text-transform:uppercase;\
+         letter-spacing:.4px;margin-bottom:4px\">what the neighbours said</div>",
+    );
+    for attr in peers {
+        let _ = write!(
+            out,
+            "<div style=\"font-size:12px;margin-top:2px\">\
+             <span style=\"{MONO};color:#3c4043\">{}</span> \
+             <span style=\"color:#5f6368\">{}</span></div>",
+            field(attr.key.trim_start_matches("peer."), FIELD_CAP),
+            field(&attr.value, CONTEXT_CAP)
+        );
+    }
+    out.push_str("</div>");
+    out
 }
 
 /// The episode id and a silence command with the alert-specific parts
@@ -807,6 +873,7 @@ fn alert_card(a: &Alert, vt: &VerdictMap) -> String {
 
     out.push_str(&confirmation_badge(a));
 
+    out.push_str(&neighbour_block(a));
     out.push_str("<table style=\"border-collapse:collapse;width:100%\">");
     if !a.exe_path.is_empty() {
         row(&mut out, "exe", &field(&a.exe_path, FIELD_CAP), true);
@@ -1952,6 +2019,96 @@ password_file = "/dev/null"
         );
         // Nothing attempted, nothing failed: archiving is off.
         assert!(archive_verdict(0, 0).is_ok());
+    }
+
+    /// A quorum is an aggregate, and the aggregate is what the operator
+    /// is asked to trust. The digest has to show what it aggregates.
+    #[test]
+    fn the_digest_reports_every_neighbour_and_what_it_said() {
+        let mut a = alert("ep-1", 0.8, false);
+        a.confirmation = Some(AlertConfirmation {
+            peers_asked: 3,
+            peers_unseen: 1,
+            peers_seen: 0,
+            peers_no_reply: 0,
+            peers_refused: 1,
+            peers_incomparable: 0,
+            peers_familiar: 1,
+            quorum: 2,
+            confirmed: false,
+        });
+        a.context = vec![
+            bowery_proto::Attribute {
+                key: "peer.b923ba65a0834160".into(),
+                value: "has this program, built differently — same package".into(),
+            },
+            bowery_proto::Attribute {
+                key: "peer.afb9902484e6f4ba".into(),
+                value: "no record of this binary".into(),
+            },
+            bowery_proto::Attribute {
+                key: "argv".into(),
+                value: "dd if=/dev/zero of=/dev/watchdog0".into(),
+            },
+        ];
+        let hosts = vec![HostAlerts {
+            host: "otter1".into(),
+            alerts: vec![a],
+        }];
+        let html = body_html(&hosts, &VerdictMap::new());
+
+        assert!(
+            html.contains("what the neighbours said"),
+            "per-peer verdicts must be their own block, not anonymous context rows"
+        );
+        assert!(html.contains("b923ba65a0834160"), "{html}");
+        assert!(html.contains("no record of this binary"), "{html}");
+
+        // Every bucket in the summary, not just the deciding one.
+        for fragment in ["1 no record", "1 same program, other build", "1 declined"] {
+            assert!(
+                html.contains(fragment),
+                "{fragment:?} missing from the tally"
+            );
+        }
+        assert!(
+            html.contains("quorum 2"),
+            "the threshold in force must be shown"
+        );
+    }
+
+    /// Buckets at zero are noise in a sentence.
+    #[test]
+    fn the_tally_omits_empty_buckets() {
+        let c = AlertConfirmation {
+            peers_asked: 2,
+            peers_unseen: 2,
+            peers_seen: 0,
+            peers_no_reply: 0,
+            peers_refused: 0,
+            peers_incomparable: 0,
+            peers_familiar: 0,
+            quorum: 2,
+            confirmed: false,
+        };
+        let text = tally(c);
+        assert!(text.contains("2 no record"), "{text}");
+        assert!(
+            !text.contains("0 "),
+            "zero buckets must not be printed: {text}"
+        );
+    }
+
+    /// An alert with no round has no peer block at all — an empty
+    /// heading would imply a round ran and said nothing.
+    #[test]
+    fn an_alert_with_no_round_shows_no_neighbour_block() {
+        let hosts = vec![HostAlerts {
+            host: "otter1".into(),
+            alerts: vec![alert("ep-1", 0.8, false)],
+        }];
+        let html = body_html(&hosts, &VerdictMap::new());
+        assert!(!html.contains("what the neighbours said"), "{html}");
     }
 
     /// A flood must not become a megabyte of HTML either.

@@ -303,6 +303,14 @@ impl EventLog {
                          ?15, ?16, ?17, ?18)",
             )?;
             for event in events {
+                // A fork record is a live attribution hint consumed
+                // within milliseconds — the pid it names has usually
+                // exec'd or exited before anything could query it — and
+                // one row per fork would roughly double this log to
+                // store what nothing reads back.
+                if matches!(event, Event::Fork(_)) {
+                    continue;
+                }
                 let r = Row::from_event(event);
                 stmt.execute(params![
                     r.ts_unix_ms,
@@ -661,6 +669,10 @@ impl Row {
             open_flags: None,
         };
         match event {
+            // Never reached: filtered in `append_batch` before this is
+            // called. Kept exhaustive so a new event type fails the
+            // build here rather than silently writing an empty row.
+            Event::Fork(_) => {}
             Event::ProcessExec(e) => {
                 r.kind = KIND_EXEC;
                 r.pid = Some(i64::from(e.pid));

@@ -52,7 +52,7 @@ use aya::programs::{Lsm, TracePoint};
 use aya::{Btf, BtfError};
 use bowery_events::source::{
     DEFAULT_CHANNEL_CAPACITY, EventSource, PROBE_CONNECT, PROBE_EXEC, PROBE_EXIT, PROBE_FILE,
-    PROBE_MODULE, PROBE_NAMES, PROBE_PTRACE, ProbeHealth,
+    PROBE_FORK, PROBE_MODULE, PROBE_NAMES, PROBE_PTRACE, ProbeHealth,
 };
 use bowery_events::{
     Event, FileOpen, NetDirection, NetFamily, NetworkConnect, ProcessExec, ProcessExit, enrich,
@@ -407,6 +407,32 @@ async fn run(
         }
     };
 
+    // Attribution for forked pids. Verified before attaching for the
+    // same reason as the others, and with more at stake: this record is
+    // used to *exempt* a privilege transition, so a wrong offset would
+    // be a missed escalation rather than lost data. Unattached, the
+    // transition rule behaves exactly as it does now.
+    let fork_probe = match verify_fork_layout() {
+        Ok(()) => attach_tp(
+            &mut ebpf,
+            "sched_process_fork",
+            "sched",
+            "sched_process_fork",
+        )
+        .inspect(|()| health.mark_attached(PROBE_FORK))
+        .map_err(|e| warn!(error = %e, "fork probe unavailable"))
+        .is_ok(),
+        Err(reason) => {
+            error!(
+                reason = %reason,
+                "refusing to attach the fork probe: the kernel's tracepoint layout does \
+                 not match what the BPF program reads, and a wrong pid here would exempt \
+                 a privilege transition that nothing granted"
+            );
+            false
+        }
+    };
+
     let ptrace_probe = match verify_ptrace_layout() {
         Ok(()) => attach_tp(&mut ebpf, "ptrace_enter", "syscalls", "sys_enter_ptrace")
             .inspect(|()| health.mark_attached(PROBE_PTRACE))
@@ -465,6 +491,14 @@ async fn run(
     let module_ring = if module_probe {
         take_ring(&mut ebpf, "MODULE_EVENTS")
             .map_err(|e| warn!(error = %e, "MODULE_EVENTS ring unavailable"))
+            .ok()
+    } else {
+        None
+    };
+
+    let fork_ring = if fork_probe {
+        take_ring(&mut ebpf, "FORK_EVENTS")
+            .map_err(|e| warn!(error = %e, "FORK_EVENTS ring unavailable"))
             .ok()
     } else {
         None
@@ -543,6 +577,13 @@ async fn run(
             PROBE_MODULE,
             health.clone()
         ),
+        drain_optional_ring(
+            fork_ring,
+            tx.clone(),
+            parse_fork,
+            PROBE_FORK,
+            health.clone()
+        ),
         drain_optional_ring(ptrace_ring, tx, parse_ptrace, PROBE_PTRACE, health.clone()),
         poll_drops(drops_map, health),
     )?;
@@ -617,6 +658,20 @@ const OPENAT_EXPECTED: [(&str, usize); 2] = [("filename", 24), ("flags", 32)];
 /// mismatch means the probe is not attached, because a wrong offset here
 /// would report module names read from arbitrary bytes.
 const MODLOAD_EXPECTED: [(&str, usize); 2] = [("taints", 8), ("name", 12)];
+
+/// `sched:sched_process_fork` field offset the BPF program assumes.
+///
+/// Only `child_pid` — the parent comes from
+/// `bpf_get_current_pid_tgid`, so there is one assumption here rather
+/// than two.
+///
+/// Verified harder than the others because of what the record is used
+/// for: the fork map *exempts* privilege transitions, so a wrong offset
+/// would not merely lose data, it would attribute a root transition to
+/// a helper that did not grant it. A proven mismatch leaves the probe
+/// unattached, and the transition rule then behaves exactly as it does
+/// today — it alerts and says the parent could not be established.
+const FORK_EXPECTED: [(&str, usize); 1] = [("child_pid", 44)];
 
 /// `sys_enter_ptrace` argument offsets. Structural for any 64-bit
 /// syscall tracepoint, and checked anyway: a wrong offset here would
@@ -728,6 +783,19 @@ fn verify_ptrace_layout() -> Result<(), String> {
     }
     info!("sys_enter_ptrace layout verified against the kernel");
     Ok(())
+}
+
+/// Same check as [`verify_openat_layout`], for
+/// `sched:sched_process_fork`.
+fn verify_fork_layout() -> Result<(), String> {
+    verify_tracepoint_layout(
+        "sched_process_fork",
+        &[
+            "/sys/kernel/tracing/events/sched/sched_process_fork/format",
+            "/sys/kernel/debug/tracing/events/sched/sched_process_fork/format",
+        ],
+        &FORK_EXPECTED,
+    )
 }
 
 /// Same check as [`verify_openat_layout`], for `module:module_load`.
@@ -940,6 +1008,28 @@ const _: () = {
         "ptrace record layout drifted from the BPF program"
     );
 };
+
+/// Wire layout of `bowery_ebpf::ForkEvent`.
+#[repr(C)]
+struct RawForkEvent {
+    parent_pid: u32,
+    child_pid: u32,
+}
+const RAW_FORK_SIZE: usize = std::mem::size_of::<RawForkEvent>();
+
+fn parse_fork(bytes: &[u8]) -> Option<Event> {
+    if bytes.len() < RAW_FORK_SIZE {
+        warn!(got = bytes.len(), want = RAW_FORK_SIZE, "short fork record");
+        return None;
+    }
+    // SAFETY: size-checked above; RawForkEvent is repr(C) POD.
+    let raw: RawForkEvent = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<RawForkEvent>()) };
+    Some(Event::Fork(bowery_events::Fork {
+        parent_pid: raw.parent_pid,
+        child_pid: raw.child_pid,
+        ts: std::time::SystemTime::now(),
+    }))
+}
 
 fn parse_ptrace(bytes: &[u8]) -> Option<Event> {
     if bytes.len() < RAW_PTRACE_SIZE {

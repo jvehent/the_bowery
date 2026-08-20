@@ -67,6 +67,30 @@ pub struct ExitEvent {
     pub comm: [u8; 16],
 }
 
+/// Fork record. Layout: 4 + 4 = 8 bytes, no padding.
+///
+/// Exists to answer one question the exec stream cannot: which process
+/// a *forked* pid came from. `sudo` forks before its child execs, and
+/// the fork never execs anything itself —
+///
+///     578630  ppid=577587  uid=1000  /usr/bin/sudo
+///     578632  ppid=578631  uid=0     /usr/bin/install
+///
+/// pid 578631 appears in no exec event, because inheriting an image
+/// through fork is not an exec. Without this, a privilege transition
+/// through `sudo` cannot be attributed to the helper that granted it
+/// once the intermediate pid exits, which on a live fleet was every
+/// remaining fire of `privesc.uid_transition_no_helper`.
+///
+/// Losing one of these costs an *exemption*, never a false exemption:
+/// an unattributed transition still alerts. That is why the ring is
+/// modest and drops are acceptable.
+#[repr(C)]
+pub struct ForkEvent {
+    pub parent_pid: u32,
+    pub child_pid: u32,
+}
+
 /// Outgoing-TCP-connect record. Layout: 4 + 2 + 2 + 4 + 16 + 16 = 44
 /// bytes. `dport` is in network byte order; `daddr_v4` is the raw 4
 /// bytes from the tracepoint (also network order). `family` is `AF_INET`
@@ -169,6 +193,12 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static EXIT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
+/// Fork records. Small: the payload is 8 bytes and a lost record only
+/// costs an attribution, so this is deliberately not sized for a fork
+/// storm.
+#[map]
+static FORK_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
 /// TCP connect events: bursty in some workloads (browsers, CI runners),
 /// so match the exec ring at 256 KiB.
 #[map]
@@ -198,6 +228,7 @@ pub const DROP_EXEC: u32 = 0;
 pub const DROP_EXIT: u32 = 1;
 pub const DROP_CONNECT: u32 = 2;
 pub const DROP_FILE: u32 = 3;
+pub const DROP_FORK: u32 = 4;
 /// Sized with headroom so a new probe doesn't require userspace to
 /// tolerate a resized map mid-upgrade.
 pub const DROP_SLOTS: u32 = 8;
@@ -344,6 +375,63 @@ fn try_exec(_ctx: &TracePointContext) -> Result<(), i64> {
     entry.submit(0);
     Ok(())
 }
+
+/// `sched_process_fork` format, stable across the kernels this targets:
+///   offset  8: char parent_comm[16]
+///   offset 24: pid_t parent_pid
+///   offset 28: char child_comm[16]
+///   offset 44: pid_t child_pid
+///
+/// Only `child_pid` is read from the record; the parent is taken from
+/// `bpf_get_current_pid_tgid`, which is the forking task. Reading one
+/// field instead of two halves the exposure to a layout that does not
+/// match, and the loader verifies this offset against the kernel's own
+/// published format before attaching.
+const FORK_CHILD_PID_OFFSET: usize = 44;
+
+#[tracepoint]
+pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
+    match try_fork(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_fork(ctx: &TracePointContext) -> Result<(), i64> {
+    let parent_pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let child_pid: u32 = unsafe { ctx.read_at(FORK_CHILD_PID_OFFSET)? };
+
+    // Reject anything implausible rather than record it.
+    //
+    // This map is consulted to *exempt* a privilege transition, so a
+    // wrong entry is a missed escalation — the one direction that must
+    // not happen quietly. If the offset assumption were ever wrong the
+    // reads would be garbage, and garbage is far more likely to fail
+    // these bounds than to impersonate a live pid. A rejection is
+    // counted, so a bad layout shows up as drops rather than as silent
+    // mis-attribution.
+    if child_pid == 0 || child_pid == parent_pid || child_pid > PID_MAX {
+        count_drop(DROP_FORK);
+        return Ok(());
+    }
+
+    let Some(mut entry) = FORK_EVENTS.reserve::<ForkEvent>(0) else {
+        count_drop(DROP_FORK);
+        return Err(-1);
+    };
+    // SAFETY: reservation guarantees a valid sizeof(ForkEvent) buffer.
+    unsafe {
+        let event = entry.as_mut_ptr();
+        (*event).parent_pid = parent_pid;
+        (*event).child_pid = child_pid;
+    }
+    entry.submit(0);
+    Ok(())
+}
+
+/// Ceiling on a plausible pid. `/proc/sys/kernel/pid_max` can be raised
+/// to 2^22 on 64-bit; anything past that is not a pid.
+const PID_MAX: u32 = 4 * 1024 * 1024;
 
 #[tracepoint]
 pub fn sched_process_exit(ctx: TracePointContext) -> u32 {

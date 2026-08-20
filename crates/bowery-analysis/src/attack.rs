@@ -540,7 +540,7 @@ fn tally_for(tactic: &str) -> (usize, usize, usize) {
 /// does not depend on the sensor crate, and one number is not worth a
 /// dependency edge. Pinned by a test in `bowery-agent`, which sees both.
 const fn bowery_events_probe_count() -> usize {
-    6
+    7
 }
 
 /// Every rule id the map claims, in declaration order.
