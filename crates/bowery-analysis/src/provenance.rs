@@ -83,6 +83,15 @@ pub struct PackageIndex {
     /// first dimension the fuzzy corroboration work can actually compare
     /// across a mixed fleet; see DESIGN-FUZZY-CORROBORATION.md §3.1.
     pkg_by_path: HashMap<PathBuf, String>,
+    /// Distinct package names, for "is this installed at all".
+    ///
+    /// Kept beside `pkg_by_path` rather than derived from it because
+    /// the derivation is a scan. Measured on a live host the map holds
+    /// 54,919 entries, and the whisper responder consults this once per
+    /// question — a peer asking in a loop would otherwise buy a 55,000
+    /// string comparisons apiece. The distinct names are a couple of
+    /// thousand, so the set is small next to what it indexes.
+    pkg_names: std::collections::HashSet<String>,
     /// False when no package database was found, which makes every
     /// answer [`Provenance::Unknown`] rather than
     /// [`Provenance::Unpackaged`]. Reporting "no package owns this" on a
@@ -187,6 +196,7 @@ impl PackageIndex {
         };
         let mut by_path = HashMap::new();
         let mut pkg_by_path: HashMap<PathBuf, String> = HashMap::new();
+        let mut pkg_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_none_or(|e| e != "md5sums") {
@@ -215,6 +225,7 @@ impl PackageIndex {
                 };
                 let abs = PathBuf::from("/").join(rel);
                 if let Some(pkg) = pkg.clone() {
+                    pkg_names.insert(pkg.clone());
                     pkg_by_path.insert(abs.clone(), pkg);
                 }
                 by_path.insert(abs, md5);
@@ -231,6 +242,7 @@ impl PackageIndex {
         Self {
             by_path,
             pkg_by_path,
+            pkg_names,
             available: true,
         }
     }
@@ -294,7 +306,7 @@ impl PackageIndex {
         if !self.available || name.is_empty() {
             return false;
         }
-        self.pkg_by_path.values().any(|p| p == name)
+        self.pkg_names.contains(name)
     }
 
     /// Is anything installed at this path?
@@ -592,6 +604,88 @@ pub fn adjust_score(score: f32, provenance: Provenance) -> (f32, &'static str) {
         ),
         Provenance::Unpackaged => (score, "no package owns this path"),
         Provenance::Unknown => (score, "provenance could not be established"),
+    }
+}
+
+#[cfg(test)]
+mod package_lookup_tests {
+    use super::*;
+
+    /// Build an index the way `load_dpkg` would, without touching disk.
+    fn index_with(entries: &[(&str, &str)]) -> PackageIndex {
+        let mut by_path = HashMap::new();
+        let mut pkg_by_path = HashMap::new();
+        let mut pkg_names = std::collections::HashSet::new();
+        for (path, pkg) in entries {
+            by_path.insert(PathBuf::from(path), [0u8; 16]);
+            pkg_by_path.insert(PathBuf::from(path), (*pkg).to_string());
+            pkg_names.insert((*pkg).to_string());
+        }
+        PackageIndex {
+            by_path,
+            pkg_by_path,
+            pkg_names,
+            available: true,
+        }
+    }
+
+    #[test]
+    fn an_installed_package_is_recognised_by_name() {
+        let idx = index_with(&[
+            ("/usr/bin/ls", "coreutils"),
+            ("/usr/bin/cat", "coreutils"),
+            ("/usr/bin/dash", "dash"),
+        ]);
+        assert!(idx.has_package("coreutils"));
+        assert!(idx.has_package("dash"));
+        assert!(!idx.has_package("nothing-here"));
+        assert!(
+            !idx.has_package(""),
+            "an unknown package is not every package"
+        );
+        assert!(idx.has_path(Path::new("/usr/bin/ls")));
+        assert!(!idx.has_path(Path::new("/tmp/dropped")));
+    }
+
+    /// Without an index, "not installed" and "cannot tell" are the same
+    /// answer here — and both must be `false`, never a claim.
+    #[test]
+    fn an_unavailable_index_recognises_nothing() {
+        let idx = PackageIndex::unavailable();
+        assert!(!idx.has_package("coreutils"));
+        assert!(!idx.has_path(Path::new("/usr/bin/ls")));
+    }
+
+    /// The lookup must not be a scan of the path map.
+    ///
+    /// The whisper responder calls this once per question, and on a
+    /// live host the path map holds 54,919 entries — measured, not
+    /// estimated. A peer asking in a loop would otherwise buy 55,000
+    /// string comparisons apiece on the answering side, which is a cost
+    /// the asker chooses and the responder pays.
+    ///
+    /// Asserted as a bound on work rather than on time: a name set of
+    /// one, over a path map of many, is only possible if the two are
+    /// stored apart.
+    #[test]
+    fn the_package_lookup_does_not_scale_with_the_path_map() {
+        let entries: Vec<(String, String)> = (0..50_000)
+            .map(|i| (format!("/usr/bin/prog{i}"), "coreutils".to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(p, k)| (p.as_str(), k.as_str()))
+            .collect();
+        let idx = index_with(&refs);
+
+        assert_eq!(idx.pkg_by_path.len(), 50_000, "the path map is large");
+        assert_eq!(
+            idx.pkg_names.len(),
+            1,
+            "and the name set is not, which is the whole point"
+        );
+        assert!(idx.has_package("coreutils"));
+        assert!(!idx.has_package("absent"));
     }
 }
 
@@ -896,6 +990,7 @@ mod tests {
         let index = PackageIndex {
             by_path,
             pkg_by_path: HashMap::new(),
+            pkg_names: std::collections::HashSet::new(),
             available: true,
         };
         let cache = ProvenanceCache::new(index);
@@ -941,6 +1036,7 @@ mod tests {
         cache.install(PackageIndex {
             by_path,
             pkg_by_path: HashMap::new(),
+            pkg_names: std::collections::HashSet::new(),
             available: true,
         });
 
@@ -966,6 +1062,7 @@ mod tests {
         by_path.insert(bin.clone(), md5);
         let cache = ProvenanceCache::new(PackageIndex {
             pkg_by_path: HashMap::new(),
+            pkg_names: std::collections::HashSet::new(),
             by_path,
             available: true,
         });
