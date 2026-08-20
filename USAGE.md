@@ -493,6 +493,24 @@ SELECT fingerprint_hex, agent_version FROM bowery_mesh_peers
 Pair it with `SELECT DISTINCT object_sha256 FROM bowery_probe_status
 --fanout`, which catches the same skew in the eBPF object.
 
+### What the neighbours actually said
+
+A confirmation is an aggregate, and the aggregate is what an alert asks
+you to trust. The digest and the alert context now carry one line per
+peer asked — whether it has the binary, has the program at another
+build, has no record, could not compare, declined, or never replied —
+so the count can be checked rather than taken on faith.
+
+```sql
+SELECT episode_id, confirmed, peers_unseen, peers_seen, peers_familiar,
+       peers_incomparable, peers_refused
+FROM bowery_alerts
+```
+
+The email shows the same under "what the neighbours said", and its
+summary line names every non-empty bucket plus the quorum in force
+rather than only the one that decided the verdict.
+
 ### When the mesh cannot check something
 
 The neighbourhood watch asks peers whether they have seen a binary's
