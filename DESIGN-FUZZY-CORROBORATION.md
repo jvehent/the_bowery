@@ -1,6 +1,9 @@
 # Fuzzy corroboration — making the neighbourhood watch mean something
 
-**Status:** slices 1–3 implemented; slices 4–6 proposed.
+**Status:** slices 1, 2, 3 and 6 implemented and verified on a live
+fleet. Slice 5 done for `file.access`. Slice 4 (retiring the older
+exact-match path) is the only structural item left, and the remaining
+evidence dimensions were measured and rejected — see §5.
 
 ## 1. The finding
 
@@ -93,7 +96,7 @@ Proposed dimensions for an executable, cheapest first:
 | `path` | same program installed | needs the path in the baseline |
 | `basename` | same program, relocated | free once path exists |
 | `pkg name+version` | same distro artifact — **survives arch** | dpkg/rpm query, cached |
-| `elf.build_id` | same build inputs | one read of `.note.gnu.build-id` |
+| `elf.build_id` | ~~same build inputs~~ — narrower than the hash it would supplement, see §5 | one read of `.note.gnu.build-id` |
 | `elf.needed` | same library dependency set — largely arch-independent | ELF parse, cached |
 | `elf.machine/class` | tells the two hosts they are comparable **at all** | ELF parse |
 | `size class` | weak, but cheap and non-zero | stat |
@@ -248,8 +251,8 @@ irreversibly.
    and says nothing about whether this copy is intact, which is
    provenance's job.
 
-   Still on the evidence-vector list: build-id and `DT_NEEDED`, both of
-   which need an ELF reader.
+   `DT_NEEDED` and build-id were the remaining candidates. Both were
+   measured and neither is being added; see §5.
 4. **Retire `whisper_qa.rs`'s exact-match path** once (3) covers it.
 5. **Port the other kinds** to fuzzy dimensions, one per slice.
 6. ~~**Operator surface.**~~ **Done.** `peers_incomparable` and
@@ -263,6 +266,36 @@ irreversibly.
 - **Not** ML/embedding similarity. The dimensions above are explainable
   and an operator can act on "same package, different build". A cosine
   score is not something anyone can argue with at 03:00.
+- **Not `DT_NEEDED`, on measurement.** It does cross the architecture
+  boundary, which was the reason to want it. Measured on the fleet, the
+  library sets are identical apart from the arch-specific interpreter:
+
+  ```
+  otter1  (x86_64)   curl: libc.so.6 libcurl.so.4 libz.so.1
+  legolas (aarch64)  curl: ld-linux-aarch64.so.1 libc.so.6 libcurl.so.4 libz.so.1
+  ```
+
+  It is still the wrong signal, for two reasons that only became clear
+  once it was measured rather than reasoned about.
+
+  It barely discriminates: `dash` needs only `libc.so.6`, and so does
+  nearly every trivial binary on the host. As a corroborating dimension
+  beside package identity it adds almost nothing, because package
+  identity has already answered.
+
+  And where it *would* be reached — an unpackaged binary, which is the
+  case worth caring about — it is actively harmful. A binary dropped in
+  `/tmp` linking `libc` and `libcurl` would be "recognised" because a
+  peer has `curl` installed. That is a recognition signal an attacker
+  chooses by linking against ordinary libraries, and this feature
+  lowers scores. A dimension that damps findings and is trivially
+  forgeable is worse than no dimension.
+
+- **Not build-id.** It identifies a build artifact exactly, which makes
+  it strictly narrower than the hash it would supplement, and it does
+  not survive an architecture boundary. It answers a question the
+  sha256 already answers.
+
 - **Not** fuzzy hashing (ssdeep/TLSH) as the primary signal. It answers
   "are these bytes similar", which for two independent compilations of
   the same source is often *no* — the same trap one level down. Worth
@@ -300,6 +333,37 @@ What remains open is whether the *model* should see the mesh verdict
 and weigh it directly, rather than having the damp applied around it.
 That needs `bowery-llm` to know the type, and it is a genuine question
 about where judgement belongs rather than a missing patch.
+
+## 5b. What the fleet showed, end to end
+
+Verified on three hosts (one x86-64, two aarch64) rather than argued
+for:
+
+```
+# a binary neither peer has the file for, recognised by package
+DEBUG peer has the same program at a different build pkg_builds=0 by_path_only=false
+INFO  the neighbourhood recognises this program; superseding with a
+      lower score familiar=2 asked=2 from=0.75 to=0.30
+
+# and the operator sees it, damped, with the reason attached
+suspicion  confirmed  peers_familiar  peers_asked
+   0.30        0            2              2
+
+# a file-access round, widened to the same program at another path
+WARN  file watch hit rule="cred.read_aws" path=/home/julien/.aws/credentials
+INFO  corroboration round complete kind="file.access" asked=2
+      corroborated=0 denied=2 confirmed=false
+
+# and the two kinds side by side, one working, one with nobody to ask
+kind                  raised  no_audience  rounds  corroborated  denied
+file.access                1            0       1             0       2
+net.inbound_connect        5            5       0             0       0
+```
+
+The `denied=2` is correct and worth reading carefully: the peers do not
+read that path, and they said so. Widening the question to "the same
+program anywhere" did not manufacture agreement, which is the property
+that matters most about a feature whose job is lowering scores.
 
 ## 6. Open questions
 
