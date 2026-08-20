@@ -365,6 +365,46 @@ read that path, and they said so. Widening the question to "the same
 program anywhere" did not manufacture agreement, which is the property
 that matters most about a feature whose job is lowering scores.
 
+## 5c. Known not to work
+
+**The `ParentGone` fallback does not rescue the `sudo` case, which is
+all that remains of it.** Recorded here because it is deployed, tested,
+and cannot fire for its motivating case — the failure mode this project
+keeps producing, and the one worth writing down rather than leaving for
+someone to rediscover.
+
+`privesc.uid_transition_no_helper` fired 206 times a fortnight. Two
+shapes were behind it. The first — `pkexec` exec-ing its target inside
+the same pid — is fixed and verified: the pair that produced a 0.90
+alert now produces none. The second is `sudo`, which forks before the
+child execs:
+
+```
+578630  ppid=577587  uid=1000  /usr/bin/sudo      <- exec'd, recorded
+578632  ppid=578631  uid=0     /usr/bin/install   <- the transition
+```
+
+pid 578631 appears in no exec event, because inheriting an image
+through fork is not an exec. `/proc` cannot answer once it exits and
+the process table never saw it. Six such fires in ninety minutes on a
+build carrying the fallback; none reached it.
+
+The fix is a `sched_process_fork` probe, so the fork is observed and
+the child can be attributed to the parent that exec'd. That is a new
+kernel-side program and a new event type, and it should be taken on
+deliberately rather than bolted onto this work.
+
+Until then the behaviour is honest rather than correct: the alert fires
+and its rationale says the parent could not be established and that a
+short-lived `sudo` looks exactly like this. An operator is told what is
+not known, which is the right failure direction, and the noise stays.
+
+The test for this lives against `ProcTable`, not the helper check.
+The helper-check test hands the function a remembered path directly,
+which proves it uses its input and says nothing about whether an input
+ever exists — the same test-design mistake that shipped a status view
+nothing had wired up.
+
 ## 6. Open questions
 
 - Does `quorum` stay a count, or become a confidence threshold? A count

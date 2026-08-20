@@ -2097,6 +2097,28 @@ pub(crate) async fn parent_privilege_helper(
     // turned a sanctioned escalation into an alert.
     //
     // Same idiom the file-open attribution path already uses.
+    //
+    // **This does not rescue the `sudo` case, and measurement says that
+    // is the whole of what remains.** `sudo` forks before the child
+    // execs, and the fork never execs anything itself:
+    //
+    //     578630  ppid=577587  uid=1000  /usr/bin/sudo
+    //     578632  ppid=578631  uid=0     /usr/bin/install
+    //
+    // pid 578631 appears in no exec event, because inheriting an image
+    // through fork is not an exec. `/proc` cannot answer once it exits
+    // and this table never saw it, so the answer stays `ParentGone`.
+    // Six such fires in ninety minutes on a build carrying this
+    // fallback, and none of them reached it.
+    //
+    // Identifying that pid needs the fork observed — a
+    // `sched_process_fork` probe the agent does not have. Until then
+    // the rationale on the alert says so in as many words, which is the
+    // honest fallback: the finding is reported, and it is reported as
+    // "could not be established" rather than as an escalation.
+    //
+    // What this *does* rescue is a parent that exec'd and then exited,
+    // which is a real shape and not the common one.
     let Some(exe) = bowery_events::enrich::pid_exe_path(ppid).or(remembered) else {
         return HelperCheck::ParentGone;
     };
@@ -2902,6 +2924,50 @@ mod remembered_parent_tests {
              manufacture an escalation, got {remembered:?}",
             helper.display()
         );
+    }
+
+    /// The shape the fallback cannot rescue, pinned so nobody reads it
+    /// as solved.
+    ///
+    /// `sudo` forks before the child execs, and the fork never execs
+    /// itself. Observed on a live host:
+    ///
+    ///     578630  ppid=577587  uid=1000  /usr/bin/sudo
+    ///     578632  ppid=578631  uid=0     /usr/bin/install
+    ///
+    /// pid 578631 is in no exec event at all — inheriting an image
+    /// through fork is not an exec — so the process table has nothing
+    /// to remember and `/proc` has nothing left to read.
+    ///
+    /// Written against `ProcTable` rather than the helper check,
+    /// because the gap is that nothing can *supply* the remembered
+    /// path. The helper-check test hands it one directly, which proves
+    /// the function uses its input and says nothing about whether an
+    /// input exists — the same mistake that shipped a status view
+    /// nothing had wired up.
+    #[test]
+    fn a_forked_parent_that_never_execs_cannot_be_remembered() {
+        let procs = crate::proc_table::ProcTable::new(Duration::from_mins(5));
+        let now = SystemTime::now();
+
+        // sudo execs and is recorded.
+        procs.record(578_630, std::path::Path::new("/usr/bin/sudo"), now);
+        // It then forks. There is no exec for 578631, so nothing to
+        // record — that is the whole problem, stated as code.
+        let forked_parent = 578_631;
+
+        assert!(
+            procs.exe_at(forked_parent, now).is_none(),
+            "a pid that never exec'd cannot be in the table, so the fallback has \
+             nothing to offer for the commonest privilege-transition shape"
+        );
+        assert!(
+            procs.previous_exe(forked_parent, now).is_none(),
+            "and it has no history either"
+        );
+        // The pid that *did* exec is still recoverable, which is the
+        // shape the fallback exists for.
+        assert!(procs.exe_at(578_630, now).is_some());
     }
 
     /// The fallback must not become a way to vouch for anything.
