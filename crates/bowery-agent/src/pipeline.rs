@@ -235,6 +235,34 @@ async fn process_event(ctx: &PipelineContext, event: Event) {
 /// rule names is exempt, on the same two-condition footing as the
 /// credential readers.
 ///
+/// What the agent remembers about a parent pid's binary.
+///
+/// Two sources, in order: the exec we watched for that pid, and — for a
+/// pid that never exec'd at all — the exec of whatever forked it.
+///
+/// The second is the `sudo` shape. `sudo` forks before its child execs
+/// and the fork inherits an image without exec-ing, so the intermediate
+/// pid appears in no exec event and `/proc` has nothing left once it
+/// exits.
+///
+/// A free function over the table so it can be tested. Asserting
+/// through `process_exec` is not reachable: the rule needs a readable
+/// parent uid before it consults this, and a pid `/proc` cannot answer
+/// for has no readable uid either — so the condition cannot be built on
+/// a live system. That is the same reason it cannot be observed on the
+/// fleet, where the only producer is a deploy that restarts the agent
+/// between the fork and the exec.
+pub(crate) fn remembered_parent_exe(
+    procs: &ProcTable,
+    ppid: u32,
+    ts: std::time::SystemTime,
+) -> Option<std::path::PathBuf> {
+    procs.exe_at(ppid, ts).or_else(|| {
+        let origin = procs.forked_from(ppid, ts)?;
+        procs.exe_at(origin, ts)
+    })
+}
+
 /// Did this pid become root by exec'ing a set-id helper in place?
 ///
 /// `Some` only when the previous exec of this same pid was a packaged,
@@ -1205,10 +1233,7 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
                 // execs the target as root, and the intermediate
                 // pid is in no exec event because inheriting an
                 // image through fork is not an exec.
-                let remembered = ctx.procs.exe_at(exec.ppid, exec.ts).or_else(|| {
-                    let origin = ctx.procs.forked_from(exec.ppid, exec.ts)?;
-                    ctx.procs.exe_at(origin, exec.ts)
-                });
+                let remembered = remembered_parent_exe(&ctx.procs, exec.ppid, exec.ts);
                 parent_privilege_helper(exec.ppid, &ctx.packages, remembered).await
             }
         } else {
@@ -1462,4 +1487,75 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
     }
 
     let _ = ctx.events_tx.send(AgentEvent::EpisodeAnalyzed { verdict });
+}
+
+#[cfg(test)]
+mod remembered_parent_exe_tests {
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
+    use super::remembered_parent_exe;
+    use crate::proc_table::ProcTable;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// The `sudo` shape, as the fleet produced it:
+    ///
+    ///     578630  ppid=577587  uid=1000  /usr/bin/sudo
+    ///     578632  ppid=578631  uid=0     /usr/bin/install
+    ///
+    /// pid 578631 execs nothing. Resolving it needs the fork.
+    #[test]
+    fn a_forked_parent_resolves_through_the_pid_that_forked_it() {
+        let procs = ProcTable::new(Duration::from_mins(5));
+        procs.record(578_630, Path::new("/usr/bin/sudo"), at(1000));
+        procs.record_fork(578_630, 578_631, at(1001));
+
+        assert_eq!(
+            remembered_parent_exe(&procs, 578_631, at(1002)).as_deref(),
+            Some(Path::new("/usr/bin/sudo")),
+            "the helper that granted the privilege must be reachable"
+        );
+    }
+
+    /// A parent that exec'd itself needs no fork record — that is the
+    /// direct case and it must keep working.
+    #[test]
+    fn a_parent_that_exec_d_is_resolved_directly() {
+        let procs = ProcTable::new(Duration::from_mins(5));
+        procs.record(4242, Path::new("/usr/bin/sudo"), at(1000));
+        assert_eq!(
+            remembered_parent_exe(&procs, 4242, at(1001)).as_deref(),
+            Some(Path::new("/usr/bin/sudo"))
+        );
+    }
+
+    /// Nothing observed, nothing claimed. This value *exempts* a
+    /// privilege transition, so inventing one is a missed escalation.
+    #[test]
+    fn an_unobserved_parent_resolves_to_nothing() {
+        let procs = ProcTable::new(Duration::from_mins(5));
+        assert!(remembered_parent_exe(&procs, 578_631, at(1002)).is_none());
+
+        // A fork whose parent never exec'd is equally useless: the
+        // chain has to end at a binary.
+        procs.record_fork(111, 222, at(1000));
+        assert!(
+            remembered_parent_exe(&procs, 222, at(1001)).is_none(),
+            "a fork of something we never saw exec explains nothing"
+        );
+    }
+
+    /// Stale records must not vouch: past the TTL the pid may have been
+    /// reused, and a reused pid would exempt a transition nothing
+    /// granted.
+    #[test]
+    fn a_stale_fork_resolves_to_nothing() {
+        let procs = ProcTable::new(Duration::from_mins(5));
+        procs.record(578_630, Path::new("/usr/bin/sudo"), at(1000));
+        procs.record_fork(578_630, 578_631, at(1000));
+        assert!(remembered_parent_exe(&procs, 578_631, at(1000 + 600)).is_none());
+    }
 }

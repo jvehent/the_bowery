@@ -365,7 +365,68 @@ read that path, and they said so. Widening the question to "the same
 program anywhere" did not manufacture agreement, which is the property
 that matters most about a feature whose job is lowering scores.
 
-## 5c. Known not to work
+## 5c. The sudo shape: fixed, and unverifiable on this fleet
+
+`privesc.uid_transition_no_helper` fired 206 times a fortnight from two
+shapes. `pkexec` exec-ing its target in place is fixed and verified —
+the pair that produced a 0.90 alert now produces none.
+
+The other is `sudo`, which forks before its child execs:
+
+```
+578630  ppid=577587  uid=1000  /usr/bin/sudo      <- exec'd, recorded
+578632  ppid=578631  uid=0     /usr/bin/install   <- the transition
+```
+
+pid 578631 is in no exec event, because inheriting an image through
+fork is not an exec. A `sched:sched_process_fork` probe now records
+parent → child so that pid can be resolved through the one that forked
+it.
+
+**It cannot be confirmed on this fleet, and the reason is structural.**
+The only thing producing `sudo` transitions here is a deploy, and a
+deploy restarts the agent between the fork and the exec — so the agent
+observes the transition having missed the fork, and reports
+`ParentGone` correctly. Measured: every fire today clusters exactly on
+a deploy timestamp, on an instance that started seconds earlier.
+
+It cannot be confirmed in an end-to-end test either, for a related
+reason: the rule needs a readable parent uid before it consults the
+fork record, and a pid `/proc` cannot answer for has no readable uid.
+The condition cannot be constructed on a live system.
+
+So the resolution is a free function over the process table with its
+own tests, and the untested link is one call site. That is a weaker
+guarantee than the rest of this document reports, and it is written
+down rather than glossed: what is proven is that the probe attaches on
+all three kernels, emits, and that the lookup resolves; what is not
+proven is a live exemption.
+
+The honest fallback has not changed. An unattributed transition alerts
+and says the parent could not be established.
+
+## 5d. Two tracepoint layouts
+
+The fork probe refused to attach on one host of three:
+
+```
+sched_process_fork.child_pid is at offset 20, but the BPF program reads 44
+```
+
+Kernel 6.18 declares the comm fields as `__data_loc` descriptors of
+four bytes instead of `char[16]`, moving `child_pid` from 44 to 20. The
+two hosts that disagreed are both aarch64, so this is a kernel-version
+difference and not an architectural one — the assumption that would
+have been wrong quietly.
+
+Both layouts ship as separate programs and the loader attaches the one
+matching the kernel's published format. An offset matching neither gets
+no probe, because a `child_pid` read from the wrong four bytes would
+*exempt* privilege transitions.
+
+This is the layout verification earning its cost on first contact.
+
+## 5e. Previously recorded as not working
 
 **The `ParentGone` fallback does not rescue the `sudo` case, which is
 all that remains of it.** Recorded here because it is deployed, tested,
