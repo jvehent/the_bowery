@@ -586,6 +586,50 @@ Same-architecture is necessary, not sufficient — the two aarch64 hosts
 above still share only 5 of ~100 hashes. Narrowing that is what the
 remaining slices in `DESIGN-FUZZY-CORROBORATION.md` cover.
 
+### Did that change help?
+
+The live counters cannot answer it. `bowery_detections.fired` resets
+every time the agent restarts, and a fix and its verification are always
+separated by a deploy — so the counter describes the minutes since the
+rollout and nothing else. `fired_since_install` is durable and has no
+rate in it: `224` says nothing about whether the last change moved
+anything.
+
+The archive timestamps every alert, so the rate was already there:
+
+```bash
+bowery alerts trend                 # last 14 days
+bowery alerts trend --since 3d
+bowery alerts trend --rule cred.read_shadow
+bowery alerts trend --agent dartagnan
+```
+
+```
+alerts per rule per day (UTC), 2026-08-19 .. 2026-08-24
+
+                                    19   20   21   22   23   24  total
+cred.read_shadow                     3    4    3    3    2    4     19
+baseline.rarity                      .    .    7    1    .    1      9
+privesc.uid_transition_no_helper     2    .    2    .    .    .      4
+
+all rules                            6    7   15    6    6    7     47
+```
+
+A `.` is "this rule produced nothing that day". The `all rules` footer
+is there for the case a table of counts cannot express on its own: a
+day where *nothing was archived at all* makes every rule read zero, and
+that is not a quiet fleet. Those days are named explicitly beneath the
+table.
+
+Counts are per episode by default, not per alert. An episode produces
+several alerts as its verdict is refined — pre-filter, LLM, quorum — and
+counting each would measure the pipeline's chattiness rather than how
+much an operator was asked to look at. `--all-versions` counts them all.
+
+This is a different measure from `bowery_detections.fired`, which counts
+rule *hits* folded into a verdict — including verdicts that never
+crossed the alert threshold. Expect the trend to be the smaller number.
+
 ### Alert history, and why it is operator-side
 
 An agent's inbox is an in-memory ring with a 72-hour TTL that dies with

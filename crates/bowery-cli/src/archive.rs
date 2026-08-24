@@ -1410,3 +1410,347 @@ mod roundtrip_tests {
         assert_eq!(row.agent_label(), "abababababab");
     }
 }
+
+// ---------------------------------------------------------------------------
+// `bowery alerts trend` — is a rule getting noisier or quieter?
+// ---------------------------------------------------------------------------
+
+/// Alerts per rule per day.
+///
+/// The question this answers is the one that kept going unanswered:
+/// *did that change help?* Every deploy restarts the agents, which
+/// resets `bowery_detections.fired`, so the live counters can only ever
+/// describe the minutes since the last rollout — and a fix and its
+/// verification are always separated by a restart. The durable count
+/// (`fired_since_install`) has no rate in it, so "224" says nothing
+/// about whether the last change moved anything.
+///
+/// The archive has a timestamp on every alert, so the rate is already
+/// there and only needed reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trend {
+    /// Day buckets, oldest first, as `YYYY-MM-DD` in UTC.
+    pub days: Vec<String>,
+    /// One row per rule, most alerts first.
+    pub rules: Vec<TrendRow>,
+    /// Total archived per day, in the same order as [`Self::days`].
+    ///
+    /// Carried because a rule reading zero on a day the archive
+    /// recorded *nothing at all* is not the same fact as a rule that
+    /// went quiet, and the two look identical in a table of counts.
+    pub totals: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrendRow {
+    pub rule_id: String,
+    /// Counts per day, in the same order as [`Trend::days`].
+    pub counts: Vec<u64>,
+    pub total: u64,
+}
+
+/// `YYYY-MM-DD` in UTC for an epoch-millisecond timestamp.
+///
+/// UTC and not local time, to match every other timestamp the agent
+/// and the archive print. A trend whose day boundaries move with the
+/// reader's timezone is one nobody can compare against a log.
+#[must_use]
+pub fn day_of(ms: u64) -> String {
+    let secs = i64::try_from(ms / 1000).unwrap_or(0);
+    time::OffsetDateTime::from_unix_timestamp(secs).map_or_else(
+        |_| "unknown".to_string(),
+        |t| format!("{:04}-{:02}-{:02}", t.year(), u8::from(t.month()), t.day()),
+    )
+}
+
+/// Bucket rows into rules × days.
+///
+/// Pure, so the bucketing is testable without an archive. Days present
+/// in the data define the columns: a window with no alerts at all
+/// produces no columns rather than a wall of zeroes claiming quiet.
+#[must_use]
+pub fn trend(rows: &[Row]) -> Trend {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut days: BTreeSet<String> = BTreeSet::new();
+    let mut per_rule: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut totals: BTreeMap<String, u64> = BTreeMap::new();
+
+    for r in rows {
+        let day = day_of(r.ts_unix_ms);
+        // An alert with no rule id still happened, and hiding it would
+        // make the totals disagree with the rows beneath them.
+        let rule = r
+            .rule_id
+            .clone()
+            .unwrap_or_else(|| "(no rule id)".to_string());
+        days.insert(day.clone());
+        *per_rule
+            .entry(rule)
+            .or_default()
+            .entry(day.clone())
+            .or_default() += 1;
+        *totals.entry(day).or_default() += 1;
+    }
+
+    let days: Vec<String> = days.into_iter().collect();
+    let mut rules: Vec<TrendRow> = per_rule
+        .into_iter()
+        .map(|(rule_id, by_day)| {
+            let counts: Vec<u64> = days
+                .iter()
+                .map(|d| by_day.get(d).copied().unwrap_or(0))
+                .collect();
+            let total = counts.iter().sum();
+            TrendRow {
+                rule_id,
+                counts,
+                total,
+            }
+        })
+        .collect();
+    // Noisiest first: the reason to open this is usually one rule
+    // producing most of the volume.
+    rules.sort_by(|a, b| {
+        b.total
+            .cmp(&a.total)
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
+    });
+
+    let totals = days
+        .iter()
+        .map(|d| totals.get(d).copied().unwrap_or(0))
+        .collect();
+    Trend {
+        days,
+        rules,
+        totals,
+    }
+}
+
+/// Render a trend as a table, days across.
+#[must_use]
+pub fn render_trend(t: &Trend, path: &Path) -> String {
+    use std::fmt::Write as _;
+
+    if t.days.is_empty() {
+        return format!(
+            "archive {} holds no alerts in this window.\n\
+             That is not the same as a quiet fleet: `bowery notify` or the console fill \
+             this as they poll, and if neither ran there is nothing recorded to read.\n",
+            path.display()
+        );
+    }
+
+    // Column headers are the day-of-month; the month is stated once, so
+    // a fortnight fits a terminal.
+    let width = 5usize;
+    let rule_col = t
+        .rules
+        .iter()
+        .map(|r| r.rule_id.chars().count())
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 40);
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "alerts per rule per day (UTC), {} .. {}",
+        t.days.first().map_or("", String::as_str),
+        t.days.last().map_or("", String::as_str)
+    );
+    let _ = write!(out, "\n{:rule_col$}", "");
+    for d in &t.days {
+        let _ = write!(out, "{:>width$}", &d[8..]);
+    }
+    let _ = writeln!(out, "{:>7}", "total");
+
+    for r in &t.rules {
+        let _ = write!(out, "{:rule_col$}", truncate(&r.rule_id, rule_col));
+        for c in &r.counts {
+            // A dot, not a zero: "this rule produced nothing that day"
+            // should not compete visually with the counts that matter.
+            if *c == 0 {
+                let _ = write!(out, "{:>width$}", ".");
+            } else {
+                let _ = write!(out, "{c:>width$}");
+            }
+        }
+        let _ = writeln!(out, "{:>7}", r.total);
+    }
+
+    let _ = write!(out, "\n{:rule_col$}", "all rules");
+    for n in &t.totals {
+        let _ = write!(out, "{n:>width$}");
+    }
+    let _ = writeln!(out, "{:>7}", t.totals.iter().sum::<u64>());
+
+    // The distinction that makes the zeroes readable.
+    let empty: Vec<&str> = t
+        .days
+        .iter()
+        .zip(&t.totals)
+        .filter(|(_, n)| **n == 0)
+        .map(|(d, _)| d.as_str())
+        .collect();
+    if !empty.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nNothing at all was archived on {}. Every rule reads zero for those days \
+             because nothing was recorded, which is not the same as nothing happening.",
+            empty.join(", ")
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod trend_tests {
+    use super::*;
+
+    fn row(rule: &str, ts: u64) -> Row {
+        Row {
+            agent_fp: "ab".repeat(32),
+            agent_name: Some("otter1".into()),
+            episode_id: format!("ep-{ts}-{rule}"),
+            ts_unix_ms: ts,
+            archived_ms: ts,
+            rule_id: Some(rule.into()),
+            suspicion: 0.9,
+            exe_path: None,
+            exe_sha256: None,
+            rationale: None,
+            backend: None,
+            confirmed: None,
+            peers_asked: None,
+            peers_unseen: None,
+            peers_seen: None,
+            peers_incomparable: None,
+            peers_familiar: None,
+            context_json: "{}".into(),
+        }
+    }
+
+    /// Midnight UTC on 2026-08-19, 20, 21.
+    const D19: u64 = 1_787_097_600_000;
+    const DAY: u64 = 86_400_000;
+
+    #[test]
+    fn alerts_bucket_by_rule_and_day() {
+        let t = trend(&[
+            row("cred.read_shadow", D19),
+            row("cred.read_shadow", D19 + 3_600_000),
+            row("cred.read_shadow", D19 + DAY),
+            row("baseline.rarity", D19 + DAY),
+        ]);
+
+        assert_eq!(t.days.len(), 2, "two distinct days: {:?}", t.days);
+        assert_eq!(t.rules[0].rule_id, "cred.read_shadow");
+        assert_eq!(t.rules[0].counts, vec![2, 1]);
+        assert_eq!(t.rules[0].total, 3);
+        assert_eq!(t.rules[1].counts, vec![0, 1]);
+        assert_eq!(t.totals, vec![2, 2]);
+    }
+
+    /// The noisiest rule is the reason to open this, so it goes first.
+    #[test]
+    fn the_loudest_rule_sorts_first() {
+        let t = trend(&[
+            row("quiet.rule", D19),
+            row("loud.rule", D19),
+            row("loud.rule", D19),
+            row("loud.rule", D19),
+        ]);
+        assert_eq!(t.rules[0].rule_id, "loud.rule");
+        assert_eq!(t.rules[0].total, 3);
+    }
+
+    /// A day the archive recorded nothing at all is not a quiet day,
+    /// and a table of zeroes cannot tell them apart on its own.
+    #[test]
+    fn a_day_with_nothing_archived_is_called_out() {
+        // Two days of alerts with a silent day between them can only
+        // appear if something was archived on that middle day, so the
+        // gap is constructed by a rule that stops.
+        let t = Trend {
+            days: vec!["2026-08-19".into(), "2026-08-20".into()],
+            rules: vec![TrendRow {
+                rule_id: "cred.read_shadow".into(),
+                counts: vec![3, 0],
+                total: 3,
+            }],
+            totals: vec![3, 0],
+        };
+        let out = render_trend(&t, Path::new("/tmp/a.db"));
+        assert!(
+            out.contains("Nothing at all was archived on 2026-08-20"),
+            "{out}"
+        );
+        assert!(
+            out.contains("not the same as nothing happening"),
+            "the distinction has to be stated, not implied: {out}"
+        );
+    }
+
+    /// A day where rules genuinely went quiet must *not* be called out
+    /// — the note would be false and would train the reader to skip it.
+    #[test]
+    fn a_genuinely_quiet_rule_is_not_called_out() {
+        let t = trend(&[
+            row("cred.read_shadow", D19),
+            row("baseline.rarity", D19 + DAY),
+        ]);
+        let out = render_trend(&t, Path::new("/tmp/a.db"));
+        assert!(!out.contains("Nothing at all was archived"), "{out}");
+        // The rule that stopped still reads as a gap in its own row.
+        assert!(out.contains('.'), "a zero renders as a dot: {out}");
+    }
+
+    /// An empty window says why rather than drawing an empty table.
+    #[test]
+    fn an_empty_window_explains_itself() {
+        let out = render_trend(&trend(&[]), Path::new("/tmp/a.db"));
+        assert!(out.contains("holds no alerts in this window"), "{out}");
+        assert!(out.contains("not the same as a quiet fleet"), "{out}");
+        assert!(!out.contains('\\'), "no stray escapes in the prose: {out}");
+    }
+
+    /// An alert with no rule id still happened. Dropping it would make
+    /// the totals disagree with the rows under them.
+    #[test]
+    fn an_alert_without_a_rule_id_is_still_counted() {
+        let mut r = row("x", D19);
+        r.rule_id = None;
+        let t = trend(&[r]);
+        assert_eq!(t.totals, vec![1]);
+        assert_eq!(t.rules[0].rule_id, "(no rule id)");
+        assert_eq!(t.rules[0].total, 1);
+    }
+
+    /// The footer must equal the rows above it, or the table is lying
+    /// about one of them.
+    #[test]
+    fn the_totals_row_agrees_with_the_rules() {
+        let t = trend(&[
+            row("a", D19),
+            row("b", D19),
+            row("a", D19 + DAY),
+            row("c", D19 + 2 * DAY),
+        ]);
+        for (i, day_total) in t.totals.iter().enumerate() {
+            let summed: u64 = t.rules.iter().map(|r| r.counts[i]).sum();
+            assert_eq!(*day_total, summed, "day {} disagrees", t.days[i]);
+        }
+        let grand: u64 = t.rules.iter().map(|r| r.total).sum();
+        assert_eq!(grand, t.totals.iter().sum::<u64>());
+    }
+
+    /// Day boundaries are UTC, matching every other timestamp printed.
+    #[test]
+    fn days_are_utc() {
+        assert_eq!(day_of(D19), "2026-08-19");
+        assert_eq!(day_of(D19 + DAY - 1), "2026-08-19", "just before midnight");
+        assert_eq!(day_of(D19 + DAY), "2026-08-20");
+    }
+}

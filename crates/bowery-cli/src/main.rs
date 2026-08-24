@@ -519,6 +519,35 @@ enum AlertsCommand {
         #[arg(long)]
         stats: bool,
     },
+    /// Alerts per rule per day, from the operator-side archive.
+    ///
+    /// Answers "did that change help?", which the live counters cannot:
+    /// every deploy restarts the agents and resets
+    /// `bowery_detections.fired`, so a fix and its verification are
+    /// always separated by a restart, and the durable total has no rate
+    /// in it.
+    Trend {
+        /// Archive file. Defaults to `~/.bowery/alerts.db`.
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        /// How far back to look.
+        #[arg(long, default_value = "14d", value_parser = parse_duration)]
+        since: Duration,
+        /// Only this rule id.
+        #[arg(long)]
+        rule: Option<String>,
+        /// Only this agent, by manifest name or fingerprint hex.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Count every superseded version rather than one per episode.
+        ///
+        /// Off by default: an episode produces several alerts as its
+        /// verdict is refined, and counting each one measures the
+        /// pipeline's chattiness rather than how much an operator was
+        /// asked to look at.
+        #[arg(long)]
+        all_versions: bool,
+    },
     /// Print every alert in the agent's inbox since the cursor, then exit
     /// (or, with --follow, re-poll every `--interval`).
     Tail {
@@ -766,6 +795,22 @@ impl Cli {
                 Ok(ExitCode::SUCCESS)
             }
             Command::Doctor { json } => doctor_cmd(json),
+            Command::Alerts {
+                sub:
+                    AlertsCommand::Trend {
+                        archive,
+                        since,
+                        rule,
+                        agent,
+                        all_versions,
+                    },
+            } => {
+                let path = match archive {
+                    Some(p) => notify::expand_tilde(&p),
+                    None => bowery_cli::archive::default_path()?,
+                };
+                alerts_trend(&path, since, rule, agent, all_versions)
+            }
             Command::Alerts {
                 sub:
                     AlertsCommand::History {
@@ -1174,6 +1219,36 @@ fn key_info(path: &PathBuf) -> Result<()> {
     println!("fingerprint: {}", identity.fingerprint());
     println!("pubkey_b64:  {pubkey_b64}");
     Ok(())
+}
+
+/// `bowery alerts trend` — alerts per rule per day.
+fn alerts_trend(
+    path: &std::path::Path,
+    since: Duration,
+    rule: Option<String>,
+    agent: Option<String>,
+    all_versions: bool,
+) -> Result<ExitCode> {
+    use bowery_cli::archive::{Archive, Filter, render_trend, trend};
+
+    let archive = Archive::open(path)?;
+    let since_ms = u64::try_from(since.as_millis()).unwrap_or(u64::MAX);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let rows = archive.query(&Filter {
+        since_unix_ms: Some(now.saturating_sub(since_ms)),
+        rule_id: rule,
+        agent,
+        all_versions,
+        // A trend over a truncated window is a wrong trend, so this
+        // deliberately does not inherit the display cap that `history`
+        // uses to keep a listing readable.
+        limit: usize::MAX,
+        ..Filter::default()
+    })?;
+    print!("{}", render_trend(&trend(&rows), path));
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `bowery alerts history` — read the operator-side archive.
