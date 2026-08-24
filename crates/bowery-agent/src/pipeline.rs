@@ -174,7 +174,7 @@ async fn process_event(ctx: &PipelineContext, event: Event) {
         // Close the pid-reuse window as soon as the kernel tells us,
         // rather than waiting out the TTL.
         Event::ProcessExit(e) => {
-            ctx.procs.forget(e.pid);
+            ctx.procs.forget(e.pid, e.ts);
             if let Some(m) = ctx.mass_writes.as_ref() {
                 m.forget(e.pid);
             }

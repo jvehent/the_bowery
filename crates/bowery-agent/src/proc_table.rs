@@ -57,10 +57,42 @@ use std::time::{Duration, SystemTime};
 pub const DEFAULT_TTL: Duration = Duration::from_mins(5);
 
 /// Recent execs, so an exited process can still be named.
+/// How long an exited pid keeps answering.
+///
+/// Covers the drain skew between the exec, exit and file rings, which
+/// are independent — an exit is routinely processed a sequence number
+/// ahead of a file open the same pid made while alive.
+///
+/// Generous against that skew and negligible against pid reuse: the pid
+/// space wraps in the millions, and a reused pid that execs overwrites
+/// the entry anyway, while one that forks is covered by the fork map.
+/// The exposure is a pid reused within two seconds that neither execs
+/// nor is observed forking.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+
 /// What a pid has exec'd: its current binary, and the one before it.
 #[derive(Debug, Clone)]
 struct Entry {
     current: (PathBuf, SystemTime),
+    /// When the kernel told us this pid exited, if it has.
+    ///
+    /// Kept rather than deleting the entry outright. Exec, exit and
+    /// file events arrive on *separate ring buffers* drained
+    /// independently, so an exit can be processed before a file open
+    /// the same pid performed while alive — measured on a live host:
+    ///
+    /// ```text
+    /// seq 59125  exec       85016  /usr/sbin/unix_chkpwd
+    /// seq 59126  exit       85016
+    /// seq 59127  file_open  85016  /etc/shadow
+    /// ```
+    ///
+    /// Deleting on the exit destroyed the attribution for an event
+    /// still in flight, so `/etc/shadow` read by PAM's own
+    /// `unix_chkpwd` could not be recognised as PAM and alerted as
+    /// credential theft. Six such alerts on one host, every one with
+    /// this ordering, and every ordinary read without it.
+    exited_at: Option<SystemTime>,
     /// The exec immediately before `current`, when there was one.
     previous: Option<(PathBuf, SystemTime)>,
 }
@@ -122,6 +154,9 @@ impl ProcTable {
             Entry {
                 current: (exe.to_path_buf(), ts),
                 previous,
+                // A fresh exec clears any exit: this is a live process
+                // now, whatever the pid did before.
+                exited_at: None,
             },
         );
     }
@@ -199,7 +234,18 @@ impl ProcTable {
     #[must_use]
     pub fn exe_at(&self, pid: u32, at: SystemTime) -> Option<PathBuf> {
         let guard = self.inner.lock().ok()?;
-        let (exe, ts) = &guard.get(&pid)?.current;
+        let entry = guard.get(&pid)?;
+        // An exited pid keeps answering briefly, for events that were
+        // already in flight when the exit was processed. Anything
+        // further out is a pid that may since have been reused.
+        if let Some(exited) = entry.exited_at
+            && at
+                .duration_since(exited)
+                .is_ok_and(|since| since > EXIT_GRACE)
+        {
+            return None;
+        }
+        let (exe, ts) = &entry.current;
         if *ts > at {
             return None;
         }
@@ -209,23 +255,117 @@ impl ProcTable {
         Some(exe.clone())
     }
 
-    /// Forget a pid that has exited.
+    /// Note that a pid has exited.
     ///
-    /// Not required for correctness — the TTL covers it — but it closes
-    /// the reuse window as soon as the kernel tells us, rather than
-    /// minutes later.
-    pub fn forget(&self, pid: u32) {
+    /// Marks rather than deletes. Deleting closed the pid-reuse window
+    /// promptly, which is worth having, and it also threw away the
+    /// attribution for events from that pid that had not been processed
+    /// yet — the rings are drained independently, so "the kernel told
+    /// us it exited" does not mean "everything it did has been seen".
+    ///
+    /// The entry now stops answering [`EXIT_GRACE`] after the exit
+    /// instead of immediately, which covers the drain skew between
+    /// rings and still refuses anything genuinely later. The TTL and
+    /// the capacity bound remove it in the end.
+    pub fn forget(&self, pid: u32, ts: SystemTime) {
         if let Ok(mut guard) = self.forks.lock() {
             guard.remove(&pid);
         }
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.remove(&pid);
+        if let Ok(mut guard) = self.inner.lock()
+            && let Some(entry) = guard.get_mut(&pid)
+        {
+            entry.exited_at = Some(ts);
         }
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.lock().map_or(0, |g| g.len())
+    }
+}
+
+#[cfg(test)]
+mod exit_ordering_tests {
+    use super::*;
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// The false positive this fixes, as the fleet produced it.
+    ///
+    /// dartagnan alerted on `/etc/shadow` being read by `unix_chkpwd`
+    /// — PAM's own password checker, and already on the list of readers
+    /// the rule exempts. Six alerts over several days, and the event
+    /// log showed the same shape every time:
+    ///
+    ///     seq 59125  exec       85016  /usr/sbin/unix_chkpwd
+    ///     seq 59126  exit       85016
+    ///     seq 59127  file_open  85016  /etc/shadow
+    ///
+    /// The exit was processed before the open, because exec, exit and
+    /// file events arrive on independent ring buffers. Deleting the
+    /// entry on exit destroyed the attribution for an event still in
+    /// flight, so the reader could not be identified and PAM doing its
+    /// job read as credential theft.
+    ///
+    /// Nine of ten ordinary runs had `exec → open → exit` and never
+    /// alerted; every one of the six alerts had the exit first.
+    #[test]
+    fn an_exited_pid_still_answers_for_an_event_already_in_flight() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record(85_016, Path::new("/usr/sbin/unix_chkpwd"), at(1000));
+        t.forget(85_016, at(1000));
+
+        assert_eq!(
+            t.exe_at(85_016, at(1000)).as_deref(),
+            Some(Path::new("/usr/sbin/unix_chkpwd")),
+            "an open the process made while alive must still be attributable"
+        );
+    }
+
+    /// The reuse protection `forget` existed for must survive: an event
+    /// well after the exit gets nothing.
+    #[test]
+    fn an_exited_pid_stops_answering_once_the_grace_passes() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record(85_016, Path::new("/usr/sbin/unix_chkpwd"), at(1000));
+        t.forget(85_016, at(1000));
+
+        assert!(
+            t.exe_at(85_016, at(1000) + EXIT_GRACE + Duration::from_secs(1))
+                .is_none(),
+            "past the grace the pid may have been reused, and attributing to the dead \
+             binary is what the immediate delete was protecting against"
+        );
+    }
+
+    /// A pid reused by something that execs takes the new identity
+    /// immediately, grace or no grace.
+    #[test]
+    fn a_reused_pid_that_execs_overwrites_the_dead_entry() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record(85_016, Path::new("/usr/sbin/unix_chkpwd"), at(1000));
+        t.forget(85_016, at(1000));
+        t.record(85_016, Path::new("/tmp/payload"), at(1001));
+
+        assert_eq!(
+            t.exe_at(85_016, at(1001)).as_deref(),
+            Some(Path::new("/tmp/payload")),
+            "the live process is what it exec'd, not what the pid used to be"
+        );
+    }
+
+    /// Forget still closes the fork mapping at once. A fork record is
+    /// consumed within milliseconds of the fork and exists only to
+    /// attribute a privilege transition, so there is no in-flight case
+    /// to protect and every reason not to let a dead pid vouch.
+    #[test]
+    fn forget_drops_the_fork_record_immediately() {
+        let t = ProcTable::new(Duration::from_mins(5));
+        t.record_fork(100, 200, at(1000));
+        t.forget(200, at(1000));
+        assert!(t.forked_from(200, at(1000)).is_none());
     }
 }
 
@@ -292,12 +432,34 @@ mod tests {
         assert_eq!(t.exe_at(999, at(1000)), None);
     }
 
+    /// Exit stops attribution, but not instantly.
+    ///
+    /// This used to assert that a forgotten pid answers nothing at
+    /// once, and that was the bug: exec, exit and file events arrive on
+    /// independent rings, so an exit is regularly processed before a
+    /// file open the same pid made while alive. Deleting immediately
+    /// threw away the attribution for the event still in flight — six
+    /// `/etc/shadow` false positives on one host, every one of them
+    /// PAM's own `unix_chkpwd`, which the rule already exempts.
+    ///
+    /// The contract is now "briefly, then not", and both halves are
+    /// asserted here.
     #[test]
-    fn an_exited_pid_can_be_forgotten_immediately() {
+    fn an_exited_pid_answers_briefly_and_then_stops() {
         let t = ProcTable::default();
         t.record(4242, Path::new("/bin/sh"), at(1000));
-        t.forget(4242);
-        assert_eq!(t.exe_at(4242, at(1001)), None);
+        t.forget(4242, at(1000));
+
+        assert_eq!(
+            t.exe_at(4242, at(1000)).as_deref(),
+            Some(Path::new("/bin/sh")),
+            "an event from before the exit must still be attributable"
+        );
+        assert_eq!(
+            t.exe_at(4242, at(1000) + EXIT_GRACE + Duration::from_secs(1)),
+            None,
+            "and a genuinely later one must not be"
+        );
     }
 
     #[test]
@@ -381,7 +543,7 @@ mod fork_tests {
     fn forgetting_a_pid_drops_its_fork_record() {
         let t = ProcTable::new(Duration::from_mins(5));
         t.record_fork(578_630, 578_631, at(1000));
-        t.forget(578_631);
+        t.forget(578_631, at(1000));
         assert!(t.forked_from(578_631, at(1001)).is_none());
     }
 
