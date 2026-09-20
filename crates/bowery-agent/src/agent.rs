@@ -1038,9 +1038,9 @@ impl Agent {
                     // the async runtime.
                     let probe = packages.clone();
                     let reloaded = tokio::task::spawn_blocking(move || {
-                        probe.database_moved().then(
-                            bowery_analysis::provenance::PackageIndex::load_system,
-                        )
+                        probe
+                            .database_moved()
+                            .then(bowery_analysis::provenance::PackageIndex::load_system)
                     })
                     .await;
                     match reloaded {
