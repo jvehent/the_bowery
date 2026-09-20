@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Where a binary came from, as far as the package manager knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +93,11 @@ pub struct PackageIndex {
     /// string comparisons apiece. The distinct names are a couple of
     /// thousand, so the set is small next to what it indexes.
     pkg_names: std::collections::HashSet<String>,
+    /// When this snapshot was taken, so that a stale one can decline to
+    /// accuse — see [`DbStamp`]. `None` for an index built in memory,
+    /// or from a directory whose state could not be stat'd; neither can
+    /// be checked for drift, so neither downgrades anything.
+    stamp: Option<DbStamp>,
     /// False when no package database was found, which makes every
     /// answer [`Provenance::Unknown`] rather than
     /// [`Provenance::Unpackaged`]. Reporting "no package owns this" on a
@@ -161,6 +167,59 @@ fn merged_usr_alias(rel: &str) -> Option<PathBuf> {
         .then(|| PathBuf::from("/usr").join(rel))
 }
 
+/// The state of the package database at the moment an index was read.
+///
+/// # Why a snapshot has to know when it was taken
+///
+/// [`PackageIndex::load_dpkg`] is a snapshot of a database that keeps
+/// moving. Every `apt upgrade` rewrites the `.md5sums` of each upgraded
+/// package, so afterwards the binaries from those packages no longer
+/// match the digests an *earlier* snapshot recorded — and
+/// [`PackageIndex::classify`] reports precisely that as
+/// [`Provenance::PackagedModified`], the strongest finding this file
+/// can produce.
+///
+/// Measured on a live host, not imagined: an agent running since 24 Aug
+/// saw 129 packages upgraded from 2 Sep onwards, and then reported
+/// every execution of `cp`, `tr`, `date`, `rm` and seventy other
+/// coreutils as a modified system binary — 8,432 alerts, 98% of
+/// everything it produced in thirty days. The detection did not merely
+/// get loud: a genuinely trojanised binary would have been
+/// indistinguishable from `cp`.
+///
+/// So the snapshot carries its own provenance, and a "modified" verdict
+/// drawn from a snapshot the database has since moved past is
+/// downgraded to [`Provenance::Unknown`]. *Cannot establish* and *was
+/// tampered with* are opposite claims, and one must never be served in
+/// place of the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbStamp {
+    /// The `info/` directory the `.md5sums` files were read from.
+    dir: PathBuf,
+    /// mtimes of that directory and of dpkg's `status` file, kept
+    /// apart rather than reduced. Their *maximum* was the first
+    /// attempt, and it cannot see a timestamp move backwards: a
+    /// database restored from a backup left the larger of the two
+    /// unchanged and read as in-step. Caught by the test below, which
+    /// steps `status` backwards precisely because that is the case a
+    /// summary statistic loses.
+    mtimes: [Option<SystemTime>; 2],
+}
+
+/// A cheap fingerprint of dpkg's state: two stats, no directory walk.
+///
+/// Both halves earn their place. `status` is rewritten on every install,
+/// removal and configure; the `info/` directory's own mtime moves when
+/// dpkg creates and renames the per-package `.md5sums` files that an
+/// upgrade replaces. Either one alone misses cases the other catches.
+fn dpkg_mtimes(info_dir: &Path) -> [Option<SystemTime>; 2] {
+    let mtime = |p: PathBuf| std::fs::metadata(p).ok()?.modified().ok();
+    [
+        mtime(info_dir.to_path_buf()),
+        info_dir.parent().map(|p| p.join("status")).and_then(mtime),
+    ]
+}
+
 impl PackageIndex {
     /// Empty index that answers [`Provenance::Unknown`] to everything.
     #[must_use]
@@ -191,6 +250,17 @@ impl PackageIndex {
     /// than a complete one, which is strictly better than none.
     #[must_use]
     pub fn load_dpkg(dir: &Path) -> Self {
+        // Read the database's state *before* the entries, never after.
+        // A package upgraded while the loop below runs would otherwise
+        // be stamped as already-included, leaving the index looking
+        // fresh while missing it. A false "fresh" is the entire bug
+        // this mechanism exists to prevent; a false "stale" costs one
+        // reload.
+        let mtimes = dpkg_mtimes(dir);
+        let stamp = mtimes.iter().any(Option::is_some).then(|| DbStamp {
+            dir: dir.to_path_buf(),
+            mtimes,
+        });
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Self::unavailable();
         };
@@ -243,6 +313,42 @@ impl PackageIndex {
             by_path,
             pkg_by_path,
             pkg_names,
+            stamp,
+            available: true,
+        }
+    }
+
+    /// Build an index directly from `(path, package, digest)` triples.
+    ///
+    /// The seam that makes [`Provenance::PackagedModified`] reachable
+    /// from a test. [`Self::load_dpkg`] indexes only paths under the
+    /// system's own binary directories — that filter is what keeps the
+    /// index small enough for a Pi — so the sole other way to produce a
+    /// mismatch is to rewrite a real binary in `/usr/bin`, which no
+    /// test has any business doing.
+    ///
+    /// Carries no stamp, so [`Self::database_moved`] is false and an
+    /// index built this way never downgrades its own answers.
+    #[must_use]
+    pub fn from_entries<I, S>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (PathBuf, S, [u8; 16])>,
+        S: Into<String>,
+    {
+        let mut by_path = HashMap::new();
+        let mut pkg_by_path = HashMap::new();
+        let mut pkg_names = std::collections::HashSet::new();
+        for (path, pkg, digest) in entries {
+            let pkg = pkg.into();
+            pkg_names.insert(pkg.clone());
+            pkg_by_path.insert(path.clone(), pkg);
+            by_path.insert(path, digest);
+        }
+        Self {
+            by_path,
+            pkg_by_path,
+            pkg_names,
+            stamp: None,
             available: true,
         }
     }
@@ -313,6 +419,32 @@ impl PackageIndex {
     #[must_use]
     pub fn has_path(&self, path: &Path) -> bool {
         self.available && self.by_path.contains_key(path)
+    }
+
+    /// Has the package database changed since this index was read?
+    ///
+    /// Two stats, and the answer that decides whether a mismatch is
+    /// allowed to be called tampering — see [`DbStamp`].
+    ///
+    /// Inequality rather than "newer than": a database restored from a
+    /// backup, or a clock that stepped backwards, has moved out from
+    /// under the snapshot just as surely as one that was upgraded, and
+    /// `>` would wave both through.
+    ///
+    /// `false` only when there is no stamp at all — an index built in
+    /// memory, or read from a directory that could not be stat'd even
+    /// then. Those could never be checked, and absence of evidence is
+    /// not evidence of change; treating it as such would silently
+    /// disable the modified-binary finding on every such host. But once
+    /// a state *has* been recorded, any deviation from it counts,
+    /// including the database becoming unreadable: a snapshot whose
+    /// freshness can no longer be confirmed is one that cannot accuse.
+    #[must_use]
+    pub fn database_moved(&self) -> bool {
+        let Some(stamp) = self.stamp.as_ref() else {
+            return false;
+        };
+        dpkg_mtimes(&stamp.dir) != stamp.mtimes
     }
 }
 
@@ -445,7 +577,17 @@ impl ProvenanceCache {
         {
             return *provenance;
         }
-        let provenance = index.classify(path, file_md5(path));
+        let provenance = match index.classify(path, file_md5(path)) {
+            // A packaged file that no longer matches is the strongest
+            // claim this module makes, so it is the one answer worth
+            // two extra stats to be sure of — and the rarest, which is
+            // why the check sits here rather than on the hot path. If
+            // the database has moved since this index was read, the
+            // mismatch is at least as likely an upgrade as a tamper,
+            // and the honest answer is that we cannot tell.
+            Provenance::PackagedModified if index.database_moved() => Provenance::Unknown,
+            other => other,
+        };
         if let Ok(mut memo) = self.memo.lock() {
             // Crude eviction: a host that legitimately runs 8192
             // distinct binaries is rare, and re-hashing after a clear is
@@ -483,6 +625,15 @@ impl ProvenanceCache {
     pub fn has_path(&self, path: &Path) -> bool {
         self.index.read().is_ok_and(|i| i.has_path(path))
     }
+
+    /// Has the package database changed since the loaded index was read?
+    ///
+    /// What the agent's refresher polls. Two stats, so it can be asked
+    /// often; [`PackageIndex::database_moved`] carries the reasoning.
+    #[must_use]
+    pub fn database_moved(&self) -> bool {
+        self.index.read().is_ok_and(|i| i.database_moved())
+    }
 }
 
 /// Is this file setuid- or setgid-root?
@@ -504,17 +655,45 @@ pub fn setid_bits(path: &Path) -> Option<(bool, bool)> {
     ))
 }
 
-/// Every rule id [`setid_finding`] can return.
+/// Every rule id this module can return.
 ///
-/// Hand-maintained alongside the match below; the test at the bottom of
-/// this module proves the two agree.
+/// Hand-maintained alongside the matches below; the test at the bottom
+/// of this module proves the two agree.
 #[must_use]
 pub const fn rule_ids() -> &'static [&'static str] {
     &[
+        MODIFIED_RULE,
         "privesc.setid_packaged_modified",
         "privesc.setid_unpackaged",
         "privesc.setid_unknown_provenance",
     ]
+}
+
+/// Rule id for a packaged binary whose contents no longer match.
+pub const MODIFIED_RULE: &str = "integrity.packaged_modified";
+
+/// A packaged binary that no longer matches its package, where no
+/// set-id bit makes [`setid_finding`] the more specific description.
+///
+/// # Why this needed an id of its own
+///
+/// The adjustment in [`adjust_score`] raised suspicion to 1.0 without
+/// recording a rule hit, so the alert was attributed to whatever score
+/// it had overwritten — `baseline.rarity`. Thirty days of "a system
+/// binary was rewritten" findings therefore reached the operator
+/// labelled "this host has not run this before". The two call for
+/// completely different responses, and only one of them is urgent.
+///
+/// The severity matches [`setid_finding`]'s modified case: the set-id
+/// bit changes what an attacker gains, not whether the file was
+/// rewritten.
+#[must_use]
+pub const fn modified_finding() -> (&'static str, f32, &'static str) {
+    (
+        MODIFIED_RULE,
+        1.0,
+        "a binary owned by a package no longer matches what the package installed, and              the package database has not changed since this index was read — something              rewrote a system binary",
+    )
 }
 
 /// Is this binary a privilege helper the distribution vouches for?
@@ -625,6 +804,7 @@ mod package_lookup_tests {
             by_path,
             pkg_by_path,
             pkg_names,
+            stamp: None,
             available: true,
         }
     }
@@ -707,6 +887,7 @@ mod tests {
         ]
         .into_iter()
         .filter_map(|p| setid_finding(true, false, p).map(|(id, _, _)| id))
+        .chain(std::iter::once(modified_finding().0))
         .collect();
         let declared: HashSet<&str> = rule_ids().iter().copied().collect();
         assert_eq!(reachable, declared);
@@ -991,6 +1172,7 @@ mod tests {
             by_path,
             pkg_by_path: HashMap::new(),
             pkg_names: std::collections::HashSet::new(),
+            stamp: None,
             available: true,
         };
         let cache = ProvenanceCache::new(index);
@@ -1037,6 +1219,7 @@ mod tests {
             by_path,
             pkg_by_path: HashMap::new(),
             pkg_names: std::collections::HashSet::new(),
+            stamp: None,
             available: true,
         });
 
@@ -1064,6 +1247,7 @@ mod tests {
             pkg_by_path: HashMap::new(),
             pkg_names: std::collections::HashSet::new(),
             by_path,
+            stamp: None,
             available: true,
         });
 
@@ -1076,6 +1260,155 @@ mod tests {
             Provenance::PackagedModified,
             "a new sha must force a re-read rather than reuse the memo"
         );
+    }
+
+    /// Build a dpkg layout: `<root>/info/` beside `<root>/status`.
+    fn dpkg_layout() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let info = root.path().join("info");
+        std::fs::create_dir(&info).unwrap();
+        std::fs::write(root.path().join("status"), b"Package: coreutils\n").unwrap();
+        (root, info)
+    }
+
+    /// Move a file's mtime to a known instant, so drift is exact rather
+    /// than a race against filesystem timestamp granularity.
+    fn set_mtime(path: &Path, at: SystemTime) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(at))
+            .unwrap();
+    }
+
+    /// The thirty-day false-positive storm, in one test.
+    ///
+    /// An agent's index was read on 24 Aug; 129 packages were upgraded
+    /// from 2 Sep onwards; every execution of `cp`, `tr`, `date` and
+    /// seventy others then reported a rewritten system binary, at
+    /// suspicion 1.0, forever. 8,432 alerts — 98% of everything the
+    /// host produced.
+    ///
+    /// The contrast is the whole point: the *same* file, with the
+    /// *same* mismatch, is a finding from a current snapshot and an
+    /// admission of ignorance from a stale one.
+    #[test]
+    fn a_mismatch_from_a_stale_snapshot_is_not_an_accusation() {
+        let (root, info) = dpkg_layout();
+        let bin = root.path().join("cp");
+        std::fs::write(&bin, b"the packaged contents").unwrap();
+        let packaged = file_md5(&bin).unwrap();
+
+        let mut by_path = HashMap::new();
+        by_path.insert(bin.clone(), packaged);
+        let snapshot_taken_at = |mtimes| PackageIndex {
+            by_path: by_path.clone(),
+            pkg_by_path: HashMap::new(),
+            pkg_names: std::collections::HashSet::new(),
+            stamp: Some(DbStamp {
+                dir: info.clone(),
+                mtimes,
+            }),
+            available: true,
+        };
+
+        // `apt upgrade`: the binary's contents change, and so does the
+        // database that says what they should be.
+        std::fs::write(&bin, b"the upgraded contents").unwrap();
+
+        let current = ProvenanceCache::new(snapshot_taken_at(dpkg_mtimes(&info)));
+        assert_eq!(
+            current.classify(&bin, &[9u8; 32]),
+            Provenance::PackagedModified,
+            "a snapshot in step with the database must still report a mismatch — \
+             this fix must not cost the detection it protects"
+        );
+
+        let stale = snapshot_taken_at([Some(SystemTime::UNIX_EPOCH); 2]);
+        assert!(stale.database_moved());
+        let outdated = ProvenanceCache::new(stale);
+        assert_eq!(
+            outdated.classify(&bin, &[9u8; 32]),
+            Provenance::Unknown,
+            "a snapshot the database has moved past cannot tell an upgrade \
+             from a tamper, and must say so"
+        );
+        let (score, _) = adjust_score(0.73, Provenance::Unknown);
+        assert!(
+            (score - 0.73).abs() < f32::EPSILON,
+            "and Unknown must leave the score alone rather than force 1.0"
+        );
+    }
+
+    /// A freshly loaded index sees the next package operation.
+    #[test]
+    fn a_loaded_index_notices_the_database_moving_underneath_it() {
+        let (root, info) = dpkg_layout();
+        std::fs::write(
+            info.join("coreutils.md5sums"),
+            format!("{NICE_MD5}  usr/bin/nice"),
+        )
+        .unwrap();
+
+        let idx = PackageIndex::load_dpkg(&info);
+        assert!(idx.is_available());
+        assert!(!idx.database_moved(), "nothing has happened yet");
+
+        // dpkg rewrites `status` on every install, removal and
+        // configure. Backwards in time on purpose: a database restored
+        // from a backup has moved just as surely as one upgraded, and
+        // a "newer than" test would wave it through.
+        set_mtime(
+            &root.path().join("status"),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+        );
+        assert!(idx.database_moved(), "a package operation must be visible");
+    }
+
+    /// The degrade must not become a blanket off-switch.
+    ///
+    /// An index with nothing to compare against — built in memory, or
+    /// loaded from a directory that cannot be stat'd — has no evidence
+    /// the database moved, and absence of evidence must not silence the
+    /// strongest finding in this module.
+    #[test]
+    fn an_index_that_cannot_check_for_drift_still_accuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("nice");
+        std::fs::write(&bin, b"original").unwrap();
+        let md5 = file_md5(&bin).unwrap();
+        let mut by_path = HashMap::new();
+        by_path.insert(bin.clone(), md5);
+        let idx = PackageIndex {
+            by_path,
+            pkg_by_path: HashMap::new(),
+            pkg_names: std::collections::HashSet::new(),
+            stamp: None,
+            available: true,
+        };
+        assert!(!idx.database_moved(), "no stamp is not a change");
+
+        std::fs::write(&bin, b"trojanised").unwrap();
+        let cache = ProvenanceCache::new(idx);
+        assert_eq!(
+            cache.classify(&bin, &[1u8; 32]),
+            Provenance::PackagedModified
+        );
+
+        // And a missing database records no stamp to begin with.
+        assert!(!PackageIndex::load_dpkg(Path::new("/nonexistent/dpkg/info")).database_moved());
+    }
+
+    /// A rewritten system binary is its own finding, not a rare one.
+    #[test]
+    fn a_modified_binary_is_attributed_to_integrity_not_to_rarity() {
+        // For thirty days these alerts reached the operator labelled
+        // `baseline.rarity` — "this host has not run this before" —
+        // because the provenance adjustment moved the score without
+        // recording a rule hit. Different finding, different response.
+        let (id, severity, why) = modified_finding();
+        assert_eq!(id, "integrity.packaged_modified");
+        assert_ne!(id, "baseline.rarity");
+        assert!((severity - 1.0).abs() < f32::EPSILON);
+        assert!(why.contains("rewrote a system binary"));
     }
 
     #[test]

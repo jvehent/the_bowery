@@ -1172,7 +1172,7 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
         .exe_path
         .as_ref()
         .and_then(|exe| bowery_analysis::provenance::setid_bits(exe));
-    if let Some(exe) = exec.exe_path.as_ref()
+    let setid_reported = if let Some(exe) = exec.exe_path.as_ref()
         && let Some((setuid, setgid)) = setid
         && let Some((rule_id, severity, why)) =
             bowery_analysis::provenance::setid_finding(setuid, setgid, exec_provenance)
@@ -1182,6 +1182,32 @@ async fn process_exec(ctx: &PipelineContext, exec: ProcessExec) {
             exe = %exe.display(),
             pid = exec.pid,
             "set-id binary finding"
+        );
+        fold_finding(ctx, &mut verdict, rule_id, severity, why.to_string());
+        true
+    } else {
+        false
+    };
+
+    // A packaged binary that no longer matches its package is a finding
+    // in its own right, and has to say so. `adjust_score` above raises
+    // suspicion to 1.0 without recording a rule hit, so the alert was
+    // attributed to whatever score it overwrote — `baseline.rarity` —
+    // and thirty days of "a system binary was rewritten" reached the
+    // operator labelled "this host has not run this before".
+    //
+    // Skipped when the set-id rule already fired: that one describes the
+    // same file more precisely, and two hits at 1.0 would leave which of
+    // them names the alert down to the order they were pushed in.
+    if exec_provenance == bowery_analysis::provenance::Provenance::PackagedModified
+        && !setid_reported
+    {
+        let (rule_id, severity, why) = bowery_analysis::provenance::modified_finding();
+        warn!(
+            rule = rule_id,
+            exe = exec.exe_path.as_ref().map(|e| e.display().to_string()),
+            pid = exec.pid,
+            "packaged binary no longer matches what the package installed"
         );
         fold_finding(ctx, &mut verdict, rule_id, severity, why.to_string());
     }

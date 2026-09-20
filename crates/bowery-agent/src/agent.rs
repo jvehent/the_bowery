@@ -985,19 +985,79 @@ impl Agent {
         // files it was configured to watch. An optimisation must not
         // gate the sensors. Until the index arrives, provenance answers
         // Unknown, which damps nothing.
+        //
+        // Reloaded whenever the package database moves, which is the
+        // other half of the same problem. An index is a snapshot, and
+        // every `apt upgrade` rewrites the `.md5sums` of the packages it
+        // touches; a snapshot from before an upgrade disagrees with
+        // every binary in those packages, and provenance reports that
+        // disagreement as a *rewritten system binary*. Measured on
+        // otter1: an agent up since 24 Aug, 129 packages upgraded from
+        // 2 Sep, and 8,432 alerts — 98% of thirty days of output —
+        // reporting `cp`, `tr`, `date` and `rm` as tampered with, on
+        // every execution, at suspicion 1.0. Until the reload lands
+        // `PackageIndex::database_moved` keeps the finding honest by
+        // downgrading it to Unknown; this is what ends the window
+        // rather than papering over it.
         {
             let packages = packages.clone();
-            tokio::task::spawn_blocking(move || {
-                let index = bowery_analysis::provenance::PackageIndex::load_system();
-                if index.is_available() {
-                    info!(executables = index.len(), "package provenance index loaded");
-                } else {
-                    warn!(
-                        "no package database found; executions cannot be damped by \
-                         provenance and rare binaries will score as never-seen"
-                    );
+            let mut shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                async fn load() -> Option<bowery_analysis::provenance::PackageIndex> {
+                    tokio::task::spawn_blocking(
+                        bowery_analysis::provenance::PackageIndex::load_system,
+                    )
+                    .await
+                    .ok()
                 }
-                packages.install(index);
+
+                if let Some(index) = load().await {
+                    if index.is_available() {
+                        info!(executables = index.len(), "package provenance index loaded");
+                    } else {
+                        warn!(
+                            "no package database found; executions cannot be damped by \
+                             provenance and rare binaries will score as never-seen"
+                        );
+                    }
+                    packages.install(index);
+                }
+
+                let period = Duration::from_mins(1);
+                let mut tick =
+                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = shutdown.changed() => break,
+                    }
+                    // The check and the reload go to the blocking pool
+                    // together: the check is two stats, the reload reads
+                    // tens of thousands of files, and neither belongs on
+                    // the async runtime.
+                    let probe = packages.clone();
+                    let reloaded = tokio::task::spawn_blocking(move || {
+                        probe.database_moved().then(
+                            bowery_analysis::provenance::PackageIndex::load_system,
+                        )
+                    })
+                    .await;
+                    match reloaded {
+                        Ok(Some(index)) if index.is_available() => {
+                            info!(
+                                executables = index.len(),
+                                "package database changed; provenance index reloaded"
+                            );
+                            packages.install(index);
+                        }
+                        Ok(Some(_)) => warn!(
+                            "the package database changed but could not be re-read; \
+                             provenance still answers from the older snapshot"
+                        ),
+                        Ok(None) | Err(_) => {}
+                    }
+                }
             });
         }
 
@@ -1251,6 +1311,15 @@ impl Agent {
 
     pub fn mesh(&self) -> &Arc<Mesh> {
         &self.mesh
+    }
+
+    /// The package provenance index this agent scores against.
+    ///
+    /// Exposed so a test can place a binary inside a package; there is
+    /// no other way to reach [`bowery_analysis::provenance::Provenance::PackagedModified`]
+    /// without rewriting a real system binary.
+    pub fn packages(&self) -> &Arc<bowery_analysis::provenance::ProvenanceCache> {
+        &self.packages
     }
 
     pub fn inbox(&self) -> &Arc<AlertInbox> {

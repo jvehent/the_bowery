@@ -174,6 +174,18 @@ pub const TECHNIQUES: &[Technique] = &[
         gap: "watches the configuration; a replaced PAM `.so` is caught only if it \
               lands under a watched path",
     },
+    Technique {
+        id: "T1554",
+        name: "Compromise Host Software Binary",
+        tactic: "Persistence",
+        coverage: Coverage::Partial,
+        rules: &["integrity.packaged_modified"],
+        gap: "compares a binary against dpkg's own `md5sums`, which an attacker able to \
+              rewrite the binary can rewrite too; it catches the ordinary case, where \
+              the package metadata is left alone. Only binaries that execute are \
+              checked — there is no filesystem sweep — and only packaged ones, so a \
+              rewritten `/usr/local` binary is `Unpackaged`, not a mismatch",
+    },
     // -- Privilege Escalation ----------------------------------------------
     Technique {
         id: "T1548.003",

@@ -544,3 +544,103 @@ async fn uid_transition_alerts(events: Vec<Event>) -> usize {
     agent.shutdown().await.expect("shutdown");
     analysed
 }
+
+/// A rewritten system binary must reach the operator as one.
+///
+/// Two defects met here, and both were found by reading thirty days of
+/// a live host's alerts rather than by reasoning about the code.
+///
+/// The provenance adjustment raises suspicion to 1.0 for a packaged
+/// binary that no longer matches its package — correctly — but recorded
+/// no `RuleHit` while doing it. `leading_rule_id` therefore fell back
+/// to `baseline.rarity`, so the strongest finding the agent can produce
+/// arrived labelled "this host has not run this before". On otter1 that
+/// mislabelled 8,432 alerts.
+///
+/// And the reason those 8,432 existed at all was a package index read
+/// at startup and never reloaded, which is covered by its own tests in
+/// `bowery-analysis`. This one covers the other half: that when the
+/// provenance genuinely is `PackagedModified`, the pipeline attaches a
+/// finding that names itself. Asserting on the rule id rather than on
+/// the suspicion is deliberate — the score was always right, and the
+/// score is not what an operator triages by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modified_packaged_binary_alerts_as_an_integrity_finding() {
+    let workdir = TempDir::new().unwrap();
+    let bin = workdir.path().join("cp");
+    std::fs::write(&bin, b"not what coreutils installed").unwrap();
+
+    let (source, gate) = MockEventSource::new(vec![Event::ProcessExec(ProcessExec {
+        pid: 6100,
+        ppid: 1,
+        parent_comm: "bash".into(),
+        uid: 0,
+        comm: "cp".into(),
+        exe_path: Some(bin.clone()),
+        args: vec!["cp".into()],
+        ts: SystemTime::now(),
+    })])
+    .gated();
+
+    let identity = Arc::new(Identity::generate());
+    let cfg = build_config(workdir.path(), reserve_udp_port(), Duration::from_hours(1));
+    let agent = Agent::start(cfg, identity, Box::new(source))
+        .await
+        .expect("start");
+
+    // Let the host's own index land first. Installing the fixture over
+    // a load still in flight would leave the test passing or failing on
+    // a race with the startup task.
+    let settle = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !agent.packages().is_ready() && tokio::time::Instant::now() < settle {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // `cp` belongs to coreutils, and what is on disk is not what
+    // coreutils installed.
+    agent
+        .packages()
+        .install(bowery_analysis::provenance::PackageIndex::from_entries([(
+            bin.clone(),
+            "coreutils",
+            [0xab; 16],
+        )]));
+    assert_eq!(
+        agent.packages().classify(&bin, &[1u8; 32]),
+        bowery_analysis::provenance::Provenance::PackagedModified,
+        "the fixture must actually produce the provenance under test — \
+         a test that cannot reach the state it names proves nothing"
+    );
+
+    let mut events = agent.subscribe();
+    gate.open();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let episode = loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for the alert");
+        if let Ok(Ok(AgentEvent::AlertEmitted { episode_id, .. })) =
+            tokio::time::timeout(left, events.recv()).await
+        {
+            break episode_id;
+        }
+    };
+
+    let (alerts, _) = agent.inbox().read_since(0, 100);
+    let alert = alerts
+        .iter()
+        .find(|a| a.episode_id == episode)
+        .expect("alert in the inbox");
+
+    assert_eq!(
+        alert.rule_id, "integrity.packaged_modified",
+        "a rewritten system binary must be attributed to integrity, not to rarity"
+    );
+    assert!(
+        alert.rationale.contains("rewrote a system binary"),
+        "and must explain itself, got: {}",
+        alert.rationale
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}

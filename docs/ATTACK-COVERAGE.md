@@ -17,7 +17,7 @@ that something fires?*
 - **partial** — one narrow variant fires; the common forms do not.
 - **none** — nothing fires. Listed anyway; the gaps are the useful half.
 
-Today: **12 good, 16 partial, 2 uncovered** across 30 techniques.
+Today: **12 good, 17 partial, 2 uncovered** across 31 techniques.
 
 ## Initial Access
 
@@ -118,6 +118,18 @@ Rules: `persist.pam`
 
 Gap: watches the configuration; a replaced PAM `.so` is caught only if it lands
 under a watched path.
+
+### T1554 — Compromise Host Software Binary
+
+**Coverage: partial**
+
+Rules: `integrity.packaged_modified`
+
+Gap: compares a binary against dpkg's own `md5sums`, which an attacker able to
+rewrite the binary can rewrite too; it catches the ordinary case, where the package
+metadata is left alone. Only binaries that execute are checked — there is no
+filesystem sweep — and only packaged ones, so a rewritten `/usr/local` binary is
+`Unpackaged`, not a mismatch.
 
 ## Privilege Escalation
 
