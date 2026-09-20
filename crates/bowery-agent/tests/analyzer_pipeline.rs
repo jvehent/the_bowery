@@ -632,14 +632,17 @@ async fn a_modified_packaged_binary_alerts_as_an_integrity_finding() {
         .find(|a| a.episode_id == episode)
         .expect("alert in the inbox");
 
+    // The rule id and not the rationale. Every site that builds an
+    // alert derives the id from the same pre-filter verdict via
+    // `leading_rule_id`, so it survives the LLM stage; the rationale
+    // does not — a mock backend legitimately replaces it with its own
+    // echo, which made an earlier version of this assertion pass
+    // locally and fail in CI on timing alone. The finding's wording is
+    // pinned by a unit test on `modified_finding` instead, where it
+    // cannot race anything.
     assert_eq!(
         alert.rule_id, "integrity.packaged_modified",
         "a rewritten system binary must be attributed to integrity, not to rarity"
-    );
-    assert!(
-        alert.rationale.contains("rewrote a system binary"),
-        "and must explain itself, got: {}",
-        alert.rationale
     );
 
     agent.shutdown().await.expect("shutdown");
