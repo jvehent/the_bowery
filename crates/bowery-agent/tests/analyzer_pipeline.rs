@@ -61,7 +61,18 @@ fn build_config(dir: &Path, mesh_addr: SocketAddr, role_interval: Duration) -> C
         role: RoleConfig {
             publish_interval: role_interval,
         },
-        llm: LlmConfig::default(),
+        // The LLM stage is never invoked in this file. Every test here
+        // asserts on the *pre-filter* verdict, and an episode over the
+        // threshold produces two alerts — the pre-filter one, then a
+        // refined one once the model answers — so "the alert for this
+        // episode" is whichever won a race. It stayed hidden until a
+        // sixth agent in this binary slowed CI enough to flip it, and
+        // then failed in a test that had nothing to do with the change.
+        // `llm_pipeline.rs` is where the refinement path is covered.
+        llm: LlmConfig {
+            invocation_threshold: 2.0,
+            ..LlmConfig::default()
+        },
         operators: OperatorsConfig::default(),
         inbox: InboxConfig::default(),
         alerts: AlertsConfig::default(),
@@ -632,17 +643,14 @@ async fn a_modified_packaged_binary_alerts_as_an_integrity_finding() {
         .find(|a| a.episode_id == episode)
         .expect("alert in the inbox");
 
-    // The rule id and not the rationale. Every site that builds an
-    // alert derives the id from the same pre-filter verdict via
-    // `leading_rule_id`, so it survives the LLM stage; the rationale
-    // does not — a mock backend legitimately replaces it with its own
-    // echo, which made an earlier version of this assertion pass
-    // locally and fail in CI on timing alone. The finding's wording is
-    // pinned by a unit test on `modified_finding` instead, where it
-    // cannot race anything.
     assert_eq!(
         alert.rule_id, "integrity.packaged_modified",
         "a rewritten system binary must be attributed to integrity, not to rarity"
+    );
+    assert!(
+        alert.rationale.contains("rewrote a system binary"),
+        "and must explain itself, got: {}",
+        alert.rationale
     );
 
     agent.shutdown().await.expect("shutdown");
