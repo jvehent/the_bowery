@@ -778,6 +778,14 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
         return;
     }
 
+    // The package manager rewriting a file the package owns, during a
+    // transaction, is not a finding about the file. See
+    // `ProvenanceCache::housekeeping` for the three conditions and for
+    // the gap this deliberately leaves open.
+    let housekeeping = ctx
+        .packages
+        .housekeeping(std::path::Path::new(&path), Some(provenance));
+
     // Repeats of an identical finding are folded rather than restated.
     let folded = match ctx.suppressor.observe(
         hit.rule_id,
@@ -801,14 +809,23 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
         ""
     };
     let episode_id = format!("file-{}-{}", hit.rule_id, current_unix_ms());
+    let severity = if housekeeping.is_some() {
+        bowery_analysis::provenance::damp_housekeeping(hit.severity)
+    } else {
+        hit.severity
+    };
+    let housekeeping_note = housekeeping
+        .as_deref()
+        .map(|why| format!(" — {why}"))
+        .unwrap_or_default();
     let alert = crate::alert_builder::AlertBuilder::new(
         ctx.originator_fp,
         &ctx.backend_label,
         hit.rule_id,
         episode_id.clone(),
-        hit.severity,
+        severity,
         format!(
-            "{} {} {path}{path_note} by {} (pid {}) — {}{folded_note}",
+            "{} {} {path}{path_note} by {} (pid {}) — {}{folded_note}{housekeeping_note}",
             hit.category.label(),
             if open.sensitive_read {
                 "read of"
@@ -837,13 +854,14 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
         path = %path,
         comm = %open.comm,
         pid = open.pid,
+        housekeeping = housekeeping.is_some(),
         "file watch hit"
     );
     let appended = ctx.inbox.append(alert);
     if appended.stored() {
         let _ = ctx.events_tx.send(AgentEvent::AlertEmitted {
             episode_id: episode_id.clone(),
-            suspicion: hit.severity,
+            suspicion: severity,
         });
     }
 
@@ -1024,7 +1042,16 @@ async fn process_file_change(ctx: &PipelineContext, change: bowery_events::FileC
         };
 
     let op = crate::monitor::file_op_label(change.op);
-    let suspicion = crate::monitor::severity_weight(rule.severity);
+    // The inotify watcher reports that a path changed and never who
+    // changed it, so the actor is unknown here by construction — hence
+    // `None`. The conffile and transaction conditions still apply.
+    let housekeeping = ctx.packages.housekeeping(&change.path, None);
+    let suspicion = match &housekeeping {
+        Some(_) => bowery_analysis::provenance::damp_housekeeping(crate::monitor::severity_weight(
+            rule.severity,
+        )),
+        None => crate::monitor::severity_weight(rule.severity),
+    };
     let alert = crate::alert_builder::AlertBuilder::for_operator_rule(
         ctx.originator_fp,
         &ctx.backend_label,
@@ -1032,10 +1059,14 @@ async fn process_file_change(ctx: &PipelineContext, change: bowery_events::FileC
         format!("file-{}-{}", rule.id, current_unix_ms()),
         suspicion,
         format!(
-            "file rule `{}`: {} was {}",
+            "file rule `{}`: {} was {}{}",
             rule.id,
             change.path.display(),
-            op
+            op,
+            housekeeping
+                .as_deref()
+                .map(|why| format!(" — {why}"))
+                .unwrap_or_default()
         ),
     )
     .subject(change.path.display().to_string())

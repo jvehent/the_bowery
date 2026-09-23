@@ -505,3 +505,270 @@ async fn a_fired_rule_shows_up_in_the_detection_counters() {
 
     agent.shutdown().await.expect("shutdown");
 }
+
+/// Build a dpkg database registering `conffile` as belonging to `pkg`.
+///
+/// `load_dpkg` reads `<dir>/*.conffiles` and takes the paths verbatim,
+/// so a tempdir path can stand in for `/etc/sudoers` without touching
+/// anything real.
+fn dpkg_db_with_conffile(dir: &Path, pkg: &str, conffile: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{pkg}.conffiles")),
+        format!("{}\n", conffile.display()),
+    )
+    .unwrap();
+}
+
+/// Install `index` on a started agent, after its own startup load lands.
+async fn install_index(agent: &Agent, index: bowery_analysis::provenance::PackageIndex) {
+    let settle = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !agent.packages().is_ready() && tokio::time::Instant::now() < settle {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    agent.packages().install(index);
+}
+
+/// Ubuntu's own unattended-upgrades, in the shape the fleet produced it.
+///
+/// otter1 alerted on `/etc/sudoers` three times in one second at 0.95,
+/// 0.90 and 0.70. The process tree said exactly what it was:
+/// `apt.systemd.daily` → `unattended-upgrade` → `dpkg --unpack
+/// sudo_1.9.15p5-3ubuntu5.24.04_amd64.deb`. The `sudo` *package* was
+/// being upgraded, and `/etc/sudoers` is a conffile of `sudo`, so dpkg
+/// rewriting it is the upgrade rather than a finding about it.
+///
+/// The threshold is dropped so the damped alert is still stored and can
+/// be asserted on. In production 0.135 is below the 0.7 default and the
+/// operator never sees it — but the access stays in the event log,
+/// which is the difference between damping and silencing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conffile_rewritten_during_a_package_transaction_is_damped() {
+    let workdir = TempDir::new().unwrap();
+    let watched = workdir.path().join("sudoers");
+    std::fs::write(&watched, b"original").unwrap();
+
+    let monitor = MonitorConfig {
+        file_rules: vec![FileRule {
+            id: Some("sudoers".to_string()),
+            path: watched.clone(),
+            ops: vec![bowery_events::FileOp::Modify],
+            severity: RuleSeverity::High,
+        }],
+        process_rules: Vec::new(),
+    };
+
+    // Written now, so the database's mtime says a transaction is
+    // running by the same measure the agent uses on a real host.
+    let db = workdir.path().join("dpkg-info");
+    dpkg_db_with_conffile(&db, "sudo", &watched);
+
+    let identity = Arc::new(Identity::generate());
+    let mut cfg = build_config(workdir.path(), reserve_udp_port(), monitor);
+    cfg.alerts.threshold = 0.01;
+    let source = Box::new(MockEventSource::new(Vec::new()));
+    let agent = Agent::start(cfg, identity, source).await.expect("start");
+    install_index(
+        &agent,
+        bowery_analysis::provenance::PackageIndex::load_dpkg(&db),
+    )
+    .await;
+    assert!(
+        agent.packages().housekeeping(&watched, None).is_some(),
+        "the fixture must actually reach the state under test"
+    );
+
+    let mut events = agent.subscribe();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::write(&watched, b"rewritten by the upgrade").unwrap();
+
+    let (episode_id, suspicion) = wait_for_alert(&mut events).await;
+    assert!(episode_id.starts_with("file-sudoers-"), "got {episode_id}");
+    assert!(
+        (suspicion - 0.135).abs() < 0.001,
+        "high severity 0.9 damped as housekeeping should be 0.135, got {suspicion}"
+    );
+
+    let (alerts, _) = agent.inbox().read_since(0, 100);
+    let alert = alerts
+        .iter()
+        .find(|a| a.episode_id == episode_id)
+        .expect("alert in the inbox");
+    assert!(
+        alert.rationale.contains("conffile of `sudo`"),
+        "the damping must name the entitlement it credited, got: {}",
+        alert.rationale
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}
+
+/// The same rewrite, with no transaction running, is undamped.
+///
+/// The contrast is the point. Without it this would be a blanket
+/// "conffiles are exempt", which would mean an edit to `/etc/sudoers`
+/// at three in the morning read the same as dpkg's own — and that edit
+/// is the finding the rule exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_same_conffile_rewritten_outside_a_transaction_is_not_damped() {
+    let workdir = TempDir::new().unwrap();
+    let watched = workdir.path().join("sudoers");
+    std::fs::write(&watched, b"original").unwrap();
+
+    let monitor = MonitorConfig {
+        file_rules: vec![FileRule {
+            id: Some("sudoers".to_string()),
+            path: watched.clone(),
+            ops: vec![bowery_events::FileOp::Modify],
+            severity: RuleSeverity::High,
+        }],
+        process_rules: Vec::new(),
+    };
+
+    let db = workdir.path().join("dpkg-info");
+    dpkg_db_with_conffile(&db, "sudo", &watched);
+    // Age the database past the transaction window. Set before the
+    // index is read so the stamp records the same quiet state.
+    let handle = std::fs::File::open(&db).unwrap();
+    handle
+        .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+        .unwrap();
+
+    let identity = Arc::new(Identity::generate());
+    let mut cfg = build_config(workdir.path(), reserve_udp_port(), monitor);
+    cfg.alerts.threshold = 0.01;
+    let source = Box::new(MockEventSource::new(Vec::new()));
+    let agent = Agent::start(cfg, identity, source).await.expect("start");
+    install_index(
+        &agent,
+        bowery_analysis::provenance::PackageIndex::load_dpkg(&db),
+    )
+    .await;
+    assert!(
+        agent.packages().housekeeping(&watched, None).is_none(),
+        "no transaction is running, so nothing should be credited"
+    );
+
+    let mut events = agent.subscribe();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::write(&watched, b"edited by someone").unwrap();
+
+    let (_, suspicion) = wait_for_alert(&mut events).await;
+    assert!(
+        (suspicion - 0.9).abs() < f32::EPSILON,
+        "an edit outside a transaction must keep its full severity, got {suspicion}"
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}
+
+/// The read side of the same false positive, through the exec record.
+///
+/// `process_file_open` is the path that *can* attribute an actor, and
+/// it passes `Some(provenance)` where the inotify path passes `None`.
+/// The unit tests cover which provenances earn the exemption; this
+/// covers that the pipeline asks at all.
+///
+/// The actor is a real packaged binary whose digest is read off the
+/// disk at test time, because `load_dpkg` only indexes paths under the
+/// system's own binary directories — a tempdir binary can never be
+/// `PackagedIntact`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conffile_read_by_the_package_manager_mid_transaction_is_damped() {
+    let workdir = TempDir::new().unwrap();
+    let actor = ["/usr/bin/dpkg", "/usr/bin/true", "/bin/true"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+        .expect("a packaged system binary to stand in for the package manager");
+    let digest = bowery_analysis::provenance::file_md5(&actor).expect("digest");
+
+    let db = workdir.path().join("dpkg-info");
+    dpkg_db_with_conffile(&db, "sudo", Path::new("/etc/sudoers"));
+    std::fs::write(
+        db.join("dpkg.md5sums"),
+        format!(
+            "{}  {}\n",
+            digest.iter().fold(String::new(), |mut acc, b| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            }),
+            actor.display().to_string().trim_start_matches('/')
+        ),
+    )
+    .unwrap();
+
+    let ghost = 4_194_299;
+    let now = SystemTime::now();
+    let (source, gate) = gated_source(vec![
+        Event::ProcessExec(bowery_events::ProcessExec {
+            pid: ghost,
+            ppid: 1,
+            parent_comm: "unattended-upgr".into(),
+            uid: 0,
+            comm: "dpkg".into(),
+            exe_path: Some(actor.clone()),
+            args: vec![actor.display().to_string()],
+            ts: now,
+        }),
+        Event::FileOpen(FileOpen {
+            pid: ghost,
+            comm: "dpkg".into(),
+            path: "/etc/sudoers".into(),
+            flags: 0,
+            truncated: false,
+            sensitive_read: true,
+            ts: now,
+        }),
+    ]);
+
+    let identity = Arc::new(Identity::generate());
+    let mut cfg = build_config(workdir.path(), reserve_udp_port(), MonitorConfig::default());
+    cfg.alerts.threshold = 0.01;
+    let agent = Agent::start(cfg, identity, source).await.expect("start");
+    install_index(
+        &agent,
+        bowery_analysis::provenance::PackageIndex::load_dpkg(&db),
+    )
+    .await;
+    assert_eq!(
+        agent.packages().classify(&actor, &[0u8; 32]),
+        bowery_analysis::provenance::Provenance::PackagedIntact,
+        "the fixture's actor must be one a package vouches for"
+    );
+
+    let mut events = agent.subscribe();
+    gate.open();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (episode, suspicion) = loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for the alert");
+        if let Ok(Ok(AgentEvent::AlertEmitted {
+            episode_id,
+            suspicion,
+        })) = tokio::time::timeout(left, events.recv()).await
+            && episode_id.starts_with("file-recon.read_sudoers-")
+        {
+            break (episode_id, suspicion);
+        }
+    };
+
+    assert!(
+        (suspicion - 0.105).abs() < 0.001,
+        "recon.read_sudoers at 0.70 damped as housekeeping should be 0.105, got {suspicion}"
+    );
+    let (alerts, _) = agent.inbox().read_since(0, 100);
+    let alert = alerts
+        .iter()
+        .find(|a| a.episode_id == episode)
+        .expect("alert in the inbox");
+    assert!(
+        alert.rationale.contains("conffile of `sudo`"),
+        "got: {}",
+        alert.rationale
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}

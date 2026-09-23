@@ -194,7 +194,13 @@ pub const TECHNIQUES: &[Technique] = &[
         coverage: Coverage::Good,
         rules: &["privesc.sudoers", "recon.read_sudoers"],
         gap: "a rule added by a package's own postinst is indistinguishable from one an \
-              attacker added",
+              attacker added — and is now actively damped, because dpkg rewriting \
+              /etc/sudoers while upgrading the sudo package is what Ubuntu's \
+              unattended-upgrades does on every host. The damping needs all three of a \
+              registered conffile, a transaction in progress, and a packaged unmodified \
+              actor, so an edit at any other time still fires; but a maintainer script \
+              from a malicious .deb meets all three by construction. Damped rather than \
+              silenced for exactly that reason: the access stays in the event log",
     },
     Technique {
         id: "T1548.001",

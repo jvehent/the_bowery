@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Where a binary came from, as far as the package manager knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +93,16 @@ pub struct PackageIndex {
     /// string comparisons apiece. The distinct names are a couple of
     /// thousand, so the set is small next to what it indexes.
     pkg_names: std::collections::HashSet<String>,
+    /// Absolute path → the package that registers it as a *conffile*.
+    ///
+    /// dpkg records these in `<pkg>.conffiles` beside the `.md5sums`
+    /// this index was already reading. A conffile is a file the package
+    /// manager owns and is expected to rewrite during an upgrade:
+    /// `/etc/sudoers` belongs to `sudo`, `/etc/pam.d/*` to the PAM
+    /// packages. That ownership is what separates "dpkg is installing
+    /// the package this file belongs to" from "something is editing the
+    /// sudo policy".
+    conffiles: HashMap<PathBuf, String>,
     /// When this snapshot was taken, so that a stale one can decline to
     /// accuse — see [`DbStamp`]. `None` for an index built in memory,
     /// or from a directory whose state could not be stat'd; neither can
@@ -206,6 +216,16 @@ struct DbStamp {
     mtimes: [Option<SystemTime>; 2],
 }
 
+/// How long after the package database was last written a transaction
+/// still counts as running.
+///
+/// dpkg touches `status` at every step of an unpack and configure, so
+/// this only has to span the gap *between* packages, not a whole
+/// upgrade. Long enough that a slow maintainer script does not end the
+/// window early; short enough that it closes minutes after `apt`
+/// finishes rather than vouching for the rest of the afternoon.
+const TRANSACTION_WINDOW: Duration = Duration::from_mins(2);
+
 /// A cheap fingerprint of dpkg's state: two stats, no directory walk.
 ///
 /// Both halves earn their place. `status` is rewritten on every install,
@@ -267,9 +287,11 @@ impl PackageIndex {
         let mut by_path = HashMap::new();
         let mut pkg_by_path: HashMap<PathBuf, String> = HashMap::new();
         let mut pkg_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut conffiles: HashMap<PathBuf, String> = HashMap::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_none_or(|e| e != "md5sums") {
+            let kind = path.extension().and_then(|e| e.to_str());
+            if !matches!(kind, Some("md5sums" | "conffiles")) {
                 continue;
             }
             // `coreutils.md5sums` and `coreutils:amd64.md5sums` both
@@ -283,6 +305,21 @@ impl PackageIndex {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
+            if kind == Some("conffiles") {
+                // One absolute path per line. Newer dpkg appends a flag
+                // (`remove-on-upgrade`), so take the first field only.
+                if let Some(pkg) = pkg.clone() {
+                    for line in text.lines() {
+                        let Some(file) = line.split_whitespace().next() else {
+                            continue;
+                        };
+                        if file.starts_with('/') {
+                            conffiles.insert(PathBuf::from(file), pkg.clone());
+                        }
+                    }
+                }
+                continue;
+            }
             for line in text.lines() {
                 let Some((digest, rel)) = line.split_once("  ") else {
                     continue;
@@ -313,6 +350,7 @@ impl PackageIndex {
             by_path,
             pkg_by_path,
             pkg_names,
+            conffiles,
             stamp,
             available: true,
         }
@@ -348,6 +386,7 @@ impl PackageIndex {
             by_path,
             pkg_by_path,
             pkg_names,
+            conffiles: HashMap::new(),
             stamp: None,
             available: true,
         }
@@ -419,6 +458,40 @@ impl PackageIndex {
     #[must_use]
     pub fn has_path(&self, path: &Path) -> bool {
         self.available && self.by_path.contains_key(path)
+    }
+
+    /// The package that registers `path` as a conffile, if any.
+    #[must_use]
+    pub fn conffile_package(&self, path: &Path) -> Option<&str> {
+        if !self.available {
+            return None;
+        }
+        self.conffiles.get(path).map(String::as_str)
+    }
+
+    /// Is the package manager in the middle of a transaction?
+    ///
+    /// dpkg rewrites `status` continuously while unpacking and
+    /// configuring, so "the database was written moments ago" is a
+    /// reliable, name-free way to know a transaction is running. The
+    /// window is generous enough to span the gaps between one package
+    /// finishing and the next starting.
+    ///
+    /// `false` when there is no stamp to name the directory, and when
+    /// the newest mtime is in the future — a clock that disagrees with
+    /// the filesystem is not evidence of an upgrade, and the
+    /// conservative answer keeps the finding alive.
+    #[must_use]
+    pub fn transaction_active(&self) -> bool {
+        let Some(stamp) = self.stamp.as_ref() else {
+            return false;
+        };
+        let Some(newest) = dpkg_mtimes(&stamp.dir).into_iter().flatten().max() else {
+            return false;
+        };
+        SystemTime::now()
+            .duration_since(newest)
+            .is_ok_and(|age| age <= TRANSACTION_WINDOW)
     }
 
     /// Has the package database changed since this index was read?
@@ -626,6 +699,70 @@ impl ProvenanceCache {
         self.index.read().is_ok_and(|i| i.has_path(path))
     }
 
+    /// Is this file finding the package manager doing its own job?
+    ///
+    /// Returns the explanation when it is, so the damping an operator
+    /// sees can be read back rather than guessed at.
+    ///
+    /// # What this is for
+    ///
+    /// `unattended-upgrades` upgrading the `sudo` package has dpkg
+    /// rewrite `/etc/sudoers`, and three rules fire on it —
+    /// `privesc.sudoers` at 0.95, the `sudoers` file rule at 0.90 and
+    /// `recon.read_sudoers` at 0.70. That is the package manager
+    /// installing the package the file belongs to, on a schedule the
+    /// distribution set, and it happens on every Ubuntu host there is.
+    /// Traced on otter1: `apt.systemd.daily` → `unattended-upgrade` →
+    /// `dpkg --unpack sudo_1.9.15p5-3ubuntu5.24.04_amd64.deb`.
+    ///
+    /// Three conditions, all required, and none of them a name:
+    ///
+    /// - the path is a **registered conffile**, so some package is
+    ///   entitled to rewrite it;
+    /// - a **transaction is running**, so the entitlement is being
+    ///   exercised now and not at three in the morning;
+    /// - the actor, where one could be identified, is **packaged and
+    ///   unmodified**.
+    ///
+    /// `actor` is `None` on the inotify path, which sees that a file
+    /// changed without ever seeing who changed it. The other two
+    /// conditions still have to hold.
+    ///
+    /// # The gap this leaves
+    ///
+    /// A maintainer script from a malicious `.deb` runs inside a real
+    /// transaction, as a packaged binary, writing a real conffile. It
+    /// is indistinguishable from a legitimate one by construction and
+    /// nothing here closes that. Which is why this damps rather than
+    /// silences: the access is recorded either way and stays
+    /// queryable, and an operator reading the rationale is told exactly
+    /// which entitlement was credited.
+    #[must_use]
+    pub fn housekeeping(&self, path: &Path, actor: Option<Provenance>) -> Option<String> {
+        // An actor we *could* identify has to be one a package vouches
+        // for. Anchored on provenance rather than on a name, for the
+        // same reason the credential-reader exemptions are: `comm` is
+        // sixteen bytes any process sets to whatever it likes.
+        if matches!(actor, Some(p) if p != Provenance::PackagedIntact) {
+            return None;
+        }
+        let index = self.index.read().ok()?;
+        let pkg = index.conffile_package(path)?.to_string();
+        if !index.transaction_active() {
+            return None;
+        }
+        Some(match actor {
+            Some(_) => format!(
+                "damped: a package transaction is running and this is a conffile of \
+                 `{pkg}`, touched by a binary the package manager vouches for"
+            ),
+            None => format!(
+                "damped: a package transaction is running and this is a conffile of \
+                 `{pkg}`; the watcher sees the change without seeing who made it"
+            ),
+        })
+    }
+
     /// Has the package database changed since the loaded index was read?
     ///
     /// What the agent's refresher polls. Two stats, so it can be asked
@@ -753,6 +890,17 @@ pub fn setid_finding(
     }
 }
 
+/// How much a finding is damped when it is package-manager housekeeping.
+///
+/// The same factor [`adjust_score`] uses for a packaged, unmodified
+/// binary, and for the same reason: enough to drop routine housekeeping
+/// below any sane alert threshold, not so much that the finding stops
+/// existing. 0.95 becomes 0.14.
+#[must_use]
+pub fn damp_housekeeping(severity: f32) -> f32 {
+    severity * 0.15
+}
+
 /// How provenance changes a rarity score.
 ///
 /// Rarity asks "has this host run this before". Provenance answers a
@@ -804,6 +952,7 @@ mod package_lookup_tests {
             by_path,
             pkg_by_path,
             pkg_names,
+            conffiles: HashMap::new(),
             stamp: None,
             available: true,
         }
@@ -1172,6 +1321,7 @@ mod tests {
             by_path,
             pkg_by_path: HashMap::new(),
             pkg_names: std::collections::HashSet::new(),
+            conffiles: HashMap::new(),
             stamp: None,
             available: true,
         };
@@ -1219,6 +1369,7 @@ mod tests {
             by_path,
             pkg_by_path: HashMap::new(),
             pkg_names: std::collections::HashSet::new(),
+            conffiles: HashMap::new(),
             stamp: None,
             available: true,
         });
@@ -1247,6 +1398,7 @@ mod tests {
             pkg_by_path: HashMap::new(),
             pkg_names: std::collections::HashSet::new(),
             by_path,
+            conffiles: HashMap::new(),
             stamp: None,
             available: true,
         });
@@ -1303,6 +1455,7 @@ mod tests {
             by_path: by_path.clone(),
             pkg_by_path: HashMap::new(),
             pkg_names: std::collections::HashSet::new(),
+            conffiles: HashMap::new(),
             stamp: Some(DbStamp {
                 dir: info.clone(),
                 mtimes,
@@ -1381,6 +1534,7 @@ mod tests {
             by_path,
             pkg_by_path: HashMap::new(),
             pkg_names: std::collections::HashSet::new(),
+            conffiles: HashMap::new(),
             stamp: None,
             available: true,
         };
@@ -1409,6 +1563,114 @@ mod tests {
         assert_ne!(id, "baseline.rarity");
         assert!((severity - 1.0).abs() < f32::EPSILON);
         assert!(why.contains("rewrote a system binary"));
+    }
+
+    /// Build a dpkg layout whose database says a transaction is running.
+    fn dpkg_with_conffile(pkg: &str, conffile: &str) -> (tempfile::TempDir, PackageIndex) {
+        let root = tempfile::tempdir().unwrap();
+        let info = root.path().join("info");
+        std::fs::create_dir(&info).unwrap();
+        std::fs::write(root.path().join("status"), b"Package: sudo\n").unwrap();
+        std::fs::write(
+            info.join(format!("{pkg}.conffiles")),
+            format!("{conffile}\n"),
+        )
+        .unwrap();
+        let idx = PackageIndex::load_dpkg(&info);
+        (root, idx)
+    }
+
+    #[test]
+    fn conffiles_are_read_alongside_the_digests() {
+        let (_root, idx) = dpkg_with_conffile("sudo", "/etc/sudoers");
+        assert_eq!(
+            idx.conffile_package(Path::new("/etc/sudoers")),
+            Some("sudo")
+        );
+        assert_eq!(idx.conffile_package(Path::new("/etc/passwd")), None);
+        // Newer dpkg appends a flag; only the path is the path.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("x.conffiles"),
+            "/etc/foo.conf remove-on-upgrade\n",
+        )
+        .unwrap();
+        let idx = PackageIndex::load_dpkg(root.path());
+        assert_eq!(idx.conffile_package(Path::new("/etc/foo.conf")), Some("x"));
+    }
+
+    /// The exemption has to be *earned*, and provenance is what earns it.
+    #[test]
+    fn only_a_binary_the_package_manager_vouches_for_is_credited() {
+        let (_root, idx) = dpkg_with_conffile("sudo", "/etc/sudoers");
+        assert!(idx.transaction_active(), "the database was just written");
+        let cache = ProvenanceCache::new(idx);
+        let sudoers = Path::new("/etc/sudoers");
+
+        assert!(
+            cache
+                .housekeeping(sudoers, Some(Provenance::PackagedIntact))
+                .is_some(),
+            "dpkg rewriting a conffile mid-upgrade is the upgrade"
+        );
+        assert!(
+            cache.housekeeping(sudoers, None).is_some(),
+            "the inotify path never sees an actor and must still be damped"
+        );
+
+        // The cases that must survive. A rewritten binary editing the
+        // sudo policy during an upgrade is *more* interesting, not
+        // less, and an unpackaged one has no entitlement at all.
+        for actor in [
+            Provenance::PackagedModified,
+            Provenance::Unpackaged,
+            Provenance::Unknown,
+        ] {
+            assert!(
+                cache.housekeeping(sudoers, Some(actor)).is_none(),
+                "{} must not earn the exemption",
+                actor.label()
+            );
+        }
+
+        // A path no package registers is not housekeeping either.
+        assert!(
+            cache
+                .housekeeping(Path::new("/etc/passwd"), Some(Provenance::PackagedIntact))
+                .is_none()
+        );
+    }
+
+    /// No transaction, no exemption — otherwise this is just "conffiles
+    /// are exempt", and an edit to /etc/sudoers at 3am reads the same
+    /// as dpkg's own.
+    #[test]
+    fn a_quiet_database_credits_nothing() {
+        let (root, _) = dpkg_with_conffile("sudo", "/etc/sudoers");
+        let info = root.path().join("info");
+        for f in [info.clone(), root.path().join("status")] {
+            let h = std::fs::File::open(&f).unwrap();
+            h.set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+                .unwrap();
+        }
+        let idx = PackageIndex::load_dpkg(&info);
+        assert!(!idx.transaction_active());
+        let cache = ProvenanceCache::new(idx);
+        assert!(
+            cache
+                .housekeeping(Path::new("/etc/sudoers"), Some(Provenance::PackagedIntact))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn damping_drops_housekeeping_below_any_sane_threshold() {
+        // The three rules the live false positive fired.
+        for severity in [0.95_f32, 0.90, 0.70] {
+            let damped = damp_housekeeping(severity);
+            assert!(damped < 0.2, "{severity} damped to {damped}");
+            assert!(damped > 0.0, "the finding must not stop existing");
+        }
     }
 
     #[test]
