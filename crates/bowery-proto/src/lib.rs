@@ -194,6 +194,28 @@ pub enum Corroboration {
     /// `Denied`, because "I won't say" and "it didn't happen" mean
     /// opposite things about the asker's suspicion.
     Refused = 3,
+    /// "Not in your window — but I do this routinely."
+    ///
+    /// Neither a sighting nor a denial, and never part of a quorum.
+    /// The behavioural counterpart of the *familiar* answer the
+    /// binary-recognition round already gives: that one says "I have
+    /// this program at a different build", this one says "I do this
+    /// thing at a different time".
+    ///
+    /// It exists because the question a corroboration round asks is
+    /// time-bounded, and the behaviour worth asking about often is not.
+    /// Package upgrades, log rotation, backups and certificate renewals
+    /// are staggered across a fleet deliberately — systemd randomises
+    /// timer delays so hosts do not act in lockstep — so a peer doing
+    /// exactly the same thing daily answers "not in your window", and
+    /// without this that reads as a denial. Measured on otter1: 12
+    /// file.access rounds, 0 corroborated, 13 denied, and the denials
+    /// were scheduling rather than evidence.
+    ///
+    /// An older build decodes this to `Unspecified` and so treats it as
+    /// "told us nothing", never as a denial. That is the safe direction
+    /// and it is why this is a new variant rather than a reused one.
+    Habitual = 4,
 }
 
 /// "Can anyone corroborate what I just saw?" — the asker half of a

@@ -285,23 +285,65 @@ impl super::CorroborationResponder for FileAccessResponder {
                 return None;
             }
             let also: Vec<&str> = also.iter().map(String::as_str).collect();
-            log.file_access_evidence(&exe_owned, &also, &path_owned, is_read, start, end)
-                .ok()
+            let evidence = log
+                .file_access_evidence(&exe_owned, &also, &path_owned, is_read, start, end)
+                .ok()?;
+            // Nothing in the asker's window is not the end of the
+            // question. Before denying, ask whether this host does the
+            // same thing on its own schedule — see
+            // `EventLog::file_access_habit` for why a window-bounded
+            // answer is the wrong shape for a habit.
+            // Asked of every answer that is not a sighting. A host
+            // whose only record of this sits *outside* the window
+            // reports `CannotAttribute` — it attributed nothing at all
+            // in that window — and that is the commonest shape of the
+            // very case this exists for: the peer does it daily, just
+            // never in anyone else's half hour.
+            let habit = if evidence == bowery_eventlog::AccessEvidence::Seen {
+                None
+            } else {
+                log.file_access_habit(&exe_owned, &also, &path_owned, is_read)
+                    .ok()
+                    .flatten()
+            };
+            Some((evidence, habit))
         })
         .await;
 
         match found {
-            Ok(Some(bowery_eventlog::AccessEvidence::Seen)) => {
+            Ok(Some((bowery_eventlog::AccessEvidence::Seen, _))) => {
                 corroborate::answer(query, Corroboration::Corroborated, Vec::new())
             }
-            Ok(Some(bowery_eventlog::AccessEvidence::NotSeen)) => {
+            // Not now, but routinely — and the asker is told how
+            // routinely, so "I do that twice a day" and "I did it once,
+            // months ago" are not the same answer.
+            //
+            // `CannotAttribute` joins `NotSeen` here: a host whose only
+            // record of this sits outside the window attributed nothing
+            // *in* the window, and that is the commonest shape of the
+            // case this exists for.
+            Ok(Some((
+                bowery_eventlog::AccessEvidence::NotSeen
+                | bowery_eventlog::AccessEvidence::CannotAttribute,
+                Some(habit),
+            ))) => corroborate::answer(
+                query,
+                Corroboration::Habitual,
+                vec![
+                    Attribute::new("times", habit.count.to_string()),
+                    Attribute::new("last_unix_ms", habit.last_unix_ms.to_string()),
+                ],
+            ),
+            Ok(Some((bowery_eventlog::AccessEvidence::NotSeen, None))) => {
                 corroborate::answer(query, Corroboration::Denied, Vec::new())
             }
-            Ok(Some(bowery_eventlog::AccessEvidence::CannotAttribute)) => corroborate::refuse(
-                query,
-                "this host has attributed no file access to a binary in that window, so \
-                 its silence is not evidence",
-            ),
+            Ok(Some((bowery_eventlog::AccessEvidence::CannotAttribute, None))) => {
+                corroborate::refuse(
+                    query,
+                    "this host has attributed no file access to a binary in that window, so \
+                     its silence is not evidence",
+                )
+            }
             Ok(None) => corroborate::refuse(
                 query,
                 "history does not cover the requested window on this host",
@@ -355,6 +397,7 @@ mod tests {
             denied: 3,
             refused: 0,
             no_reply: 0,
+            habitual: 0,
         };
         assert!(
             !c.rule.confirms(&tally),
@@ -423,5 +466,132 @@ mod tests {
             a.dedup_key, other.dedup_key,
             "a read and a write are different questions"
         );
+    }
+}
+
+#[cfg(test)]
+mod habit_tests {
+    use super::*;
+    use crate::corroboration::CorroborationResponder as _;
+    use std::time::{Duration, SystemTime};
+
+    /// A log holding one `sudoers` read by dpkg, `age` ago.
+    fn log_with_read(age: Duration) -> Arc<bowery_eventlog::EventLog> {
+        let log = Arc::new(bowery_eventlog::EventLog::open_in_memory().unwrap());
+        let when = SystemTime::now() - age;
+        log.record_file_access(4242, "dpkg", "/usr/bin/dpkg", "/etc/sudoers", true, when)
+            .unwrap();
+        log
+    }
+
+    fn ask_about_now() -> CorroborationQuery {
+        let now = SystemTime::now();
+        let c = claim_for(
+            Some("/usr/bin/dpkg"),
+            Some("dpkg"),
+            "/etc/sudoers",
+            true,
+            "file-recon.read_sudoers-1".into(),
+            now,
+            Duration::from_mins(30),
+            0.7,
+        )
+        .expect("claim");
+        CorroborationQuery {
+            kind: c.kind.to_string(),
+            subject: c.subject,
+            window_start_unix_ms: c.window_start_unix_ms,
+            window_end_unix_ms: c.window_end_unix_ms,
+            ..Default::default()
+        }
+    }
+
+    /// The otter1 failure: a peer that does exactly this, on its own
+    /// schedule, denying the asker into an alert.
+    ///
+    /// `unattended-upgrades` runs per host with a randomised delay, so
+    /// two machines almost never upgrade `sudo` in the same half hour.
+    /// Twelve rounds on the live fleet produced zero corroborations and
+    /// thirteen denials, and every denial was scheduling rather than
+    /// evidence.
+    #[tokio::test]
+    async fn a_peer_that_does_this_daily_says_so_instead_of_denying() {
+        // Outside the asker's ±30m window, well inside the log.
+        let log = log_with_read(Duration::from_hours(20));
+        let responder = FileAccessResponder::new(log.clone());
+        let answer = responder
+            .respond(Fingerprint::from_bytes([9u8; 32]), &ask_about_now())
+            .await;
+
+        assert_eq!(
+            answer.outcome(),
+            Corroboration::Habitual,
+            "not in the window, but routine — that is not a denial"
+        );
+        let times = answer
+            .evidence
+            .iter()
+            .find(|a| a.key == "times")
+            .expect("the answer must say how routinely");
+        assert_eq!(times.value, "1");
+    }
+
+    /// A host that has genuinely never done it still denies.
+    #[tokio::test]
+    async fn a_peer_with_no_history_of_it_still_denies() {
+        let log = Arc::new(bowery_eventlog::EventLog::open_in_memory().unwrap());
+        // Something else entirely, and old enough that the log covers
+        // the window — so this host *can* attribute accesses and its
+        // silence is evidence rather than blindness.
+        for age in [Duration::from_hours(2), Duration::from_secs(1)] {
+            log.record_file_access(
+                1,
+                "sshd",
+                "/usr/sbin/sshd",
+                "/etc/ssh/ssh_host_rsa_key",
+                true,
+                SystemTime::now() - age,
+            )
+            .unwrap();
+        }
+        let responder = FileAccessResponder::new(log.clone());
+        let answer = responder
+            .respond(Fingerprint::from_bytes([9u8; 32]), &ask_about_now())
+            .await;
+        assert_eq!(
+            answer.outcome(),
+            Corroboration::Denied,
+            "never seen at all is still the finding"
+        );
+    }
+
+    /// Habitual answers must never confirm, and must not deny.
+    #[test]
+    fn habitual_counts_as_neither_sighting_nor_denial() {
+        let mut tally = super::super::Tally {
+            asked: 3,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            tally.record(Corroboration::Habitual);
+        }
+        assert_eq!(tally.habitual, 3);
+        assert_eq!(tally.denied, 0, "a habit is not a denial");
+        assert_eq!(tally.corroborated, 0, "nor is it a sighting");
+
+        let rule = super::super::Rule {
+            deny_quorum: 2,
+            corroboration_clears: true,
+        };
+        assert!(
+            !rule.confirms(&tally),
+            "three peers saying 'I do that too' must never confirm a finding"
+        );
+
+        // …and it reaches the operator through the field the damping
+        // already reads.
+        let conf = tally.to_confirmation(rule, false);
+        assert_eq!(conf.peers_familiar, 3);
+        assert_eq!(conf.peers_unseen, 0);
     }
 }

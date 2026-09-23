@@ -188,6 +188,15 @@ pub enum AccessEvidence {
     CannotAttribute,
 }
 
+/// How routinely a host does something, across everything it retains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessHabit {
+    /// Times recorded. Never zero — absence is `None`.
+    pub count: u64,
+    /// When it last happened.
+    pub last_unix_ms: u64,
+}
+
 /// Append-only event store.
 #[derive(Debug)]
 pub struct EventLog {
@@ -566,6 +575,59 @@ impl EventLog {
         } else {
             AccessEvidence::CannotAttribute
         })
+    }
+
+    /// How often this host has done the same thing, over everything it
+    /// still retains.
+    ///
+    /// `None` when it has no record of it at all.
+    ///
+    /// # Why the window is deliberately absent
+    ///
+    /// [`Self::file_access_evidence`] answers "did you see this *in my
+    /// window*", which is the right question for a connection and the
+    /// wrong one for a habit. Package upgrades, log rotation, backup
+    /// jobs and certificate renewals are all staggered across a fleet
+    /// on purpose — systemd randomises timer delays precisely so hosts
+    /// do not act in lockstep — so a peer that does exactly the same
+    /// thing every day answers "not in your window" and the asker reads
+    /// a denial.
+    ///
+    /// Measured on otter1: 12 file.access rounds, 0 corroborated, 13
+    /// denied. The denials were scheduling, not evidence.
+    ///
+    /// # Errors
+    /// Propagates `SQLite` failures.
+    pub fn file_access_habit(
+        &self,
+        exe: &str,
+        also_exe: &[&str],
+        path: &str,
+        is_read: bool,
+    ) -> Result<Option<AccessHabit>> {
+        let conn = self.inner.lock().expect("event log mutex poisoned");
+        let op = if is_read { "read" } else { "write" };
+        let mut candidates: Vec<&str> = vec![exe];
+        candidates.extend(also_exe.iter().copied());
+        for candidate in &candidates {
+            let row: Option<(i64, Option<i64>)> = conn
+                .query_row(
+                    "SELECT COUNT(*), MAX(ts_unix_ms) FROM events
+                     WHERE kind = ?1 AND exe_path = ?2 AND path = ?3 AND file_op = ?4",
+                    params![KIND_FILE_ACCESS, candidate, path, op],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((count, Some(last))) = row
+                && count > 0
+            {
+                return Ok(Some(AccessHabit {
+                    count: u64::try_from(count).unwrap_or(u64::MAX),
+                    last_unix_ms: u64::try_from(last).unwrap_or(0),
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// Record an access that matched a watch rule and whose binary we

@@ -63,9 +63,19 @@ impl Appended {
 
 /// Lower a score the neighbourhood explained.
 ///
-/// Recognition — peers holding the same program at a different build —
-/// is evidence that the *program* is fleet-normal. It is not evidence
-/// that this copy is intact, which is provenance's job, so the damp is
+/// Recognition comes in two shapes and they damp for the same reason.
+/// A peer holding the **same program at a different build** says the
+/// program is fleet-normal. A peer that does the **same thing on a
+/// different schedule** — `Corroboration::Habitual` — says the
+/// behaviour is. The second exists because a corroboration round asks
+/// a time-bounded question and a habit is not time-bounded: staggered
+/// package upgrades, log rotation and certificate renewal are all
+/// things every host does and no two hosts do at once, and without a
+/// way to say "not now, but routinely" each peer denies the others
+/// into an alert.
+///
+/// Neither is evidence that *this* copy is intact or that *this*
+/// instance was benign — that is provenance's job — so the damp is
 /// proportional to how much of the neighbourhood recognised it and
 /// never reaches zero. A binary planted at a path a package owns is
 /// exactly the `PackagedModified` case, and prevalence must not talk
@@ -87,9 +97,10 @@ fn damp_for_recognition(mut alert: Alert) -> Alert {
     let from = alert.suspicion;
     alert.suspicion = from * (1.0 - 0.6 * fraction.clamp(0.0, 1.0));
     alert.rationale = format!(
-        "{} | {MARKER}: {} of {} peers run it built differently, so {from:.2} was lowered \
-         to {:.2}. Their copies are not this copy — provenance, not prevalence, says \
-         whether this one was tampered with.",
+        "{} | {MARKER}: {} of {} peers know this one — the same program built \
+         differently, or the same behaviour on their own schedule — so {from:.2} was \
+         lowered to {:.2}. What the fleet does is not what this copy is: provenance, \
+         not prevalence, says whether anything here was tampered with.",
         alert.rationale, c.peers_familiar, c.peers_asked, alert.suspicion
     );
     alert

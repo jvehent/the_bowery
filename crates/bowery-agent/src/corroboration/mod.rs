@@ -237,10 +237,12 @@ impl Rule {
 
 /// What a round heard back.
 ///
-/// Four buckets, not two. Collapsing `refused` or `no_reply` into
-/// `denied` is the mistake this type exists to prevent: an unreachable
-/// peer and a peer that declined both told us nothing, and only a peer
-/// that actually looked and found nothing is evidence.
+/// Five buckets, not two. Collapsing `refused`, `no_reply` or
+/// `habitual` into `denied` is the mistake this type exists to prevent:
+/// an unreachable peer and a peer that declined both told us nothing, a
+/// peer that does the same thing on its own schedule told us something
+/// close to the opposite, and only a peer that actually looked and
+/// found nothing is evidence.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Tally {
     pub asked: usize,
@@ -252,6 +254,12 @@ pub struct Tally {
     pub refused: usize,
     /// Timed out, failed to dial, or answered unintelligibly.
     pub no_reply: usize,
+    /// "Not in your window, but I do this routinely."
+    ///
+    /// Never counts toward a quorum — it is not a sighting — but it is
+    /// the answer that stops a fleet of staggered cron jobs from
+    /// denying each other into an alert.
+    pub habitual: usize,
 }
 
 impl Tally {
@@ -260,6 +268,7 @@ impl Tally {
             Corroboration::Corroborated => self.corroborated += 1,
             Corroboration::Denied => self.denied += 1,
             Corroboration::Refused => self.refused += 1,
+            Corroboration::Habitual => self.habitual += 1,
             // An outcome this build doesn't recognise decodes to
             // `Unspecified`, which means the peer told us nothing —
             // never that it denied anything.
@@ -295,10 +304,17 @@ impl Tally {
             // §3.3. Reporting a fabricated non-zero here would be worse
             // than reporting none.
             peers_incomparable: 0,
-            // Same reasoning as `peers_incomparable`: "same program,
-            // different build" is a question about binaries, and these
-            // kinds ask about paths and endpoints.
-            peers_familiar: 0,
+            // The behavioural form of familiarity: not "I have this
+            // program at another build" but "I do this thing at
+            // another time". A staggered upgrade, a rotated log, a
+            // renewed certificate — the fleet does them all, never at
+            // the same instant, and a window-bounded question reads
+            // that as denial unless this is carried.
+            //
+            // Reported through `peers_familiar` deliberately, because
+            // `damp_for_recognition` already consumes that field and
+            // already refuses to let prevalence talk over provenance.
+            peers_familiar: u32::try_from(self.habitual).unwrap_or(u32::MAX),
             quorum: u32::try_from(rule.deny_quorum).unwrap_or(u32::MAX),
             confirmed,
         }
@@ -974,6 +990,7 @@ mod tests {
             denied,
             refused,
             no_reply,
+            habitual: 0,
         }
     }
 

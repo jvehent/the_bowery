@@ -466,6 +466,65 @@ which proves it uses its input and says nothing about whether an input
 ever exists — the same test-design mistake that shipped a status view
 nothing had wired up.
 
+## 5f. Habit: the behavioural form of *familiar*
+
+§3.1 gave the binary round a `familiar` answer — *"I have that program,
+at a different build"* — neither a sighting nor a denial, never part of
+a quorum, and enough to break one the denials would otherwise have
+reached. The behavioural kinds never got the equivalent, and the gap
+showed up on 23 Sep 2026 in the plainest possible form.
+
+otter1 alerted three times in one second on `/etc/sudoers`. The process
+tree explained it outright:
+
+```
+apt.systemd.daily install          (1149670)
+└─ unattended-upgrade [python3.12] (1149703)
+   └─ dpkg --unpack sudo_1.9.15p5-3ubuntu5.24.04_amd64.deb (1149790)
+```
+
+Ubuntu patching itself. `bowery_corroboration_status` for the period:
+
+```
+kind          raised  rounds  corroborated  denied  refused
+file.access       12      12             0      13       11
+```
+
+Zero corroborations, thirteen denials — and every denial was wrong.
+The question a `file.access` round asks is bounded by
+`window_around(ts, half_window)`, capped at six hours. Package
+upgrades are staggered *on purpose*: systemd randomises timer delays
+precisely so a fleet does not act in lockstep, hosts have different
+package sets, and a peer that upgraded `sudo` last Tuesday answers
+"not in your window". That reads as a denial, which is the same
+conflation this document was written about — absence of a
+*simultaneous* sighting read as a negative statement.
+
+`Corroboration::Habitual = 4` is the answer that was missing. Before
+denying, the responder asks its own log whether it does this at all,
+over everything it retains, and answers with the count and the last
+time if it does. Three properties, all deliberate:
+
+- **It never counts toward a quorum.** It is not a sighting. It simply
+  is not a denial either, so a fleet of staggered cron jobs stops
+  denying each other into an alert.
+- **It carries how routine.** "Twice a day" and "once, months ago" are
+  different answers and the asker gets to tell them apart.
+- **It reaches the operator through `peers_familiar`,** which
+  `damp_for_recognition` already consumes and which already refuses to
+  let prevalence talk over provenance. A host that does something
+  daily says the *behaviour* is fleet-normal; it says nothing about
+  whether this instance was benign, and a uniformly compromised fleet
+  would vouch for itself. So it damps, bounded, and never silences.
+
+`CannotAttribute` answers ask the same question, because a host whose
+only record of the behaviour sits outside the window attributed
+nothing *inside* it — which is the commonest shape of the case.
+
+An older build decodes `4` to `Unspecified` and treats it as "told us
+nothing", never as a denial. That is the safe direction, and it is why
+this is a new variant rather than a reused one.
+
 ## 6. Open questions
 
 - Does `quorum` stay a count, or become a confidence threshold? A count
