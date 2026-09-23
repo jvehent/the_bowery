@@ -2477,6 +2477,24 @@ fn handle_llm_outcome(
                         suspicion: verdict.suspicion,
                     });
                 }
+            } else {
+                // The model lowered it below the bar — which used to
+                // mean nothing was appended and nothing else happened,
+                // leaving the pre-filter alert standing at its original
+                // score. The operator went on seeing 0.95 for something
+                // the model had just explained, and the only case where
+                // inference earned its keep was the one case it was
+                // discarded. Correct the standing record instead. The
+                // damp is floored, because the model reads argv.
+                let damped = inbox.damp_episode(&episode_id, verdict.suspicion, &verdict.rationale);
+                if damped > 0 {
+                    info!(
+                        episode = %episode_id,
+                        to = verdict.suspicion,
+                        alerts = damped,
+                        "the model explained a standing alert; suspicion lowered"
+                    );
+                }
             }
             // Phase 7: route every suggested action through the
             // response engine. The engine is policy-gated (defaults
@@ -3196,5 +3214,100 @@ mod alert_chunk_tests {
         // An empty inbox still yields one (empty) batch → one `end` chunk,
         // so the operator's read loop always terminates.
         assert_eq!(chunk_alerts(Vec::new(), ALERTS_CHUNK_BUDGET_BYTES).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod llm_outcome_tests {
+    use super::*;
+
+    /// A model verdict below the bar must correct the record, not
+    /// vanish.
+    ///
+    /// `handle_llm_outcome` appends a refined alert when the model
+    /// scores at or above the threshold. Below it, the original code
+    /// did nothing at all — and "nothing" left the pre-filter alert
+    /// standing at its own score, which is the one the operator reads.
+    /// So the single case where inference is most useful, telling you
+    /// that a 0.95 is routine, was the case its answer was discarded.
+    ///
+    /// Driven through the real function rather than through
+    /// `damp_episode` directly: the unit tests already prove the
+    /// damping, and what is in doubt is whether this branch reaches it.
+    #[test]
+    fn a_below_threshold_verdict_damps_the_standing_alert() {
+        let inbox = Arc::new(AlertInbox::new(64, Duration::from_hours(72)));
+        let identity = Arc::new(Identity::generate());
+        let fp = identity.fingerprint();
+        let episode = "ep-unattended-upgrade";
+
+        let _ = inbox.append(Alert {
+            originator_fp: fp.as_bytes().to_vec(),
+            rule_id: "baseline.rarity".into(),
+            episode_id: episode.into(),
+            suspicion: 0.95,
+            rationale: "pre-filter score above threshold".into(),
+            ts_unix_ms: crate::inbox::current_unix_ms(),
+            ..Default::default()
+        });
+
+        let (events_tx, _rx) = broadcast::channel(16);
+        let policy = ResponsePolicy::default();
+        let engine: Arc<dyn ResponseEngine> = Arc::new(NoopEngine::new(policy));
+        let audit_sink: Arc<dyn AuditSink> = Arc::new(NoopSink);
+        let pending = Arc::new(crate::pending_actions::PendingActions::new(
+            Duration::from_mins(5),
+        ));
+
+        let mut pre = bowery_analysis::Verdict {
+            episode_id: episode.to_string(),
+            suspicion: 0.95,
+            score: bowery_analysis::BinaryScore {
+                value: 0.95,
+                baseline_seen_count: 0,
+                reason: "never seen".into(),
+            },
+            rule_hits: Vec::new(),
+        };
+        pre.episode_id = episode.to_string();
+
+        handle_llm_outcome(
+            &events_tx,
+            &inbox,
+            fp,
+            0.7,
+            "test",
+            &engine,
+            &audit_sink,
+            &identity,
+            &pending,
+            InferenceOutcome::Verdict {
+                episode_id: episode.to_string(),
+                ctx: Box::new(bowery_llm::AnalysisContext::new(pre)),
+                verdict: Box::new(LlmVerdict {
+                    suspicion: 0.05,
+                    rationale: "apt.systemd.daily running unattended-upgrade; routine".into(),
+                    suggested_actions: Vec::new(),
+                    whisper_query: String::new(),
+                    backend: "test".into(),
+                }),
+            },
+        );
+
+        let (alerts, _) = inbox.read_since(0, 100);
+        let alert = alerts
+            .iter()
+            .find(|a| a.episode_id == episode)
+            .expect("the standing alert is still there");
+        assert!(
+            alert.suspicion < 0.95,
+            "the model's conclusion must reach the record the operator reads, got {}",
+            alert.suspicion
+        );
+        assert!(
+            alert.rationale.contains("unattended-upgrade"),
+            "and must carry why, got: {}",
+            alert.rationale
+        );
     }
 }
