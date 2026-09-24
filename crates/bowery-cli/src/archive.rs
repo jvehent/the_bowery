@@ -86,7 +86,8 @@ const LATEST_VIEW: &str = "CREATE VIEW IF NOT EXISTS alerts_latest AS
 const SELECT_COLUMNS: &str = "agent_fp, agent_name, episode_id, ts_unix_ms, archived_ms, \
                               rule_id, suspicion, exe_path, exe_sha256, rationale, backend, \
                               confirmed, peers_asked, peers_unseen, peers_seen, \
-                              peers_incomparable, peers_familiar, context_json";
+                              peers_incomparable, peers_familiar, context_json, \
+                              model_explanation";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS alerts (
@@ -112,6 +113,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     quorum          INTEGER,
     context_json    TEXT    NOT NULL DEFAULT '{}',
     actions_json    TEXT    NOT NULL DEFAULT '[]',
+    model_explanation TEXT,
     PRIMARY KEY (agent_fp, episode_id, ts_unix_ms)
 ) WITHOUT ROWID;
 
@@ -136,6 +138,7 @@ CREATE INDEX IF NOT EXISTS alerts_by_sha   ON alerts (exe_sha256);
 const ADDED_COLUMNS: &[(&str, &str)] = &[
     ("peers_incomparable", "INTEGER"),
     ("peers_familiar", "INTEGER"),
+    ("model_explanation", "TEXT"),
 ];
 
 /// Bring an existing archive up to the current schema.
@@ -245,8 +248,8 @@ impl Archive {
                         rule_id, suspicion, exe_path, exe_sha256, rationale, backend,
                         confirmed, peers_asked, peers_unseen, peers_seen,
                         peers_no_reply, peers_refused, peers_incomparable, peers_familiar,
-                        quorum, context_json, actions_json
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                        quorum, context_json, actions_json, model_explanation
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
                 )
                 .context("preparing archive insert")?;
             for a in alerts {
@@ -275,6 +278,7 @@ impl Archive {
                         c.map(|c| c.quorum),
                         context_json(a),
                         actions_json(a),
+                        empty_to_null(&a.model_explanation),
                     ])
                     .context("inserting alert")?;
             }
@@ -484,6 +488,9 @@ pub struct Row {
     /// Peers that had the same program at a different build. `NULL`
     /// from a row archived before the field existed.
     pub peers_familiar: Option<u32>,
+    /// What the local model said, when one judged this alert. `None`
+    /// for the overwhelming majority, which no model ever saw.
+    pub model_explanation: Option<String>,
     pub context_json: String,
 }
 
@@ -508,6 +515,7 @@ impl Row {
             peers_incomparable: opt_u32(r, 15)?,
             peers_familiar: opt_u32(r, 16)?,
             context_json: r.get(17)?,
+            model_explanation: r.get(18)?,
         })
     }
 
@@ -533,6 +541,7 @@ impl Row {
             suggested_actions: Vec::new(),
             ts_unix_ms: self.ts_unix_ms,
             backend: self.backend.clone().unwrap_or_default(),
+            model_explanation: self.model_explanation.clone().unwrap_or_default(),
             confirmation: self
                 .confirmed
                 .map(|confirmed| bowery_proto::AlertConfirmation {
@@ -703,6 +712,7 @@ mod tests {
 
     fn alert(fp: u8, episode: &str, ts: u64, suspicion: f32) -> Alert {
         Alert {
+            model_explanation: String::new(),
             originator_fp: vec![fp; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: episode.into(),
@@ -1323,6 +1333,7 @@ mod roundtrip_tests {
     #[test]
     fn an_alert_survives_the_archive_round_trip() {
         let original = Alert {
+            model_explanation: "routine credential read by the backup agent".into(),
             originator_fp: vec![0x3a; 32],
             rule_id: "cred.read_aws".into(),
             episode_id: "ep-7f3a91".into(),
@@ -1360,6 +1371,11 @@ mod roundtrip_tests {
         assert_eq!(back.exe_path, original.exe_path);
         assert_eq!(back.exe_sha256_hex, original.exe_sha256_hex);
         assert_eq!(back.rationale, original.rationale);
+        // The model's reading has to survive too, and stay separate: an
+        // operator reading archived history needs the same distinction
+        // between measurement and inference that the live alert drew.
+        assert_eq!(back.model_explanation, original.model_explanation);
+        assert_ne!(back.model_explanation, back.rationale);
         assert_eq!(back.ts_unix_ms, original.ts_unix_ms);
         assert!((back.suspicion - original.suspicion).abs() < 1e-6);
         assert_eq!(back.context, original.context, "context attributes");
@@ -1611,6 +1627,7 @@ mod trend_tests {
 
     fn row(rule: &str, ts: u64) -> Row {
         Row {
+            model_explanation: None,
             agent_fp: "ab".repeat(32),
             agent_name: Some("otter1".into()),
             episode_id: format!("ep-{ts}-{rule}"),

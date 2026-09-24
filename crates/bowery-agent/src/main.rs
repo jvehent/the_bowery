@@ -142,7 +142,7 @@ async fn build_llm(config: &Config) -> Result<Option<Arc<dyn bowery_llm::LlmAnal
         model = %llama_cfg.model_path.display(),
         n_ctx = llama_cfg.n_ctx,
         n_threads = llama_cfg.n_threads,
-        "loading Qwen3 GGUF via llama-cpp"
+        "loading GGUF model via llama-cpp"
     );
     let analyzer = LlamaCppAnalyzer::new(llama_cfg)
         .await

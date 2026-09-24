@@ -430,7 +430,13 @@ impl BoweryTable for BoweryAlertsTable {
                 peers_seen        INTEGER,
                 peers_refused     INTEGER,
                 peers_incomparable INTEGER,
-                peers_familiar    INTEGER
+                peers_familiar    INTEGER,
+                -- What the local model said, when one judged this
+                -- alert. Empty for the overwhelming majority: the LLM
+                -- stage sees only exec episodes above the invocation
+                -- threshold, so file findings and watchdog alerts
+                -- reach the operator without inference having run.
+                model_explanation TEXT
             );",
         )?;
         let (alerts, _) = self.inbox.read_since(0, usize::MAX);
@@ -440,8 +446,9 @@ impl BoweryTable for BoweryAlertsTable {
                                          exe_sha256_hex, exe_path, suspicion, rationale,
                                          ts_unix_ms, backend, confirmed, peers_asked,
                                          peers_unseen, peers_seen, peers_refused,
-                                         peers_incomparable, peers_familiar)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                                         peers_incomparable, peers_familiar,
+                                         model_explanation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )?;
         for a in alerts {
             let originator_hex = hex_lower(&a.originator_fp);
@@ -469,6 +476,7 @@ impl BoweryTable for BoweryAlertsTable {
                 a.confirmation.map(|c| i64::from(c.peers_refused)),
                 a.confirmation.map(|c| i64::from(c.peers_incomparable)),
                 a.confirmation.map(|c| i64::from(c.peers_familiar)),
+                a.model_explanation,
             ])?;
         }
         Ok(())
@@ -1707,6 +1715,7 @@ mod alerts_view_tests {
     async fn exposes_every_confirmation_column() {
         let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
         let _ = inbox.append(Alert {
+            model_explanation: String::new(),
             originator_fp: vec![0xab; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: "corr-net.inbound_connect-deadbeef".into(),
@@ -1764,6 +1773,7 @@ mod alerts_view_tests {
     async fn an_unwhispered_alert_has_null_confirmation_columns() {
         let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
         let _ = inbox.append(Alert {
+            model_explanation: String::new(),
             originator_fp: vec![0xcd; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: "ep-plain".into(),
@@ -1801,6 +1811,7 @@ mod alerts_view_tests {
     async fn a_superseded_alert_does_not_get_its_own_row() {
         let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
         let base = |rationale: &str, suspicion: f32| Alert {
+            model_explanation: String::new(),
             originator_fp: vec![0x11; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: "ep-27234-refined".into(),
@@ -1846,6 +1857,7 @@ mod alerts_view_tests {
         let inbox = Arc::new(AlertInbox::new(16, Duration::from_hours(1)));
         for path in ["/tmp/a", "/tmp/b", "/tmp/c"] {
             let _ = inbox.append(Alert {
+                model_explanation: String::new(),
                 originator_fp: vec![0x22; 32],
                 rule_id: "cred.read_netrc".into(),
                 episode_id: String::new(),

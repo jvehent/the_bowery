@@ -531,6 +531,13 @@ pub fn body(hosts: &[HostAlerts], vt: &VerdictMap) -> String {
                 "{}",
                 labelled("why", &sanitize(&a.rationale, RATIONALE_CAP))
             );
+            if !a.model_explanation.is_empty() {
+                let _ = write!(
+                    out,
+                    "{}",
+                    labelled("model says", &sanitize(&a.model_explanation, RATIONALE_CAP))
+                );
+            }
             // Per alert, not just as a digest total: an operator triaging
             // one finding needs the verdict for *that* binary.
             if let Some(v) = vt.get(&a.exe_sha256_hex.to_ascii_lowercase()) {
@@ -904,6 +911,18 @@ fn alert_card(a: &Alert, vt: &VerdictMap) -> String {
         );
     }
     row(&mut out, "why", &field(&a.rationale, RATIONALE_CAP), false);
+    // The model's reading, labelled as the model's. Deliberately a
+    // separate row from `why`: one is what a rule matched, the other is
+    // what a language model inferred from attacker-influenced strings,
+    // and an operator deciding at 03:00 needs to know which is which.
+    if !a.model_explanation.is_empty() {
+        row(
+            &mut out,
+            "model says",
+            &field(&a.model_explanation, RATIONALE_CAP),
+            false,
+        );
+    }
     for attr in &a.context {
         row(
             &mut out,
@@ -1590,8 +1609,9 @@ mod tests {
     use super::*;
     use bowery_proto::AlertConfirmation;
 
-    fn alert(episode: &str, suspicion: f32, confirmed: bool) -> Alert {
+    pub(super) fn alert(episode: &str, suspicion: f32, confirmed: bool) -> Alert {
         Alert {
+            model_explanation: String::new(),
             originator_fp: vec![0xab; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: episode.into(),
@@ -2473,5 +2493,82 @@ password_file = "/dev/null"
 
         fs::set_permissions(&pw, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(cfg.password().unwrap(), "hunter2");
+    }
+}
+
+#[cfg(test)]
+mod model_explanation_tests {
+    use super::tests::alert;
+    use super::*;
+
+    /// The model's reading reaches the operator, labelled as the
+    /// model's.
+    ///
+    /// The refinement used to *overwrite* `rationale`, so the rule's
+    /// own finding was replaced by model prose and a reader could not
+    /// tell a measurement from an inference — both arrived in the
+    /// agent's own voice.
+    #[test]
+    fn the_model_speaks_in_its_own_row_and_the_rule_keeps_its_own() {
+        let mut a = alert("ep-model", 0.9, false);
+        a.rationale = "exec from world-writable path".into();
+        a.model_explanation = "apt.systemd.daily running unattended-upgrade; routine".into();
+        let hosts = vec![HostAlerts {
+            host: "otter1".into(),
+            alerts: vec![a],
+        }];
+
+        let html = body_html(&hosts, &VerdictMap::new());
+        assert!(html.contains("model says"), "the row must be labelled");
+        assert!(html.contains("unattended-upgrade"));
+        assert!(
+            html.contains("exec from world-writable path"),
+            "and the rule's own finding must survive alongside it"
+        );
+    }
+
+    /// An alert no model judged says nothing about one.
+    #[test]
+    fn an_alert_without_a_model_verdict_shows_no_model_row() {
+        let a = alert("ep-plain", 0.9, false);
+        assert!(a.model_explanation.is_empty());
+        let hosts = vec![HostAlerts {
+            host: "otter1".into(),
+            alerts: vec![a],
+        }];
+        let html = body_html(&hosts, &VerdictMap::new());
+        assert!(
+            !html.contains("model says"),
+            "most alerts are judged by rules alone and must not imply otherwise"
+        );
+    }
+
+    /// Model output is the *last* text that may render as markup.
+    ///
+    /// Its inputs are attacker-influenced — `argv`, paths and `comm`
+    /// all reach the prompt — so a model can be induced to emit
+    /// whatever an attacker put there. It goes through the same
+    /// escaping as every other interpolated field, and this proves it
+    /// rather than assuming it.
+    #[test]
+    fn a_hostile_model_explanation_cannot_render_as_markup() {
+        let mut a = alert("ep-evil", 0.9, false);
+        a.model_explanation =
+            "benign </div><script>fetch('//evil.test')</script><img src=x onerror=x()".into();
+        let hosts = vec![HostAlerts {
+            host: "otter1".into(),
+            alerts: vec![a],
+        }];
+        let html = body_html(&hosts, &VerdictMap::new());
+        assert!(
+            !html.contains("<script>"),
+            "script tag reached the document"
+        );
+        assert!(!html.contains("</div><script"), "card structure was forged");
+        assert!(!html.contains("<img src=x"), "tag opened");
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "the payload must appear escaped, not dropped"
+        );
     }
 }

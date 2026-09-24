@@ -605,6 +605,33 @@ pub struct Alert {
     /// `lineage.service_spawned_shell` episode is still that finding.
     #[prost(string, tag = "12")]
     pub rule_id: String,
+
+    /// What the local model said, kept apart from [`Self::rationale`].
+    ///
+    /// Empty when no model judged this alert, which is most of them —
+    /// the LLM stage sees only exec episodes above the invocation
+    /// threshold, so every file finding and every watchdog alert
+    /// reaches the operator without inference having run.
+    ///
+    /// # Why it is not merged into `rationale`
+    ///
+    /// The refinement used to *overwrite* the rationale, so the
+    /// deterministic text — which rule fired, what it matched, what the
+    /// baseline knew — was replaced by model prose and lost. Two
+    /// problems, and the second is the serious one. A reader could no
+    /// longer tell a measurement from an inference: both arrived in the
+    /// alert's own voice, so a model that was confidently wrong was
+    /// indistinguishable from the rule that was simply right. And the
+    /// model's inputs are attacker-influenced — `argv`, paths and
+    /// `comm` all reach the prompt — so its prose is the *last* text
+    /// that should be able to impersonate the agent's own.
+    ///
+    /// Kept separate, an operator reads the rule's finding and the
+    /// model's reading of it as two statements, attributable to two
+    /// different things, one of which can be wrong without taking the
+    /// other with it.
+    #[prost(string, tag = "13")]
+    pub model_explanation: String,
 }
 
 /// What the neighbourhood said when asked about an alert.
@@ -1915,6 +1942,7 @@ mod tests {
     #[test]
     fn alert_roundtrip() {
         let alert = Alert {
+            model_explanation: String::new(),
             originator_fp: vec![0xaa; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: "ep-7".into(),
@@ -1955,6 +1983,7 @@ mod tests {
     #[test]
     fn alert_without_confirmation_field_still_decodes() {
         let mut legacy = Alert {
+            model_explanation: String::new(),
             originator_fp: vec![0xbb; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: "ep-legacy".into(),
@@ -1995,6 +2024,7 @@ mod tests {
 
         let resp = Alerts {
             items: vec![Alert {
+                model_explanation: String::new(),
                 originator_fp: vec![1; 32],
                 rule_id: "cred.read_netrc".into(),
                 episode_id: "x".into(),

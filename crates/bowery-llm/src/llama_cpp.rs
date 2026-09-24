@@ -37,9 +37,6 @@ use crate::context::AnalysisContext;
 use crate::parse::parse_verdict;
 use crate::prompt::PromptStyle;
 
-/// Backend tag embedded in [`LlmVerdict::backend`] for log/audit purposes.
-const BACKEND_TAG: &str = "llama-cpp/qwen3-0.6b";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlamaCppConfig {
     /// Path to the Qwen3-0.6B GGUF file. The agent's `[llm.llama_cpp]
@@ -109,7 +106,10 @@ impl LlamaCppAnalyzer {
     /// Initialise the backend, load the model, and spawn the worker.
     /// Returns once the worker is ready to accept requests.
     pub async fn new(config: LlamaCppConfig) -> Result<Self, LlmError> {
-        info!(model = %config.model_path.display(), "loading Qwen3 GGUF (this is slow)");
+        info!(
+            model = %config.model_path.display(),
+            "loading GGUF model (this is slow)"
+        );
 
         let (request_tx, mut request_rx) = mpsc::channel::<Request>(REQUEST_CHANNEL_DEPTH);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), LlmError>>();
@@ -146,7 +146,7 @@ impl LlamaCppAnalyzer {
 
         Ok(Self {
             request_tx,
-            backend_tag: BACKEND_TAG.to_string(),
+            backend_tag: crate::backend::backend_tag_for(&config.model_path),
             max_tokens,
         })
     }

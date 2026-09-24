@@ -315,6 +315,7 @@ mod json_tests {
 
     fn base() -> Alert {
         Alert {
+            model_explanation: String::new(),
             originator_fp: vec![0xab; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: "ep-1".into(),

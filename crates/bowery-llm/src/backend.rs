@@ -67,6 +67,31 @@ pub trait LlmAnalyzer: Send + Sync {
     fn name(&self) -> &str;
 }
 
+/// Prefix for the backend tag embedded in [`LlmVerdict::backend`].
+///
+/// The rest of the tag is the model actually loaded — see
+/// [`backend_tag_for`]. It used to be the whole tag, a constant reading
+/// `llama-cpp/qwen3-0.6b`, and otter1 spent an afternoon stamping that
+/// on every alert while running `gemma-4-e2b-it-q4_k_m`. A label that
+/// names the wrong model is worse than no label: it is the audit trail
+/// for "which analyser judged this", and it was confidently wrong.
+const BACKEND_PREFIX: &str = "llama-cpp";
+
+/// The backend tag for a given model file.
+///
+/// Derived from the file stem rather than from GGUF metadata: the stem
+/// is what the operator wrote in `[llm.llama_cpp] model_path`, so it is
+/// the string they can match against their own config, and it needs no
+/// model to be loaded to compute. A path with no usable stem yields
+/// just the prefix, which claims nothing beyond the backend itself.
+#[must_use]
+pub fn backend_tag_for(model_path: &std::path::Path) -> String {
+    match model_path.file_stem().and_then(|s| s.to_str()) {
+        Some(stem) if !stem.is_empty() => format!("{BACKEND_PREFIX}/{stem}"),
+        _ => BACKEND_PREFIX.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MockLlmAnalyzer
 // ---------------------------------------------------------------------------
@@ -227,5 +252,52 @@ mod tests {
             .await
             .expect_err("should error");
         assert!(matches!(err, LlmError::Inference(_)));
+    }
+}
+
+#[cfg(test)]
+mod backend_tag_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The tag names the model that is loaded, not a guess made at
+    /// compile time.
+    ///
+    /// It used to be `const BACKEND_TAG = "llama-cpp/qwen3-0.6b"`.
+    /// otter1 ran `gemma-4-e2b-it-q4_k_m` for an afternoon and stamped
+    /// `qwen3-0.6b` on every alert it produced. The `backend` field is
+    /// the audit trail for *which analyser judged this*, so a label
+    /// that names the wrong model is worse than none: it is confidently
+    /// wrong, and it is the field a mixed fleet would be segmented by.
+    ///
+    /// Lives here rather than beside the llama.cpp backend on purpose.
+    /// That module is behind `feature = "llama-cpp"`, which CI does not
+    /// build, so a test next to it would never run — which is how the
+    /// constant survived in the first place.
+    #[test]
+    fn the_tag_names_the_model_actually_configured() {
+        assert_eq!(
+            backend_tag_for(Path::new(
+                "/var/lib/bowery/models/gemma-4-e2b-it-q4_k_m.gguf"
+            )),
+            "llama-cpp/gemma-4-e2b-it-q4_k_m"
+        );
+        assert_eq!(
+            backend_tag_for(Path::new("/var/lib/bowery/models/qwen3-0.6b-q4_k_m.gguf")),
+            "llama-cpp/qwen3-0.6b-q4_k_m"
+        );
+        assert_ne!(
+            backend_tag_for(Path::new("/models/gemma-4-e2b-it-q4_k_m.gguf")),
+            "llama-cpp/qwen3-0.6b",
+            "the bug this replaced"
+        );
+    }
+
+    /// A path with nothing usable claims only the backend.
+    #[test]
+    fn an_unusable_path_claims_nothing_beyond_the_backend() {
+        assert_eq!(backend_tag_for(Path::new("/")), "llama-cpp");
+        assert_eq!(backend_tag_for(Path::new("")), "llama-cpp");
+        assert_eq!(backend_tag_for(Path::new("..")), "llama-cpp");
     }
 }

@@ -691,6 +691,7 @@ mod render_tests {
     fn sample(n: usize) -> Vec<Alert> {
         (0..n)
             .map(|i| Alert {
+                model_explanation: String::new(),
                 originator_fp: vec![0xaa; 32],
                 rule_id: "cred.read_netrc".into(),
                 episode_id: format!("ep-{i}"),

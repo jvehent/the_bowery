@@ -15,6 +15,7 @@ fn main() {
     let base: u64 = 1_755_400_000_000;
 
     let mk = |fp: u8, ep: &str, rule: &str, ts: u64, sus: f32, path: &str, why: &str| Alert {
+        model_explanation: String::new(),
         originator_fp: vec![fp; 32],
         rule_id: rule.into(),
         episode_id: ep.into(),

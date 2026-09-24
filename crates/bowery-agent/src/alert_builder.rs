@@ -32,6 +32,21 @@ pub struct AlertBuilder {
     alert: Alert,
 }
 
+/// The `backend` an alert carries when no model judged it.
+///
+/// Most alerts are not judged by a model at all. The LLM stage sees
+/// only exec episodes above the invocation threshold, so every file
+/// finding and every watchdog alert reaches the operator without
+/// inference having run. They were stamped with whatever backend the
+/// agent *had*: on otter1, alerts carrying verbatim rule text arrived
+/// labelled `llama-cpp/qwen3-0.6b`, which reads as "a local model
+/// judged this" and was false twice over — the model had never seen
+/// them, and it was not even that model.
+///
+/// An alert refined by the LLM carries `LlmVerdict::backend` instead,
+/// which names the model that actually produced the verdict.
+pub const PRE_FILTER_BACKEND: &str = "pre-filter";
+
 impl AlertBuilder {
     /// Start an alert.
     ///
@@ -109,6 +124,7 @@ impl AlertBuilder {
     ) -> Self {
         Self {
             alert: Alert {
+                model_explanation: String::new(),
                 originator_fp: originator_fp.as_bytes().to_vec(),
                 episode_id: episode_id.into(),
                 exe_sha256_hex: String::new(),
@@ -148,6 +164,17 @@ impl AlertBuilder {
     #[must_use]
     pub fn context(mut self, context: Vec<Attribute>) -> Self {
         self.alert.context = context;
+        self
+    }
+
+    /// What the local model said about this alert.
+    ///
+    /// Additive: it never replaces the rule's own rationale. See
+    /// [`bowery_proto::Alert::model_explanation`] for why the two are
+    /// kept apart.
+    #[must_use]
+    pub fn model_explanation(mut self, text: impl Into<String>) -> Self {
+        self.alert.model_explanation = text.into();
         self
     }
 

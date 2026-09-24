@@ -22,6 +22,7 @@ fn main() {
               why: &str,
               conf: Option<AlertConfirmation>,
               ctx: Vec<(&str, &str)>| Alert {
+        model_explanation: String::new(),
         originator_fp: vec![0x3a; 32],
         rule_id: rule.into(),
         episode_id: ep.into(),

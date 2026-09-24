@@ -944,7 +944,6 @@ impl Agent {
             inbox.clone(),
             fingerprint,
             config.alerts.threshold,
-            llm.name().to_string(),
             response_engine.clone(),
             audit_sink.clone(),
             identity.clone(),
@@ -971,7 +970,7 @@ impl Agent {
                 inbox: inbox.clone(),
                 originator_fp: fingerprint,
                 alert_threshold: config.alerts.threshold,
-                backend_label: llm.name().to_string(),
+                backend_label: crate::alert_builder::PRE_FILTER_BACKEND.to_string(),
                 quorum: config.whisper.qa.quorum,
             },
             shutdown_rx.clone(),
@@ -1076,7 +1075,7 @@ impl Agent {
                     peers: mesh.peers_watcher(),
                     inbox: inbox.clone(),
                     originator_fp: fingerprint,
-                    backend_label: llm.name().to_string(),
+                    backend_label: crate::alert_builder::PRE_FILTER_BACKEND.to_string(),
                     config: config.whisper.corroboration.clone(),
                     events_tx: events_tx.clone(),
                 },
@@ -1121,7 +1120,7 @@ impl Agent {
             inbox: inbox.clone(),
             monitor_rules: monitor_rules.clone(),
             originator_fp: fingerprint,
-            backend_label: llm.name().to_string(),
+            backend_label: crate::alert_builder::PRE_FILTER_BACKEND.to_string(),
             alert_threshold: config.alerts.threshold,
             events_tx: events_tx.clone(),
             llm_submitter,
@@ -2384,7 +2383,6 @@ fn spawn_llm_outcomes_task(
     inbox: Arc<AlertInbox>,
     originator_fp: Fingerprint,
     alert_threshold: f32,
-    backend_label: String,
     response_engine: Arc<dyn ResponseEngine>,
     audit_sink: Arc<dyn AuditSink>,
     identity: Arc<Identity>,
@@ -2402,7 +2400,6 @@ fn spawn_llm_outcomes_task(
                         &inbox,
                         originator_fp,
                         alert_threshold,
-                        &backend_label,
                         &response_engine,
                         &audit_sink,
                         &identity,
@@ -2423,7 +2420,6 @@ fn handle_llm_outcome(
     inbox: &Arc<AlertInbox>,
     originator_fp: Fingerprint,
     alert_threshold: f32,
-    backend_label: &str,
     response_engine: &Arc<dyn ResponseEngine>,
     audit_sink: &Arc<dyn AuditSink>,
     identity: &Arc<Identity>,
@@ -2449,12 +2445,25 @@ fn handle_llm_outcome(
             if verdict.suspicion >= alert_threshold {
                 let alert = crate::alert_builder::AlertBuilder::new(
                     originator_fp,
-                    backend_label,
+                    // The model that produced *this* verdict, not the
+                    // backend the agent happens to have configured.
+                    // This is the one alert a model did judge, so it is
+                    // the one entitled to carry its name.
+                    &verdict.backend,
                     leading_rule_id(&ctx.pre_verdict),
                     episode_id.clone(),
                     verdict.suspicion,
-                    verdict.rationale.clone(),
+                    // The rule's own finding, kept. This used to be
+                    // `verdict.rationale`, so the model's prose
+                    // *replaced* the deterministic text — which rule
+                    // fired, what it matched, what the baseline knew —
+                    // and a reader could no longer tell a measurement
+                    // from an inference. Both arrived in the alert's
+                    // own voice.
+                    leading_rule_message(&ctx.pre_verdict)
+                        .unwrap_or_else(|| ctx.pre_verdict.score.reason.clone()),
                 )
+                .model_explanation(verdict.rationale.clone())
                 .subject(
                     ctx.exe_path
                         .as_ref()
@@ -3165,6 +3174,7 @@ mod alert_chunk_tests {
 
     fn sample_alert(i: u64, rationale_len: usize) -> Alert {
         Alert {
+            model_explanation: String::new(),
             originator_fp: vec![0u8; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: format!("ep-{i}"),
@@ -3221,6 +3231,100 @@ mod alert_chunk_tests {
 mod llm_outcome_tests {
     use super::*;
 
+    /// Only the alert a model judged carries a model's name.
+    ///
+    /// `backend` is the audit trail for *which analyser decided this*.
+    /// It used to be set once, agent-wide, from whatever backend
+    /// happened to be configured — so on otter1 an `evade.wtmp` alert
+    /// carrying verbatim rule text arrived stamped
+    /// `llama-cpp/qwen3-0.6b`. Two falsehoods in one field: the model
+    /// never saw that alert, and it was not that model.
+    #[test]
+    fn a_refined_alert_names_the_model_and_a_pre_filter_alert_does_not() {
+        let inbox = Arc::new(AlertInbox::new(64, Duration::from_hours(72)));
+        let identity = Arc::new(Identity::generate());
+        let fp = identity.fingerprint();
+        let episode = "ep-refined";
+
+        // What a file finding or a watchdog writes: no model involved.
+        let _ = inbox.append(Alert {
+            originator_fp: fp.as_bytes().to_vec(),
+            rule_id: "evade.wtmp".into(),
+            episode_id: "ep-rule-only".into(),
+            suspicion: 0.85,
+            rationale: "defense-evasion write to /var/log/wtmp".into(),
+            backend: crate::alert_builder::PRE_FILTER_BACKEND.to_string(),
+            ts_unix_ms: crate::inbox::current_unix_ms(),
+            ..Default::default()
+        });
+
+        let (events_tx, _rx) = broadcast::channel(16);
+        let engine: Arc<dyn ResponseEngine> = Arc::new(NoopEngine::new(ResponsePolicy::default()));
+        let audit_sink: Arc<dyn AuditSink> = Arc::new(NoopSink);
+        let pending = Arc::new(crate::pending_actions::PendingActions::new(
+            Duration::from_mins(5),
+        ));
+        let pre = bowery_analysis::Verdict {
+            episode_id: episode.to_string(),
+            suspicion: 0.9,
+            score: bowery_analysis::BinaryScore {
+                value: 0.9,
+                baseline_seen_count: 0,
+                reason: "never seen".into(),
+            },
+            rule_hits: Vec::new(),
+        };
+
+        handle_llm_outcome(
+            &events_tx,
+            &inbox,
+            fp,
+            0.7,
+            &engine,
+            &audit_sink,
+            &identity,
+            &pending,
+            InferenceOutcome::Verdict {
+                episode_id: episode.to_string(),
+                ctx: Box::new(bowery_llm::AnalysisContext::new(pre)),
+                verdict: Box::new(LlmVerdict {
+                    // Above the threshold, so a refined alert is
+                    // appended and carries this.
+                    suspicion: 0.88,
+                    rationale: "a rewritten system binary".into(),
+                    suggested_actions: Vec::new(),
+                    whisper_query: String::new(),
+                    backend: "llama-cpp/gemma-4-e2b-it-q4_k_m".into(),
+                }),
+            },
+        );
+
+        let (alerts, _) = inbox.read_since(0, 100);
+        let refined = alerts
+            .iter()
+            .find(|a| a.episode_id == episode)
+            .expect("refined alert");
+        assert_eq!(
+            refined.backend, "llama-cpp/gemma-4-e2b-it-q4_k_m",
+            "the alert a model judged must name that model"
+        );
+
+        let rule_only = alerts
+            .iter()
+            .find(|a| a.episode_id == "ep-rule-only")
+            .expect("rule alert");
+        assert_eq!(
+            rule_only.backend,
+            crate::alert_builder::PRE_FILTER_BACKEND,
+            "an alert no model saw must not borrow one's name"
+        );
+        assert!(
+            !rule_only.backend.contains("llama"),
+            "got {}",
+            rule_only.backend
+        );
+    }
+
     /// A model verdict below the bar must correct the record, not
     /// vanish.
     ///
@@ -3276,7 +3380,6 @@ mod llm_outcome_tests {
             &inbox,
             fp,
             0.7,
-            "test",
             &engine,
             &audit_sink,
             &identity,
@@ -3305,8 +3408,13 @@ mod llm_outcome_tests {
             alert.suspicion
         );
         assert!(
-            alert.rationale.contains("unattended-upgrade"),
-            "and must carry why, got: {}",
+            alert.model_explanation.contains("unattended-upgrade"),
+            "and the model's reason must be attributable to the model, got: {}",
+            alert.model_explanation
+        );
+        assert!(
+            !alert.rationale.contains("unattended-upgrade"),
+            "not blended into the agent's own voice: {}",
             alert.rationale
         );
     }

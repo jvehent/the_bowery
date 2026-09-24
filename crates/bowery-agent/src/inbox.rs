@@ -280,11 +280,16 @@ impl AlertInbox {
             }
             let from = alert.suspicion;
             alert.suspicion = to.max(from * 0.4);
-            let why: String = why.chars().take(MAX_WHY).collect();
+            // The score change is the agent's own fact, so it goes in
+            // the rationale and doubles as the idempotency marker. The
+            // model's *reason* is the model's, and goes where it can be
+            // attributed to it rather than blending into the agent's
+            // voice — see `Alert::model_explanation`.
             alert.rationale = format!(
-                "{} | {MARKER}: {from:.2} lowered to {:.2} — {why}",
+                "{} | {MARKER}: {from:.2} lowered to {:.2}",
                 alert.rationale, alert.suspicion
             );
+            alert.model_explanation = why.chars().take(MAX_WHY).collect();
             damped += 1;
         }
         damped
@@ -458,9 +463,18 @@ mod model_damping_tests {
         let after = suspicion_of(&inbox, "ep-1");
         assert!(after < 0.95, "must actually lower it, got {after}");
         let (alerts, _) = inbox.read_since(0, 100);
+        assert_eq!(
+            alerts[0].model_explanation, "routine unattended-upgrade",
+            "the model's reason must be attributable to the model"
+        );
         assert!(
-            alerts[0].rationale.contains("routine unattended-upgrade"),
-            "and must carry the model's reason: {}",
+            !alerts[0].rationale.contains("routine unattended-upgrade"),
+            "and must not be blended into the agent's own voice: {}",
+            alerts[0].rationale
+        );
+        assert!(
+            alerts[0].rationale.contains("lowered to"),
+            "while the score change, which is the agent's fact, stays: {}",
             alerts[0].rationale
         );
     }
@@ -759,6 +773,7 @@ mod tests {
 
         fn netrc_alert(suspicion: f32) -> Alert {
             Alert {
+                model_explanation: String::new(),
                 originator_fp: vec![0xaa; 32],
                 episode_id: "file-cred.read_netrc-1".into(),
                 rule_id: "cred.read_netrc".into(),
@@ -848,6 +863,7 @@ mod tests {
 
     fn alert_at(ts_ms: u64, episode: &str) -> Alert {
         Alert {
+            model_explanation: String::new(),
             originator_fp: vec![0u8; 32],
             rule_id: "cred.read_netrc".into(),
             episode_id: episode.into(),

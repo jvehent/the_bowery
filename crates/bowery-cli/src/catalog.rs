@@ -49,7 +49,7 @@ pub const TABLES: &[Table] = &[
         name: "bowery_alerts",
         about: "the agent's live inbox — bounded and 72h, so use the operator-side \
                 archive (`bowery alerts history`) for anything older",
-        columns: "originator_fp_hex, episode_id, rule_id, exe_sha256_hex, exe_path, suspicion, rationale, ts_unix_ms, backend, confirmed, peers_asked, peers_unseen, peers_seen, peers_refused",
+        columns: "originator_fp_hex, episode_id, rule_id, exe_sha256_hex, exe_path, suspicion, rationale, model_explanation, ts_unix_ms, backend, confirmed, peers_asked, peers_unseen, peers_seen, peers_refused",
     },
     Table {
         name: "bowery_baseline_binaries",
