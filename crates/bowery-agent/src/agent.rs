@@ -1076,6 +1076,7 @@ impl Agent {
                     inbox: inbox.clone(),
                     originator_fp: fingerprint,
                     backend_label: crate::alert_builder::PRE_FILTER_BACKEND.to_string(),
+                    llm_submitter: llm_submitter.clone(),
                     config: config.whisper.corroboration.clone(),
                     events_tx: events_tx.clone(),
                 },

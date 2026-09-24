@@ -524,6 +524,8 @@ pub struct CorroborationContext {
     pub inbox: Arc<AlertInbox>,
     pub originator_fp: Fingerprint,
     pub backend_label: String,
+    /// So a round can tell the local model what the neighbours said.
+    pub llm_submitter: bowery_llm::Submitter,
     pub config: CorroborationConfig,
     pub events_tx: broadcast::Sender<AgentEvent>,
     /// Per-kind claim outcomes. Filled by `spawn`; detectors never set
@@ -821,6 +823,39 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
         }
     }
 
+    // Now tell the local model what the neighbourhood said.
+    //
+    // The first pass ran in `process_file_open`, before anyone had been
+    // asked — it has to, because a round that never happens (a
+    // single-node install, a partition, every peer down) must not cost
+    // the host its inference, which is the same reasoning the alert
+    // itself is raised on. So the model's first answer is necessarily
+    // uninformed about peers.
+    //
+    // This is the second, informed one. It lands on the superseding
+    // alert the branches above appended, which is the alert an operator
+    // actually reads, and `apply_model_verdict` fills only an
+    // explanation that is still empty — so the first pass's answer on
+    // the original alert is left intact rather than overwritten.
+    //
+    // Only when somebody actually answered. A round where every peer
+    // timed out learned nothing, and paying for a second inference to
+    // tell the model so would be cost with no information.
+    let answered = tally.corroborated + tally.denied + tally.refused + tally.habitual;
+    if answered > 0
+        && let Some(episode_id) = claim.supersedes.as_ref()
+        && let Err(reason) = ctx
+            .llm_submitter
+            .submit(neighbourhood_context(&claim, episode_id, &tally))
+    {
+        // Shed rather than swallowed: the queue is the backpressure
+        // and an operator has to be able to see it bite.
+        let _ = ctx.events_tx.send(AgentEvent::LlmShed {
+            episode_id: episode_id.clone(),
+            reason: reason.into(),
+        });
+    }
+
     // The corroborating peer's evidence is logged where it arrives,
     // named with the peer that supplied it — see the ask loop above.
 
@@ -834,6 +869,59 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
             confirmed,
             evidence,
         })));
+}
+
+/// A second look at a finding, now that the neighbourhood has spoken.
+///
+/// Built from the claim rather than from a context threaded through the
+/// channel: the claim already carries the subject — exe, package, path,
+/// access — and the summary, which is everything the first prompt had
+/// about the finding, plus the one thing it could not have.
+///
+/// `refining_in_place` because this is another reading of the same
+/// episode, not a second finding about it.
+fn neighbourhood_context(
+    claim: &Claim,
+    episode_id: &str,
+    tally: &Tally,
+) -> bowery_llm::AnalysisContext {
+    let rule_id = rule_id_for_kind(claim.kind);
+    let mut ctx = bowery_llm::AnalysisContext::new(bowery_analysis::Verdict {
+        episode_id: episode_id.to_string(),
+        suspicion: claim.explained_suspicion,
+        score: bowery_analysis::BinaryScore {
+            value: claim.explained_suspicion,
+            baseline_seen_count: 0,
+            reason: format!("corroboration round for `{}`", claim.kind),
+        },
+        rule_hits: vec![bowery_analysis::RuleHit {
+            rule_id,
+            severity: bowery_analysis::RuleSeverity::from_weight(claim.suspicion),
+            reason: claim.summary.clone(),
+        }],
+    })
+    .refining_in_place();
+    // Every bucket, not just the agreeing one. "Nobody answered" and
+    // "everybody denied" are opposite facts and the model has to be
+    // able to tell them apart — the same reason `Tally` has five
+    // buckets rather than two.
+    ctx.extra.push((
+        "neighbourhood".to_string(),
+        format!(
+            "asked {}: {} report the same, {} have no record, {} do it routinely but \
+             not in this window, {} declined, {} never answered",
+            tally.asked,
+            tally.corroborated,
+            tally.denied,
+            tally.habitual,
+            tally.refused,
+            tally.no_reply
+        ),
+    ));
+    for a in &claim.subject {
+        ctx.extra.push((a.key.clone(), a.value.clone()));
+    }
+    ctx
 }
 
 /// One peer, one question. `None` means "told us nothing" — the caller
@@ -1223,5 +1311,88 @@ mod tests {
         assert_eq!(end, 1_060_000);
         let (start, _) = window_around(UNIX_EPOCH, Duration::from_mins(1));
         assert_eq!(start, 0, "no underflow into a far-future window");
+    }
+}
+
+#[cfg(test)]
+mod neighbourhood_prompt_tests {
+    use super::*;
+
+    fn claim() -> Claim {
+        Claim {
+            kind: "file.access",
+            subject: vec![
+                Attribute::new("exe", "/usr/bin/dpkg"),
+                Attribute::new("path", "/etc/sudoers"),
+            ],
+            window_start_unix_ms: 0,
+            window_end_unix_ms: 1,
+            audience: Audience::Neighbourhood { limit: 3 },
+            rule: Rule::deny_alerts(),
+            dedup_key: "k".into(),
+            summary: "dpkg read /etc/sudoers".into(),
+            suspicion: 0.7,
+            supersedes: Some("file-recon.read_sudoers-1".into()),
+            explained_suspicion: 0.15,
+        }
+    }
+
+    /// The model is told what every peer said, not just the agreeing
+    /// ones.
+    ///
+    /// "Nobody answered" and "everybody denied" are opposite facts, and
+    /// a model that cannot tell them apart will reason from the wrong
+    /// one. It is the same reason `Tally` has five buckets rather than
+    /// two, carried through to the prompt.
+    #[test]
+    fn the_prompt_carries_every_bucket_and_the_subject() {
+        let tally = Tally {
+            asked: 5,
+            corroborated: 1,
+            denied: 2,
+            refused: 1,
+            no_reply: 1,
+            habitual: 3,
+        };
+        let ctx = neighbourhood_context(&claim(), "file-recon.read_sudoers-1", &tally);
+        let hood = ctx
+            .extra
+            .iter()
+            .find(|(k, _)| k == "neighbourhood")
+            .map(|(_, v)| v.clone())
+            .expect("the summary must be there");
+        for expected in [
+            "asked 5",
+            "1 report the same",
+            "2 have no record",
+            "3 do it routinely",
+            "1 declined",
+            "1 never answered",
+        ] {
+            assert!(hood.contains(expected), "missing {expected:?} in {hood}");
+        }
+        // And what the finding was about, or the neighbourhood verdict
+        // is floating free of the thing it is a verdict on.
+        assert!(
+            ctx.extra
+                .iter()
+                .any(|(k, v)| k == "exe" && v == "/usr/bin/dpkg")
+        );
+        assert!(
+            ctx.extra
+                .iter()
+                .any(|(k, v)| k == "path" && v == "/etc/sudoers")
+        );
+    }
+
+    /// Another reading of the same episode, not a second finding.
+    #[test]
+    fn the_second_pass_refines_in_place() {
+        let ctx = neighbourhood_context(&claim(), "file-recon.read_sudoers-1", &Tally::default());
+        assert!(
+            ctx.refine_in_place,
+            "appending would undo the repeat fold and duplicate the episode"
+        );
+        assert_eq!(ctx.pre_verdict.episode_id, "file-recon.read_sudoers-1");
     }
 }
