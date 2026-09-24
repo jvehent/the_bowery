@@ -39,11 +39,37 @@ pub struct AnalysisContext {
     /// process, if known. Used by Phase 7's `BpfLsmEngine` to
     /// materialise a `BlockExec` action.
     pub exe_comm: Option<String>,
+
+    /// What the alert is *about*, when that is not the executable.
+    ///
+    /// An exec episode's subject is its binary, so `exe_path` serves.
+    /// A file finding's subject is the path that was read or written,
+    /// and a refined alert that quietly swapped it for the reading
+    /// binary would point an operator at the wrong thing — the same
+    /// alert, superseded, silently about something else.
+    pub subject: Option<String>,
+
+    /// Attach the verdict to the alert that already exists rather than
+    /// appending a second one.
+    ///
+    /// An exec episode deliberately produces two alerts: the pre-filter
+    /// one, then a refined one carrying the model's score and suggested
+    /// actions, last-one-wins at display.
+    ///
+    /// A file finding is different. Its alert is already complete and
+    /// already correct — the rule matched a path, and no re-scoring
+    /// changes what was read. The model adds an explanation, not a
+    /// second finding, and appending one made four folded repeats of a
+    /// credential read produce two alerts where the fold had carefully
+    /// produced one.
+    pub refine_in_place: bool,
 }
 
 impl AnalysisContext {
     pub fn new(pre_verdict: Verdict) -> Self {
         Self {
+            subject: None,
+            refine_in_place: false,
             pre_verdict,
             exe_path: None,
             exe_sha256_hex: None,
@@ -87,6 +113,20 @@ impl AnalysisContext {
     #[must_use]
     pub fn with_exe_pid(mut self, pid: u32) -> Self {
         self.exe_pid = Some(pid);
+        self
+    }
+
+    /// The alert's subject, when it is not the executable.
+    #[must_use]
+    pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
+
+    /// Refine the existing alert instead of appending another.
+    #[must_use]
+    pub fn refining_in_place(mut self) -> Self {
+        self.refine_in_place = true;
         self
     }
 

@@ -809,6 +809,11 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
         ""
     };
     let episode_id = format!("file-{}-{}", hit.rule_id, current_unix_ms());
+    // Built once and shared with the LLM submission below, exactly as
+    // the exec path shares `exec_context`: it samples /proc for
+    // ancestry, cmdline and open connections, and by the time inference
+    // returns the process is usually gone.
+    let file_context = file_open_context(open, exe_str.as_deref());
     let severity = if housekeeping.is_some() {
         bowery_analysis::provenance::damp_housekeeping(hit.severity)
     } else {
@@ -846,7 +851,7 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
     )
     .subject(path.clone())
     .exe_sha256_hex(exe_sha.as_ref().map(sha_to_hex).unwrap_or_default())
-    .context(file_open_context(open, exe_str.as_deref()))
+    .context(file_context.clone())
     .build();
     ctx.detections.record(hit.rule_id);
     warn!(
@@ -863,6 +868,77 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
             episode_id: episode_id.clone(),
             suspicion: severity,
         });
+    }
+
+    // Ask the local model what it makes of this.
+    //
+    // Until now the LLM stage saw only exec episodes, so every file
+    // finding — which is most of what an operator actually reads —
+    // reached them with no model having looked at it. That is the half
+    // where a model earns its keep: `file_context` above already
+    // carries six levels of ancestry, the command line and the open
+    // connections, and reading a process tree to say "this is
+    // `apt.systemd.daily` running `unattended-upgrade` on the `sudo`
+    // package" is exactly the world knowledge that is expensive to
+    // encode as rules and that a model already has.
+    //
+    // Three gates, and none of them is new machinery:
+    //
+    // - the finding must clear the same `llm_threshold` an exec does;
+    // - it must not already be explained. Provenance housekeeping is a
+    //   deterministic answer, and spending inference to re-derive one
+    //   we already have is the cost with none of the benefit;
+    // - it must have survived the repeat fold above, so a process
+    //   reading the same key four thousand times buys one inference
+    //   rather than four thousand.
+    //
+    // Overload beyond that is the queue's job: `submit` sheds and says
+    // why, the same as for execs.
+    if appended.stored() && housekeeping.is_none() && severity >= ctx.llm_threshold {
+        let mut llm_ctx = bowery_llm::AnalysisContext::new(bowery_analysis::Verdict {
+            episode_id: episode_id.clone(),
+            suspicion: severity,
+            score: bowery_analysis::BinaryScore {
+                value: severity,
+                baseline_seen_count: 0,
+                reason: format!("file watch rule `{}`", hit.rule_id),
+            },
+            rule_hits: vec![bowery_analysis::RuleHit {
+                rule_id: hit.rule_id,
+                severity: bowery_analysis::RuleSeverity::from_weight(severity),
+                reason: hit.why.to_string(),
+            }],
+        })
+        .with_exe_pid(open.pid)
+        .with_exe_comm(open.comm.clone())
+        .with_subject(path.clone())
+        .refining_in_place();
+        if let Some(exe) = exe.as_ref() {
+            llm_ctx = llm_ctx.with_exe_path(exe.clone());
+        }
+        if let Some(sha) = exe_sha.as_ref() {
+            llm_ctx = llm_ctx.with_exe_sha256(sha);
+        }
+        // The path is the subject of a file finding, so it has to be in
+        // the prompt — an exec's subject is its exe, and this one's is
+        // not.
+        llm_ctx.extra.push(("file".to_string(), path.clone()));
+        llm_ctx.extra.push((
+            "access".to_string(),
+            if open.sensitive_read { "read" } else { "write" }.to_string(),
+        ));
+        llm_ctx
+            .extra
+            .push(("provenance".to_string(), provenance.label().to_string()));
+        for a in &file_context {
+            llm_ctx.extra.push((a.key.clone(), a.value.clone()));
+        }
+        if let Err(reason) = ctx.llm_submitter.submit(llm_ctx) {
+            let _ = ctx.events_tx.send(AgentEvent::LlmShed {
+                episode_id: episode_id.clone(),
+                reason: reason.into(),
+            });
+        }
     }
 
     // Ask the neighbourhood whether this is just what the fleet does.

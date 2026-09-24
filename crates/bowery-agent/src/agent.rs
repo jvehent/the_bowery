@@ -2442,7 +2442,7 @@ fn handle_llm_outcome(
             // The LLM may have lowered the suspicion below the alert
             // threshold (e.g. "this is a known build artifact, not
             // malicious"). In that case we don't append.
-            if verdict.suspicion >= alert_threshold {
+            if !ctx.refine_in_place && verdict.suspicion >= alert_threshold {
                 let alert = crate::alert_builder::AlertBuilder::new(
                     originator_fp,
                     // The model that produced *this* verdict, not the
@@ -2495,7 +2495,13 @@ fn handle_llm_outcome(
                 // inference earned its keep was the one case it was
                 // discarded. Correct the standing record instead. The
                 // damp is floored, because the model reads argv.
-                let damped = inbox.damp_episode(&episode_id, verdict.suspicion, &verdict.rationale);
+                //
+                // Also the whole story for a file finding, which asks
+                // to be refined in place: its alert is already complete
+                // and correct, and a second one would undo the repeat
+                // fold that had carefully produced just the one.
+                let damped =
+                    inbox.apply_model_verdict(&episode_id, verdict.suspicion, &verdict.rationale);
                 if damped > 0 {
                     info!(
                         episode = %episode_id,

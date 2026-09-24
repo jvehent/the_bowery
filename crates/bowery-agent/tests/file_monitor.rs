@@ -772,3 +772,212 @@ async fn a_conffile_read_by_the_package_manager_mid_transaction_is_damped() {
 
     agent.shutdown().await.expect("shutdown");
 }
+
+/// A file finding reaches the local model.
+///
+/// Until this, the LLM stage saw only exec episodes — so every alert an
+/// operator actually reads was judged without a model having looked at
+/// it. Measured on otter1 after inference was enabled: the model loaded
+/// fine and produced **zero** verdicts in nearly two hours, because
+/// nothing that reaches the operator was routed to it.
+///
+/// `MockMode::Quiet` scores 0.0, which is below the alert threshold, so
+/// the verdict lands through `damp_episode` and corrects the standing
+/// alert. That makes this one test cover the whole path: the file
+/// finding was submitted, a verdict came back, and it reached the
+/// record the operator reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_finding_is_judged_by_the_model_and_the_verdict_lands() {
+    let workdir = TempDir::new().unwrap();
+    let ghost = 4_194_297;
+    let now = SystemTime::now();
+    let (source, gate) = gated_source(vec![
+        Event::ProcessExec(bowery_events::ProcessExec {
+            pid: ghost,
+            ppid: 1,
+            parent_comm: "cron".into(),
+            uid: 0,
+            comm: "harvest".into(),
+            exe_path: Some("/tmp/harvest".into()),
+            args: vec!["/tmp/harvest".into()],
+            ts: now,
+        }),
+        Event::FileOpen(FileOpen {
+            pid: ghost,
+            comm: "harvest".into(),
+            path: "/root/.aws/credentials".into(),
+            flags: 0,
+            truncated: false,
+            sensitive_read: true,
+            ts: now,
+        }),
+    ]);
+
+    let identity = Arc::new(Identity::generate());
+    let cfg = build_config(workdir.path(), reserve_udp_port(), MonitorConfig::default());
+    // Quiet: every verdict is 0.0, well under the alert threshold.
+    let llm: Arc<dyn bowery_llm::LlmAnalyzer> = Arc::new(bowery_llm::MockLlmAnalyzer::new(
+        bowery_llm::MockMode::Quiet,
+    ));
+    let agent = Agent::start_with_llm(cfg, identity, source, llm)
+        .await
+        .expect("start");
+    let mut events = agent.subscribe();
+    gate.open();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let episode = loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for the alert");
+        if let Ok(Ok(AgentEvent::AlertEmitted { episode_id, .. })) =
+            tokio::time::timeout(left, events.recv()).await
+            && episode_id.starts_with("file-cred.read_aws-")
+        {
+            break episode_id;
+        }
+    };
+
+    // The verdict arrives asynchronously; wait for it to reach the record.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (alerts, _) = agent.inbox().read_since(0, 100);
+        let a = alerts
+            .iter()
+            .find(|a| a.episode_id == episode)
+            .expect("the standing alert");
+        if !a.model_explanation.is_empty() {
+            assert_eq!(
+                a.model_explanation, "mock-quiet",
+                "the model's reading must be attributed to the model"
+            );
+            assert!(
+                a.rationale.contains("credentials") || a.rationale.contains("cred"),
+                "and the rule's own finding must survive: {}",
+                a.rationale
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the model never judged the file finding — it was not routed to the LLM stage"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    agent.shutdown().await.expect("shutdown");
+}
+
+/// An answer we already have is not worth an inference.
+///
+/// Provenance housekeeping is deterministic: a conffile rewritten
+/// inside a package transaction by a binary the package manager
+/// vouches for is explained without asking anyone. Spending a model
+/// round-trip to re-derive that is cost with no benefit, and on a
+/// four-core Pi it is cost that matters.
+///
+/// The threshold is dropped to 0.01 deliberately. At the 0.7 default
+/// the housekeeping damp (×0.15) already puts every such finding under
+/// the bar, so the guard would never be the deciding condition and a
+/// test at that threshold would prove nothing about it. Here it is the
+/// only thing standing between the finding and the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_already_explained_finding_is_not_sent_to_the_model() {
+    let workdir = TempDir::new().unwrap();
+    let actor = ["/usr/bin/dpkg", "/usr/bin/true", "/bin/true"]
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+        .expect("a packaged system binary");
+    let digest = bowery_analysis::provenance::file_md5(&actor).expect("digest");
+
+    let db = workdir.path().join("dpkg-info");
+    dpkg_db_with_conffile(&db, "sudo", Path::new("/etc/sudoers"));
+    std::fs::write(
+        db.join("dpkg.md5sums"),
+        format!(
+            "{}  {}\n",
+            digest.iter().fold(String::new(), |mut acc, b| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            }),
+            actor.display().to_string().trim_start_matches('/')
+        ),
+    )
+    .unwrap();
+
+    let ghost = 4_194_295;
+    let now = SystemTime::now();
+    let (source, gate) = gated_source(vec![
+        Event::ProcessExec(bowery_events::ProcessExec {
+            pid: ghost,
+            ppid: 1,
+            parent_comm: "unattended-upgr".into(),
+            uid: 0,
+            comm: "dpkg".into(),
+            exe_path: Some(actor.clone()),
+            args: vec![actor.display().to_string()],
+            ts: now,
+        }),
+        Event::FileOpen(FileOpen {
+            pid: ghost,
+            comm: "dpkg".into(),
+            path: "/etc/sudoers".into(),
+            flags: 0,
+            truncated: false,
+            sensitive_read: true,
+            ts: now,
+        }),
+    ]);
+
+    let identity = Arc::new(Identity::generate());
+    let mut cfg = build_config(workdir.path(), reserve_udp_port(), MonitorConfig::default());
+    cfg.alerts.threshold = 0.01;
+    cfg.llm.invocation_threshold = 0.01;
+    let llm: Arc<dyn bowery_llm::LlmAnalyzer> = Arc::new(bowery_llm::MockLlmAnalyzer::new(
+        bowery_llm::MockMode::Quiet,
+    ));
+    let agent = Agent::start_with_llm(cfg, identity, source, llm)
+        .await
+        .expect("start");
+    install_index(
+        &agent,
+        bowery_analysis::provenance::PackageIndex::load_dpkg(&db),
+    )
+    .await;
+    let mut events = agent.subscribe();
+    gate.open();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let episode = loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for the alert");
+        if let Ok(Ok(AgentEvent::AlertEmitted { episode_id, .. })) =
+            tokio::time::timeout(left, events.recv()).await
+            && episode_id.starts_with("file-recon.read_sudoers-")
+        {
+            break episode_id;
+        }
+    };
+
+    // Long enough that a submitted round would have returned — the
+    // positive test above lands in well under a second.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (alerts, _) = agent.inbox().read_since(0, 100);
+    let a = alerts
+        .iter()
+        .find(|a| a.episode_id == episode)
+        .expect("the standing alert");
+    assert!(
+        a.model_explanation.is_empty(),
+        "a finding provenance already explained must not buy an inference, got: {}",
+        a.model_explanation
+    );
+    assert!(
+        a.rationale.contains("conffile of `sudo`"),
+        "and the deterministic explanation is the one that stands: {}",
+        a.rationale
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}
