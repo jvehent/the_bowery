@@ -53,7 +53,7 @@ const MAX_BASELINE_REASON_LEN: usize = 256;
 ///
 /// 3. **Length amplification.** Truncate at `max_len` with a trailing
 ///    ellipsis so the model can see truncation occurred and weigh it.
-fn sanitise(s: &str, max_len: usize) -> String {
+pub(crate) fn sanitise(s: &str, max_len: usize) -> String {
     let mut out = String::with_capacity(s.len().min(max_len));
     for ch in s.chars() {
         if out.len() >= max_len {

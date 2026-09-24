@@ -11,6 +11,44 @@ use serde::Deserialize;
 
 use crate::backend::{LlmError, LlmVerdict, SUGGESTED_ACTIONS};
 
+/// How much of an unparseable response to quote back in the error.
+///
+/// Enough to show a `<think>` preamble or a wrong chat template at a
+/// glance, bounded because it is model output and ends up in a log.
+const MAX_EXCERPT: usize = 240;
+
+/// Strip a reasoning model's `<think>…</think>` preamble.
+///
+/// Qwen3 — which is what the Pis run — thinks out loud before
+/// answering, and the thinking is prose. [`extract_json_object`] is
+/// deliberately lenient about framing, but a preamble that happens to
+/// contain a brace would hand it the wrong substring, and one that
+/// contains none makes it report that the model produced no JSON when
+/// what really happened is that it never got as far as answering.
+///
+/// The answer follows the *last* closing tag: the opening one is often
+/// injected by the chat template rather than generated, so keying on
+/// the close is the reliable half.
+///
+/// An opening tag with no close is its own diagnosis — generation
+/// stopped inside the preamble, which means `max_tokens` is too small
+/// for this model, and saying so beats reporting missing JSON.
+fn without_reasoning(raw: &str) -> Result<&str, LlmError> {
+    const CLOSE: &str = "</think>";
+    if let Some(i) = raw.rfind(CLOSE) {
+        return Ok(&raw[i + CLOSE.len()..]);
+    }
+    if raw.contains("<think>") {
+        return Err(LlmError::BadResponse(format!(
+            "model output was still inside its <think> preamble after {} chars; \
+             raise max_tokens or disable thinking: {}",
+            raw.chars().count(),
+            crate::prompt::sanitise(raw, MAX_EXCERPT)
+        )));
+    }
+    Ok(raw)
+}
+
 #[derive(Debug, Deserialize)]
 struct Raw {
     suspicion: f32,
@@ -29,8 +67,25 @@ struct Raw {
 /// `backend_tag` is embedded as-is in the resulting verdict so logs can
 /// distinguish llama-cpp / candle / mock / etc.
 pub fn parse_verdict(raw: &str, backend_tag: &str) -> Result<LlmVerdict, LlmError> {
-    let json_str = extract_json_object(raw)
-        .ok_or_else(|| LlmError::BadResponse("no JSON object found in model output".into()))?;
+    let answer = without_reasoning(raw)?;
+    let json_str = extract_json_object(answer).ok_or_else(|| {
+        // The excerpt is the whole point. Every inference on both Pis
+        // failed with a bare "no JSON object found in model output",
+        // which reports that parsing failed and discards the only
+        // evidence of *why* — so a reasoning preamble, a wrong prompt
+        // template and a response truncated mid-sentence were
+        // indistinguishable from the outside, and the next test could
+        // only ever be another guess.
+        //
+        // The length is carried too: a response sitting exactly on
+        // `max_tokens` is a truncation, and says so without anyone
+        // having to reason about it.
+        LlmError::BadResponse(format!(
+            "no JSON object found in model output ({} chars): {}",
+            answer.chars().count(),
+            crate::prompt::sanitise(answer, MAX_EXCERPT)
+        ))
+    })?;
 
     let parsed: Raw = serde_json::from_str(json_str).map_err(|e| {
         LlmError::BadResponse(format!(
@@ -215,5 +270,85 @@ mod tests {
         let raw = r#"{"suspicion": 0.5, "rationale": "  spaced out  \n", "suggested_actions": [], "whisper_query": ""}"#;
         let v = parse_verdict(raw, "test").unwrap();
         assert_eq!(v.rationale, "spaced out");
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+
+    const OK_JSON: &str = r#"{"suspicion": 0.2, "rationale": "routine package upgrade"}"#;
+
+    /// Qwen3 thinks out loud, then answers.
+    #[test]
+    fn a_verdict_after_a_reasoning_preamble_parses() {
+        let raw = format!(
+            "<think>The user is asking about dpkg. dpkg is the package \
+             manager. {{ this brace is inside the thinking }} So this is \
+             routine.</think>\n\n{OK_JSON}"
+        );
+        let v = parse_verdict(&raw, "test").expect("must parse");
+        assert!((v.suspicion - 0.2).abs() < 1e-6);
+        assert_eq!(v.rationale, "routine package upgrade");
+    }
+
+    /// Some templates inject the opening tag, so only the close is
+    /// generated. Keying on the close is what makes that work.
+    #[test]
+    fn a_closing_tag_alone_is_enough() {
+        let raw = format!("thinking about it…</think>{OK_JSON}");
+        assert!(parse_verdict(&raw, "test").is_ok());
+    }
+
+    /// Generation that stopped inside the preamble says so, rather than
+    /// reporting missing JSON.
+    ///
+    /// This is the live failure: every inference on both Pis returned
+    /// `no JSON object found in model output`, which is true and
+    /// useless. `max_tokens` was 128 and Qwen3 had not finished
+    /// thinking.
+    #[test]
+    fn an_unfinished_preamble_names_the_actual_problem() {
+        let raw = "<think>Let me consider what dpkg is doing here. First I should";
+        let err = parse_verdict(raw, "test").expect_err("must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_tokens"),
+            "the error must say what to change, got: {msg}"
+        );
+        assert!(msg.contains("<think>"), "and why: {msg}");
+    }
+
+    /// A response with no JSON quotes itself back.
+    ///
+    /// The bare message discarded the only evidence of what went wrong,
+    /// leaving a reasoning preamble, a wrong chat template and a
+    /// truncated response indistinguishable from outside the process.
+    #[test]
+    fn an_unparseable_response_carries_its_own_evidence() {
+        let err =
+            parse_verdict("I'm sorry, I can't help with that.", "test").expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("I'm sorry"), "the output itself: {msg}");
+        assert!(msg.contains("chars"), "and its length: {msg}");
+    }
+
+    /// Model output reaches a log, so it must not be able to forge one.
+    #[test]
+    fn the_excerpt_neutralises_control_characters() {
+        let raw = "no json here\n2026-01-01 FAKE LOG LINE\rmore";
+        let err = parse_verdict(raw, "test").expect_err("must fail");
+        let msg = err.to_string();
+        assert!(!msg.contains('\n'), "a newline survived into the error");
+        assert!(!msg.contains('\r'), "a carriage return survived");
+        assert!(msg.contains('␤'), "and is shown as a visible marker: {msg}");
+    }
+
+    /// Plain JSON, no reasoning, still works.
+    #[test]
+    fn output_without_any_reasoning_is_untouched() {
+        assert!(parse_verdict(OK_JSON, "test").is_ok());
+        let fenced = format!("```json\n{OK_JSON}\n```");
+        assert!(parse_verdict(&fenced, "test").is_ok());
     }
 }
