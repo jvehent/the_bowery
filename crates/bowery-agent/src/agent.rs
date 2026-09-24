@@ -2507,7 +2507,15 @@ fn handle_llm_outcome(
                         episode = %episode_id,
                         to = verdict.suspicion,
                         alerts = damped,
-                        "the model explained a standing alert; suspicion lowered"
+                        // Not "suspicion lowered": `apply_model_verdict`
+                        // counts alerts *reached*, and a model that
+                        // agrees with the pre-filter reaches one
+                        // without moving it. Observed on legolas —
+                        // to=0.90 against a standing 0.90, logged as a
+                        // lowering that never happened. `to` is the
+                        // model's score; the reader can see whether it
+                        // moved.
+                        "the model explained a standing alert"
                     );
                 }
             }
