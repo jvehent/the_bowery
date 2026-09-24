@@ -135,13 +135,67 @@ pub enum PromptStyle {
     /// many other instruct-tuned models.
     #[default]
     Qwen3Chat,
+    /// The same, with the assistant's reasoning block pre-closed.
+    ///
+    /// Qwen3 is a reasoning model: left to itself it thinks out loud
+    /// before answering. Measured on legolas — a Pi 5, four cores —
+    /// it produced **508 characters of reasoning** about a single
+    /// `cat /home/julien/.aws/credentials` and never reached the JSON,
+    /// because `max_tokens` was 128 and the preamble had consumed all
+    /// of it. Every inference on both Pis failed that way.
+    ///
+    /// Budgeting for the thinking is the other option and it is the
+    /// wrong one here: several hundred extra tokens per alert, on a
+    /// four-core Pi, for reasoning nobody reads. What this stage wants
+    /// is a short structured verdict.
+    ///
+    /// Pre-filling an empty `<think></think>` in the assistant turn is
+    /// what Qwen3's own chat template emits for `enable_thinking=false`,
+    /// so it is the model's documented off switch rather than a trick —
+    /// and it is mechanical, where the `/no_think` soft switch depends
+    /// on the model choosing to honour it.
+    Qwen3ChatNoThink,
 }
 
 impl PromptStyle {
     /// Render `ctx` to a single prompt string.
+    #[must_use]
     pub fn render(self, ctx: &AnalysisContext) -> String {
-        match self {
-            Self::Qwen3Chat => render_qwen3_chat(ctx),
+        let mut prompt = render_qwen3_chat(ctx);
+        if self == Self::Qwen3ChatNoThink {
+            // Straight after the assistant primer the renderer left.
+            prompt.push_str("<think>\n\n</think>\n\n");
+        }
+        prompt
+    }
+
+    /// Pick a style for the model file being loaded.
+    ///
+    /// Sniffed from the filename, which is unlovely but buys something
+    /// worth having: the Pis get this without another edit to
+    /// `/etc/bowery/agent.toml`, and a config edit is what took both of
+    /// them down for hours earlier today.
+    ///
+    /// Only Qwen3 and `QwQ` reason by default; Qwen2 and Gemma do not,
+    /// and pre-closing a block they never open would put a stray tag in
+    /// their prompt. So this matches narrowly and leaves everything
+    /// else alone.
+    ///
+    /// If the sniff misses, the failure is now loud and specific —
+    /// `parse_verdict` reports that generation stopped inside the
+    /// preamble and names `max_tokens`. A silent wrong guess is what
+    /// this has to avoid, and it does.
+    #[must_use]
+    pub fn for_model(model_path: &std::path::Path) -> Self {
+        let stem = model_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if stem.contains("qwen3") || stem.contains("qwq") {
+            Self::Qwen3ChatNoThink
+        } else {
+            Self::Qwen3Chat
         }
     }
 }
@@ -286,7 +340,7 @@ mod tests {
     use super::*;
     use bowery_analysis::{BinaryScore, RuleHit, RuleSeverity, Verdict};
 
-    fn ctx() -> AnalysisContext {
+    pub(super) fn ctx() -> AnalysisContext {
         let verdict = Verdict {
             episode_id: "ep-1234-100".into(),
             suspicion: 0.92,
@@ -429,6 +483,70 @@ mod tests {
         assert_eq!(
             line_starts, 1,
             "newline in exe_path created a forged Pre-filter line; got:\n{p}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod no_think_tests {
+    use super::tests::ctx;
+    use super::*;
+    use std::path::Path;
+
+    /// Qwen3 gets its reasoning block pre-closed.
+    ///
+    /// Measured on legolas: 508 characters of preamble about a single
+    /// `cat ~/.aws/credentials`, against a 128-token budget, so the
+    /// model never reached the JSON. Every inference on both Pis
+    /// failed that way.
+    #[test]
+    fn a_reasoning_model_is_told_not_to_reason() {
+        let p = PromptStyle::for_model(Path::new("/var/lib/bowery/models/qwen3-0.6b-q4_k_m.gguf"));
+        assert_eq!(p, PromptStyle::Qwen3ChatNoThink);
+        let rendered = p.render(&ctx());
+        assert!(
+            rendered.ends_with("<think>\n\n</think>\n\n"),
+            "the empty block must be the last thing before generation: {}",
+            &rendered[rendered.len().saturating_sub(60)..]
+        );
+        // And it has to come *after* the assistant primer, or the model
+        // is being asked to close a block in someone else's turn.
+        let primer = rendered.rfind("<|im_start|>assistant").expect("primer");
+        let think = rendered.rfind("<think>").expect("think");
+        assert!(primer < think);
+    }
+
+    /// Models that do not reason are left alone.
+    ///
+    /// Pre-closing a block Gemma never opens would put a stray tag in
+    /// its prompt, and otter1 runs Gemma through this same renderer.
+    #[test]
+    fn a_model_that_does_not_reason_gets_no_stray_tag() {
+        for name in [
+            "/var/lib/bowery/models/gemma-4-e2b-it-q4_k_m.gguf",
+            "/var/lib/bowery/models/qwen2-1.5b-instruct-q4.gguf",
+            "/models/llama-3.2-1b.gguf",
+        ] {
+            let p = PromptStyle::for_model(Path::new(name));
+            assert_eq!(p, PromptStyle::Qwen3Chat, "{name}");
+            assert!(!p.render(&ctx()).contains("<think>"), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_sniff_is_case_insensitive_and_survives_an_odd_path() {
+        assert_eq!(
+            PromptStyle::for_model(Path::new("/m/Qwen3-0.6B-Q4_K_M.gguf")),
+            PromptStyle::Qwen3ChatNoThink
+        );
+        assert_eq!(
+            PromptStyle::for_model(Path::new("/m/QwQ-32B.gguf")),
+            PromptStyle::Qwen3ChatNoThink
+        );
+        // No stem at all: claim nothing, change nothing.
+        assert_eq!(
+            PromptStyle::for_model(Path::new("/")),
+            PromptStyle::Qwen3Chat
         );
     }
 }

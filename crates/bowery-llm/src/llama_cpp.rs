@@ -76,6 +76,9 @@ impl Default for LlamaCppConfig {
 pub struct LlamaCppAnalyzer {
     request_tx: mpsc::Sender<Request>,
     backend_tag: String,
+    /// Chosen from the model file, so a reasoning model is told not to
+    /// reason — see [`PromptStyle::for_model`].
+    prompt_style: PromptStyle,
     max_tokens: usize,
 }
 
@@ -147,6 +150,7 @@ impl LlamaCppAnalyzer {
         Ok(Self {
             request_tx,
             backend_tag: crate::backend::backend_tag_for(&config.model_path),
+            prompt_style: PromptStyle::for_model(&config.model_path),
             max_tokens,
         })
     }
@@ -155,7 +159,7 @@ impl LlamaCppAnalyzer {
 #[async_trait]
 impl LlmAnalyzer for LlamaCppAnalyzer {
     async fn analyze(&self, ctx: &AnalysisContext) -> Result<LlmVerdict, LlmError> {
-        let prompt = PromptStyle::Qwen3Chat.render(ctx);
+        let prompt = self.prompt_style.render(ctx);
         let (responder, response_rx) = oneshot::channel();
         // Honor `LlamaCppConfig.max_tokens` instead of hardcoding 256.
         // try_send (not send().await) so backpressure surfaces as
