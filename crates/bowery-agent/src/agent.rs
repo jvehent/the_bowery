@@ -2500,8 +2500,12 @@ fn handle_llm_outcome(
                 // to be refined in place: its alert is already complete
                 // and correct, and a second one would undo the repeat
                 // fold that had carefully produced just the one.
-                let damped =
-                    inbox.apply_model_verdict(&episode_id, verdict.suspicion, &verdict.rationale);
+                let damped = inbox.apply_model_verdict(
+                    &episode_id,
+                    verdict.suspicion,
+                    &verdict.rationale,
+                    &verdict.backend,
+                );
                 if damped > 0 {
                     info!(
                         episode = %episode_id,
