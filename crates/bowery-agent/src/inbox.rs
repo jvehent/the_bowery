@@ -86,6 +86,13 @@ impl Appended {
 /// and again as an inherited verdict on a later write.
 fn damp_for_recognition(mut alert: Alert) -> Alert {
     const MARKER: &str = "the neighbourhood recognises this program";
+    // A finding that the file was *rewritten* is not about the program,
+    // so what the fleet thinks of the program cannot speak to it. Every
+    // peer answers `familiar` about `/usr/bin/curl`; that is precisely
+    // why a backdoored `/usr/bin/curl` must not be damped for it.
+    if bowery_analysis::provenance::TAMPER_RULES.contains(&alert.rule_id.as_str()) {
+        return alert;
+    }
     let Some(c) = alert.confirmation else {
         return alert;
     };
@@ -453,6 +460,78 @@ fn hex_lower(bytes: &[u8]) -> String {
         let _ = write!(acc, "{b:02x}");
         acc
     })
+}
+
+#[cfg(test)]
+mod tamper_damping_tests {
+    use super::*;
+    use bowery_proto::AlertConfirmation;
+
+    fn recognised(rule: &str, suspicion: f32) -> Alert {
+        Alert {
+            originator_fp: vec![1u8; 32],
+            rule_id: rule.into(),
+            episode_id: format!("ep-{rule}"),
+            suspicion,
+            rationale: "something rewrote a system binary".into(),
+            ts_unix_ms: current_unix_ms(),
+            confirmation: Some(AlertConfirmation {
+                peers_asked: 2,
+                peers_familiar: 2,
+                peers_seen: 0,
+                peers_unseen: 0,
+                peers_no_reply: 0,
+                peers_refused: 0,
+                peers_incomparable: 0,
+                quorum: 2,
+                confirmed: false,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Prevalence must not talk over provenance.
+    ///
+    /// Observed on legolas: `integrity.packaged_modified` on
+    /// `/usr/bin/bowery` damped from 1.00 to 0.40 because two peers
+    /// recognised the program — while the rationale the damping wrote
+    /// said "provenance, not prevalence, says whether anything here was
+    /// tampered with". The design doc promised this exemption from the
+    /// start; the code never had it.
+    ///
+    /// The attack it opened: plant a modified binary at a packaged path
+    /// the fleet has — `/usr/bin/curl`, `/usr/bin/ssh` — and every peer
+    /// answers *familiar*, because they do have that program. The
+    /// finding is damped 60% for exactly the reason it must not be.
+    #[test]
+    fn a_rewritten_binary_is_not_damped_by_peers_who_have_the_program() {
+        for rule in bowery_analysis::provenance::TAMPER_RULES {
+            let before = recognised(rule, 1.0);
+            let after = damp_for_recognition(before.clone());
+            assert!(
+                (after.suspicion - 1.0).abs() < f32::EPSILON,
+                "{rule} was damped to {} by prevalence",
+                after.suspicion
+            );
+            assert_eq!(
+                after.rationale, before.rationale,
+                "{rule} must not be annotated as recognised either"
+            );
+        }
+    }
+
+    /// And everything else still is — this is an exemption, not an
+    /// off switch.
+    #[test]
+    fn an_ordinary_finding_is_still_damped_by_recognition() {
+        let after = damp_for_recognition(recognised("baseline.rarity", 1.0));
+        assert!(
+            after.suspicion < 0.5,
+            "recognition must still damp a rarity finding, got {}",
+            after.suspicion
+        );
+        assert!(after.rationale.contains("neighbourhood recognises"));
+    }
 }
 
 #[cfg(test)]

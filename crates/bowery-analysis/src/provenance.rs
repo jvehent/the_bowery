@@ -833,6 +833,26 @@ pub const fn modified_finding() -> (&'static str, f32, &'static str) {
     )
 }
 
+/// Rule ids asserting that a file's contents no longer match the
+/// package that owns it.
+///
+/// # Why these are named as a set
+///
+/// Prevalence must never damp them. Recognition — peers holding the
+/// same program at a different build — says the *program* is
+/// fleet-normal, and says nothing about whether this copy is intact.
+/// A binary planted at a path a package owns is exactly this case, and
+/// every peer will answer *familiar* about it, because they do have
+/// that program.
+///
+/// `DESIGN-FUZZY-CORROBORATION.md` promised this from the start and the
+/// code never had it. Observed on legolas: `integrity.packaged_modified`
+/// on `/usr/bin/bowery` lowered from **1.00 to 0.40** because two peers
+/// recognised the program — while the very rationale the damping wrote
+/// into the alert read *"provenance, not prevalence, says whether
+/// anything here was tampered with"*.
+pub const TAMPER_RULES: &[&str] = &[MODIFIED_RULE, "privesc.setid_packaged_modified"];
+
 /// Is this binary a privilege helper the distribution vouches for?
 ///
 /// The sanctioned path to root: `sudo`, `su`, `pkexec`, `newgrp`,
