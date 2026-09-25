@@ -6,6 +6,7 @@ members = [
     "crates/bowery-baseline",
     "crates/bowery-cli",
     "crates/bowery-console",
+    "crates/bowery-web",
     "crates/bowery-crypto",
     "crates/bowery-ebpf-loader",
     "crates/bowery-events",
@@ -83,6 +84,7 @@ clap = { version = "4", features = ["derive"] }
 
 # VirusTotal lookups (`bowery vt`, and the notify filter). rustls for
 # the same reason as lettre: the CLI cross-compiles to aarch64-musl.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "charset",

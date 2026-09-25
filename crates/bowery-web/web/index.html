@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Bowery</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='9' fill='none' stroke='%2356f2d6' stroke-width='3'/><circle cx='16' cy='16' r='3' fill='%23ff5ea8'/></svg>">
+</head>
+<body>
+<div class="scanlines" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <span class="name">THE BOWERY</span>
+  </div>
+  <div class="relay" id="relay-info">connecting…</div>
+  <div class="spacer"></div>
+  <button class="ghost" id="refresh" title="Refresh the active pane (r)">↻ refresh</button>
+  <div class="status" id="status"><span class="dot"></span><span id="status-text">idle</span></div>
+</header>
+
+<div class="shell">
+  <nav class="rail" id="rail">
+    <button class="tab active" data-pane="query"><span class="glyph">▚</span>Query</button>
+    <button class="tab" data-pane="alerts"><span class="glyph">◆</span>Alerts</button>
+    <button class="tab" data-pane="mesh"><span class="glyph">✳</span>Mesh</button>
+    <button class="tab" data-pane="audit"><span class="glyph">▤</span>Audit</button>
+    <button class="tab" data-pane="peers"><span class="glyph">⬡</span>Peers</button>
+    <button class="tab" data-pane="silences"><span class="glyph">⏻</span>Silences</button>
+    <button class="tab" data-pane="doctor"><span class="glyph">✚</span>Doctor</button>
+    <button class="tab" data-pane="chat"><span class="glyph">✎</span>Chat</button>
+    <button class="tab" data-pane="help"><span class="glyph">?</span>Help</button>
+  </nav>
+
+  <main class="stage">
+
+    <section class="pane active" id="pane-query">
+      <div class="pane-head">
+        <h2>Query</h2>
+        <label class="toggle"><input type="checkbox" id="q-fanout"> fan out to every peer</label>
+        <button class="primary" id="q-run">run ⏎</button>
+      </div>
+      <textarea id="q-sql" spellcheck="false" rows="4">SELECT rule_id, fired, fired_since_install FROM bowery_detections ORDER BY fired DESC LIMIT 20</textarea>
+      <div class="chips" id="q-examples"></div>
+      <div class="result" id="q-result"></div>
+    </section>
+
+    <section class="pane" id="pane-alerts">
+      <div class="pane-head">
+        <h2>Alerts</h2>
+        <input id="a-text" class="search" placeholder="search rationale, path, rule…" spellcheck="false">
+        <label class="toggle"><input type="checkbox" id="a-confirmed"> confirmed only</label>
+        <button class="primary" id="a-run">search</button>
+      </div>
+      <div class="split">
+        <div class="list" id="a-list"></div>
+        <div class="detail" id="a-detail"><p class="muted">Pick an alert to see what the host saw and what the neighbourhood said.</p></div>
+      </div>
+    </section>
+
+    <section class="pane" id="pane-mesh">
+      <div class="pane-head">
+        <h2>Mesh</h2>
+        <span class="legend">
+          <i class="k-reporting"></i> answering
+          <i class="k-silent"></i> named only
+          <i class="k-pin"></i> pinned edge
+        </span>
+        <button class="primary" id="m-run">redraw</button>
+      </div>
+      <div class="graphwrap">
+        <svg id="mesh-svg" role="img" aria-label="mesh graph"></svg>
+        <div class="nodecard" id="mesh-card"></div>
+      </div>
+      <div class="muted" id="mesh-note"></div>
+    </section>
+
+    <section class="pane" id="pane-audit">
+      <div class="pane-head"><h2>Audit</h2><span class="muted">what the response engine did, or would have</span></div>
+      <div class="result" id="audit-result"></div>
+    </section>
+
+    <section class="pane" id="pane-peers">
+      <div class="pane-head"><h2>Peers</h2><span class="muted">manifest, and the relay's gossip view</span></div>
+      <div class="result" id="peers-manifest"></div>
+      <div class="result" id="peers-mesh"></div>
+    </section>
+
+    <section class="pane" id="pane-silences">
+      <div class="pane-head"><h2>Silences</h2><span class="muted">in force, and who signed them</span></div>
+      <div class="result" id="silences-result"></div>
+    </section>
+
+    <section class="pane" id="pane-doctor">
+      <div class="pane-head"><h2>Doctor</h2><span class="muted">sensor self-attestation — a quiet host vs a blind one</span></div>
+      <div class="result" id="doctor-probes"></div>
+      <div class="result" id="doctor-detections"></div>
+    </section>
+
+    <section class="pane" id="pane-chat">
+      <div class="pane-head"><h2>Chat</h2></div>
+      <div class="notice">
+        <p><strong>Not wired in this build.</strong></p>
+        <p>The terminal console's Chat pane runs a GGUF model in-process behind the
+        <code>llm-llama-cpp</code> feature. Serving that from here would mean loading a
+        second copy of the model beside the agent's, on the same box, so it is left out
+        rather than faked.</p>
+        <p class="muted">Everything Chat was grounded in is in the Query pane, which talks
+        to the same tables.</p>
+      </div>
+    </section>
+
+    <section class="pane" id="pane-help">
+      <div class="pane-head"><h2>Help</h2></div>
+      <div class="notice" id="help-body"></div>
+    </section>
+
+  </main>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
