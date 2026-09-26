@@ -418,14 +418,35 @@ mod tests {
         assert_eq!(attribute(&answer.evidence, ATTR_PID), Some("4242"));
     }
 
+    /// A window that has settled, and that the log covers.
+    ///
+    /// Denial is only an honest answer about a period this host's own
+    /// writes have finished landing in — see `super::SETTLE`. A window
+    /// ending now is one the responder must refuse, so a test of
+    /// *denial* has to ask about a settled one or it is testing the
+    /// guard instead.
+    fn settled_query_for(addr: &str, port: u16) -> CorroborationQuery {
+        let now = crate::corroboration::now_unix_ms();
+        corroborate::build_query(
+            KIND,
+            vec![
+                Attribute::new(ATTR_DST_ADDR, addr),
+                Attribute::new(ATTR_DST_PORT, port.to_string()),
+            ],
+            now.saturating_sub(7_200_000),
+            now.saturating_sub(5_400_000),
+            Duration::from_secs(30),
+        )
+    }
+
     #[tokio::test]
     async fn denies_a_connection_it_did_not_make() {
         let asker = Fingerprint::from_bytes([7; 32]);
-        // History covers the window (there is an older event), but holds
-        // nothing to 10.0.0.1:22.
-        let old = SystemTime::now() - Duration::from_hours(1);
+        // History reaches back past the window (there is an older
+        // event), but holds nothing to 10.0.0.1:22.
+        let old = SystemTime::now() - Duration::from_hours(3);
         let (r, _tx) = responder(asker, &[outbound_to("192.0.2.5", 443, old)]);
-        let answer = r.respond(asker, &query_for("10.0.0.1", 22)).await;
+        let answer = r.respond(asker, &settled_query_for("10.0.0.1", 22)).await;
         assert_eq!(answer.corroboration(), Corroboration::Denied);
     }
 

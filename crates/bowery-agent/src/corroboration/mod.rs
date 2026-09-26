@@ -619,6 +619,16 @@ pub fn spawn(
                     };
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
+                        // Let the peer's own write land before asking.
+                        // Inside the spawned task, so the dispatch loop
+                        // keeps draining; the permit is held across it
+                        // because a round waiting to be asked is a
+                        // round in flight.
+                        //
+                        // The alert has already been raised by the
+                        // detector — a round only ever supersedes one —
+                        // so this delays a correction, never a finding.
+                        tokio::time::sleep(SETTLE).await;
                         run_round(&ctx, claim, targets).await;
                         drop(permit);
                     });
@@ -630,6 +640,29 @@ pub fn spawn(
 
     (sink, task)
 }
+
+/// How long a peer's own record of an event may take to become
+/// answerable.
+///
+/// An event travels sensor → channel → writer task → `spawn_blocking`
+/// → `SQLite` commit before any query can see it. A round dispatched
+/// the instant the asker sees its half of the same event arrives at
+/// the peer before the peer's half has landed, and the peer answers
+/// truthfully about its database: *no record*.
+///
+/// Which is the worst possible answer. A denial is the only reply that
+/// counts toward a quorum, under a rule whose severity comment reads
+/// "a peer denying a connection it is the recorded source of" — so the
+/// asker's own speed manufactures the strongest signal in the system.
+///
+/// Measured, not guessed: legolas SSH'd to otter1, both agents
+/// recorded their halves 93ms apart, otter1 asked 83ms after that, and
+/// legolas denied a connection it had made. Re-running the responder's
+/// exact query minutes later returns the row.
+///
+/// Two seconds, matching `proc_table::EXIT_GRACE` — the same shape of
+/// race, between a write and a read that chase each other.
+pub const SETTLE: Duration = Duration::from_secs(2);
 
 /// Resolve an audience against the live mesh view.
 ///
@@ -1395,5 +1428,45 @@ mod neighbourhood_prompt_tests {
             "appending would undo the repeat fold and duplicate the episode"
         );
         assert_eq!(ctx.pre_verdict.episode_id, "file-recon.read_sudoers-1");
+    }
+}
+
+#[cfg(test)]
+mod settling_tests {
+    use super::*;
+
+    /// The asker waits before asking, and that is the whole fix.
+    ///
+    /// Live failure: legolas SSH'd to otter1, both agents recorded
+    /// their halves 93ms apart, otter1 asked 83ms after that, and
+    /// legolas denied a connection it had made — the row had not
+    /// reached `SQLite` yet. Re-running the responder's exact query
+    /// minutes later returns it.
+    ///
+    /// A denial is the only answer that counts toward a quorum, so the
+    /// asker's own speed was manufacturing the strongest finding the
+    /// engine can produce.
+    ///
+    /// It has to be fixed on the asking side. A responder cannot tell
+    /// "asked the instant it happened" from "asked later about a
+    /// window that includes now", because `window_around` straddles
+    /// the observation: `window_end` is half a window in the *future*
+    /// for every live claim. A responder-side guard on that quantity
+    /// refuses every real round and kills the detection — which is
+    /// exactly what the end-to-end test caught when I tried it.
+    #[test]
+    fn the_settle_delay_outlasts_the_race_it_exists_for() {
+        // The observed race, end to end, was about 176ms.
+        assert!(
+            SETTLE >= Duration::from_millis(500),
+            "too short to outlast a commit that lost by 176ms"
+        );
+        // And bounded: a round only ever supersedes an alert that was
+        // already raised, but an operator still waits this long for
+        // the correction.
+        assert!(
+            SETTLE <= Duration::from_secs(5),
+            "too long to keep a correction waiting"
+        );
     }
 }

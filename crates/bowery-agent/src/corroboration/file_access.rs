@@ -484,6 +484,33 @@ mod habit_tests {
         log
     }
 
+    /// Ask about a window that has already settled.
+    ///
+    /// A denial is only honest about a period this host's own writes
+    /// have finished landing in; a window ending now must be refused.
+    /// See `super::SETTLE`.
+    fn ask_about_a_settled_window() -> CorroborationQuery {
+        let long_ago = SystemTime::now() - Duration::from_hours(2);
+        let c = claim_for(
+            Some("/usr/bin/dpkg"),
+            Some("dpkg"),
+            "/etc/sudoers",
+            true,
+            "file-recon.read_sudoers-1".into(),
+            long_ago,
+            Duration::from_mins(30),
+            0.7,
+        )
+        .expect("claim");
+        CorroborationQuery {
+            kind: c.kind.to_string(),
+            subject: c.subject,
+            window_start_unix_ms: c.window_start_unix_ms,
+            window_end_unix_ms: c.window_end_unix_ms,
+            ..Default::default()
+        }
+    }
+
     fn ask_about_now() -> CorroborationQuery {
         let now = SystemTime::now();
         let c = claim_for(
@@ -543,7 +570,7 @@ mod habit_tests {
         // Something else entirely, and old enough that the log covers
         // the window — so this host *can* attribute accesses and its
         // silence is evidence rather than blindness.
-        for age in [Duration::from_hours(2), Duration::from_secs(1)] {
+        for age in [Duration::from_hours(4), Duration::from_hours(2)] {
             log.record_file_access(
                 1,
                 "sshd",
@@ -556,7 +583,10 @@ mod habit_tests {
         }
         let responder = FileAccessResponder::new(log.clone());
         let answer = responder
-            .respond(Fingerprint::from_bytes([9u8; 32]), &ask_about_now())
+            .respond(
+                Fingerprint::from_bytes([9u8; 32]),
+                &ask_about_a_settled_window(),
+            )
             .await;
         assert_eq!(
             answer.outcome(),
