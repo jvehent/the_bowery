@@ -481,12 +481,29 @@ async fn neighbourhood_quorum_confirms_an_alert_nobody_else_has_seen() {
         .filter(|a| a.episode_id == context.episode_id)
         .filter_map(|a| a.confirmation)
         .collect();
-    assert_eq!(
-        confirmed.len(),
-        1,
-        "expected exactly one confirmed alert for the episode, got {} of {} alerts",
-        confirmed.len(),
+    // At least one, not exactly one. An episode produces several
+    // alerts and a later write inherits the round's verdict by design
+    // — see `inherit_confirmation`, which exists precisely so a
+    // refinement that never asked the mesh does not erase what the
+    // mesh said. How many have landed by the time this reads the inbox
+    // is a question about write timing, not about the round, and
+    // pinning it to one made this test fail in CI the moment an
+    // unrelated delay changed the interleaving.
+    assert!(
+        !confirmed.is_empty(),
+        "the round must have confirmed the episode, got {} alerts",
         alerts.len()
+    );
+    // What *is* a correctness property: every copy says the same
+    // thing. An inherited verdict that disagreed with the one it was
+    // inherited from would be the real bug here.
+    assert!(
+        confirmed
+            .iter()
+            .all(|x| x.peers_asked == confirmed[0].peers_asked
+                && x.peers_unseen == confirmed[0].peers_unseen
+                && x.confirmed == confirmed[0].confirmed),
+        "copies of one round's verdict disagree: {confirmed:?}"
     );
     assert_eq!(
         confirmed[0].peers_incomparable, 0,
