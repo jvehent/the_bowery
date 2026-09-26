@@ -48,6 +48,15 @@ pub struct Counters {
     pub denied: u64,
     pub refused: u64,
     pub no_reply: u64,
+    /// "Not in your window, but I do this routinely."
+    ///
+    /// Counted here because this table's whole job is to say *why* a
+    /// round produced what it did — `no_audience` exists so a zero can
+    /// name which kind of zero it is. A reply category with no counter
+    /// is the same defect one layer down: on otter1 eight rounds ran,
+    /// every one with an audience, and the counted outcomes summed to
+    /// one. The other seven answers were habitual and invisible.
+    pub habitual: u64,
 }
 
 impl CorroborationStats {
@@ -102,6 +111,7 @@ impl CorroborationStats {
         denied: u64,
         refused: u64,
         no_reply: u64,
+        habitual: u64,
     ) {
         self.bump(kind, |c| {
             c.rounds += 1;
@@ -109,6 +119,7 @@ impl CorroborationStats {
             c.denied += denied;
             c.refused += refused;
             c.no_reply += no_reply;
+            c.habitual += habitual;
         });
     }
 
@@ -158,7 +169,7 @@ mod tests {
     fn rounds_and_answers_are_counted_apart_from_drops() {
         let s = CorroborationStats::new();
         s.raised("file.access");
-        s.round("file.access", 2, 1, 0, 1);
+        s.round("file.access", 2, 1, 0, 1, 3);
         s.raised("net.inbound_connect");
         s.no_audience("net.inbound_connect");
 

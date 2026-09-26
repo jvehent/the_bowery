@@ -1176,7 +1176,12 @@ impl BoweryTable for BoweryCorroborationStatusTable {
                 corroborated INTEGER,
                 denied       INTEGER,
                 refused      INTEGER,
-                no_reply     INTEGER
+                no_reply     INTEGER,
+                -- Not in your window, but I do this routinely.
+                -- Neither a sighting nor a denial; without a column of
+                -- its own, a round that heard it looks exactly like a
+                -- round that heard nothing.
+                habitual     INTEGER
             );",
         )?;
         let Some(stats) = self.stats.as_ref() else {
@@ -1185,8 +1190,8 @@ impl BoweryTable for BoweryCorroborationStatusTable {
         let mut stmt = conn.prepare(
             "INSERT INTO bowery_corroboration_status
                 (kind, raised, no_audience, deduped, shed, rounds,
-                 corroborated, denied, refused, no_reply)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 corroborated, denied, refused, no_reply, habitual)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         for (kind, c) in stats.snapshot() {
             let _ = stmt.execute(params![
@@ -1200,6 +1205,7 @@ impl BoweryTable for BoweryCorroborationStatusTable {
                 i64::try_from(c.denied).unwrap_or(i64::MAX),
                 i64::try_from(c.refused).unwrap_or(i64::MAX),
                 i64::try_from(c.no_reply).unwrap_or(i64::MAX),
+                i64::try_from(c.habitual).unwrap_or(i64::MAX),
             ]);
         }
         Ok(())
@@ -1475,13 +1481,13 @@ mod corroboration_status_tests {
             stats.no_audience("net.inbound_connect");
         }
         stats.raised("file.access");
-        stats.round("file.access", 1, 0, 0, 2);
+        stats.round("file.access", 1, 0, 0, 2, 4);
 
         let table = BoweryCorroborationStatusTable::new(Some(stats));
         let rows = query(
             &table,
-            "SELECT kind, raised, no_audience, rounds FROM bowery_corroboration_status \
-             ORDER BY kind",
+            "SELECT kind, raised, no_audience, rounds, habitual \
+             FROM bowery_corroboration_status ORDER BY kind",
         );
         assert_eq!(rows.len(), 2, "one row per kind");
         assert!(rows[0][0].contains("file.access"), "{rows:?}");
@@ -1492,6 +1498,15 @@ mod corroboration_status_tests {
         assert!(rows[1][0].contains("net.inbound_connect"), "{rows:?}");
         assert!(rows[1][1].contains("87"), "raised: {rows:?}");
         assert!(rows[1][2].contains("87"), "no_audience: {rows:?}");
+        // The bucket that had no column. On otter1 eight rounds ran,
+        // every one with an audience, and the counted outcomes summed
+        // to one — the rest were habitual and invisible, because this
+        // table is where a round explains itself and it had nowhere to
+        // say so.
+        assert!(
+            rows[0][4].contains('4'),
+            "habitual must be counted: {rows:?}"
+        );
         assert!(
             rows[1][3].contains('0'),
             "and no round was ever run: {rows:?}"

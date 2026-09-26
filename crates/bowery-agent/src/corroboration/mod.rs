@@ -741,6 +741,7 @@ async fn run_round(ctx: &CorroborationContext, claim: Claim, targets: Vec<PeerIn
         tally.denied as u64,
         tally.refused as u64,
         tally.no_reply as u64,
+        tally.habitual as u64,
     );
 
     let confirmed = claim.rule.confirms(&tally);

@@ -71,7 +71,7 @@ pub const TABLES: &[Table] = &[
                 kind. A rule at zero fires may mean nothing happened or that every claim \
                 was dropped before anyone could be asked — `no_audience` is the difference",
         columns: "kind, raised, no_audience, deduped, shed, rounds, corroborated, denied, \
-                  refused, no_reply",
+                  refused, no_reply, habitual",
     },
     Table {
         name: "bowery_probe_status",
