@@ -743,7 +743,37 @@ async fn process_file_open(ctx: &PipelineContext, open: &bowery_events::FileOpen
     // ability to *look*; when neither source can name the binary, the
     // finding is still raised.
     let exe = bowery_events::enrich::pid_exe_path(open.pid)
-        .or_else(|| ctx.procs.exe_at(open.pid, open.ts));
+        .or_else(|| ctx.procs.exe_at(open.pid, open.ts))
+        // Third: the binary the *parent* was running.
+        //
+        // Between fork and exec a child is running its parent's image.
+        // That is a kernel fact, not an inference — a child cannot run
+        // different code until it execs, and if it does exec we have
+        // its own record and never reach here.
+        //
+        // Without this, a forked child that never execs has no exe at
+        // all: `/proc/<pid>/exe` is gone the moment it exits, and
+        // there is no exec record because there was no exec. The
+        // exemption then fails closed and the read is a finding.
+        //
+        // Which is what otter1 was doing. `cron` forks a child, PAM
+        // reads `/etc/shadow` to open the session, and the child exits
+        // — pid 1284830 read the file twice and was gone **3ms**
+        // later, with zero exec events. Meanwhile 1,359 cron reads
+        // that *did* resolve were exempted correctly, because
+        // `/usr/sbin/cron` is a sanctioned reader. Same daemon, same
+        // file, same legitimate purpose, and the only difference was
+        // whether the agent could still name the binary.
+        //
+        // This resolves the name; it does not widen the exemption.
+        // Sanctioning still needs the resolved path to be on the list
+        // *and* provenance to vouch for it, so a trojanised cron is
+        // still a finding.
+        .or_else(|| {
+            ctx.procs
+                .forked_from(open.pid, open.ts)
+                .and_then(|parent| ctx.procs.exe_at(parent, open.ts))
+        });
     let (exe_sha, provenance) = hash_and_classify(ctx, exe.as_ref()).await;
     let exe_str = exe.as_ref().map(|p| p.display().to_string());
 

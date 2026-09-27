@@ -981,3 +981,106 @@ async fn an_already_explained_finding_is_not_sent_to_the_model() {
 
     agent.shutdown().await.expect("shutdown");
 }
+
+/// A child that forked and never exec'd is named by its parent.
+///
+/// otter1 kept alerting on `/etc/shadow` long after `/usr/sbin/cron`
+/// was made a sanctioned reader, and 1,359 cron reads *were* being
+/// exempted correctly. The twelve that alerted were the ones the agent
+/// could not name: `cron` forks a child, PAM reads the password
+/// database to open the session, and the child exits. Traced on the
+/// live host, pid 1284830 read `/etc/shadow` twice and was gone **3ms
+/// later, with zero exec events** — so `/proc/<pid>/exe` was gone and
+/// there was no exec record, because there had been no exec.
+///
+/// Distinct from the `unix_chkpwd` case, which the exec-record
+/// fallback already covers: there the child had exec'd and the record
+/// was being dropped too early. Here there is no record to keep.
+///
+/// Between fork and exec a child runs its parent's image — a kernel
+/// fact, not a guess — so the parent's exe is the correct answer, and
+/// the agent already records every fork.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forked_child_that_never_execs_is_named_by_its_parent() {
+    let workdir = TempDir::new().unwrap();
+    let parent_exe = workdir.path().join("cron-like");
+    std::fs::write(&parent_exe, b"#!/bin/sh\n").unwrap();
+
+    let parent = 4_194_287;
+    let child = 4_194_288;
+    let now = SystemTime::now();
+    let (source, gate) = gated_source(vec![
+        // The daemon itself execs, so the agent learns its binary.
+        Event::ProcessExec(bowery_events::ProcessExec {
+            pid: parent,
+            ppid: 1,
+            parent_comm: "systemd".into(),
+            uid: 0,
+            comm: "cron-like".into(),
+            exe_path: Some(parent_exe.clone()),
+            args: vec![parent_exe.display().to_string()],
+            ts: now,
+        }),
+        // It forks a worker, which never execs.
+        Event::Fork(bowery_events::Fork {
+            parent_pid: parent,
+            child_pid: child,
+            ts: now,
+        }),
+        // The worker reads the password database and is gone. The pid
+        // is fabricated, so `/proc` cannot answer for it either.
+        Event::FileOpen(FileOpen {
+            pid: child,
+            comm: "cron-like".into(),
+            path: "/etc/shadow".into(),
+            flags: 0,
+            truncated: false,
+            sensitive_read: true,
+            ts: now,
+        }),
+    ]);
+
+    let identity = Arc::new(Identity::generate());
+    let cfg = build_config(workdir.path(), reserve_udp_port(), MonitorConfig::default());
+    let agent = Agent::start(cfg, identity, source).await.expect("start");
+    let mut events = agent.subscribe();
+    gate.open();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let episode = loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for the alert");
+        if let Ok(Ok(AgentEvent::AlertEmitted { episode_id, .. })) =
+            tokio::time::timeout(left, events.recv()).await
+            && episode_id.starts_with("file-cred.read_shadow-")
+        {
+            break episode_id;
+        }
+    };
+
+    let (alerts, _) = agent.inbox().read_since(0, 100);
+    let alert = alerts
+        .iter()
+        .find(|a| a.episode_id == episode)
+        .expect("alert in the inbox");
+
+    // The parent's path, not a fallback to `comm`. Naming the binary
+    // is what lets the sanctioned-reader check run at all; with only
+    // `comm` the exemption fails closed and every one of these is a
+    // 0.90 finding.
+    let named = parent_exe.display().to_string();
+    assert!(
+        alert.rationale.contains(&named),
+        "the forked child must be named by its parent's binary, got: {}",
+        alert.rationale
+    );
+    assert!(
+        alert
+            .context
+            .iter()
+            .any(|a| a.key == "exe" && a.value == named),
+        "and the context must agree with the rationale"
+    );
+
+    agent.shutdown().await.expect("shutdown");
+}
