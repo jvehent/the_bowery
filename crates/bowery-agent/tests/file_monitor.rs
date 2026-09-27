@@ -23,6 +23,20 @@ use tokio::sync::broadcast::error::RecvError;
 mod common;
 use common::{loopback_ephemeral, reserve_udp_port};
 
+/// A pid the kernel cannot have handed out.
+///
+/// Above the default `pid_max` of 4194304, so `/proc/<pid>/exe` can
+/// never resolve and these tests really do exercise the fallback they
+/// say they do.
+///
+/// They used 4242, which is an ordinary live pid on a busy machine. On
+/// a CI runner it was **the test binary's own pid**: `/proc/4242/exe`
+/// resolved to `target/debug/deps/file_monitor-…`, the rationale named
+/// that binary instead of falling back to `comm`, and a test about the
+/// fallback passed or failed on whether the harness happened to land
+/// on that number.
+const UNREACHABLE_PID: u32 = 4_194_295;
+
 fn build_config(dir: &Path, mesh_addr: SocketAddr, monitor: MonitorConfig) -> Config {
     Config {
         identity: IdentityConfig {
@@ -244,7 +258,7 @@ async fn a_write_to_a_persistence_path_alerts_and_names_the_process() {
     // Feed the event the kernel sensor would produce, held until we are
     // watching — see `EventGate`.
     let (source, gate) = gated_source(vec![Event::FileOpen(FileOpen {
-        pid: 4242,
+        pid: UNREACHABLE_PID,
         comm: "curl".into(),
         path: "/root/.ssh/authorized_keys".into(),
         flags: 0o1101,
@@ -281,7 +295,11 @@ async fn a_write_to_a_persistence_path_alerts_and_names_the_process() {
     assert!(alert.rationale.contains("/root/.ssh/authorized_keys"));
     // The process is the lead an operator follows next.
     assert!(alert.rationale.contains("curl"), "{}", alert.rationale);
-    assert!(alert.rationale.contains("pid 4242"), "{}", alert.rationale);
+    assert!(
+        alert.rationale.contains(&format!("pid {UNREACHABLE_PID}")),
+        "{}",
+        alert.rationale
+    );
     // And it explains why the path matters at all.
     assert!(
         alert.rationale.contains("passwordless login"),
@@ -300,7 +318,7 @@ async fn a_write_to_a_persistence_path_alerts_and_names_the_process() {
 /// Sixty-one of 63 alerts on a three-host fleet were restatements like
 /// this one.
 ///
-/// The reader is unresolvable here (pid 4242 does not exist), which is
+/// The reader is unresolvable here (the pid cannot exist), which is
 /// deliberate — it is the case where the agent knows least, and it must
 /// still fold rather than restate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -310,7 +328,7 @@ async fn an_identical_finding_repeated_is_folded_into_one_alert() {
 
     let dup = || {
         Event::FileOpen(FileOpen {
-            pid: 4242,
+            pid: UNREACHABLE_PID,
             comm: "curl".into(),
             path: "/root/.ssh/authorized_keys".into(),
             flags: 0o1101,
@@ -454,7 +472,7 @@ async fn a_fired_rule_shows_up_in_the_detection_counters() {
     let cfg = build_config(workdir.path(), reserve_udp_port(), MonitorConfig::default());
 
     let (source, gate) = gated_source(vec![Event::FileOpen(FileOpen {
-        pid: 4242,
+        pid: UNREACHABLE_PID,
         comm: "curl".into(),
         path: "/root/.ssh/authorized_keys".into(),
         flags: 0o1101,
