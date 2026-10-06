@@ -33,6 +33,7 @@ pub(crate) fn router(relay: Shared) -> Router {
         .route("/api/peers", get(peers))
         .route("/api/mesh", get(mesh))
         .route("/api/table/{name}", get(table))
+        .route("/api/schema", get(schema))
         .with_state(relay)
 }
 
@@ -144,6 +145,81 @@ async fn table(
         r.query(&format!("SELECT * FROM {name} LIMIT {limit}"), p.fanout)
             .await?,
     ))
+}
+
+// ---------------------------------------------------------------------
+// Schema — for the table browser and the query builder
+// ---------------------------------------------------------------------
+
+#[derive(Serialize, Clone)]
+struct Column {
+    name: String,
+    ty: String,
+}
+
+#[derive(Serialize)]
+struct SchemaTable {
+    name: &'static str,
+    about: &'static str,
+    columns: Vec<Column>,
+}
+
+#[derive(Serialize)]
+struct SchemaExample {
+    question: &'static str,
+    sql: &'static str,
+}
+
+#[derive(Serialize)]
+struct Schema {
+    tables: Vec<SchemaTable>,
+    examples: Vec<SchemaExample>,
+    /// Where these column lists came from, said out loud.
+    ///
+    /// The catalogue's lists are hand-maintained and have been wrong
+    /// before — nine of seventeen examples once errored against a real
+    /// agent because the columns were written from memory. So they are
+    /// a *hint* for drawing the sidebar before anything is browsed,
+    /// and the browser replaces them with the agent's own column list
+    /// the moment a table is queried: a `SELECT` response carries the
+    /// column names it returned, which is authoritative and free.
+    ///
+    /// Not read from `pragma_table_info`, which would have been the
+    /// obvious way: the agent's `SQLite` authorizer refuses it — "not
+    /// authorized" — and that is a hardening control worth keeping
+    /// rather than a gap to work around.
+    columns_from: &'static str,
+}
+
+async fn schema(State(_r): State<Shared>) -> Json<Schema> {
+    let examples = bowery_cli::catalog::EXAMPLES
+        .iter()
+        .map(|e| SchemaExample {
+            question: e.question,
+            sql: e.sql,
+        })
+        .collect();
+    let tables = bowery_cli::catalog::TABLES
+        .iter()
+        .map(|t| SchemaTable {
+            name: t.name,
+            about: t.about,
+            columns: t
+                .columns
+                .split(',')
+                .map(|c| Column {
+                    name: c.trim().to_string(),
+                    ty: String::new(),
+                })
+                .filter(|c| !c.name.is_empty())
+                .collect(),
+        })
+        .collect();
+    Json(Schema {
+        tables,
+        examples,
+        columns_from: "catalogue (provisional until the table is browsed)",
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -587,6 +663,64 @@ mod tests {
             model_explanation: None,
             context_json: "{}".into(),
         }
+    }
+
+    /// The agent will not describe its own schema, so the browser
+    /// reads it from a result instead.
+    ///
+    /// `pragma_table_info` was the obvious route and the agent refuses
+    /// it outright — "sqlite error: not authorized". That authorizer
+    /// is a hardening control on a surface reachable over the network,
+    /// so the answer is not to work around it: a plain `SELECT`
+    /// already reports the columns it returned, which is both
+    /// authoritative and free, and the browser is running one of those
+    /// the moment a table is clicked.
+    ///
+    /// (The terminal console's table-schema view issues
+    /// `SELECT * FROM pragma_table_info(…)`, so it is refused the same
+    /// way. Noted here because this is where it was found.)
+    #[test]
+    fn the_schema_hint_comes_from_the_catalogue_and_says_so() {
+        let names = bowery_cli::catalog::table_names();
+        assert!(!names.is_empty(), "the catalogue cannot be empty");
+        // Every catalogue entry must parse into usable field names, or
+        // the sidebar renders a table nobody can pick columns from.
+        for t in bowery_cli::catalog::TABLES {
+            let cols: Vec<&str> = t
+                .columns
+                .split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .collect();
+            assert!(!cols.is_empty(), "{} lists no columns", t.name);
+            assert!(
+                !t.about.is_empty(),
+                "{} has no description to show in the browser",
+                t.name
+            );
+        }
+    }
+
+    /// The columns an operator browses are the agent's, not ours.
+    ///
+    /// The catalogue's lists are hand-maintained prose and have been
+    /// wrong before — nine of seventeen examples once errored against
+    /// a real agent because the columns were written from memory. So
+    /// the browser reads `pragma_table_info` and only falls back to
+    /// the catalogue when the relay cannot be reached, saying which it
+    /// used either way. A remembered column list that *looks* measured
+    /// is the failure worth preventing.
+    #[test]
+    fn the_catalogue_is_a_labelled_fallback_not_the_source() {
+        // The fallback parses the catalogue's comma-separated prose
+        // into something the picker can render.
+        let t = bowery_cli::catalog::TABLES
+            .iter()
+            .find(|t| t.name == "bowery_detections")
+            .expect("a known table");
+        let parsed: Vec<&str> = t.columns.split(',').map(str::trim).collect();
+        assert!(parsed.contains(&"rule_id"), "got {parsed:?}");
+        assert!(parsed.len() > 1, "a single blob would be useless as fields");
     }
 
     #[test]

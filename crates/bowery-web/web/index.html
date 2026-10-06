@@ -39,12 +39,39 @@
     <section class="pane active" id="pane-query">
       <div class="pane-head">
         <h2>Query</h2>
+        <span class="muted" id="schema-source"></span>
+        <div class="spacer"></div>
         <label class="toggle"><input type="checkbox" id="q-fanout"> fan out to every peer</label>
-        <button class="primary" id="q-run">run ⏎</button>
+        <button class="primary" id="q-run">run ⌘⏎</button>
       </div>
-      <textarea id="q-sql" spellcheck="false" rows="4">SELECT rule_id, fired, fired_since_install FROM bowery_detections ORDER BY fired DESC LIMIT 20</textarea>
-      <div class="chips" id="q-examples"></div>
-      <div class="result" id="q-result"></div>
+
+      <div class="qgrid">
+        <aside class="tablist">
+          <input id="t-search" class="search tiny" placeholder="filter tables…" spellcheck="false">
+          <div id="t-list"></div>
+        </aside>
+
+        <div class="qmain">
+          <div class="builder" id="builder">
+            <p class="muted">Pick a table on the left to browse it, then tick the fields you want.</p>
+          </div>
+
+          <div class="sqlrow">
+            <textarea id="q-sql" spellcheck="false" rows="4">SELECT rule_id, fired, fired_since_install FROM bowery_detections ORDER BY fired DESC LIMIT 20</textarea>
+            <div class="sqlside">
+              <span class="badge" id="q-dirty" hidden>hand-edited</span>
+              <button class="ghost" id="q-rebuild" hidden>rebuild from fields</button>
+            </div>
+          </div>
+
+          <details class="examples">
+            <summary>queries worth starting from</summary>
+            <div class="chips" id="q-examples"></div>
+          </details>
+
+          <div class="result" id="q-result"></div>
+        </div>
+      </div>
     </section>
 
     <section class="pane" id="pane-alerts">

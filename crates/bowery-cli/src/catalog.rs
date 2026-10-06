@@ -43,13 +43,17 @@ pub const TABLES: &[Table] = &[
         about: "every observed host event, append-only and persisted — the only place \
                 process exits, network connects and file opens are kept",
         columns: "seq, ts_unix_ms, kind, pid, ppid, uid, comm, exe_path, args, exit_code, \
-                  dst_addr, dst_port, local_port, direction, path, file_op, open_flags",
+                  net_family, dst_addr, dst_port, local_port, local_addr, direction, \
+                  path, file_op, open_flags",
     },
     Table {
         name: "bowery_alerts",
         about: "the agent's live inbox — bounded and 72h, so use the operator-side \
                 archive (`bowery alerts history`) for anything older",
-        columns: "originator_fp_hex, episode_id, rule_id, exe_sha256_hex, exe_path, suspicion, rationale, model_explanation, ts_unix_ms, backend, confirmed, peers_asked, peers_unseen, peers_seen, peers_refused",
+        columns: "originator_fp_hex, episode_id, rule_id, exe_sha256_hex, exe_path, \
+                  suspicion, rationale, ts_unix_ms, backend, confirmed, peers_asked, \
+                  peers_unseen, peers_seen, peers_refused, peers_incomparable, \
+                  peers_familiar, model_explanation",
     },
     Table {
         name: "bowery_baseline_binaries",

@@ -11,7 +11,12 @@
 'use strict';
 
 const $ = (sel) => document.querySelector(sel);
-const state = { pane: 'query', alerts: [], selected: null, mesh: null, sim: null };
+const state = {
+  pane: 'query', alerts: [], selected: null, mesh: null, sim: null,
+  schema: { tables: [], examples: [], columns_from: '' },
+  table: null, fields: [], orderBy: '', orderDir: 'DESC', limit: 100,
+  generated: '', dirty: false,
+};
 
 /* ---------- tiny DOM helpers (textContent only) ---------- */
 
@@ -103,32 +108,276 @@ async function loadTable(container, name, fanout) {
 
 /* ---------- Query pane ---------- */
 
-const EXAMPLES = [
-  ['detections that fired', 'SELECT rule_id, fired, fired_since_install FROM bowery_detections WHERE fired > 0 ORDER BY fired DESC'],
-  ['sensor health', 'SELECT probe, attached, emitted, kernel_drops, stopped_reason FROM bowery_probe_status'],
-  ['corroboration', 'SELECT * FROM bowery_corroboration_status'],
-  ['live alerts', 'SELECT rule_id, suspicion, exe_path, backend, model_explanation FROM bowery_alerts ORDER BY ts_unix_ms DESC LIMIT 30'],
-  ['recent execs', "SELECT pid, comm, exe_path, substr(args,1,80) AS args FROM bowery_events WHERE kind='exec' ORDER BY ts_unix_ms DESC LIMIT 40"],
-  ['outbound peers', 'SELECT addr, port, seen_count, last_seen_unix FROM bowery_net_destinations ORDER BY seen_count DESC LIMIT 30'],
-];
+/* ---------- table browser + query builder ----------
+ *
+ * The draft is generated from the fields, and the textarea stays
+ * editable: a builder that owns the text would make every query it
+ * cannot express impossible, and most interesting queries are joins
+ * and expressions no field picker is going to produce. So the builder
+ * writes a starting point, and the moment you type the badge says the
+ * two have diverged.
+ */
+
+function sqlName(n) {
+  // Identifiers come from the schema the agent reported, never from
+  // typing, so quoting is belt-and-braces rather than the barrier.
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(n) ? n : '"' + n.replace(/"/g, '""') + '"';
+}
+
+function sqlLit(value, ty) {
+  const numeric = /INT|REAL|NUM|FLOA|DOUB/i.test(ty || '');
+  if (numeric && value.trim() !== '' && !Number.isNaN(Number(value))) return value.trim();
+  // Doubling the quote is the SQLite escape. The agent enforces
+  // read-only on its side; this is about not generating broken SQL.
+  return "'" + value.replace(/'/g, "''") + "'";
+}
+
+function buildDraft() {
+  const t = state.table;
+  if (!t) return '';
+  const picked = state.fields.filter((f) => f.checked).map((f) => sqlName(f.name));
+  const select = picked.length ? picked.join(', ') : '*';
+
+  const where = state.fields
+    .filter((f) => f.value && f.value.trim() !== '')
+    .map((f) => {
+      const c = sqlName(f.name);
+      if (f.op === 'contains') return `${c} LIKE ${sqlLit('%' + f.value + '%', 'TEXT')}`;
+      return `${c} ${f.op} ${sqlLit(f.value, f.ty)}`;
+    });
+
+  let sql = `SELECT ${select}\n  FROM ${sqlName(t.name)}`;
+  if (where.length) sql += `\n WHERE ${where.join('\n   AND ')}`;
+  if (state.orderBy) sql += `\n ORDER BY ${sqlName(state.orderBy)} ${state.orderDir}`;
+  sql += `\n LIMIT ${state.limit}`;
+  return sql;
+}
+
+function applyDraft(run) {
+  const sql = buildDraft();
+  if (!sql) return;
+  state.generated = sql;
+  $('#q-sql').value = sql;
+  setDirty(false);
+  if (run) runQuery();
+}
+
+function setDirty(on) {
+  state.dirty = on;
+  $('#q-dirty').hidden = !on;
+  $('#q-rebuild').hidden = !on;
+}
+
+function renderTableList() {
+  const box = $('#t-list');
+  clear(box);
+  const needle = $('#t-search').value.trim().toLowerCase();
+  const shown = state.schema.tables.filter(
+    (t) => !needle || t.name.toLowerCase().includes(needle) || t.about.toLowerCase().includes(needle)
+  );
+  if (!shown.length) {
+    box.appendChild(el('p', 'muted', 'nothing matches'));
+    return;
+  }
+  shown.forEach((t) => {
+    const row = el('div', 'trow' + (state.table && state.table.name === t.name ? ' sel' : ''));
+    row.appendChild(el('span', 'tn', t.name.replace(/^bowery_/, '')));
+    row.appendChild(el('span', 'tc', String(t.columns.length)));
+    row.title = t.about;
+    row.addEventListener('click', () => selectTable(t));
+    box.appendChild(row);
+  });
+}
+
+function selectTable(t) {
+  state.table = t;
+  // Everything resets with the table: a filter on a column that no
+  // longer exists would silently produce an error instead of a query.
+  state.fields = t.columns.map((c) => ({ name: c.name, ty: c.ty, checked: false, op: 'contains', value: '' }));
+  state.orderBy = '';
+  state.orderDir = 'DESC';
+  state.limit = 100;
+  renderTableList();
+  renderBuilder();
+  // Clicking a table browses it. That is the point of a browser.
+  applyDraft(true);
+}
+
+function renderBuilder() {
+  const b = $('#builder');
+  clear(b);
+  const t = state.table;
+  if (!t) {
+    b.appendChild(el('p', 'muted', 'Pick a table on the left to browse it, then tick the fields you want.'));
+    return;
+  }
+  b.appendChild(el('h3', null, t.name));
+  b.appendChild(el('p', 'about', t.about));
+
+  const ctl = el('div', 'bctl');
+
+  const all = el('button', 'ghost', 'all fields');
+  all.addEventListener('click', () => {
+    const every = state.fields.every((f) => f.checked);
+    state.fields.forEach((f) => { f.checked = !every; });
+    renderBuilder();
+    applyDraft(false);
+  });
+  ctl.appendChild(all);
+
+  const ordLabel = el('label', null, 'order by');
+  const ord = el('select');
+  ord.appendChild(el('option', null, '—'));
+  t.columns.forEach((c) => {
+    const o = el('option', null, c.name);
+    o.value = c.name;
+    if (c.name === state.orderBy) o.selected = true;
+    ord.appendChild(o);
+  });
+  ord.addEventListener('change', () => {
+    state.orderBy = ord.value === '—' ? '' : ord.value;
+    applyDraft(false);
+  });
+  ordLabel.appendChild(ord);
+  ctl.appendChild(ordLabel);
+
+  const dir = el('button', 'ghost', state.orderDir);
+  dir.addEventListener('click', () => {
+    state.orderDir = state.orderDir === 'DESC' ? 'ASC' : 'DESC';
+    dir.textContent = state.orderDir;
+    applyDraft(false);
+  });
+  ctl.appendChild(dir);
+
+  const limLabel = el('label', null, 'limit');
+  const lim = el('input');
+  lim.type = 'number';
+  lim.min = '1';
+  lim.value = String(state.limit);
+  lim.addEventListener('change', () => {
+    const n = Number(lim.value);
+    state.limit = Number.isFinite(n) && n > 0 ? Math.min(n, 5000) : 100;
+    lim.value = String(state.limit);
+    applyDraft(false);
+  });
+  limLabel.appendChild(lim);
+  ctl.appendChild(limLabel);
+
+  const go = el('button', 'primary', 'browse');
+  go.addEventListener('click', () => applyDraft(true));
+  ctl.appendChild(go);
+  b.appendChild(ctl);
+
+  const grid = el('div', 'fields');
+  state.fields.forEach((f) => {
+    const row = el('div', 'field');
+    const cb = el('input');
+    cb.type = 'checkbox';
+    cb.checked = f.checked;
+    cb.id = 'f-' + f.name;
+    cb.addEventListener('change', () => { f.checked = cb.checked; applyDraft(false); });
+    row.appendChild(cb);
+
+    const name = el('label', 'fn', f.name);
+    name.setAttribute('for', cb.id);
+    row.appendChild(name);
+    if (f.ty) row.appendChild(el('span', 'ft', f.ty));
+    row.appendChild(el('span', 'fspacer'));
+
+    const op = el('select', 'fop');
+    ['contains', '=', '!=', '>', '<'].forEach((o) => {
+      const opt = el('option', null, o);
+      opt.value = o;
+      if (o === f.op) opt.selected = true;
+      op.appendChild(opt);
+    });
+    op.addEventListener('change', () => { f.op = op.value; applyDraft(false); });
+    row.appendChild(op);
+
+    const val = el('input', 'fval');
+    val.placeholder = 'filter';
+    val.value = f.value;
+    val.addEventListener('input', () => { f.value = val.value; });
+    val.addEventListener('change', () => applyDraft(false));
+    val.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { f.value = val.value; applyDraft(true); }
+    });
+    row.appendChild(val);
+
+    grid.appendChild(row);
+  });
+  b.appendChild(grid);
+}
 
 function buildExamples() {
   const box = $('#q-examples');
-  EXAMPLES.forEach(([label, sql]) => {
-    const c = el('button', 'chip', label);
-    c.addEventListener('click', () => { $('#q-sql').value = sql; runQuery(); });
+  clear(box);
+  state.schema.examples.forEach((ex) => {
+    const c = el('button', 'chip', ex.question);
+    c.title = ex.sql;
+    c.addEventListener('click', () => {
+      $('#q-sql').value = ex.sql;
+      setDirty(true);
+      runQuery();
+    });
     box.appendChild(c);
   });
+}
+
+async function loadSchema() {
+  try {
+    state.schema = await getJSON('/api/schema');
+    $('#schema-source').textContent =
+      `${state.schema.tables.length} tables · field lists confirmed on browse`;
+    renderTableList();
+    buildExamples();
+  } catch (e) {
+    showError($('#t-list'), e);
+  }
 }
 
 async function runQuery() {
   const out = $('#q-result');
   try {
-    renderTable(out, await postJSON('/api/query', {
+    const t = await postJSON('/api/query', {
       sql: $('#q-sql').value,
       fanout: $('#q-fanout').checked,
-    }));
+    });
+    renderTable(out, t);
+    adoptColumns(t.columns);
   } catch (e) { showError(out, e); }
+}
+
+/* The agent's own column list, taken from the result it just returned.
+ *
+ * This is the authoritative source. The catalogue's lists are
+ * hand-maintained and have been wrong — nine of seventeen examples
+ * once errored against a real agent because the columns were written
+ * from memory — and `pragma_table_info` is refused outright by the
+ * agent's authorizer, which is a hardening control worth keeping. A
+ * SELECT reports what it returned, so browsing a table is also how the
+ * browser learns its shape.
+ *
+ * Only adopted for a plain `SELECT *` of the selected table: the
+ * columns of a projection or a join describe the query, not the table,
+ * and feeding those back into the field picker would quietly shrink it
+ * to whatever was last asked for.
+ */
+function adoptColumns(cols) {
+  const t = state.table;
+  if (!t || !cols || !cols.length) return;
+  if (!state.fields.every((f) => !f.checked)) return;
+  const known = new Set(state.fields.map((f) => f.name));
+  const differs = cols.length !== state.fields.length || cols.some((c) => !known.has(c));
+  if (!differs) return;
+  const prior = new Map(state.fields.map((f) => [f.name, f]));
+  state.fields = cols.map((c) => prior.get(c) || { name: c, ty: '', checked: false, op: 'contains', value: '' });
+  t.columns = cols.map((c) => ({ name: c, ty: '' }));
+  state.measured = true;
+  renderBuilder();
+  renderTableList();
+  $('#schema-source').textContent =
+    `${state.schema.tables.length} tables · ${t.name} read from the agent`;
 }
 
 /* ---------- Alerts ---------- */
@@ -480,7 +729,11 @@ function buildHelp() {
   add('p', null, 'The same panes as bowery-console, over the same data: live tables come from the relay agent through the whisper transport, and alerts come from the operator-side archive.');
   add('h3', null, 'keys');
   const ul = el('ul');
-  [['1 … 9', 'switch pane'], ['r', 'refresh the active pane'], ['ctrl/⌘ + enter', 'run the query']]
+  [
+    ['1 … 9', 'switch pane'],
+    ['r', 'refresh the active pane'],
+    ['ctrl/⌘ + enter', 'run the query'],
+  ]
     .forEach(([k, v]) => ul.appendChild(el('li', null, `${k} — ${v}`)));
   b.appendChild(ul);
   add('h3', null, 'where the numbers come from');
@@ -489,6 +742,8 @@ function buildHelp() {
     'Alerts, and every per-peer whisper verdict, come from ~/.bowery/alerts.db — the agent\'s own bowery_alerts table does not carry an alert\'s context.',
     'The mesh graph is a fan-out: every agent\'s own view of its neighbours, not one host\'s opinion of the fleet.',
     'A node drawn hollow was named by somebody else\'s gossip and did not answer for itself.',
+    'The table browser reads its column lists from the agent, not from the compiled-in catalogue — the two have disagreed before. The header says which source was used.',
+    'The field picker writes a draft and then leaves the text alone. Edit it freely; the "hand-edited" badge means the text and the fields have diverged, and nothing is overwritten until you touch a field or press rebuild.',
   ].forEach((t) => ul2.appendChild(el('li', null, t)));
   b.appendChild(ul2);
   add('h3', null, 'this listener is unauthenticated');
@@ -498,7 +753,7 @@ function buildHelp() {
 /* ---------- pane wiring ---------- */
 
 const LOADERS = {
-  query: () => {},
+  query: loadSchema,
   alerts: loadAlerts,
   mesh: loadMesh,
   audit: () => loadTable($('#audit-result'), 'bowery_audit'),
@@ -533,7 +788,6 @@ function switchPane(name) {
 }
 
 function init() {
-  buildExamples();
   buildHelp();
   document.querySelectorAll('.tab').forEach((t) =>
     t.addEventListener('click', () => switchPane(t.dataset.pane)));
@@ -545,6 +799,13 @@ function init() {
   $('#q-sql').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runQuery(); }
   });
+  // Typing marks the text as diverged from the fields rather than
+  // having the builder silently win the next time anything is clicked.
+  $('#q-sql').addEventListener('input', () => {
+    setDirty($('#q-sql').value !== state.generated);
+  });
+  $('#q-rebuild').addEventListener('click', () => applyDraft(false));
+  $('#t-search').addEventListener('input', renderTableList);
 
   const order = ['query', 'alerts', 'mesh', 'audit', 'peers', 'silences', 'doctor', 'chat', 'help'];
   window.addEventListener('keydown', (e) => {
@@ -555,6 +816,7 @@ function init() {
   });
   window.addEventListener('resize', () => { if (state.pane === 'mesh' && state.mesh) drawMesh(state.mesh); });
 
+  loadSchema();
   getJSON('/api/health').then((h) => {
     $('#relay-info').textContent = `relay ${h.relay_addr} · ${h.relay_fp.slice(0, 12)} · ${h.version}`;
     setStatus('ok', 'connected');
