@@ -23,6 +23,7 @@ pub mod audit;
 pub mod catalog;
 pub mod doctor;
 pub mod exec;
+pub mod hunts;
 pub mod mesh_trust;
 pub mod model;
 pub mod notify;

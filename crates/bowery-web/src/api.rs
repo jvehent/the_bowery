@@ -34,6 +34,7 @@ pub(crate) fn router(relay: Shared) -> Router {
         .route("/api/mesh", get(mesh))
         .route("/api/table/{name}", get(table))
         .route("/api/schema", get(schema))
+        .route("/api/hunts", get(hunts))
         .with_state(relay)
 }
 
@@ -220,6 +221,68 @@ async fn schema(State(_r): State<Shared>) -> Json<Schema> {
         examples,
         columns_from: "catalogue (provisional until the table is browsed)",
     })
+}
+
+// ---------------------------------------------------------------------
+// Hunts — the curated incident-response questions
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct HuntParam {
+    key: &'static str,
+    label: &'static str,
+    default: &'static str,
+    hint: &'static str,
+    /// "text" or "number"; the browser picks the input and knows
+    /// whether the value will be quoted.
+    kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct HuntView {
+    id: &'static str,
+    name: &'static str,
+    about: &'static str,
+    group: &'static str,
+    table: &'static str,
+    /// The template, with `{key}` placeholders left in.
+    ///
+    /// Sent unrendered on purpose: the browser fills it and shows the
+    /// result *before* anything runs. A hunt goes to every host in the
+    /// fleet at once, so the operator reads the query first — same
+    /// reasoning as the field picker writing a draft it does not own.
+    sql: &'static str,
+    params: Vec<HuntParam>,
+}
+
+async fn hunts() -> Json<Vec<HuntView>> {
+    Json(
+        bowery_cli::hunts::HUNTS
+            .iter()
+            .map(|h| HuntView {
+                id: h.id,
+                name: h.name,
+                about: h.about,
+                group: h.group,
+                table: h.table,
+                sql: h.sql,
+                params: h
+                    .params
+                    .iter()
+                    .map(|p| HuntParam {
+                        key: p.key,
+                        label: p.label,
+                        default: p.default,
+                        hint: p.hint,
+                        kind: match p.kind {
+                            bowery_cli::hunts::ParamKind::Number => "number",
+                            bowery_cli::hunts::ParamKind::Text => "text",
+                        },
+                    })
+                    .collect(),
+            })
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------

@@ -69,6 +69,25 @@ mod tests {
         }
     }
 
+    /// The Hunt pane is the one the browser has and the terminal does
+    /// not.
+    ///
+    /// Kept out of `the_panes_match_the_terminal_console` deliberately:
+    /// that test is about parity and this is a deliberate addition, so
+    /// folding it in would quietly redefine what parity means.
+    #[test]
+    fn the_hunt_pane_exists_and_is_wired() {
+        assert!(INDEX_HTML.contains("data-pane=\"hunt\""), "no hunt pane");
+        assert!(
+            APP_JS.contains("/api/hunts"),
+            "the hunt pane never loads any"
+        );
+        assert!(
+            APP_JS.contains("fillHunt"),
+            "a hunt must be rendered before it runs against every host"
+        );
+    }
+
     /// The assets are actually wired, not empty files that compile.
     #[test]
     fn the_assets_are_not_empty() {

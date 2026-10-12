@@ -14,6 +14,7 @@ const $ = (sel) => document.querySelector(sel);
 const state = {
   pane: 'query', alerts: [], selected: null, mesh: null, sim: null,
   schema: { tables: [], examples: [], columns_from: '' },
+  hunts: [], hunt: null, huntValues: {}, huntGenerated: '',
   table: null, fields: [], orderBy: '', orderDir: 'DESC', limit: 100,
   generated: '', dirty: false,
 };
@@ -580,6 +581,154 @@ function renderWhisper(pane, a) {
   pane.appendChild(block);
 }
 
+/* ---------- Hunt ----------
+ *
+ * A hunt goes to every host at once, so the rendered SQL is shown
+ * before anything runs and stays editable — the same bargain the field
+ * picker strikes. The server sends templates unrendered for exactly
+ * that reason.
+ */
+
+function fillHunt(h, values) {
+  let sql = h.sql;
+  let bad = null;
+  h.params.forEach((p) => {
+    const raw = (values[p.key] ?? '').trim() === '' ? p.default : values[p.key].trim();
+    let filled;
+    if (p.kind === 'number') {
+      if (!/^-?\d+$/.test(raw)) { bad = { key: p.key, msg: 'needs a whole number' }; filled = raw; }
+      else filled = raw;
+    } else {
+      // Doubling the quote is the SQLite escape. The operator can edit
+      // the result anyway; this is about generating valid SQL.
+      filled = raw.replace(/'/g, "''");
+    }
+    sql = sql.split('{' + p.key + '}').join(filled);
+  });
+  return { sql, bad };
+}
+
+function renderHuntDraft(run) {
+  const h = state.hunt;
+  if (!h) return;
+  const { sql, bad } = fillHunt(h, state.huntValues);
+  document.querySelectorAll('.param').forEach((n) => n.classList.remove('bad'));
+  document.querySelectorAll('.perr').forEach((n) => n.remove());
+  if (bad) {
+    const wrap = document.querySelector(`.param[data-key="${bad.key}"]`);
+    if (wrap) {
+      wrap.classList.add('bad');
+      wrap.appendChild(el('span', 'perr', bad.msg));
+    }
+    return;
+  }
+  state.huntGenerated = sql;
+  $('#h-sql').value = sql;
+  setHuntDirty(false);
+  if (run) runHunt();
+}
+
+function setHuntDirty(on) {
+  $('#h-dirty').hidden = !on;
+  $('#h-rebuild').hidden = !on;
+}
+
+function renderHuntList() {
+  const pick = $('#h-pick');
+  clear(pick);
+  const box = $('#h-list');
+  clear(box);
+  let group = '';
+  state.hunts.forEach((h) => {
+    if (h.group !== group) {
+      group = h.group;
+      const og = document.createElement('optgroup');
+      og.label = group;
+      og.dataset.group = group;
+      pick.appendChild(og);
+      box.appendChild(el('div', 'hgroup', group));
+    }
+    const o = el('option', null, h.name);
+    o.value = h.id;
+    if (state.hunt && state.hunt.id === h.id) o.selected = true;
+    pick.lastElementChild.appendChild(o);
+
+    const row = el('div', 'trow' + (state.hunt && state.hunt.id === h.id ? ' sel' : ''));
+    row.appendChild(el('span', 'tn', h.name));
+    row.title = h.about;
+    row.addEventListener('click', () => selectHunt(h));
+    box.appendChild(row);
+  });
+  pick.addEventListener('change', () => {
+    const h = state.hunts.find((x) => x.id === pick.value);
+    if (h) selectHunt(h);
+  });
+}
+
+function selectHunt(h) {
+  state.hunt = h;
+  state.huntValues = {};
+  h.params.forEach((p) => { state.huntValues[p.key] = p.default; });
+  renderHuntList();
+  renderHuntDetail();
+  // Rendered, not run: a hunt reaches every host, so it waits for a
+  // deliberate press. The one exception is a hunt that takes no
+  // parameters and asks nothing of the fleet it would not ask anyway.
+  renderHuntDraft(h.params.length === 0);
+}
+
+function renderHuntDetail() {
+  const b = $('#h-detail');
+  clear(b);
+  const h = state.hunt;
+  if (!h) return;
+  b.appendChild(el('h3', null, h.name));
+  b.appendChild(el('p', 'about', h.about));
+
+  if (h.params.length) {
+    const grid = el('div', 'params');
+    h.params.forEach((p) => {
+      const wrap = el('div', 'param');
+      wrap.dataset.key = p.key;
+      wrap.appendChild(el('span', 'plabel', p.label));
+      const inp = el('input');
+      inp.type = p.kind === 'number' ? 'number' : 'text';
+      inp.value = state.huntValues[p.key] ?? p.default;
+      inp.placeholder = p.default || '(blank)';
+      inp.addEventListener('input', () => {
+        state.huntValues[p.key] = inp.value;
+        renderHuntDraft(false);
+      });
+      inp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') renderHuntDraft(true);
+      });
+      wrap.appendChild(inp);
+      wrap.appendChild(el('span', 'phint', p.hint));
+      grid.appendChild(wrap);
+    });
+    b.appendChild(grid);
+  }
+  b.appendChild(el('div', 'huntmeta', `reads ${h.table} · bowery hunts --sql ${h.id}`));
+}
+
+async function runHunt() {
+  const out = $('#h-result');
+  try {
+    renderTable(out, await postJSON('/api/query', {
+      sql: $('#h-sql').value,
+      fanout: $('#h-fanout').checked,
+    }));
+  } catch (e) { showError(out, e); }
+}
+
+async function loadHunts() {
+  if (state.hunts.length) return;
+  try {
+    state.hunts = await getJSON('/api/hunts');
+    renderHuntList();
+  } catch (e) { showError($('#h-list'), e); }
+}
+
 /* ---------- Mesh graph ---------- */
 
 function stopSim() { if (state.sim) { cancelAnimationFrame(state.sim); state.sim = null; } }
@@ -755,6 +904,7 @@ function buildHelp() {
 const LOADERS = {
   query: loadSchema,
   alerts: loadAlerts,
+  hunt: loadHunts,
   mesh: loadMesh,
   audit: () => loadTable($('#audit-result'), 'bowery_audit'),
   peers: async () => {
@@ -795,6 +945,14 @@ function init() {
   $('#a-run').addEventListener('click', loadAlerts);
   $('#a-text').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadAlerts(); });
   $('#m-run').addEventListener('click', loadMesh);
+  $('#h-run').addEventListener('click', runHunt);
+  $('#h-rebuild').addEventListener('click', () => renderHuntDraft(false));
+  $('#h-sql').addEventListener('input', () => {
+    setHuntDirty($('#h-sql').value !== state.huntGenerated);
+  });
+  $('#h-sql').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runHunt(); }
+  });
   $('#refresh').addEventListener('click', () => LOADERS[state.pane]());
   $('#q-sql').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runQuery(); }
@@ -807,7 +965,7 @@ function init() {
   $('#q-rebuild').addEventListener('click', () => applyDraft(false));
   $('#t-search').addEventListener('input', renderTableList);
 
-  const order = ['query', 'alerts', 'mesh', 'audit', 'peers', 'silences', 'doctor', 'chat', 'help'];
+  const order = ['query', 'alerts', 'hunt', 'mesh', 'audit', 'peers', 'silences', 'doctor', 'chat', 'help'];
   window.addEventListener('keydown', (e) => {
     const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
     if (typing) return;

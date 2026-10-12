@@ -289,4 +289,37 @@ GOT=$(echo "$OUT" | awk -F'\t' 'NR==2 {print $NF}')
     exit 1
 }
 
+# Every curated hunt, executed against this agent.
+#
+# This is the only check that can catch a hunt whose SQL no longer
+# matches the schema. The unit tests hold them to being SELECTs
+# against catalogued tables, which is a check on the shape and not on
+# the columns — and the columns are exactly what drifted before:
+# `bowery_events` lost `local_addr` from the catalogue and nobody
+# noticed for weeks. A hunt that errors is discovered mid-incident,
+# which is the worst possible time, so it is discovered here instead.
+echo "==> hunts: every curated hunt executes"
+HUNT_FAIL=0
+for id in $("$BOWERY_BIN" hunts | awk '/^  [a-z]/ {print $1}'); do
+    HSQL=$("$BOWERY_BIN" hunts --sql "$id") || {
+        echo "FAIL: could not render hunt $id" >&2
+        HUNT_FAIL=$((HUNT_FAIL + 1))
+        continue
+    }
+    if ! run_sql "$HSQL" >/dev/null 2>"$TEST_DIR/hunt.err"; then
+        echo "FAIL: hunt $id did not execute: $(head -c 200 "$TEST_DIR/hunt.err")" >&2
+        HUNT_FAIL=$((HUNT_FAIL + 1))
+    fi
+done
+[[ "$HUNT_FAIL" -eq 0 ]] || {
+    echo "FAIL: $HUNT_FAIL hunt(s) failed to execute" >&2
+    exit 1
+}
+HUNT_N=$("$BOWERY_BIN" hunts | awk '/^  [a-z]/' | wc -l)
+[[ "$HUNT_N" -gt 0 ]] || {
+    echo "FAIL: no hunts were listed, so nothing was checked" >&2
+    exit 1
+}
+echo "    $HUNT_N hunts executed cleanly"
+
 echo "==> all integration checks passed"

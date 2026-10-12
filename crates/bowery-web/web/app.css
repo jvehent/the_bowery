@@ -345,3 +345,28 @@ svg { width: 100%; height: 100%; display: block; }
   .qgrid { grid-template-columns: 170px 1fr; }
   .fields { grid-template-columns: 1fr; }
 }
+
+/* ---------- hunt ---------- */
+
+.huntpick {
+  width: 100%; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line-hot); border-radius: 5px;
+  font-family: var(--mono); font-size: 11.5px; padding: 5px 7px;
+}
+.huntpick:focus { outline: none; border-color: var(--cyan); }
+.hgroup {
+  color: var(--muted); font-size: 9.5px; letter-spacing: .16em;
+  text-transform: uppercase; margin: 10px 0 3px; padding: 0 7px;
+}
+.builder .params { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 10px 16px; margin-top: 10px; }
+.param { display: flex; flex-direction: column; gap: 3px; }
+.param .plabel { color: var(--text); font-size: 11.5px; }
+.param .phint { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.param input {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line-hot);
+  border-radius: 4px; font-family: var(--mono); font-size: 11.5px; padding: 4px 7px;
+}
+.param input:focus { outline: none; border-color: var(--cyan); }
+.param.bad input { border-color: var(--danger); }
+.param .perr { color: var(--danger); font-size: 10px; }
+.huntmeta { color: var(--muted); font-size: 10.5px; margin-top: 8px; }

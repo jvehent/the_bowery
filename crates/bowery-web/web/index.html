@@ -25,6 +25,7 @@
   <nav class="rail" id="rail">
     <button class="tab active" data-pane="query"><span class="glyph">▚</span>Query</button>
     <button class="tab" data-pane="alerts"><span class="glyph">◆</span>Alerts</button>
+    <button class="tab" data-pane="hunt"><span class="glyph">⌖</span>Hunt</button>
     <button class="tab" data-pane="mesh"><span class="glyph">✳</span>Mesh</button>
     <button class="tab" data-pane="audit"><span class="glyph">▤</span>Audit</button>
     <button class="tab" data-pane="peers"><span class="glyph">⬡</span>Peers</button>
@@ -84,6 +85,39 @@
       <div class="split">
         <div class="list" id="a-list"></div>
         <div class="detail" id="a-detail"><p class="muted">Pick an alert to see what the host saw and what the neighbourhood said.</p></div>
+      </div>
+    </section>
+
+    <section class="pane" id="pane-hunt">
+      <div class="pane-head">
+        <h2>Hunt</h2>
+        <span class="muted">curated questions, asked of every host at once</span>
+        <div class="spacer"></div>
+        <label class="toggle"><input type="checkbox" id="h-fanout" checked> fan out to every peer</label>
+        <button class="primary" id="h-run">hunt ⏎</button>
+      </div>
+
+      <div class="qgrid">
+        <aside class="tablist">
+          <select id="h-pick" class="huntpick"></select>
+          <div id="h-list"></div>
+        </aside>
+
+        <div class="qmain">
+          <div class="builder" id="h-detail">
+            <p class="muted">Pick a hunt. Start with <strong>Is anyone blind</strong> — a quiet host and a blind one look identical from every other hunt here.</p>
+          </div>
+
+          <div class="sqlrow">
+            <textarea id="h-sql" spellcheck="false" rows="5" placeholder="the rendered hunt appears here, editable before it runs"></textarea>
+            <div class="sqlside">
+              <span class="badge" id="h-dirty" hidden>hand-edited</span>
+              <button class="ghost" id="h-rebuild" hidden>rebuild</button>
+            </div>
+          </div>
+
+          <div class="result" id="h-result"></div>
+        </div>
       </div>
     </section>
 

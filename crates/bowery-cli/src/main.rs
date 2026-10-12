@@ -129,6 +129,21 @@ enum Command {
     /// The same reference the console shows on its idle Query pane.
     Tables,
 
+    /// List the curated incident-response hunts, or print one's SQL.
+    ///
+    /// `bowery hunts` lists them. `bowery hunts --sql <id>` renders
+    /// that hunt's SQL with its defaults, which is what you pipe into
+    /// `bowery exec sql --fanout` to ask the whole fleet. Override a
+    /// parameter with `--set key=value`, repeatably.
+    Hunts {
+        /// Render this hunt's SQL instead of listing them.
+        #[arg(long)]
+        sql: Option<String>,
+        /// Override a parameter, as `key=value`. Repeatable.
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+    },
+
     /// Fetch and validate LLM model artifacts (GGUF files) from a
     /// curated registry. Models are written to a local cache directory
     /// the agent reads at startup; nothing is downloaded at agent
@@ -794,6 +809,7 @@ impl Cli {
                 print!("{}", bowery_cli::catalog::render());
                 Ok(ExitCode::SUCCESS)
             }
+            Command::Hunts { sql, set } => hunts_cmd(sql.as_deref(), &set),
             Command::Doctor { json } => doctor_cmd(json),
             Command::Alerts {
                 sub:
@@ -1282,6 +1298,64 @@ fn alerts_history(args: &bowery_cli::archive::HistoryArgs) -> Result<ExitCode> {
         println!("\n{} row(s) shown of {} archived.", rows.len(), stats.rows);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `bowery hunts` — list the curated hunts, or render one's SQL.
+///
+/// Rendering to stdout rather than running it is deliberate: a hunt is
+/// a starting point, and an operator mid-incident should see the query
+/// before it goes to every host. Pipe it into `bowery exec sql
+/// --fanout` when it says what you meant.
+fn hunts_cmd(sql: Option<&str>, set: &[String]) -> Result<ExitCode> {
+    use bowery_cli::hunts;
+
+    let Some(id) = sql else {
+        let mut group = "";
+        for h in hunts::HUNTS {
+            if h.group != group {
+                group = h.group;
+                println!("\n{}", group.to_uppercase());
+            }
+            println!("  {:<22} {}", h.id, h.name);
+            for p in h.params {
+                println!("      --set {}=<{}>  ({})", p.key, p.label, p.default);
+            }
+        }
+        println!("\nbowery hunts --sql <id> [--set key=value] | bowery exec sql --fanout --sql -");
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    let Some(hunt) = hunts::by_id(id) else {
+        let ids: Vec<&str> = hunts::HUNTS.iter().map(|h| h.id).collect();
+        anyhow::bail!("unknown hunt `{id}`; known: {}", ids.join(", "));
+    };
+
+    let mut values = hunt.defaults();
+    for kv in set {
+        let Some((k, v)) = kv.split_once('=') else {
+            anyhow::bail!("--set expects key=value, got {kv:?}");
+        };
+        if !hunt.params.iter().any(|p| p.key == k) {
+            let keys: Vec<&str> = hunt.params.iter().map(|p| p.key).collect();
+            anyhow::bail!(
+                "hunt `{id}` has no parameter `{k}`; it takes: {}",
+                if keys.is_empty() {
+                    "none".to_string()
+                } else {
+                    keys.join(", ")
+                }
+            );
+        }
+        values.insert(k.to_string(), v.to_string());
+    }
+
+    match hunt.render(&values) {
+        Ok(rendered) => {
+            println!("{rendered}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => anyhow::bail!("{e}"),
+    }
 }
 
 fn doctor_cmd(json: bool) -> Result<ExitCode> {
