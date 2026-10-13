@@ -76,6 +76,7 @@ function renderTable(container, table) {
     return;
   }
   const multiAgent = table.agents.some((a) => a !== '');
+  const names = table.agent_names || [];
   const t = el('table');
   const thead = el('thead');
   const hr = el('tr');
@@ -87,7 +88,15 @@ function renderTable(container, table) {
   const tb = el('tbody');
   table.rows.forEach((row, i) => {
     const tr = el('tr');
-    if (multiAgent) tr.appendChild(el('td', 'agentcol', table.agents[i] || '—'));
+    if (multiAgent) {
+      // The operator's nickname, with the fingerprint on hover. The
+      // name is manifest-only — no agent knows it and no table carries
+      // it — so this is the one place it can be attached.
+      const label = names[i] && names[i] !== '?' ? names[i] : (table.agents[i] || '—');
+      const cell = el('td', 'agentcol', label);
+      if (table.agents[i]) cell.title = table.agents[i] + (names[i] === '?' ? ' (not in your peer manifest)' : '');
+      tr.appendChild(cell);
+    }
     row.forEach((v) => {
       if (v === null) { tr.appendChild(el('td', 'null', 'NULL')); return; }
       const num = typeof v === 'number';
@@ -914,6 +923,7 @@ const LOADERS = {
       renderTable(man, {
         columns: ['name', 'fingerprint', 'addr'],
         agents: list.map(() => ''),
+        agent_names: list.map(() => ''),
         rows: list.map((p) => [p.name, p.fp, p.addr]),
       });
     } catch (e) { showError(man, e); }

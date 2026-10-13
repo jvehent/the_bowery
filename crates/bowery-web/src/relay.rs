@@ -31,7 +31,28 @@ pub(crate) struct Table {
     /// Which agent produced each row, short hex. Empty string for a
     /// single-agent query, so the browser can tell "one host answered"
     /// from "this host answered" without guessing.
+    ///
+    /// Stays hex because the mesh graph keys its nodes by it; the
+    /// label a human reads is [`Self::agent_names`].
     pub agents: Vec<String>,
+    /// The operator's own nickname for each row's agent.
+    ///
+    /// The nickname lives only in `~/.bowery/peers.toml`, which is
+    /// operator-side: no agent knows it, and nothing in the SQL
+    /// surface carries it, so it cannot be joined to. Every
+    /// peer-identity table there has `fingerprint_hex` and nothing
+    /// else.
+    ///
+    /// `bowery exec sql --fanout` resolves it into an `_agent_name`
+    /// column; `CollectSink` drops it, because `set_agent_names` has a
+    /// no-op default impl — so the browser showed sixteen hex
+    /// characters where the terminal shows "legolas". Resolved here
+    /// from the same manifest the fan-out pubkeys come from.
+    ///
+    /// `"?"` for a fingerprint the manifest does not name, matching
+    /// what the CLI prints: a peer answered that the operator has no
+    /// name for is a different fact from no peer answering.
+    pub agent_names: Vec<String>,
 }
 
 impl Relay {
@@ -59,8 +80,25 @@ impl Relay {
             &mut sink,
         )
         .await?;
+        let names = peer_names();
         Ok(Table {
             columns: sink.columns,
+            agent_names: sink
+                .rows
+                .iter()
+                .map(|r| {
+                    if r.agent_fp.is_empty() {
+                        // Single-agent query: the relay answered for
+                        // itself and no agent column is drawn at all.
+                        String::new()
+                    } else {
+                        names
+                            .get(&hex_all(&r.agent_fp))
+                            .cloned()
+                            .unwrap_or_else(|| "?".to_string())
+                    }
+                })
+                .collect(),
             agents: sink.rows.iter().map(|r| short_hex(&r.agent_fp)).collect(),
             rows: sink
                 .rows
@@ -69,6 +107,20 @@ impl Relay {
                 .collect(),
         })
     }
+}
+
+/// Full lowercase fingerprint → the operator's nickname for it.
+fn peer_names() -> std::collections::HashMap<String, String> {
+    bowery_cli::peers::default_path()
+        .ok()
+        .and_then(|p| bowery_cli::peers::Manifest::load(&p).ok())
+        .map(|m| {
+            m.peers
+                .into_iter()
+                .map(|p| (p.fp.to_ascii_lowercase(), p.name))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Verifying keys for every peer in the operator's manifest.
